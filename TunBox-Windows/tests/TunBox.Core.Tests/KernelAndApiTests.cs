@@ -396,3 +396,47 @@ public class WorkspaceDataTests
         finally { try { Directory.Delete(home, true); } catch { } }
     }
 }
+
+/// <summary>
+/// 版本号写死在四个地方（app 程序集、installer.nsi 的两处、make-installer.ps1），漏一个就会发出
+/// 「文件名 0.3.0、关于页 0.4.8」这种自相矛盾的包 —— 0.4.8 那轮真就这么差点出事。
+/// 两端还要对齐：鸿蒙端 AppScope/app.json5 的 versionName 是同一个产品的版本号。
+/// </summary>
+public class VersionConsistencyTests
+{
+    private static string RepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        for (var depth = 0; dir != null && depth < 10; depth++, dir = dir.Parent)
+            if (Directory.Exists(Path.Combine(dir.FullName, "TunBox-Windows"))) return dir.FullName;
+        throw new DirectoryNotFoundException("找不到仓库根（应有 TunBox-Windows/）");
+    }
+
+    [Fact]
+    public void Windows_version_matches_the_app_the_installer_and_the_harmonyos_client()
+    {
+        var root = RepoRoot();
+        var nsi = File.ReadAllText(Path.Combine(root, "TunBox-Windows", "scripts", "installer.nsi"));
+        var ps1 = File.ReadAllText(Path.Combine(root, "TunBox-Windows", "scripts", "make-installer.ps1"));
+
+        string Grab(string text, string pattern) =>
+            Regex.Match(text, pattern).Groups[1].Value;
+
+        var appVersion = typeof(TunBox.App.MainViewModel).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .Cast<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion.Split('+')[0] ?? "";
+        var nsiVersion = Grab(nsi, "!define VERSION \"([^\"]+)\"");
+        var nsiResource = Grab(nsi, "VIAddVersionKey \"ProductVersion\" \"([^\"]+)\"");
+        var scriptVersion = Grab(ps1, @"(?m)^\$ver = '([^']+)'");
+
+        Assert.False(appVersion.Length == 0, "读不到程序集版本");
+        Assert.Equal(appVersion, nsiVersion);
+        Assert.Equal(nsiVersion, nsiResource);
+        Assert.Equal(nsiVersion, scriptVersion);
+
+        var json5 = File.ReadAllText(Path.Combine(root, "TunBox_HarmonyOS", "AppScope", "app.json5"));
+        var harmonyVersion = Grab(json5, "\"versionName\":\\s*\"([^\"]+)\"");
+        Assert.Equal(harmonyVersion, appVersion);
+    }
+}

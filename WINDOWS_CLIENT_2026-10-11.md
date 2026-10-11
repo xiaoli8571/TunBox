@@ -515,3 +515,59 @@ public List<ProxyNode> Nodes { get; } = new();   // 写得出去，读回来 0 �
 
 本机检出 `C:\Worker\_release\TunBox-repo` 上那条本地提交 `897fd6b` 与远端 `2ab642b` 内容等价但历史不同，
 **不要 `git push` 它**；等 7890 可用时先 `git fetch` 再把本地分支对回 origin/main。
+
+---
+
+# 0.3.0 轮（2026-10-12 零点）：版本号并回鸿蒙端 + 安装时自动关掉正在运行的程序
+
+## 1. 版本号 0.4.x → **0.3.0**
+
+用户要求两端版本一致：鸿蒙端 `TunBox_HarmonyOS/AppScope/app.json5` 是 `versionName "0.3.0"`
+（versionCode 300），Windows 端此前自己爬到了 0.4.8，属于同一产品的两个头各报各的号。
+现在四处一起改（`TunBox.App.csproj` 的 `<Version>`、`installer.nsi` 的 `!define VERSION` 与
+`VIProductVersion`/`VIAddVersionKey`、`make-installer.ps1` 的 `$ver`），并且**加了测试守着**：
+`VersionConsistencyTests.Windows_version_matches_the_app_the_installer_and_the_harmonyos_client`
+从程序集 InformationalVersion、`.nsi` 两处、`.ps1` 一处和鸿蒙 `app.json5` 一起取值比对 ——
+0.4.8 那轮我差点发出「文件名 0.4.8、关于页 0.4.7」的包（先改完脚本忘了改 csproj），
+没有这条测试就还会再犯。GitHub 上 `windows-v0.4.6/0.4.7/0.4.8` 三个 Release 按要求删除，
+只留 `windows-v0.3.0`。
+
+## 2. 装新版时自动关闭正在运行的 TunBox
+
+原来的失败方式：主程序在跑 → `File /r` 覆盖 `TunBox.exe` 报「无法写入文件」→ 安装中止。
+现在安装节先 `Call CloseRunningApp`：优雅 `taskkill /IM "TunBox.exe"`（不带 /F = 发 WM_CLOSE）→
+等文件解锁（6 次 × 500ms ≈ 3 秒）→ **还锁着就 `taskkill /F`** → 再等解锁（12 次 ≈ 6 秒）。
+
+这里有个坑值得记：**判据不能用 taskkill 的返回码**。最小化到托盘的 WPF 程序窗口是隐藏的，
+taskkill 会当成「没有可关的窗口」报错返回，看着像「进程已经没了」，其实文件还锁着 ——
+安装照样在下一行失败。所以 `WaitForUnlock` 只认一件事：`FileOpen "$INSTDIR\TunBox.exe" a`
+能不能打开。打点实测每步 220–500ms，最坏总耗时约 10 秒，绝不会变成无限等。
+顺带补一刀 `taskkill /F /IM "tunbox-core.exe"`：内核 normally 随主程序的 Job Object
+（KILL_ON_JOB_CLOSE）一起走，补这刀是防上次崩溃留下的孤儿内核占着 `core\tunbox-core.exe` 与 7890。
+两个镜像名都是我们自己的，不碰用户机器上的其他代理程序。
+
+实测（`C:\Worker\_release\test-close-app.ps1`，在临时目录里跑假 TunBox.exe，不动真安装目录与
+`%APPDATA%\TunBox`）：无进程 1.1s 通过；窗口型进程优雅关闭 1s、文件立刻可写；
+活着的控制台进程被关掉后文件解锁 1s；被外部句柄锁住时正确报「仍占用」。
+
+## 3. 顺手修的一个仓库陷阱
+
+根 `.gitignore` 为鸿蒙打包产物写的 `*.app`，在大小写不敏感的 Windows 上（`core.ignorecase=true`）
+会把 **`TunBox-Windows/src/TunBox.App/` 这个源码目录整个判为忽略**：已跟踪的文件照常提交，
+所以一直没露脸；但**以后在该目录新建的 .cs/.xaml 会被 `git add` 静默跳过**（这轮 `git add` 就报了
+"The following paths are ignored"，才把它揪出来）。已在 `.gitignore` 里显式豁免：
+
+```
+!TunBox-Windows/src/TunBox.App/
+!TunBox-Windows/src/TunBox.App/**
+```
+
+判据：往该目录扔一个 `__ignore_probe.cs`，`git status` 能看见 `??` 才算真通（`git check-ignore -v`
+只回显最后命中的规则，看着像“被忽略”，别被它骗）。
+
+## 4. 版本与验证
+
+- 测试 **70/70**（新增版本一致性那条）。
+- `dist/TunBox-Setup-0.3.0.exe` 80,698,375 字节，makensis 汇总仍是 `5 pages, 2 sections (1 required)`
+  —— 组件页那颗「清理个人数据」默认不勾选的行为不变。
+- 本机没有覆盖安装用户的 TunBox（那该由他自己在向导里决定保不保留数据）。

@@ -11,6 +11,10 @@ entry/build/
 *.hap
 *.hap.gz
 *.app
+# 但 *.app 在大小写不敏感的 Windows 上会顺手把 Windows 端源码目录 TunBox.App 整个判为忽略，
+# 那里新增的 .cs/.xaml 会静默进不了仓库（tracked 文件不受影响，所以一直没人发现）。显式豁免它。
+!TunBox-Windows/src/TunBox.App/
+!TunBox-Windows/src/TunBox.App/**
 *.log
 *.json.gz
 oh-package-lock.json5
