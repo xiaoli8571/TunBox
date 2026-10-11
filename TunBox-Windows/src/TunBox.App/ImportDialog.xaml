@@ -1,0 +1,77 @@
+<Window x:Class="TunBox.App.ImportDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="导入订阅" Width="430" SizeToContent="Height" MaxHeight="620"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize" ShowInTaskbar="False"
+        Background="White"
+        FontFamily="Segoe UI, Microsoft YaHei UI" FontSize="13"
+        AllowDrop="True" Drop="OnDropFile">
+    <Window.Resources>
+        <!-- 样式合并进窗口自己（和主窗口同理）：对话框不能指望 App 级资源，
+             否则在非 App 宿主（单测的裸 Application）里 StaticResource 直接炸 -->
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="/TunBox;component/Assets/Styles.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
+            <Style x:Key="FieldLabel" TargetType="TextBlock">
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter Property="Foreground" Value="{DynamicResource TextMain}"/>
+                <Setter Property="Margin" Value="0,14,0,6"/>
+            </Style>
+            <Style x:Key="Placeholder" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="#9AA4B2"/>
+                <Setter Property="IsHitTestVisible" Value="False"/>
+                <Setter Property="Visibility" Value="Collapsed"/>
+                <Style.Triggers>
+                    <DataTrigger Binding="{Binding Text, RelativeSource={RelativeSource AncestorType=TextBox}}" Value="">
+                        <Setter Property="Visibility" Value="Visible"/>
+                    </DataTrigger>
+                </Style.Triggers>
+            </Style>
+        </ResourceDictionary>
+    </Window.Resources>
+    <StackPanel Margin="22,18,22,18">
+
+        <TextBlock Text="导入订阅" FontSize="16" FontWeight="Bold" Foreground="{DynamicResource TextMain}"/>
+        <TextBlock Text="订阅链接、本地配置文件，或直接粘贴节点链接，任选其一"
+                   Foreground="{DynamicResource TextMuted}" Margin="0,4,0,0"/>
+
+        <TextBlock Text="订阅链接或节点链接" Style="{StaticResource FieldLabel}"/>
+        <Grid>
+            <TextBox x:Name="InputBox" AcceptsReturn="True" MinHeight="64" MaxHeight="140"
+                     VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
+                     FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"/>
+            <TextBlock Style="{StaticResource Placeholder}" Margin="11,9,0,0" TextWrapping="Wrap"
+                       Text="https://example.com/api/subscribe?token=…&#x0a;ss://… 或 vless://…（粘贴时每行一条）"/>
+        </Grid>
+        <TextBlock Style="{DynamicResource Hint}" Margin="0,6,0,0"
+                   Text="导入后会依次尝试 Clash Verge / mihomo 等主流客户端的 User-Agent；失败时显示面板返回的原文。"/>
+
+        <Grid Margin="0,16,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Separator Grid.Column="0" VerticalAlignment="Center" Background="#E5E9F0"/>
+            <TextBlock Grid.Column="1" Text="或者" Margin="10,0" VerticalAlignment="Center"
+                       Foreground="{DynamicResource TextMuted}" FontSize="11.5"/>
+            <Separator Grid.Column="2" VerticalAlignment="Center" Background="#E5E9F0"/>
+        </Grid>
+
+        <TextBlock Text="本地配置文件（yaml / conf）" Style="{StaticResource FieldLabel}"/>
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button Content="选择文件…" Style="{StaticResource GhostButton}" Padding="12,6" Click="OnPickFile"/>
+            <TextBlock x:Name="FileName" Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center"
+                       Style="{DynamicResource Hint}" TextTrimming="CharacterEllipsis"/>
+        </Grid>
+        <TextBlock Style="{DynamicResource Hint}" Margin="0,6,0,0"
+                   Text="也可以把文件直接拖进这个窗口。"/>
+
+        <Button Content="导入" Height="38" Margin="0,18,0,0" FontWeight="Bold" Click="OnImport"/>
+    </StackPanel>
+</Window>

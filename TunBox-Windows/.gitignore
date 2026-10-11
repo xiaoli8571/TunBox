@@ -1,0 +1,7 @@
+bin/
+obj/
+publish/
+dist/
+# 内核与 smart 模型不入库：体积大（tunbox-core.exe 66MB / Model.bin 9.3MB），
+# 且构建脚本会校验它们在不在位。取法见 README.md。
+core/

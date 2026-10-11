@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- exe 本体的图标：资源管理器、任务栏大图标、快捷方式都取自它。
+         之前重写工程时丢了这一行，任务栏一直是白纸图标（用户点名的问题）。 -->
+    <ApplicationIcon>Assets\tunbox.ico</ApplicationIcon>
+    <AssemblyName>TunBox</AssemblyName>
+    <RootNamespace>TunBox.App</RootNamespace>
+    <Version>0.4.6</Version>
+    <Product>TunBox</Product>
+    <AssemblyTitle>TunBox for Windows</AssemblyTitle>
+    <SupportedOSPlatform>windows</SupportedOSPlatform>
+    <!-- 自包含 + 目录式：单文件会把 core/ 一起封进 exe，而 CoreHost 按磁盘路径找内核 -->
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- WinForms 会注入全局 using 与 WPF 撞名；托盘代码用别名 WinForms. -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\tunbox.ico" />
+    <Resource Include="Assets\logo.png" />
+    <None Include="..\..\core\tunbox-core.exe">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Link>core\tunbox-core.exe</Link>
+    </None>
+    <None Include="..\..\core\Model.bin">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Link>core\Model.bin</Link>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TunBox.Core\TunBox.Core.csproj" />
+  </ItemGroup>
+
+</Project>
