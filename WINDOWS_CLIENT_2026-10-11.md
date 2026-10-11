@@ -392,3 +392,48 @@ IPv6、常规这种一句话的功能不再占掉和端口表一样大的一块�
 另外第一次提交把路径写重了一层（`TunBox-Windows/TunBox-Windows/…`，相对路径前缀加了两次）：
 用同一批 blob 重建 tree、换掉 commit，并 `PATCH refs/tags/windows-v0.4.6` 把标签移到修正后的提交上 ——
 **Release 的附件跟标签名走，所以 77MB 不用重传**。
+
+---
+
+# 0.4.7 轮（2026-10-11 深夜，接上）：折叠排序 + smart 上界面 + 真 git 推送
+
+## 界面
+
+1. **设置页每节都做成可折叠条**（网络配置 / 内核 / 分流规则 / 常规），并且**折叠着的排在上面、展开的那节
+   自动挪到后面**：`MainWindow.xaml.cs` 的 `OnSectionToggled` → `SortSettingsSections()` 按 IsExpanded
+   稳定重排 `SettingsPanel.Children`。注意 `UIElementCollection` 没有 `Move`（那是 ObservableCollection 的），
+   只能 Remove + Insert。
+2. **顶栏流量串去掉「N 条连接」**（最长时最右边显示不全），连接数改放「实时连接」卡标题
+   （`ConnectionsHeader`，快照应用时 Raise）。
+3. **IPv6 + DNS 覆写并入「网络配置」**（原「端口与局域网」改名）；**分流库的「更新」从首页挪进
+   「分流规则」**，与「去广告」同级。
+4. 折叠态全部走视图模型 + `Mode=TwoWay`（切页会丢视觉树，绑在控件上必弹开）。
+
+## smart 自动优选（mihomo-smart 的内置 LightGBM）
+
+对照鸿蒙端（`TunBox_HarmonyOS`）的实现搬到 Windows：
+
+- 组名 `♻️ 自动选择` 两端一致；发射判据一致（开关开 + 模型在盘 + ≥2 节点），
+  新增 `ConnectionManager.SmartGroupReady`。
+- **模型要在 `ConnectionManager` 构造时 `EnsureSmartModelInPlace()`**：以前只在 BuildConfig 里放，
+  第一次打开界面时模型还没到位 → 「自动选择」这一条会凭空消失。
+- 订阅页顶部一条「自动选择」（副标题带候选节点数 + 使用中徽标）；
+  `Settings.SelectedNodeId == "smart"` 是「出口交给 smart 组」的哨兵值；
+  **没显式选过节点时默认即自动态**；点任意真实节点 → 哨兵被节点 id 覆盖 = 切回手动。
+- 首页「当前出口」在自动态显示组名。鸿蒙端那条关键事实同样适用：
+  **LightGBM 的按连接选择不会写回 `/proxies` 的 `now`**，只有每条连接的 `chains` 是事实 ——
+  所以 Windows 端实际走的节点看「实时连接」的出口列（chain[0]）。
+
+## 推送：本地代理可用，改回真 git
+
+用户给了本地代理 `127.0.0.1:7890`。实测 `curl -x` 打 github.com 与 `info/refs` 都是 200 ——
+**上一轮记的「github.com 被阻断」其实是没走代理**，不是网络封锁。于是这轮走正规路径：
+
+- `git -c http.proxy=http://127.0.0.1:7890 clone` 到 `C:\Worker\_release\TunBox-repo`（本机终于有一个真检出）；
+- robocopy `/MIR /XD bin obj publish dist core` 同步源码（Git Bash 会把 `/MIR` 当路径转换，
+  要 `MSYS_NO_PATHCONV=1`），只提交 9 个文件 +298/-68，构建产物与内核二进制一个没带；
+- `git push origin main` → `53d0fea..3297ddc` ✓；
+- Release `windows-v0.4.7`（id 409735079）：`Invoke-RestMethod` 直连传 77MB 附件**超时**，
+  改 `curl -x http://127.0.0.1:7890 --data-binary` → 201，复查 `state=uploaded`、80,702,311 字节。
+
+测试 **66/66**；`dist/TunBox-Setup-0.4.7.exe`。
