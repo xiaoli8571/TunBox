@@ -500,3 +500,18 @@ public List<ProxyNode> Nodes { get; } = new();   // 写得出去，读回来 0 �
 - 测试 **69/69**（新增 3 条：设置页不跳位、名单全量往返、半截文件回落）；
   `dist/TunBox-Setup-0.4.8.exe` 80,690,136 字节。
 - 未在本机覆盖安装（用户机上那份 0.4.7 实例常驻，两个实例抢 7890 会污染验证）。
+
+## 5. 发布
+
+`127.0.0.1:7890` 这轮不通（用户机上 TunBox 没在跑，端口无人监听），`git ls-remote` 直连 github.com 依旧
+连不上，而 `api.github.com` 正常 —— 于是回退到 0.4.6 那套 Data API（脚本 `C:\Worker\_release\publish-048.ps1`）：
+10 个文件逐个 `POST /git/blobs`（**base64**，`.nsi` 的 BOM 与 CJK 才能逐字节保住，落地后用
+`git hash-object --no-filters` 对过号）→ `POST /git/trees`（base_tree = 上一提交的树）→
+`POST /git/commits` → `PATCH /git/refs/heads/main`（不带 force，只能快进）。
+提交 `2ab642b`（父 `2e2d149`）、Release `windows-v0.4.8`（id 409758115）、
+附件 `TunBox-Setup-0.4.8.exe` 80,690,136 字节 `state=uploaded`。
+提交信息与正文都走 `[Text.Encoding]::UTF8.GetBytes` + `charset=utf-8`，回读确认中文没变 `?`
+（控制台打印是 GBK 码页的花码，不代表存坏了 —— 要用 `sed` 直接看 API 返回的字节）。
+
+本机检出 `C:\Worker\_release\TunBox-repo` 上那条本地提交 `897fd6b` 与远端 `2ab642b` 内容等价但历史不同，
+**不要 `git push` 它**；等 7890 可用时先 `git fetch` 再把本地分支对回 origin/main。
