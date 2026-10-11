@@ -80,6 +80,32 @@ public partial class MainWindow : Window
         ViewModel.EditSubscription(item, name, url);
     }
 
+    /// <summary>
+    /// 设置页每一节都可折叠；折叠着的排在上面，展开的自动挪到后面 ——
+    /// 这样这一页平时是一列整齐的条，不会有人展开一节就高低不平。
+    /// </summary>
+    private void OnSectionToggled(object sender, RoutedEventArgs e) =>
+        Dispatcher.BeginInvoke(new Action(SortSettingsSections));
+
+    private void SortSettingsSections()
+    {
+        var sections = new[] { SecNetwork, SecKernel, SecRules, SecGeneral };
+        // 稳定排序：折叠(0) 在前、展开(1) 在后，同组内保持声明顺序
+        var order = sections
+            .OrderBy(b => ((System.Windows.Controls.Expander)((System.Windows.Controls.Border)b).Child).IsExpanded ? 1 : 0)
+            .ToList();
+        for (var i = 0; i < order.Count; i++)
+        {
+            var at = SettingsPanel.Children.IndexOf(order[i]);
+            // UIElementCollection 没有 Move（ObservableCollection 才有），只能摘了再插
+            if (at >= 0 && at != i)
+            {
+                SettingsPanel.Children.Remove(order[i]);
+                SettingsPanel.Children.Insert(i, order[i]);
+            }
+        }
+    }
+
     /// <summary>页签切换 → 连接页要轮询，别的页不该摊上这份开销。</summary>
     private void OnTabChanged(object sender, SelectionChangedEventArgs e)
     {

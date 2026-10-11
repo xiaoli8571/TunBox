@@ -516,6 +516,8 @@ public class UiTests
                     if (tab == null) return "找不到设置页";
                     tab.IsSelected = true;
                     WpfHost.PumpUntil(() => tab.IsSelected);
+                    // 「常规」现在默认折叠，下拉框在折叠里 —— 先展开（也证明折叠可用）
+                    window.ViewModel.GeneralExpanded = true;
                     PumpIdle(500);
 
                     var box = Descendants(window).OfType<System.Windows.Controls.ComboBox>()
@@ -574,6 +576,10 @@ public class UiTests
                     if (settings == null) return "找不到设置页";
                     settings.IsSelected = true;
                     WpfHost.PumpUntil(() => settings.IsSelected);
+                    // 网络配置与内核两张卡默认折叠，下拉框藏在折叠里 —— 先展开（顺带证明折叠可用）
+                    window.ViewModel.PortsExpanded = true;
+                    window.ViewModel.GeneralExpanded = true;
+                    window.ViewModel.KernelExpanded = true;
                     PumpIdle(500);
                     var boxes = Descendants(window).OfType<System.Windows.Controls.ComboBox>().ToList();
                     if (boxes.Count < 2) return "设置页上的下拉框数量 " + boxes.Count;
@@ -721,7 +727,7 @@ public class UiTests
                 var exit = Descendants(window).OfType<System.Windows.Controls.Button>()
                     .FirstOrDefault(b => (b.Content as string) == "退出");
                 var traffic = Descendants(window).OfType<System.Windows.Controls.TextBlock>()
-                    .FirstOrDefault(t => (t.Text ?? "").Contains("条连接"));
+                    .FirstOrDefault(t => (t.Text ?? "").Contains("累计"));
                 if (exit == null) return "找不到退出按钮";
                 if (traffic == null)
                 {
@@ -733,6 +739,46 @@ public class UiTests
                 var left = exit.TranslatePoint(new Point(0, 0), window).X;
                 return right <= left ? null
                     : $"流量串（右沿 {right:0}）压到退出按钮（左沿 {left:0}）：{vm.TrafficText}";
+            }
+            finally { window.Close(); }
+        }).Result;
+
+        try { Directory.Delete(home, true); } catch { }
+        Assert.Null(failure);
+    }
+
+    /// <summary>设置页：折叠着的条排在上面，展开的那节自动挪到后面（用户要的「整齐一点」）。</summary>
+    [Fact]
+    public void Settings_page_keeps_collapsed_sections_above_expanded_ones()
+    {
+        var home = TempHome("reorder");
+        var failure = WpfHost.OnUi<string?>(() =>
+        {
+            var vm = new MainViewModel(new Workspace(home));
+            var window = new MainWindow(vm);
+            window.Show();
+            WpfHost.PumpUntil(() => window.ActualWidth > 100);
+            try
+            {
+                var settings = FindTab(window, "设置");
+                if (settings == null) return "找不到设置页";
+                settings.IsSelected = true;
+                WpfHost.PumpUntil(() => settings.IsSelected);
+                PumpIdle(400);
+                vm.KernelExpanded = true;
+                PumpIdle(800);
+
+                var cards = Descendants(window).OfType<System.Windows.Controls.Border>()
+                    .Where(b => b.Child is System.Windows.Controls.Expander).ToList();
+                if (cards.Count < 4) return "设置页的折叠节数量 " + cards.Count;
+                var expanded = cards.Where(b => ((System.Windows.Controls.Expander)b.Child).IsExpanded).ToList();
+                if (expanded.Count != 1) return "展开的节数 " + expanded.Count;
+                var ey = expanded[0].TranslatePoint(new Point(0, 0), window).Y;
+                var stragglers = cards.Where(b => !ReferenceEquals(b, expanded[0])
+                    && !((System.Windows.Controls.Expander)b.Child).IsExpanded
+                    && b.TranslatePoint(new Point(0, 0), window).Y > ey).ToList();
+                return stragglers.Count == 0 ? null
+                    : $"还有 {stragglers.Count} 张折叠的条排在展开的节下面";
             }
             finally { window.Close(); }
         }).Result;

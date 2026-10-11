@@ -59,6 +59,9 @@ public sealed class ConnectionManager : IDisposable
         _lib.Nodes.RemoveAll(n => !liveSubIds.Contains(n.SubscriptionId));
         _lib.Groups.RemoveAll(g => !liveSubIds.Contains(g.SubscriptionId));
         Api.Configure(Settings.ApiPort, Settings.ApiSecret);
+        // 先把随程序发布的 LightGBM 模型放进内核 home：不放到时候 smart 组不发射，
+        // 界面上「自动选择」这一条会凭空消失（要等第一次 BuildConfig 才补上，太晚了）。
+        _ws.EnsureSmartModelInPlace();
         _host = new CoreHost(_ws.RuntimeDir);
         _host.StateChanged += s =>
         {
@@ -732,6 +735,13 @@ public sealed class ConnectionManager : IDisposable
     }
 
     public bool TunAdapterPresent() => TunAdapter.Exists(ClashConfigGenerator.TunDeviceName);
+
+    /// <summary>
+    /// smart 组这次会不会被写进配置：开了开关 + LightGBM 模型在盘上 + 至少两个节点。
+    /// 与鸿蒙端同一判据 —— 缺模型时绝不发射，否则内核会在启动路径同步去 GitHub 下 Model.bin（实测阻塞 ~90s）。
+    /// </summary>
+    public bool SmartGroupReady => Settings.UseSmartGroup
+        && _ws.DetectGates().SmartModelReady && _lib.Nodes.Count >= 2;
 
     public void Dispose()
     {

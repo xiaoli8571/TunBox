@@ -256,7 +256,7 @@
                         </Border>
                         <TextBlock Margin="0,10,0,0" FontSize="12" HorizontalAlignment="Center"
                                    Foreground="{StaticResource TextMuted}">
-                            <Run Text="当前出口 "/><Run Text="{Binding SelectedNode.Name, Mode=OneWay}" FontWeight="Bold"/>
+                            <Run Text="当前出口 "/><Run Text="{Binding SelectedEgressText, Mode=OneWay}" FontWeight="Bold"/>
                         </TextBlock>
                     </StackPanel>
                 </Border>
@@ -278,23 +278,11 @@
                     </StackPanel>
                 </Border>
 
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <Grid>
-                            <TextBlock Text="分流库" FontWeight="Bold" FontSize="14"
-                                       Foreground="{StaticResource TextMain}"/>
-                            <Button Content="更新" Style="{StaticResource GhostButton}" Padding="10,5" FontSize="12"
-                                    HorizontalAlignment="Right" Command="{Binding RefreshGeoCommand}"/>
-                        </Grid>
-                        <TextBlock Text="{Binding GeoSummaryText}" TextWrapping="Wrap" FontSize="11.5"
-                                   Foreground="{StaticResource TextMain}" Margin="0,6,0,0"/>
-                    </StackPanel>
-                </Border>
-
-                <!-- 实时连接：原来单独一页，竖屏下并进首页；默认折叠，展开才看列表 -->
+                <!-- 实时连接：原来单独一页，竖屏下并进首页；默认折叠，展开才看列表。
+                     连接数放在标题上（顶栏那条放不下）。 -->
                 <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding ConnectionsExpanded, Mode=TwoWay}"
-                              Header="实时连接" FontSize="14" FontWeight="Bold"
+                              Header="{Binding ConnectionsHeader}" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
                         <ListView ItemsSource="{Binding Connections}" Margin="0,8,0,0" BorderThickness="0"
                                   Background="Transparent" MaxHeight="240"
@@ -332,6 +320,42 @@
                             FontSize="16" FontWeight="Bold" Click="OnImportClick"
                             ToolTip="导入订阅：链接 / 本地 yaml 文件 / 粘贴节点"/>
                 </StackPanel>
+
+                <!-- mihomo-smart 的自动优选：内核内置 LightGBM 小模型，按每条连接的目标自己挑节点。
+                     没手动选过节点时出口默认就是它；点下面任意真实节点即切回手动（与鸿蒙端一致）。 -->
+                <Border Style="{StaticResource Card}" Margin="0,0,0,10"
+                        Visibility="{Binding SmartAvailable, Converter={StaticResource BoolVis}}">
+                    <Button Command="{Binding SelectSmartCommand}" Cursor="Hand"
+                            HorizontalContentAlignment="Stretch">
+                        <Button.Template>
+                            <ControlTemplate TargetType="Button">
+                                <Border x:Name="b" Background="Transparent" CornerRadius="9" Padding="10,8">
+                                    <ContentPresenter/>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter TargetName="b" Property="Background" Value="#F7F8FB"/>
+                                    </Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </Button.Template>
+                        <Grid>
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="&#x267B;&#xFE0F;" FontSize="19" VerticalAlignment="Center"/>
+                                <StackPanel Margin="10,0,0,0" VerticalAlignment="Center">
+                                    <TextBlock Text="自动选择" FontWeight="Bold" FontSize="14"
+                                               Foreground="{StaticResource TextMain}"/>
+                                    <TextBlock Text="{Binding SmartSubtitle}" Style="{StaticResource Hint}"/>
+                                </StackPanel>
+                            </StackPanel>
+                            <Border Background="{StaticResource Running}" CornerRadius="8" Padding="9,3"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center"
+                                    Visibility="{Binding SmartActive, Converter={StaticResource BoolVis}}">
+                                <TextBlock Text="使用中" FontSize="11.5" Foreground="White"/>
+                            </Border>
+                        </Grid>
+                    </Button>
+                </Border>
 
                 <ItemsControl ItemsSource="{Binding Subscriptions}">
                     <ItemsControl.ItemTemplate>
@@ -443,10 +467,13 @@
 
         <!-- ── 设置（保存按钮悬浮在右上角；规则细节默认折叠） ─────────── -->
         <TabItem Header="设置" Tag="&#xE713;" Style="{StaticResource BottomNav}">
-            <StackPanel>
-                <Border Style="{StaticResource Card}">
+            <!-- 每一节都是可折叠的条：折叠着的排在上面，展开的自动排到后面（代码里重排），
+                 这样这一页永远是一列整齐的条，不会被撑开的卡片挤得高低不平。 -->
+            <StackPanel x:Name="SettingsPanel">
+                <Border x:Name="SecNetwork" Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding PortsExpanded, Mode=TwoWay}"
-                              Header="端口与局域网" FontSize="14" FontWeight="Bold"
+                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
+                              Header="网络配置" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
                         <Grid>
@@ -476,56 +503,62 @@
                                      Text="{Binding ApiPortText, UpdateSourceTrigger=PropertyChanged}"/>
                         </Grid>
                         <CheckBox Content="允许局域网其他设备连接" Margin="0,10,0,0" IsChecked="{Binding AllowLan}"/>
-                        </StackPanel>
-                    </Expander>
-                </Border>
-
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <TextBlock Text="内核" Style="{StaticResource SectionTitle}"/>
-                        <TextBlock Text="测速地址" Foreground="{StaticResource TextMain}" Margin="0,0,0,4"/>
-                        <TextBox Text="{Binding TestUrlText, UpdateSourceTrigger=PropertyChanged}"
-                                 ToolTip="默认 cp.cloudflare.com 国内可达；换成 gstatic 之类，一整排节点会一起报红"/>
-                        <TextBlock Text="日志级别" Foreground="{StaticResource TextMain}" Margin="0,12,0,4"/>
-                        <ComboBox SelectedValue="{Binding LogLevelChoice}" SelectedValuePath="Tag">
-                            <ComboBoxItem Content="info（推荐）" Tag="info"/>
-                            <ComboBoxItem Content="debug（排查用）" Tag="debug"/>
-                        </ComboBox>
-                        <CheckBox Content="嗅探域名（sniffer）" Margin="0,12,0,0" IsChecked="{Binding SnifferOn}"/>
-                        <CheckBox Content="smart 组自动优选" Margin="0,6,0,0" IsChecked="{Binding SmartOn}"/>
-                        <Button Content="打开内核日志" Style="{StaticResource QuietButton}" Margin="0,12,0,0"
-                                HorizontalAlignment="Left" Command="{Binding OpenLogCommand}"/>
-                    </StackPanel>
-                </Border>
-
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <TextBlock Text="IPv6" Style="{StaticResource SectionTitle}"/>
-                        <CheckBox Content="启用 IPv6（解析与出口都支持 v6）" IsChecked="{Binding Ipv6On}"
+                        <!-- IPv6 与 DNS 覆写归到这张「网络配置」里：都是网络层的选项，
+                             单独开两张卡反而把设置页拉得很长 -->
+                        <CheckBox Content="启用 IPv6（解析与出口都支持 v6）" Margin="0,10,0,0" IsChecked="{Binding Ipv6On}"
                                   ToolTip="入口没有 v6 时开着只会多问一次 AAAA；要访问纯 v6 站点再开"/>
-                    </StackPanel>
-                </Border>
-
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <TextBlock Text="DNS 覆写" Style="{StaticResource SectionTitle}"/>
-                        <CheckBox Content="接管 DNS" IsChecked="{Binding DnsOverrideOn}"
+                        <CheckBox Content="DNS 覆写（接管解析）" Margin="0,10,0,0" IsChecked="{Binding DnsOverrideOn}"
                                   ToolTip="只替换解析用的 nameserver；关掉就用内置（阿里 + 腾讯 DoT）"/>
                         <TextBox Text="{Binding DnsServersText, UpdateSourceTrigger=PropertyChanged}"
-                                 AcceptsReturn="True" MinHeight="52" MaxHeight="110" Margin="0,8,0,0"
+                                 AcceptsReturn="True" MinHeight="52" MaxHeight="110" Margin="0,6,0,0"
                                  FontFamily="Consolas, Microsoft YaHei UI" FontSize="12"
                                  VerticalScrollBarVisibility="Auto" VerticalContentAlignment="Top"
                                  ToolTip="一行一个：223.5.5.5、tls://223.5.5.5:853、https://doh.pub/dns-query"/>
                         <TextBlock Text="{Binding DnsFeedback}" Style="{StaticResource Hint}" Margin="0,6,0,0"
                                    Foreground="#B45309"/>
-                    </StackPanel>
+                        </StackPanel>
+                    </Expander>
                 </Border>
 
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <TextBlock Text="分流规则" Style="{StaticResource SectionTitle}"/>
+                <Border x:Name="SecKernel" Style="{StaticResource Card}">
+                    <Expander IsExpanded="{Binding KernelExpanded, Mode=TwoWay}"
+                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
+                              Header="内核" FontSize="14" FontWeight="Bold"
+                              Foreground="{StaticResource TextMain}">
+                        <StackPanel Margin="0,8,0,0">
+                            <TextBlock Text="测速地址" Foreground="{StaticResource TextMain}" Margin="0,0,0,4"/>
+                            <TextBox Text="{Binding TestUrlText, UpdateSourceTrigger=PropertyChanged}"
+                                     ToolTip="默认 cp.cloudflare.com 国内可达；换成 gstatic 之类，一整排节点会一起报红"/>
+                            <TextBlock Text="日志级别" Foreground="{StaticResource TextMain}" Margin="0,12,0,4"/>
+                            <ComboBox SelectedValue="{Binding LogLevelChoice}" SelectedValuePath="Tag">
+                                <ComboBoxItem Content="info（推荐）" Tag="info"/>
+                                <ComboBoxItem Content="debug（排查用）" Tag="debug"/>
+                            </ComboBox>
+                            <CheckBox Content="嗅探域名（sniffer）" Margin="0,12,0,0" IsChecked="{Binding SnifferOn}"/>
+                            <CheckBox Content="smart 组自动优选" Margin="0,6,0,0" IsChecked="{Binding SmartOn}"/>
+                            <Button Content="打开内核日志" Style="{StaticResource QuietButton}" Margin="0,12,0,0"
+                                    HorizontalAlignment="Left" Command="{Binding OpenLogCommand}"/>
+                        </StackPanel>
+                    </Expander>
+                </Border>
+
+                <Border x:Name="SecRules" Style="{StaticResource Card}">
+                    <Expander IsExpanded="{Binding RulesExpanded, Mode=TwoWay}"
+                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
+                              Header="分流规则" FontSize="14" FontWeight="Bold"
+                              Foreground="{StaticResource TextMain}">
+                    <StackPanel Margin="0,8,0,0">
                         <CheckBox Content="启用分流规则" IsChecked="{Binding RulesOn}"/>
                         <CheckBox Content="去广告（HyperADRules）" Margin="0,8,0,0" IsChecked="{Binding AdRulesOn}"/>
+                        <!-- 分流库从首页挪到这里，和「去广告」同级：它只是分流规则的数据件 -->
+                        <Grid Margin="0,12,0,0">
+                            <TextBlock Text="分流库" FontSize="12.5" FontWeight="Bold" VerticalAlignment="Center"
+                                       Foreground="{StaticResource TextMain}"/>
+                            <Button Content="更新" Style="{StaticResource GhostButton}" Padding="10,5" FontSize="12"
+                                    HorizontalAlignment="Right" Command="{Binding RefreshGeoCommand}"/>
+                        </Grid>
+                        <TextBlock Text="{Binding GeoSummaryText}" TextWrapping="Wrap" FontSize="11.5"
+                                   Foreground="{StaticResource TextMuted}" Margin="0,4,0,0"/>
                         <!-- 去广告以下全部折叠：多数人只动上面两个开关 -->
                         <Expander Header="强制站点 / 自定义规则 / 应用分流" Margin="0,10,0,0" FontSize="12">
                             <StackPanel Margin="0,8,0,0">
@@ -559,11 +592,15 @@
                             </StackPanel>
                         </Expander>
                     </StackPanel>
+                    </Expander>
                 </Border>
 
-                <Border Style="{StaticResource Card}">
-                    <StackPanel>
-                        <TextBlock Text="常规" Style="{StaticResource SectionTitle}"/>
+                <Border x:Name="SecGeneral" Style="{StaticResource Card}">
+                    <Expander IsExpanded="{Binding GeneralExpanded, Mode=TwoWay}"
+                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
+                              Header="常规" FontSize="14" FontWeight="Bold"
+                              Foreground="{StaticResource TextMain}">
+                    <StackPanel Margin="0,8,0,0">
                         <CheckBox Content="开机自动启动" IsChecked="{Binding AutoStartOn}"/>
                         <TextBlock Text="关闭主窗口时" Foreground="{StaticResource TextMain}" Margin="0,12,0,4"/>
                         <ComboBox SelectedValue="{Binding CloseChoice}" SelectedValuePath="Tag"
@@ -573,6 +610,7 @@
                             <ComboBoxItem Content="直接退出 TunBox" Tag="exit"/>
                         </ComboBox>
                     </StackPanel>
+                    </Expander>
                 </Border>
             </StackPanel>
         </TabItem>

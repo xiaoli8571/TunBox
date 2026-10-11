@@ -349,3 +349,46 @@ IPv6、常规这种一句话的功能不再占掉和端口表一样大的一块�
   折叠态扛得住重建、界面契约（画出来的电源符号 / 没有系统代理字样 / 只有一颗保存 / DNS 叫覆写且有默认值）；
 - 渲染 PNG 复核：电源环、设置页悬浮保存条、430 宽的导入框；
 - `dist/TunBox-Setup-0.4.5.exe`（77MB）。
+
+---
+
+# 0.4.6 轮 + 发布（2026-10-11 深夜）
+
+## 界面（用户点名）
+
+1. 顶栏「退出 TunBox」→「退出」：流量串可以很长（速率 + 连接数 + 累计），会把按钮盖住；
+   同时给左侧留 `Margin 0,0,64,0` 并让流量文字 `MaxWidth=300 + TextTrimming`。
+   回归测试 `Long_traffic_line_never_covers_the_exit_button` 用 34 条连接的真快照量一次坐标，
+   断言两者矩形不相交（注意：喂快照必须在 `window.Show()` 之后，否则首页轮询第一轮就把 TrafficText 打回 0）。
+2. 首页「实时连接」卡改成可折叠（`ConnectionsExpanded`）。
+3. 设置页「端口与局域网」卡改成可折叠（`PortsExpanded`）。
+   两者折叠态都放在视图模型里并 `Mode=TwoWay`：TabControl 切页会丢掉上一页的视觉树，
+   绑在控件上就会在切回来时弹开（订阅卡已经踩过一次）。
+
+测试 **65/65**；`dist/TunBox-Setup-0.4.6.exe`（77MB）。
+
+## 发布到 GitHub
+
+本机 **没有 git 检出**（`C:\Worker\TunBox` 无 `.git`；skill 里记的是另一台机器的路径），
+且 **github.com 被网络阻断**（curl 直连与指定 IP 都 000），但 `api.github.com` / `uploads.github.com` 通、令牌有效。
+所以整轮走 REST：blobs → tree(base_tree) → commit → `PATCH refs/heads/main`。
+
+- 提交：**`53d0fea`**（父 `c6b2472`，40 个文件，+9563 行），main 已指到这里；
+- Release：**`windows-v0.4.6`** · `TunBox Windows v0.4.6` · 附件 `TunBox-Setup-0.4.6.exe`（80,699,900 B，state=uploaded）
+  → https://github.com/xiaoli8571/TunBox/releases/tag/windows-v0.4.6
+- 不入库：`publish/`、`dist/`、`bin/`、`obj/`，以及内核二进制
+  （`core/tunbox-core.exe` 66MB、`core/Model.bin` 9.3MB）—— 新增 `TunBox-Windows/.gitignore` 与
+  `TunBox-Windows/README.md` 说明怎么取（来自仓库根已有的 `mihomo-build/`）。
+- 提交前按 skill 跑了敏感材料扫描（文件名 + 内容正则），`skills/` 与令牌未进仓库。
+
+**这一轮踩到并修掉的四个坑**（细节已写进 Agent 记忆 `env-github-publish`）：
+
+1. PS 5.1 把无 BOM 的 UTF-8 脚本按 GBK 读 —— 中文注释会咬坏语法（同一个错这一轮犯了两次）；
+2. `Get-Content -Raw` 的字符串直接进 `ConvertTo-Json` 会变成 `{"value":…,"Count":1}`，要 `[string]` 转；
+3. `Invoke-RestMethod -Body <string>` 按 ASCII 发出去，**中文全变 `?`**（提交信息就这么毁了）——
+   必须 `[Text.Encoding]::UTF8.GetBytes($json)` + `charset=utf-8`；
+4. `GET /git/trees/<sha>?recursive=1` 返回整棵仓库（1984 个 blob），全塞进新 tree 会 500 —— 只发本轮新增条目。
+
+另外第一次提交把路径写重了一层（`TunBox-Windows/TunBox-Windows/…`，相对路径前缀加了两次）：
+用同一批 blob 重建 tree、换掉 commit，并 `PATCH refs/tags/windows-v0.4.6` 把标签移到修正后的提交上 ——
+**Release 的附件跟标签名走，所以 77MB 不用重传**。

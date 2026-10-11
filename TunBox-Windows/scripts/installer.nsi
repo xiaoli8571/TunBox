@@ -6,7 +6,7 @@ Unicode true
 !include "MUI2.nsh"
 
 !define APPNAME "TunBox"
-!define VERSION "0.4.6"
+!define VERSION "0.4.7"
 !define UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\TunBox"
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
@@ -23,10 +23,10 @@ InstallDirRegKey HKCU "${UNINSTKEY}" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 
-VIProductVersion "0.4.6.0"
+VIProductVersion "0.4.7.0"
 VIAddVersionKey "ProductName" "TunBox"
-VIAddVersionKey "FileVersion" "0.4.6.0"
-VIAddVersionKey "ProductVersion" "0.4.6"
+VIAddVersionKey "FileVersion" "0.4.7.0"
+VIAddVersionKey "ProductVersion" "0.4.7"
 VIAddVersionKey "FileDescription" "TunBox installer"
 VIAddVersionKey "LegalCopyright" "xiaoli8571"
 

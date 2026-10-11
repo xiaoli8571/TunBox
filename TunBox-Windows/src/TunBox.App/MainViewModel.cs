@@ -391,6 +391,51 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (!ok) { DetailText = $"选 {item.Name} 没被内核接受（节点可能刚下线），先点「更新」。"; return; }
         foreach (var n in Nodes) n.IsSelectedNow = ReferenceEquals(n, item);
         Raise(nameof(SelectedNode));
+        // 手点一个节点 = 退出自动优选（与鸿蒙端一致）
+        Raise(nameof(SmartActive));
+        Raise(nameof(SelectedEgressText));
+    }
+
+    /// <summary>SelectedNodeId 的这个取值表示「出口交给内核的 smart 组」，不是某个具体节点。</summary>
+    public const string SmartEgressId = "smart";
+
+    /// <summary>模型在盘上 + 开了开关 + 至少两个节点，才有自动优选可选。</summary>
+    public bool SmartAvailable => _manager.SmartGroupReady;
+
+    /// <summary>
+    /// 当前出口是不是「自动选择」。**没显式选过节点时默认就是它** ——
+    /// mihomo-smart 的卖点就是内置小模型按每条连接的目标自动择优，用户第一次打开就该在用它。
+    /// </summary>
+    public bool SmartActive => SmartAvailable &&
+        (_manager.Settings.SelectedNodeId.Length == 0 || _manager.Settings.SelectedNodeId == SmartEgressId);
+
+    public string SmartSubtitle => $"内核智能选点 · 按每条连接的目标自动择优 · {Nodes.Count} 个候选节点";
+
+    /// <summary>首页「当前出口」：自动优选时显示组名，不假装是某个节点（内核的 now 也不会随每条连接变）。</summary>
+    public string SelectedEgressText => SmartActive
+        ? ClashConfigGenerator.SmartGroupName
+        : SelectedNode?.Name ?? "还没选节点";
+
+    public AsyncRelayCommand SelectSmartCommand { get; }
+
+    /// <summary>把总出口交给 smart 组：PROXY 选到 ♻️ 自动选择，之后每条连接由模型决定走哪个节点。</summary>
+    private async Task SelectSmartAsync()
+    {
+        if (!SmartAvailable)
+        {
+            DetailText = "自动优选现在不可用：需要至少两个节点，并且内核的 LightGBM 模型在位。";
+            return;
+        }
+        var ok = await _manager.SelectNodeAsync(ClashConfigGenerator.SmartGroupName, "PROXY");
+        // SelectNodeAsync 按节点名找 id，smart 组不是节点所以找不到 —— 出口标记要自己写
+        _manager.Settings.SelectedNodeId = SmartEgressId;
+        _manager.SaveSettings();
+        foreach (var n in Nodes) n.IsSelectedNow = false;
+        Raise(nameof(SmartActive));
+        Raise(nameof(SelectedEgressText));
+        DetailText = ok
+            ? "已交给自动优选：内核按每条连接的目标自己挑节点，「实时连接」的出口列就是它选中的那个。"
+            : "内核没接受切到自动优选（可能这份配置里还没发射 smart 组），点「连接」后重试。";
     }
 
     private string _detailText = "";
@@ -582,6 +627,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _ = _manager.SetProxyModeAsync(mode);
             ProxyMode = mode;
         });
+        SelectSmartCommand = new AsyncRelayCommand(_ => SelectSmartAsync());
         RemoveSubscriptionCommand = new RelayCommand(p =>
         {
             if (p is SubscriptionItem item) _manager.RemoveSubscription(item.Model.Id);
@@ -703,6 +749,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 SyncTunStatus();
                 SyncGeoSummary();
                 foreach (var item in Nodes) item.Refresh();
+                // 导入完节点数变了，自动优选的可用性与候选数得跟着刷新
+                Raise(nameof(SmartAvailable));
+                Raise(nameof(SmartActive));
+                Raise(nameof(SmartSubtitle));
+                Raise(nameof(SelectedEgressText));
                 foreach (var c in new[] { TestAllCommand, ToggleConnectCommand }) c.Refresh();
             }
             catch (Exception e)
@@ -1266,6 +1317,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _portsExpanded;
     public bool PortsExpanded { get => _portsExpanded; set => Set(ref _portsExpanded, value); }
 
+    private bool _kernelExpanded;
+    public bool KernelExpanded { get => _kernelExpanded; set => Set(ref _kernelExpanded, value); }
+
+    private bool _rulesExpanded;
+    public bool RulesExpanded { get => _rulesExpanded; set => Set(ref _rulesExpanded, value); }
+
+    private bool _generalExpanded;
+    public bool GeneralExpanded { get => _generalExpanded; set => Set(ref _generalExpanded, value); }
+
     private void StartConnectionsPolling()
     {
         if (_poll != null) return;
@@ -1337,9 +1397,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         TrafficText = $"↑ {ConnectionItem.FmtSpeed(up)}   ↓ {ConnectionItem.FmtSpeed(down)}"
-            + $"   ·   {Connections.Count} 条连接   ·   累计 ↑{ConnectionItem.FmtBytes(snap.UploadTotal)}"
+            + $"   ·   累计 ↑{ConnectionItem.FmtBytes(snap.UploadTotal)}"
             + $" ↓{ConnectionItem.FmtBytes(snap.DownloadTotal)}";
+        // 连接数从顶栏挪到「实时连接」卡的标题上：顶栏要一直显示得下速率 + 累计，
+        // 再塞一段「· 34 条连接」最右边就被截掉（用户点名）。
+        Raise(nameof(ConnectionsHeader));
     }
+
+    /// <summary>实时连接卡的标题：折叠着也能看见现在有几条。</summary>
+    public string ConnectionsHeader => Connections.Count > 0
+        ? $"实时连接（{Connections.Count}）" : "实时连接";
 
     public void CloseConnection(ConnectionItem? item)
     {
