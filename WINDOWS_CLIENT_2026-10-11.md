@@ -575,15 +575,23 @@ taskkill 会当成「没有可关的窗口」报错返回，看着像「进程�
 ## 5. 发布
 
 `127.0.0.1:7890` 还是没人监听（用户的 TunBox 没在跑），github.com 的 git 通道依旧连不上，`api.github.com`
-正常 —— 走 Data API。但这轮撞上一个新墙：**PowerShell 5.1 的 `Invoke-RestMethod` 发小 body 也会被 nginx
-打回**（tree POST 832 字节回 413 `Request Entity Too Large`，上一轮单文件 tree POST 回的
-422 `tree.path contains a malformed path component` 大概率是同一个毛病，不是路径的问题）。
-**换成 curl 负责传输、PS 只用 `ConvertTo-Json` 生成 payload** 就一把过 —— 脚本
-`C:\Worker\_release\publish-030-commit.ps1` / `publish-030-release.ps1`，以后直接抄这两个。
-另外两个坑：① PowerShell 里 **`Curl` 是 `Invoke-WebRequest` 的内置别名，别名优先级高于同名 function**，
-自定义函数必须换名（`Invoke-Github`）；② 函数里别顺手 `Write-Output` 日志 —— 返回值是整个流水线输出，
-日志行会跟路径粘在一起喂给 curl。
-blob sha 这次用 `git hash-object --no-filters` 本地算（与 GitHub 收到的逐字节相同，省掉 6 次 blob POST）。
+正常 —— 走 Data API。这轮把三个假象逐个剥掉了，脚本 `C:\Worker\_release\publish-030-commit.ps1`
+（提交）与 `publish-030-release.ps1`（发 Release + 删旧的）以后直接抄：
+
+1. **`Invoke-RestMethod` 的 413 `Request Entity Too Large` 是真的**：一个 832 字节的 tree POST 就被 nginx
+   打回。同一份 JSON 交给 curl 就过 —— 所以**传输一律用 curl，PS 只用 `ConvertTo-Json` 生成 payload**。
+2. **上一轮那个 422 `tree.path contains a malformed path component` 跟 nginx 无关**，本轮用 curl 照样复现，
+   真正的根因是 PS 5.1 的老毛病换了个面孔：从管道里取出的**单行**路径是个单元素 `Object[]`，
+   `ConvertTo-Json` 把它写成 `{"path":{"value":"…","Count":1}}`（跟「`Get-Content -Raw` 的字符串要先
+   `[string]` 转」是同一条规则）。凡是读进内存再喂给 `ConvertTo-Json` 的东西，一律 `[string]` 定死。
+3. **blob 必须真上传**：`git hash-object` 本地算出的 sha 内容与 GitHub 那份逐字节一致，但**对象不在库里
+   就是 `tree.sha … is not a valid blob`**。之前那次能成，是因为上一轮失败的脚本已经把同内容的 blob 传上去过
+   —— 靠运气而不是设计。现在每个文件都先 `POST /git/blobs`（base64，保 BOM 与中文），
+   再把本地 `hash-object` 的值与返回的 sha **比对**，两边对不上就中止。
+
+另外两个 PowerShell 坑：① **`Curl` 是 `Invoke-WebRequest` 的内置别名，而别名优先级高于同名 function**，
+自己写的函数必须换名（`Curl-Json` / `Invoke-Github`）；② **函数的返回值是整个流水线输出**，
+里面顺手 `Write-Output` 一行日志，调用方拿到的就是「日志 + 路径」拼起来的字符串，喂给 curl 直接报错。
 
 - main `337aa83 → ab96236`（6 个文件：版本四处、`.nsi` 的自动关闭、版本一致性测试、`.gitignore` 豁免、文档）。
 - Release `windows-v0.3.0`（id 409781893），附件 `TunBox-Setup-0.3.0.exe` 80,698,375 字节 `state=uploaded`。
