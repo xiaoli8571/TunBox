@@ -288,3 +288,111 @@ public class SubscriptionFetcherTests
         Assert.Equal(24 * 60, interval);
     }
 }
+
+/// <summary>
+/// 本地数据（订阅、节点、设置）不许「装新版/重启就没了」。两条路都盯着：
+/// 一是只读集合属性让 STJ 写得出去读不回来；二是半截 JSON（写一半进程被杀：升级安装、注销、断电）
+/// 解析失败后若无条件回落默认值，下一次保存就把原文冲掉了。
+/// </summary>
+public class WorkspaceDataTests
+{
+    private static string TempHome() => Path.Combine(
+        Path.GetTempPath(), "tunbox-data-" + Guid.NewGuid().ToString("N")[..8]);
+
+    [Fact]
+    public void Half_written_nodes_file_falls_back_to_the_last_good_copy()
+    {
+        var home = TempHome();
+        try
+        {
+            var ws = new Workspace(home);
+            var lib = ws.LoadNodes();
+            lib.Nodes.Add(new TunBox.Core.Models.ProxyNode
+            { Id = "n1", Name = "香港 A", Server = "hk.example.com", Port = 443 });
+            lib.Subscriptions.Add(new TunBox.Core.Models.Subscription
+            { Id = "s1", Name = "吹雪云", Url = "https://example.com/sub" });
+            Assert.True(ws.SaveNodes(lib));
+            Assert.True(ws.SaveNodes(lib)); // 第二次保存才留下上一次的好副本 .bak
+
+            var nodesPath = Path.Combine(home, "nodes.json");
+            var bak = nodesPath + ".bak";
+            Assert.True(File.Exists(bak), "第二次保存没留下 .bak 好副本");
+            File.WriteAllText(nodesPath, "{ \"nodes\": [ { \"id\": \"n1\", \"na");
+
+            var back = new Workspace(home).LoadNodes();
+            Assert.Equal("香港 A", back.Nodes[0].Name);
+            Assert.Single(back.Subscriptions);
+
+            // 坏文件改名留档，不静默删除；主文件也不会留成半截
+            Assert.True(Directory.GetFiles(home, "nodes.json.bad-*").Length > 0);
+            Assert.False(File.Exists(nodesPath + ".tmp"));
+        }
+        finally { try { Directory.Delete(home, true); } catch { } }
+    }
+
+    /// <summary>
+    /// 存得进去就必须读得回来。只读集合属性是这个坑的经典形态：STJ 能把 List 写出去，
+    /// 读回来却一个元素都不填 —— 订阅、节点、分组名单、自定义规则会「重启就没了」。
+    /// </summary>
+    [Fact]
+    public void Every_persisted_list_round_trips_through_disk()
+    {
+        var home = TempHome();
+        try
+        {
+            var ws = new Workspace(home);
+            var lib = ws.LoadNodes();
+            var node = new TunBox.Core.Models.ProxyNode { Id = "n1", Name = "东京 B", Server = "tyo", Port = 8443 };
+            node.Extras["alpn"] = "h3";
+            lib.Nodes.Add(node);
+            var group = new TunBox.Core.Models.ProxyGroup { Name = "自动选择", GroupType = "select" };
+            group.Members.Add("东京 B");
+            lib.Groups.Add(group);
+            lib.Subscriptions.Add(new TunBox.Core.Models.Subscription { Id = "s1", Name = "吹雪云" });
+            Assert.True(ws.SaveNodes(lib));
+
+            var again = new Workspace(home).LoadNodes();
+            Assert.Single(again.Nodes);
+            Assert.Equal("h3", again.Nodes[0].Extras["alpn"]);
+            Assert.Single(again.Groups);
+            Assert.Equal(new[] { "东京 B" }, again.Groups[0].Members);
+            Assert.Single(again.Subscriptions);
+
+            var s = ws.LoadSettings();
+            s.CustomRules.Add("DOMAIN-SUFFIX,example.com,Proxy");
+            s.ForceProxySites.Add("example.com");
+            s.ForceDirectSites.Add("lan.local");
+            s.AppProcesses.Add("ChatGPT.exe");
+            s.DnsServers.Add("tls://223.5.5.5:853");
+            Assert.True(ws.SaveSettings(s));
+
+            var settings = new Workspace(home).LoadSettings();
+            Assert.Equal(new[] { "DOMAIN-SUFFIX,example.com,Proxy" }, settings.CustomRules);
+            Assert.Equal(new[] { "example.com" }, settings.ForceProxySites);
+            Assert.Equal(new[] { "lan.local" }, settings.ForceDirectSites);
+            Assert.Equal(new[] { "ChatGPT.exe" }, settings.AppProcesses);
+            Assert.Equal(new[] { "tls://223.5.5.5:853" }, settings.DnsServers);
+        }
+        finally { try { Directory.Delete(home, true); } catch { } }
+    }
+
+    [Fact]
+    public void Settings_save_never_leaves_the_main_file_half_written()
+    {
+        var home = TempHome();
+        try
+        {
+            var ws = new Workspace(home);
+            var s = ws.LoadSettings();
+            s.MixedPort = 17890;
+            Assert.True(ws.SaveSettings(s));
+            Assert.True(ws.SaveSettings(s));
+
+            // 落盘走的是「临时文件 + 原子替换」：主文件任意时刻都是完整 JSON
+            var raw = File.ReadAllText(Path.Combine(home, "settings.json"));
+            Assert.NotNull(JsonNode.Parse(raw));
+            Assert.Equal(17890, new Workspace(home).LoadSettings().MixedPort);
+        }
+        finally { try { Directory.Delete(home, true); } catch { } }
+    }
+}

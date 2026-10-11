@@ -747,14 +747,18 @@ public class UiTests
         Assert.Null(failure);
     }
 
-    /// <summary>设置页：折叠着的条排在上面，展开的那节自动挪到后面（用户要的「整齐一点」）。</summary>
+    /// <summary>
+    /// 设置页四节的顺序是固定的（网络配置 / 内核 / 分流规则 / 常规）：
+    /// 展开某一节只能在原位撑开，不许跳到页尾——0.4.7 就是靠重排把「网络配置」甩到了最后一个。
+    /// </summary>
     [Fact]
-    public void Settings_page_keeps_collapsed_sections_above_expanded_ones()
+    public void Settings_sections_keep_their_order_when_one_expands()
     {
-        var home = TempHome("reorder");
+        var home = TempHome("sectionorder");
         var failure = WpfHost.OnUi<string?>(() =>
         {
             var vm = new MainViewModel(new Workspace(home));
+            vm.PortsExpanded = vm.KernelExpanded = vm.RulesExpanded = vm.GeneralExpanded = false;
             var window = new MainWindow(vm);
             window.Show();
             WpfHost.PumpUntil(() => window.ActualWidth > 100);
@@ -765,20 +769,27 @@ public class UiTests
                 settings.IsSelected = true;
                 WpfHost.PumpUntil(() => settings.IsSelected);
                 PumpIdle(400);
+
+                string? TopDown()
+                {
+                    var known = new[] { "网络配置", "内核", "分流规则", "常规" };
+                    var cards = Descendants(window).OfType<System.Windows.Controls.Border>()
+                        .Where(b => b.Child is System.Windows.Controls.Expander
+                            && known.Contains(((System.Windows.Controls.Expander)b.Child).Header as string))
+                        .OrderBy(b => b.TranslatePoint(new Point(0, 0), window).Y)
+                        .Select(b => (string)((System.Windows.Controls.Expander)b.Child).Header!)
+                        .ToList();
+                    return cards.Count != 4 ? "设置页的四节数量 " + string.Join("/", cards) : string.Join(",", cards);
+                }
+
+                var declared = TopDown();
+                if (declared!.Contains("数量")) return declared;
+
                 vm.KernelExpanded = true;
                 PumpIdle(800);
 
-                var cards = Descendants(window).OfType<System.Windows.Controls.Border>()
-                    .Where(b => b.Child is System.Windows.Controls.Expander).ToList();
-                if (cards.Count < 4) return "设置页的折叠节数量 " + cards.Count;
-                var expanded = cards.Where(b => ((System.Windows.Controls.Expander)b.Child).IsExpanded).ToList();
-                if (expanded.Count != 1) return "展开的节数 " + expanded.Count;
-                var ey = expanded[0].TranslatePoint(new Point(0, 0), window).Y;
-                var stragglers = cards.Where(b => !ReferenceEquals(b, expanded[0])
-                    && !((System.Windows.Controls.Expander)b.Child).IsExpanded
-                    && b.TranslatePoint(new Point(0, 0), window).Y > ey).ToList();
-                return stragglers.Count == 0 ? null
-                    : $"还有 {stragglers.Count} 张折叠的条排在展开的节下面";
+                var after = TopDown()!;
+                return after == declared ? null : $"展开「内核」后排位变了：{declared} → {after}";
             }
             finally { window.Close(); }
         }).Result;

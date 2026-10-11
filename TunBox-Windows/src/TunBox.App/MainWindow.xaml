@@ -467,12 +467,11 @@
 
         <!-- ── 设置（保存按钮悬浮在右上角；规则细节默认折叠） ─────────── -->
         <TabItem Header="设置" Tag="&#xE713;" Style="{StaticResource BottomNav}">
-            <!-- 每一节都是可折叠的条：折叠着的排在上面，展开的自动排到后面（代码里重排），
-                 这样这一页永远是一列整齐的条，不会被撑开的卡片挤得高低不平。 -->
-            <StackPanel x:Name="SettingsPanel">
-                <Border x:Name="SecNetwork" Style="{StaticResource Card}">
+            <!-- 每一节都可折叠，但顺序固定（网络配置 / 内核 / 分流规则 / 常规）：
+                 展开收起只在本位变化，不会跳页，用户才找得到刚才那一节。 -->
+            <StackPanel>
+                <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding PortsExpanded, Mode=TwoWay}"
-                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
                               Header="网络配置" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
@@ -520,9 +519,8 @@
                     </Expander>
                 </Border>
 
-                <Border x:Name="SecKernel" Style="{StaticResource Card}">
+                <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding KernelExpanded, Mode=TwoWay}"
-                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
                               Header="内核" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
                         <StackPanel Margin="0,8,0,0">
@@ -542,9 +540,8 @@
                     </Expander>
                 </Border>
 
-                <Border x:Name="SecRules" Style="{StaticResource Card}">
+                <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding RulesExpanded, Mode=TwoWay}"
-                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
                               Header="分流规则" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
                     <StackPanel Margin="0,8,0,0">
@@ -595,9 +592,8 @@
                     </Expander>
                 </Border>
 
-                <Border x:Name="SecGeneral" Style="{StaticResource Card}">
+                <Border Style="{StaticResource Card}">
                     <Expander IsExpanded="{Binding GeneralExpanded, Mode=TwoWay}"
-                              Expanded="OnSectionToggled" Collapsed="OnSectionToggled"
                               Header="常规" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
                     <StackPanel Margin="0,8,0,0">

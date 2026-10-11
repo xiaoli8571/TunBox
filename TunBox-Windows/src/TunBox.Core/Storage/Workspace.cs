@@ -9,9 +9,11 @@ namespace TunBox.Core.Storage;
 
 public sealed class NodeLibrary
 {
-    public List<ProxyNode> Nodes { get; } = new();
-    public List<ProxyGroup> Groups { get; } = new();
-    public List<Subscription> Subscriptions { get; } = new();
+    // 集合属性必须带 setter：System.Text.Json 能写出「只读集合」，读回来却是空的（它不会往只读属性里 Add）。
+    // 少一个 set 就等于「存得进去、重启就没了」——订阅与节点全部消失，正是「装新版数据被清空」的真身。
+    public List<ProxyNode> Nodes { get; set; } = new();
+    public List<ProxyGroup> Groups { get; set; } = new();
+    public List<Subscription> Subscriptions { get; set; } = new();
 
     [JsonIgnore]
     public static NodeLibrary Empty => new();
@@ -36,6 +38,11 @@ public sealed class Workspace
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
+    /// <summary>读写共用这一套参数；外面（测试、诊断）要解析同一份文件时也走这里。</summary>
+    public static T? Deserialize<T>(string json) => JsonSerializer.Deserialize<T>(json, Json);
+
+    public static string Serialize<T>(T value) => JsonSerializer.Serialize(value, Json);
+
     public Workspace() : this(Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TunBox")) { }
 
@@ -49,45 +56,74 @@ public sealed class Workspace
 
     public AppSettings LoadSettings()
     {
-        try
+        var s = ReadJson<AppSettings>(SettingsPath);
+        if (s != null)
         {
-            if (File.Exists(SettingsPath))
-            {
-                var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath), Json);
-                if (s != null)
-                {
-                    if (string.IsNullOrEmpty(s.ApiSecret)) s.ApiSecret = NewSecret();
-                    return s;
-                }
-            }
+            if (string.IsNullOrEmpty(s.ApiSecret)) s.ApiSecret = NewSecret();
+            return s;
         }
-        catch { /* 设置损坏不能阻止启动：回落默认值，保留原文件供排查 */ }
         var fresh = new AppSettings { ApiSecret = NewSecret() };
         SaveSettings(fresh);
         return fresh;
     }
 
     /// <summary>落盘失败不能让应用起不来：只读配置、杀软拦截都走到这里，设置在内存里仍是好的。</summary>
-    public bool SaveSettings(AppSettings s)
-    {
-        try { File.WriteAllText(SettingsPath, JsonSerializer.Serialize(s, Json)); return true; }
-        catch { return false; }
-    }
+    public bool SaveSettings(AppSettings s) => WriteAtomic(SettingsPath, JsonSerializer.Serialize(s, Json));
 
-    public NodeLibrary LoadNodes()
+    public NodeLibrary LoadNodes() => ReadJson<NodeLibrary>(NodesPath) ?? new NodeLibrary();
+
+    public bool SaveNodes(NodeLibrary lib) => WriteAtomic(NodesPath, JsonSerializer.Serialize(lib, Json));
+
+    /// <summary>
+    /// 读主文件，坏了再读上一次存盘的好副本。
+    /// 直接覆盖写会在「写一半进程被杀」（升级安装、注销、断电）时留下半截 JSON，
+    /// 那时若无条件回落默认值，下一次保存就把用户的数据冲掉了 —— 表现为「装新版数据被清空」。
+    /// 损坏的原文件改名留档，不删。
+    /// </summary>
+    private static T? ReadJson<T>(string path) where T : class
     {
         try
         {
-            if (File.Exists(NodesPath))
-                return JsonSerializer.Deserialize<NodeLibrary>(File.ReadAllText(NodesPath), Json) ?? new NodeLibrary();
+            if (File.Exists(path))
+            {
+                var main = JsonSerializer.Deserialize<T>(File.ReadAllText(path), Json);
+                if (main != null) return main;
+            }
         }
-        catch { /* 同上 */ }
-        return new NodeLibrary();
+        catch
+        {
+            Quarantine(path);
+        }
+        try
+        {
+            if (File.Exists(path + ".bak"))
+                return JsonSerializer.Deserialize<T>(File.ReadAllText(path + ".bak"), Json);
+        }
+        catch { /* 备份也坏了就回落默认值 */ }
+        return null;
     }
 
-    public bool SaveNodes(NodeLibrary lib)
+    private static void Quarantine(string path)
     {
-        try { File.WriteAllText(NodesPath, JsonSerializer.Serialize(lib, Json)); return true; }
+        try
+        {
+            var bad = $"{path}.bad-{DateTime.Now:yyyyMMdd-HHmmss}";
+            File.Move(path, bad, overwrite: true);
+        }
+        catch { /* 留档失败也不能挡住启动 */ }
+    }
+
+    /// <summary>先写临时文件，备份旧副本，再原子替换；任何一步失败都不会让主文件变成半截。</summary>
+    private static bool WriteAtomic(string path, string json)
+    {
+        var tmp = path + ".tmp";
+        try
+        {
+            File.WriteAllText(tmp, json);
+            if (File.Exists(path)) File.Copy(path, path + ".bak", overwrite: true);
+            File.Move(tmp, path, overwrite: true);
+            return true;
+        }
         catch { return false; }
     }
 

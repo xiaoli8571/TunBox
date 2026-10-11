@@ -437,3 +437,66 @@ IPv6、常规这种一句话的功能不再占掉和端口表一样大的一块�
   改 `curl -x http://127.0.0.1:7890 --data-binary` → 201，复查 `state=uploaded`、80,702,311 字节。
 
 测试 **66/66**；`dist/TunBox-Setup-0.4.7.exe`。
+
+---
+
+# 0.4.8 轮（2026-10-11 深夜）：设置页不许跳位 + 「数据被清空」的真身
+
+## 1. 设置页排序：把「折叠的排上面」这条启发式删掉
+
+用户反馈：「网络配置在第一个，展开后就跑到了最后一个」。上一轮那个 `SortSettingsSections()`
+（Expanded/Collapsed 事件里按 IsExpanded 稳定重排 `Children`）是把「整齐」做成了动态规则 ——
+展开一节就整页换位，用户下一秒找不到刚才那节。现在四节**固定按声明顺序**
+（网络配置 / 内核 / 分流规则 / 常规），只在本位撑开；`OnSectionToggled`、`SortSettingsSections`、
+以及只为其服务的 `x:Name`（SettingsPanel / Sec*）一并删掉。
+测试换成 `Settings_sections_keep_their_order_when_one_expands`：按 Y 取四节表头，
+展开「内核」前后必须逐字相等。
+
+## 2. 「每次装新版数据都被清空」——安装包没删过数据，是 app 自己读不回来
+
+先排除嫌疑：`installer.nsi` 从头到尾没碰过 `%APPDATA%\TunBox`，卸载器也没有。真正的根因是
+**`System.Text.Json` 不会往「只读集合属性」里填元素**：
+
+```csharp
+public List<ProxyNode> Nodes { get; } = new();   // 写得出去，读回来 0 个
+```
+
+`NodeLibrary.Nodes/Groups/Subscriptions`、`ProxyNode.Extras`、`ProxyGroup.Members`、
+`AppSettings.DnsServers/CustomRules/ForceProxySites/ForceDirectSites/AppProcesses`
+全是这个形态 —— 落盘是完整的 42KB JSON，重启解析出来一个都不剩，用户看到的就是「数据没了」。
+判据（一次性探针，跑完即删）：改 setter 前 `LoadNodes()` 返回 0 节点，改完读到
+**1 条订阅 / 24 个节点 / 3 个分组**（真机 `%APPDATA%\TunBox\nodes.json`）。
+所以这类「持久化模型的集合」一律 `get; set;`，并加测试 `Every_persisted_list_round_trips_through_disk`
+盯住每一条名单，免得以后又加一个只读集合悄悄丢数据。
+
+顺手补的第二个洞（同一条投诉的另一半）：**半截 JSON 会静默重置**。原来 `LoadNodes` 解析失败就
+`return new NodeLibrary()`，而 `File.WriteAllText` 是先截断再写 —— 写一半时进程被杀（升级安装、
+注销、断电）就留下半截文件，下一次保存直接冲掉原文。现在：
+
+- 落盘改「写 `.tmp` → 把旧主文件复制成 `.bak` → `File.Move` 原子替换」；
+- 读取：主文件坏了就改名留档成 `nodes.json.bad-<时间戳>`（不删，供排查），再回落到 `.bak`；
+- 测试 `Half_written_nodes_file_falls_back_to_the_last_good_copy`。
+
+`Workspace` 另加 `Serialize/Deserialize` 两个静态口子，读写共用同一套 `JsonSerializerOptions`
+（外部要解析同一份文件时不必重打参数）。
+
+## 3. 安装向导给出「保留 / 清理数据」的选择
+
+`!insertmacro MUI_PAGE_COMPONENTS` 组件页 + 两个 section：
+
+- `Section "TunBox 主程序" InstMain` —— `SectionIn RO`，勾不掉；
+- `Section /o "清理个人数据（订阅、节点、设置、分流库）" SecWipe` —— **`/o` 默认不勾选**，
+  勾上才 `RMDir /r "$APPDATA\TunBox"`。静默安装（`/S`）走默认，绝不会清数据。
+- 两项都配了 `MUI_DESCRIPTION_TEXT` 中文说明（鼠标悬停即解释「不勾选=升级不丢数据」）。
+- `.nsi` 必须 **UTF-8 with BOM**，否则 makensis 按 ANSI 读，中文全成乱码 —— 已用
+  `[IO.File]::WriteAllText($p, $text, (New-Object Text.UTF8Encoding($true)))` 补上 BOM。
+
+编译结果自证：`Install: 5 pages, 2 sections (1 required)`。
+
+## 4. 版本与验证
+
+- 0.4.7 → **0.4.8**（csproj `Version`、`installer.nsi` 的 `!define VERSION` + `VIProductVersion`/
+  `VIAddVersionKey`、`make-installer.ps1` 的 `$ver` 四处同步）。
+- 测试 **69/69**（新增 3 条：设置页不跳位、名单全量往返、半截文件回落）；
+  `dist/TunBox-Setup-0.4.8.exe` 80,690,136 字节。
+- 未在本机覆盖安装（用户机上那份 0.4.7 实例常驻，两个实例抢 7890 会污染验证）。

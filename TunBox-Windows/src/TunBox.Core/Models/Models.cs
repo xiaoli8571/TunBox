@@ -50,7 +50,7 @@ public sealed class ProxyNode
     public bool Udp { get; set; } = true;
     public bool SkipCertVerify { get; set; }
     public string SubscriptionId { get; set; } = "";
-    public Dictionary<string, string> Extras { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> Extras { get; set; } = new(StringComparer.Ordinal);
     public string RawTemplate { get; set; } = "";
 
     /// <summary>最近一次测速延迟（毫秒）；-1 失败，0 未测。</summary>
@@ -64,7 +64,7 @@ public sealed class ProxyGroup
 {
     public string Name { get; set; } = "";
     public string GroupType { get; set; } = "select";
-    public List<string> Members { get; } = new();
+    public List<string> Members { get; set; } = new();
     public string Url { get; set; } = "";
     public int IntervalSec { get; set; }
     public int ToleranceMs { get; set; }
@@ -131,16 +131,17 @@ public sealed class AppSettings
     /// <summary>DNS 复写：用户接管解析用的 nameserver（对齐 Verge / FlClash 的「DNS 覆写」）。</summary>
     public bool DnsOverrideEnabled { get; set; }
     /// <summary>复写用的 DNS 服务器；只换 nameserver，引导 DNS 与 fake-ip 规则不动。</summary>
-    public List<string> DnsServers { get; } = new();
+    // 下面这些名单同理：只读集合能存不能读，一律给 setter（见 NodeLibrary 的注释）。
+    public List<string> DnsServers { get; set; } = new();
     public string CoreLogLevel { get; set; } = "info";
     /// <summary>国内可达性好的测速地址：gstatic 不通时整屏节点会一起报红。</summary>
     public string TestUrl { get; set; } = "http://cp.cloudflare.com/generate_204";
-    public List<string> CustomRules { get; } = new();
-    public List<string> ForceProxySites { get; } = new();
-    public List<string> ForceDirectSites { get; } = new();
+    public List<string> CustomRules { get; set; } = new();
+    public List<string> ForceProxySites { get; set; } = new();
+    public List<string> ForceDirectSites { get; set; } = new();
     public AppRoutingMode AppRouting { get; set; } = AppRoutingMode.All;
     /// <summary>进程名（如 ChatGPT.exe）。Windows 上内核能查到连接归属进程，应用分流走 PROCESS-NAME 规则。</summary>
-    public List<string> AppProcesses { get; } = new();
+    public List<string> AppProcesses { get; set; } = new();
     public string SelectedNodeId { get; set; } = "";
     public bool StartWithWindows { get; set; }
     public bool StartMinimized { get; set; }
