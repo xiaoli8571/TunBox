@@ -571,3 +571,21 @@ taskkill 会当成「没有可关的窗口」报错返回，看着像「进程�
 - `dist/TunBox-Setup-0.3.0.exe` 80,698,375 字节，makensis 汇总仍是 `5 pages, 2 sections (1 required)`
   —— 组件页那颗「清理个人数据」默认不勾选的行为不变。
 - 本机没有覆盖安装用户的 TunBox（那该由他自己在向导里决定保不保留数据）。
+
+## 5. 发布
+
+`127.0.0.1:7890` 还是没人监听（用户的 TunBox 没在跑），github.com 的 git 通道依旧连不上，`api.github.com`
+正常 —— 走 Data API。但这轮撞上一个新墙：**PowerShell 5.1 的 `Invoke-RestMethod` 发小 body 也会被 nginx
+打回**（tree POST 832 字节回 413 `Request Entity Too Large`，上一轮单文件 tree POST 回的
+422 `tree.path contains a malformed path component` 大概率是同一个毛病，不是路径的问题）。
+**换成 curl 负责传输、PS 只用 `ConvertTo-Json` 生成 payload** 就一把过 —— 脚本
+`C:\Worker\_release\publish-030-commit.ps1` / `publish-030-release.ps1`，以后直接抄这两个。
+另外两个坑：① PowerShell 里 **`Curl` 是 `Invoke-WebRequest` 的内置别名，别名优先级高于同名 function**，
+自定义函数必须换名（`Invoke-Github`）；② 函数里别顺手 `Write-Output` 日志 —— 返回值是整个流水线输出，
+日志行会跟路径粘在一起喂给 curl。
+blob sha 这次用 `git hash-object --no-filters` 本地算（与 GitHub 收到的逐字节相同，省掉 6 次 blob POST）。
+
+- main `337aa83 → ab96236`（6 个文件：版本四处、`.nsi` 的自动关闭、版本一致性测试、`.gitignore` 豁免、文档）。
+- Release `windows-v0.3.0`（id 409781893），附件 `TunBox-Setup-0.3.0.exe` 80,698,375 字节 `state=uploaded`。
+- 按要求删除 `windows-v0.4.6 / 0.4.7 / 0.4.8` 三个 Release **及各自的 tag**（删 Release 不会删 tag），
+  全部 204；剩下的 Release 只有 `windows-v0.3.0` 与鸿蒙端 `v0.2.0`、`v0.1.0`。
