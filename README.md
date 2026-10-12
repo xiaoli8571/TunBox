@@ -7,6 +7,7 @@ Nexus 是一款鸿蒙 NEXT（纯 ArkTS）原生 VPN 客户端，内核采用 **M
 > ⚠️ 本项目仅供学习与技术研究。使用者需自行遵守所在地法律法规及所用网络服务条款。
 > 仓库内 HAP 为**未签名**产物，不能直接安装，需自行签名（见下文）。
 > 欢迎加入交流群：https://t.me/+x9D290Stp9NhYWU9
+> 邀测链接：https://appgallery.huawei.com/link/invite-test-wap?taskId=c7a8431522e4468f9d3d87d95f597d54&invitationCode=8Q6Xp0dcxN6
 
 ## 主要能力
 
