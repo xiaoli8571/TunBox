@@ -58,6 +58,9 @@ public sealed class ConnectionManager : IDisposable
         var liveSubIds = _lib.Subscriptions.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
         _lib.Nodes.RemoveAll(n => !liveSubIds.Contains(n.SubscriptionId));
         _lib.Groups.RemoveAll(g => !liveSubIds.Contains(g.SubscriptionId));
+        // 老数据里跨订阅重复的 id 在启动这一刻就治好并落盘（否则 PROXY 成员表会少节点，
+        // 用户点那些节点就被内核拒「proxy not exist」）。
+        if (EnsureUniqueIds(_lib.Nodes)) PersistNodes();
         Api.Configure(Settings.ApiPort, Settings.ApiSecret);
         // 先把随程序发布的 LightGBM 模型放进内核 home：不放到时候 smart 组不发射，
         // 界面上「自动选择」这一条会凭空消失（要等第一次 BuildConfig 才补上，太晚了）。
@@ -266,11 +269,36 @@ public sealed class ConnectionManager : IDisposable
     {
         var parsed = SubscriptionParser.Parse(content, sub.Id);
         ImportWarnings = parsed.Warnings;
+        // id 必须全库唯一：解析器是按订阅各自从 n1 编号的，多条订阅一合并就撞车 ——
+        // 「选中的节点」按 id 反查会挑到别家订阅的同名编号，而生成 PROXY 成员时
+        // `n.Id != selected.Id` 会把所有同 id 的节点一起剔掉，内核于是回 400「proxy not exist」，
+        // 用户看到的是「点了节点没反应」或「说节点刚下线」。
+        var prefix = sub.Id.Length >= 8 ? sub.Id[..8] : sub.Id;
+        var seq = 0;
+        foreach (var n in parsed.Nodes) n.Id = $"{prefix}-n{++seq}";
         _lib.Nodes.RemoveAll(n => n.SubscriptionId == sub.Id);
         _lib.Groups.RemoveAll(g => g.SubscriptionId == sub.Id);
         _lib.Nodes.AddRange(parsed.Nodes);
         _lib.Groups.AddRange(parsed.Groups);
+        EnsureUniqueIds(_lib.Nodes);   // 顺手把老数据里已经撞掉的 id 治好（升级后第一次更新订阅即生效）
         sub.UpdatedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    }
+
+    /// <summary>给重复/空缺的 id 重新编号；返回是否改过（改过就要落盘）。</summary>
+    internal static bool EnsureUniqueIds(List<ProxyNode> nodes)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var changed = false;
+        var salt = 0;
+        foreach (var n in nodes)
+        {
+            if (n.Id.Length > 0 && seen.Add(n.Id)) continue;
+            string id;
+            do { id = $"node-{++salt:x}"; } while (!seen.Add(id));
+            n.Id = id;
+            changed = true;
+        }
+        return changed;
     }
 
     public void RemoveSubscription(string id)
@@ -739,10 +767,23 @@ public sealed class ConnectionManager : IDisposable
 
     public async Task<bool> SelectNodeAsync(string name, string group = ProxyGroup)
     {
-        Settings.SelectedNodeId = _lib.Nodes.FirstOrDefault(n => n.Name == name)?.Id ?? Settings.SelectedNodeId;
+        // 点的是自动优选组 → 记哨兵值；点的是具体节点 → 记它的 id。
+        // 之前只在新名字能对上节点时才更新 id，结果 settings 里长期挂着「上一个节点」，
+        // 与内核实际选择各行其是（一重载就把用户打回自动选择，或反过来）。
+        Settings.SelectedNodeId = name == ClashConfigGenerator.SmartGroupName
+            ? AutoEgressId
+            : _lib.Nodes.FirstOrDefault(n => n.Name == name)?.Id ?? Settings.SelectedNodeId;
         PersistSettings();
         if (!CoreAlive) return true;
         var ok = await Api.SelectNodeAsync(group, name).ConfigureAwait(false);
+        if (!ok)
+        {
+            // 内核那份配置里还没这个成员（多半是配置落后于节点库，刚更新过订阅）：
+            // 先把配置推过去再试一次 —— 不能拿「节点可能刚下线」去打发用户，他点的就是库里有的节点。
+            if (await ReapplyRunningConfigAsync().ConfigureAwait(false))
+                ok = await Api.SelectNodeAsync(group, name).ConfigureAwait(false);
+            if (!ok) LastError = $"切到「{name}」没成功，流量还在走原来的出口。";
+        }
         // 全局模式下用户点的名片要同时落到 GLOBAL，否则切了节点流量照旧走 GLOBAL 里那个旧选择
         await SyncGlobalEgressAsync().ConfigureAwait(false);
         return ok;
@@ -793,14 +834,24 @@ public sealed class ConnectionManager : IDisposable
             return;
         }
         var proxies = await Api.ProxiesAsync(ct).ConfigureAwait(false);
-        if (!proxies.TryGetValue(ProxyGroup, out var proxy) || proxy.Now == name) return;
+        if (!proxies.TryGetValue(ProxyGroup, out var proxy)) return;   // 组还没建好，别抢
+        if (proxy.Now == name) return;
         if (!proxy.All.Contains(name, StringComparer.Ordinal))
         {
-            // 订阅被删/重名整理之后这个节点已经不在这个组里：退回自动优选，并说清楚，别假装还选着它
-            Settings.SelectedNodeId = AutoEgressId;
-            PersistSettings();
-            LastError = $"之前选的「{name}」已经不在出口列表里，改走自动优选。";
-            return;
+            // 内核跑的那份配置里没有这个节点 = 配置落后于节点库（刚更新过订阅等）：
+            // 先把配置推过去再试一次，不能反过来把用户的选择判成「节点已下线」。
+            if (!await ReapplyRunningConfigAsync(ct).ConfigureAwait(false)) return;
+            proxies = await Api.ProxiesAsync(ct).ConfigureAwait(false);
+            if (!proxies.TryGetValue(ProxyGroup, out proxy)) return;
+            if (proxy.Now == name) return;
+            if (!proxy.All.Contains(name, StringComparer.Ordinal))
+            {
+                // 两轮之后仍然没有：这个节点确实不在库里了，收回自动优选并说清楚
+                Settings.SelectedNodeId = AutoEgressId;
+                PersistSettings();
+                LastError = $"之前选的「{name}」在当前出口列表里没有了，改走自动优选。";
+                return;
+            }
         }
         if (!await Api.SelectNodeAsync(ProxyGroup, name, ct).ConfigureAwait(false))
             LastError = $"切到「{name}」没成功，流量还在走原来的出口。";

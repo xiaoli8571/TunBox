@@ -389,7 +389,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         // 统一落在总出口 PROXY：与鸿蒙订阅页同口径，点了哪行哪行就是出口。
         var ok = await _manager.SelectNodeAsync(item.Model.Name, "PROXY");
-        if (!ok) { DetailText = $"选 {item.Name} 没被内核接受（节点可能刚下线），先点「更新」。"; return; }
+        // 内核拒了（Manager 已经把原因写进 LastError）：不假装选中，也不给用户瞎指一条路
+        if (!ok) { DetailText = _manager.LastError ?? $"内核没有接受这次切换：{item.Name}"; return; }
         foreach (var n in Nodes) n.IsSelectedNow = ReferenceEquals(n, item);
         Raise(nameof(SelectedNode));
         // 手点一个节点 = 退出自动优选（与鸿蒙端一致）

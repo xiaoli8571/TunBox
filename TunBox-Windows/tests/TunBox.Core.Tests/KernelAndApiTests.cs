@@ -388,6 +388,109 @@ public class SubscriptionFetcherTests
 }
 
 /// <summary>
+/// 多订阅合并时的节点身份。真机踩过：解析器给每条订阅各自从 n1 编号，三条订阅就有 24 个 id 撞车 ——
+/// 「选中的节点」按 id 反查会挑到别家订阅，生成 PROXY 成员时 `Id != selected.Id` 还会把同 id 的
+/// 节点一起剔掉，用户点那些节点就被内核拒 400「proxy not exist」。
+/// </summary>
+public class MultiSubscriptionNodeIdsTests
+{
+    private static string Home() => Path.Combine(
+        Path.GetTempPath(), "tunbox-ids-" + Guid.NewGuid().ToString("N").Substring(0, 6));
+
+    /// <summary>从生成的配置里抠出 PROXY 组的成员表。</summary>
+    private static List<string> ProxyMembers(string yaml)
+    {
+        var lines = yaml.Split('\n');
+        var start = Array.FindIndex(lines, l => l.TrimEnd() == "  - name: \"PROXY\"");
+        Assert.True(start >= 0, "配置里没有 PROXY 组");
+        var members = new List<string>();
+        for (var i = start + 1; i < lines.Length && !lines[i].StartsWith("  - name:"); i++)
+        {
+            var m = Regex.Match(lines[i].TrimEnd(), "^\\s+- \"(.+)\"$");
+            if (m.Success) members.Add(m.Groups[1].Value);
+        }
+        return members;
+    }
+
+    [Fact]
+    public async Task Every_node_from_every_subscription_reaches_the_PROXY_group()
+    {
+        var home = Home();
+        try
+        {
+            var cm = new ConnectionManager(new Workspace(home));
+            // 两条各两个节点，base64 的 ss:// 链接（解析器会各自从 n1 开始编号）
+            Assert.True(await cm.AddSubscriptionAsync(
+                "ss://YWVzLTI1Ni1nY206cEBzcw==@1.1.1.1:8389#A1\nss://YWVzLTI1Ni1nY206cEBzcw==@1.1.1.2:8389#A2"));
+            Assert.True(await cm.AddSubscriptionAsync(
+                "ss://YWVzLTI1Ni1nY206cEBzcw==@2.2.2.1:8389#B1\nss://YWVzLTI1Ni1nY206cEBzcw==@2.2.2.2:8389#B2"));
+
+            var yaml = cm.BuildConfig();
+            var members = ProxyMembers(yaml);
+            foreach (var name in new[] { "A1", "A2", "B1", "B2" })
+                Assert.Contains(name, members);
+            Assert.True(members.Count >= 4, $"PROXY 成员表只有 {members.Count} 项");
+        }
+        finally { try { Directory.Delete(home, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task Selected_node_from_the_second_subscription_resolves_to_itself()
+    {
+        var home = Home();
+        try
+        {
+            var cm = new ConnectionManager(new Workspace(home));
+            await cm.AddSubscriptionAsync("ss://YWVzLTI1Ni1nY206cEBzcw==@1.1.1.1:8389#A1");
+            await cm.AddSubscriptionAsync("ss://YWVzLTI1Ni1nY206cEBzcw==@2.2.2.1:8389#B1");
+            await cm.SelectNodeAsync("B1");   // 内核没跑：只记选择
+            var yaml = cm.BuildConfig();
+            // 选中的是 B1，配置的 now 就必须是 B1；曾经是 n1 撞车后按「第一个」解析成 A1
+            Assert.Contains("    now: \"B1\"", yaml.Split('\n'));
+            Assert.Contains("A1", ProxyMembers(yaml));   // A1 不能被一起剔出成员表
+        }
+        finally { try { Directory.Delete(home, true); } catch { } }
+    }
+
+    /// <summary>
+    /// 老数据（已经带着重复 id 落盘的）必须在启动这一刻被治好 —— 否则用户升级完还得重新更新一次订阅
+    /// 才能点节点。这里直接伪造一份撞了 id 的 nodes.json 走启动路径。
+    /// </summary>
+    [Fact]
+    public void Duplicate_ids_in_legacy_data_are_healed_on_startup()
+    {
+        var home = Home();
+        try
+        {
+            var seed = new NodeLibrary();
+            foreach (var (id, name, sub) in new[]
+                     { ("n1", "A1", "sa"), ("n2", "A2", "sa"), ("n1", "B1", "sb"), ("n2", "B2", "sb") })
+                seed.Nodes.Add(new TunBox.Core.Models.ProxyNode
+                {
+                    Id = id, Name = name, OriginalName = name, SubscriptionId = sub,
+                    Kind = TunBox.Core.Models.ProxyKind.Ss, Server = "1.2.3.4", Port = 8389,
+                    Password = "pw", Method = "aes-256-gcm",
+                });
+            foreach (var s in new[] { "sa", "sb" })
+                seed.Subscriptions.Add(new TunBox.Core.Models.Subscription { Id = s, Name = s, Url = "" });
+            Directory.CreateDirectory(home);
+            File.WriteAllText(Path.Combine(home, "nodes.json"), Workspace.Serialize(seed));
+
+            var cm = new ConnectionManager(new Workspace(home));
+            var members = ProxyMembers(cm.BuildConfig());
+            Assert.Contains("A1", members);
+            Assert.Contains("A2", members);
+            Assert.Contains("B1", members);
+            Assert.Contains("B2", members);
+            // 治完要落盘，别每次都重新治一遍
+            var onDisk = Workspace.Deserialize<NodeLibrary>(File.ReadAllText(Path.Combine(home, "nodes.json")))!;
+            Assert.Equal(onDisk.Nodes.Count, onDisk.Nodes.Select(n => n.Id).Distinct(StringComparer.Ordinal).Count());
+        }
+        finally { try { Directory.Delete(home, true); } catch { } }
+    }
+}
+
+/// <summary>
 /// 本地数据（订阅、节点、设置）不许「装新版/重启就没了」。两条路都盯着：
 /// 一是只读集合属性让 STJ 写得出去读不回来；二是半截 JSON（写一半进程被杀：升级安装、注销、断电）
 /// 解析失败后若无条件回落默认值，下一次保存就把原文冲掉了。

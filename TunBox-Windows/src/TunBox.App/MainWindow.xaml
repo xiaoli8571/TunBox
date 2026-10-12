@@ -285,8 +285,8 @@
                         <Grid>
                             <TextBlock Text="出口信息" FontWeight="Bold" FontSize="14"
                                        Foreground="{StaticResource TextMain}"/>
-                            <Button Content="&#x21BB;" Style="{StaticResource GhostButton}" Width="32" Height="28"
-                                    HorizontalAlignment="Right" FontSize="14"
+                            <Button Content="刷新" Style="{StaticResource GhostButton}" Padding="10,5"
+                                    HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="12"
                                     Command="{Binding RefreshEgressCommand}"
                                     ToolTip="重新查一次出口 IP 与本机 IP"/>
                         </Grid>
