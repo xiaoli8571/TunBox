@@ -744,7 +744,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private EgressSnapshot _egress = EgressSnapshot.Empty;
     private bool _egressBusy;
     private string _egressStamp = "";
-    private CancellationTokenSource? _egressDebounce;
+    private int _egressGeneration;
 
     public bool EgressBusy { get => _egressBusy; private set => Set(ref _egressBusy, value); }
     public string EgressIpText => _egress.HasEgress ? _egress.EgressIp : (_egressBusy ? "查询中…" : "—");
@@ -777,6 +777,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Raise(n);
     }
 
+    /// <summary>测试缝隙：换一下「出口身份」并排队一次出口查询（模拟用户连着点节点）。</summary>
+    internal void PokeEgressForTests(string selectedNodeId)
+    {
+        _manager.Settings.SelectedNodeId = selectedNodeId;
+        RefreshEgressSoon();
+    }
+
     private async Task QueryEgressAsync()
     {
         if (EgressBusy) return;
@@ -801,26 +808,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         RaiseEgress();
     }
 
-    /// <summary>出口该变了就重查一次：连接上、换节点、切模式都算；连珠炮式的重建合并成一次。</summary>
-    private void RefreshEgressSoon()
+    /// <summary>
+    /// 出口该变了就重查一次：连接上、换节点、切模式都算；连珠炮式的重建合并成一次。
+    /// 这里不用 CancellationTokenSource：上一版让 UI 线程 Cancel/Dispose 旧令牌、后台任务再 Dispose 一次，
+    /// 谁先谁后没有约定 —— 抢输了就是用户看到的「界面刷新出错：ObjectDisposedException」。
+    /// 改成只数代数：过期的那次自己走人，没有任何可被释放的对象。
+    /// </summary>
+    internal void RefreshEgressSoon()
     {
         var stamp = $"{(_manager.State == TunnelState.Connected ? "on" : "off")}"
             + $"|{_manager.Settings.ProxyMode}|{_manager.Settings.SelectedNodeId}";
         if (stamp == _egressStamp) return;
         _egressStamp = stamp;
-        var cts = new CancellationTokenSource();
-        var old = Interlocked.Exchange(ref _egressDebounce, cts);
-        old?.Cancel();
-        old?.Dispose();
+        var generation = Interlocked.Increment(ref _egressGeneration);
         _ = Task.Run(async () =>
         {
-            try
+            await Task.Delay(800);
+            if (generation != Volatile.Read(ref _egressGeneration)) return;   // 后面又点过了，让最新那次去查
+            Application.Current?.Dispatcher.InvokeAsync(() =>
             {
-                await Task.Delay(800, cts.Token);
-                Application.Current?.Dispatcher.InvokeAsync(() => _ = QueryEgressAsync());
-            }
-            catch (OperationCanceledException) { /* 被下一次刷新合并掉了 */ }
-            finally { cts.Dispose(); }
+                if (generation != Volatile.Read(ref _egressGeneration)) return;
+                _ = QueryEgressAsync();
+            });
         });
     }
 

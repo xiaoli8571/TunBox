@@ -851,6 +851,36 @@ public class UiTests
         Assert.Null(failure);
     }
 
+    /// <summary>
+    /// 连着点节点时，「800ms 后查一次出口」的排队不许把界面刷崩。
+    /// 上一版用 CancellationTokenSource 做防抖：UI 线程对上一枚 Cancel/Dispose，
+    /// 后台任务的 finally 又 Dispose 一次，谁先谁后没有约定 —— 抢输了就是真机那句
+    /// 「界面刷新出错：ObjectDisposedException The CancellationTokenSource has been disposed」。
+    /// 所以这里刻意留出间隔，让前一次的后台任务先跑完（旧代码在第二次点时必抛）。
+    /// </summary>
+    [Fact]
+    public void Egress_requeue_survives_clicks_spaced_apart()
+    {
+        var home = TempHome("egressstorm");
+        var failure = WpfHost.OnUi<string?>(() =>
+        {
+            var vm = new MainViewModel(new Workspace(home));
+            try
+            {
+                for (var i = 0; i < 4; i++)
+                {
+                    vm.PokeEgressForTests($"node-{i}");
+                    PumpIdle(1000);   // 让上一轮的延时任务跑完并释放自己
+                }
+                return null;
+            }
+            catch (Exception e) { return e.GetType().Name + " " + e.Message; }
+        }).Result;
+
+        try { Directory.Delete(home, true); } catch { }
+        Assert.Null(failure);
+    }
+
     private static void PumpIdle(int ms) =>
         WpfHost.PumpUntil(() => false, ms);
 

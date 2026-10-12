@@ -766,3 +766,17 @@ Clash Verge Rev，验证网卡时别把它们的卡当成我们的。
    改成文字「刷新」+ `Padding=10,5`。
 
 测试 **86/86**；`dist/TunBox-Setup-0.3.0.exe` 已重出（仍按「覆盖 0.3.0 附件」的方式发布，与鸿蒙同号）。
+
+## 追加：出口查询的防抖把界面刷崩了（ObjectDisposedException）
+
+用户换节点又冒出「界面刷新出错：ObjectDisposedException The CancellationTokenSource has been disposed」。
+是我上一轮那张卡的防抖写坏的：`RefreshEgressSoon()` 把上一枚 `CancellationTokenSource`
+拿过来 `Cancel()+Dispose()`，而**后台任务自己的 `finally` 里也 Dispose 同一名对象** ——
+两次点击隔 800ms 以上时，前一枚已经由后台释放过，UI 这边再 Cancel 就抛，
+异常正好落在 `OnManagerChanged` 的大兜底里，于是变成那句难懂的「界面刷新出错」。
+
+改成**只数代数**（`_egressGeneration`）：过期的那次自己退出，全程没有可被释放的对象，
+也就没有先后约定。测试 `Egress_requeue_survives_clicks_spaced_apart` 刻意把点击间隔拉开到 1 秒
+（正是用户那种一次点一个的节奏），并把旧的令牌写法临时放回做过反向验证：**旧实现必红**。
+
+测试 **87/87**；安装包重出，仍按「覆盖 windows-v0.3.0 附件」发布。
