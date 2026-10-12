@@ -107,6 +107,8 @@ public enum CloseBehavior { Ask, Tray, Exit }
 /// <summary>代理模式。内核认 rule / global / direct 三种。</summary>
 public sealed class AppSettings
 {
+    /// <summary>SelectedNodeId 的这个哨兵值 = 出口交给 smart 组按每条连接自动择优，不是某个具体节点。</summary>
+    public const string AutoNodeId = "smart";
     public string ProxyMode { get; set; } = "rule";
     /// <summary>混合端口：同一端口同时讲 HTTP 与 SOCKS。0 = 不监听。</summary>
     public int MixedPort { get; set; } = 7890;

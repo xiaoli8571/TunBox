@@ -9,6 +9,7 @@ using System.IO;
 using TunBox.Core.Api;
 using System.Windows.Media;
 using TunBox.Core.Config;
+using TunBox.Core.Fetching;
 using TunBox.Core.Geo;
 using TunBox.Core.Models;
 using TunBox.Core.Runtime;
@@ -420,6 +421,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public AsyncRelayCommand SelectSmartCommand { get; }
 
+    /// <summary>手动查一次出口信息（卡片右上角那个刷新）。</summary>
+    public AsyncRelayCommand RefreshEgressCommand { get; }
+
     /// <summary>把总出口交给 smart 组：PROXY 选到 ♻️ 自动选择，之后每条连接由模型决定走哪个节点。</summary>
     private async Task SelectSmartAsync()
     {
@@ -630,6 +634,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ProxyMode = mode;
         });
         SelectSmartCommand = new AsyncRelayCommand(_ => SelectSmartAsync());
+        RefreshEgressCommand = new AsyncRelayCommand(_ => QueryEgressAsync());
         RemoveSubscriptionCommand = new RelayCommand(p =>
         {
             if (p is SubscriptionItem item) _manager.RemoveSubscription(item.Model.Id);
@@ -722,8 +727,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 : "已打开：点「连接」时接管";
     }
 
-    private void SyncGeoSummary()
-    {
+    private void SyncGeoSummary()    {
         var parts = new List<string>();
         foreach (var a in _manager.GeoAssets.Statuses)
         {
@@ -731,6 +735,92 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             parts.Add($"{a.Title}：{a.Detail}");
         }
         GeoSummaryText = parts.Count == 0 ? "分流库：还没开始下载" : string.Join("\n", parts);
+    }
+
+    // ── 出口信息卡（首页，虚拟网卡与实时连接之间）───────────────────────
+    // 这张卡的存在理由就是用户报的那件事：「我选的节点和我查到的 IP 不对应」。
+    // 走代理问一次出口 IP + 归属，再和直连问到的本机 IP 并排摆出来，对不对一眼就看穿。
+    private EgressSnapshot _egress = EgressSnapshot.Empty;
+    private bool _egressBusy;
+    private string _egressStamp = "";
+    private CancellationTokenSource? _egressDebounce;
+
+    public bool EgressBusy { get => _egressBusy; private set => Set(ref _egressBusy, value); }
+    public string EgressIpText => _egress.HasEgress ? _egress.EgressIp : (_egressBusy ? "查询中…" : "—");
+    public string EgressLocationText => _egress.HasEgress ? _egress.LocationText : "—";
+    public string EgressCarrierText => _egress.HasEgress ? _egress.CarrierText : "—";
+    public string LocalIpText => _egress.HasLocal ? _egress.LocalIp : "—";
+    public bool HasEgressInfo => _egress.HasEgress;
+
+    /// <summary>右下角那句提醒：出口=本机说明压根没走代理；查询失败就引用接口给的原因。</summary>
+    public string EgressNote
+    {
+        get
+        {
+            if (_egress.Error != null) return "查不到：" + _egress.Error;
+            if (_egress.SameAsLocal) return "出口 IP 与本机相同，这条连接没走代理（检查分流规则或换节点）";
+            if (!_egress.HasEgress) return IsConnected ? "" : "点「连接」之后才能查出口 IP";
+            return _egress.At == DateTime.MinValue ? "" : $" {_egress.At:HH:mm} 更新";
+        }
+    }
+
+    public bool ShowEgressWarn => _egress.SameAsLocal || _egress.Error != null;
+
+    private void RaiseEgress()
+    {
+        foreach (var n in new[]
+                 {
+                     nameof(EgressIpText), nameof(EgressLocationText), nameof(EgressCarrierText),
+                     nameof(LocalIpText), nameof(HasEgressInfo), nameof(EgressNote), nameof(ShowEgressWarn),
+                 })
+            Raise(n);
+    }
+
+    private async Task QueryEgressAsync()
+    {
+        if (EgressBusy) return;
+        if (!_manager.EgressQueryable)
+        {
+            _egress = EgressSnapshot.Empty with { Connected = IsConnected };
+            RaiseEgress();
+            return;
+        }
+        EgressBusy = true;
+        RaiseEgress();
+        try
+        {
+            // 本机 IP 只在第一次（或用户手动刷新）时直连问一次，别每轮都多打一个请求
+            _egress = await _manager.QueryEgressAsync(withLocal: !_egress.HasLocal);
+        }
+        catch (Exception e)
+        {
+            _egress = _egress with { Error = e.Message };
+        }
+        EgressBusy = false;
+        RaiseEgress();
+    }
+
+    /// <summary>出口该变了就重查一次：连接上、换节点、切模式都算；连珠炮式的重建合并成一次。</summary>
+    private void RefreshEgressSoon()
+    {
+        var stamp = $"{(_manager.State == TunnelState.Connected ? "on" : "off")}"
+            + $"|{_manager.Settings.ProxyMode}|{_manager.Settings.SelectedNodeId}";
+        if (stamp == _egressStamp) return;
+        _egressStamp = stamp;
+        var cts = new CancellationTokenSource();
+        var old = Interlocked.Exchange(ref _egressDebounce, cts);
+        old?.Cancel();
+        old?.Dispose();
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(800, cts.Token);
+                Application.Current?.Dispatcher.InvokeAsync(() => _ = QueryEgressAsync());
+            }
+            catch (OperationCanceledException) { /* 被下一次刷新合并掉了 */ }
+            finally { cts.Dispose(); }
+        });
     }
 
     private void OnManagerChanged()
@@ -758,6 +848,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 Raise(nameof(SmartSubtitle));
                 Raise(nameof(SelectedEgressText));
                 foreach (var c in new[] { TestAllCommand, ToggleConnectCommand }) c.Refresh();
+                // 出口换了就该重新查一次出口 IP（连接、换节点、切模式都会走到这里，800ms 合并）
+                RefreshEgressSoon();
             }
             catch (Exception e)
             {

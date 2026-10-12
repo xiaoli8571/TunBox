@@ -278,6 +278,57 @@
                     </StackPanel>
                 </Border>
 
+                <!-- 出口信息：走代理问一次出口 IP 与归属，再和直连问到的本机 IP 并排摆出来。
+                     「我点的节点和查到的 IP 对不上」这件事，这张卡一眼就能证实或排除。 -->
+                <Border Style="{StaticResource Card}">
+                    <StackPanel>
+                        <Grid>
+                            <TextBlock Text="出口信息" FontWeight="Bold" FontSize="14"
+                                       Foreground="{StaticResource TextMain}"/>
+                            <Button Content="&#x21BB;" Style="{StaticResource GhostButton}" Width="32" Height="28"
+                                    HorizontalAlignment="Right" FontSize="14"
+                                    Command="{Binding RefreshEgressCommand}"
+                                    ToolTip="重新查一次出口 IP 与本机 IP"/>
+                        </Grid>
+                        <Grid Margin="0,9,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="出口 IP" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,4"/>
+                            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding EgressIpText, Mode=OneWay}"
+                                       FontSize="12.5" FontWeight="SemiBold" TextWrapping="Wrap"
+                                       Foreground="{StaticResource TextMain}"/>
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="位置" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,4"/>
+                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding EgressLocationText, Mode=OneWay}"
+                                       FontSize="12.5" TextWrapping="Wrap"
+                                       Foreground="{StaticResource TextMain}"/>
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="运营商" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,4"/>
+                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding EgressCarrierText, Mode=OneWay}"
+                                       FontSize="12.5" TextWrapping="Wrap"
+                                       Foreground="{StaticResource TextMain}"/>
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="本机 IP" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}" Margin="0,0,12,0"/>
+                            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding LocalIpText, Mode=OneWay}"
+                                       FontSize="12.5" Foreground="{StaticResource TextMuted}"/>
+                        </Grid>
+                        <Border Background="{StaticResource WarnSoft}" CornerRadius="7" Padding="8,6" Margin="0,8,0,0"
+                                Visibility="{Binding ShowEgressWarn, Converter={StaticResource BoolVis}}">
+                            <TextBlock Text="{Binding EgressNote, Mode=OneWay}" FontSize="11.5" TextWrapping="Wrap"
+                                       Foreground="{StaticResource Warn}"/>
+                        </Border>
+                    </StackPanel>
+                </Border>
+
                 <!-- 实时连接：原来单独一页，竖屏下并进首页；默认折叠，展开才看列表。
                      连接数放在标题上（顶栏那条放不下）。 -->
                 <Border Style="{StaticResource Card}">

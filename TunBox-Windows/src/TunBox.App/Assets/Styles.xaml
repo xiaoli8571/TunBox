@@ -9,6 +9,9 @@
     <SolidColorBrush x:Key="TextMuted" Color="#6B7280"/>
     <SolidColorBrush x:Key="Line" Color="#E5E9F0"/>
     <SolidColorBrush x:Key="Danger" Color="#B91C1C"/>
+    <!-- 提醒用琥珀色，不用红色：红色留给「出错了」，这里是「结果和你的预期不一致」。 -->
+    <SolidColorBrush x:Key="Warn" Color="#B45309"/>
+    <SolidColorBrush x:Key="WarnSoft" Color="#FDF3E3"/>
     <!-- 「正在接管」的绿：总开关用它和未接管的蓝色区分（同色看不出开没开）。 -->
     <SolidColorBrush x:Key="Running" Color="#16A34A"/>
     <!-- 电源环（照鸿蒙 StatusRing 的三层圆） -->

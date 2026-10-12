@@ -199,9 +199,16 @@ public static class ClashConfigGenerator
         lines.Add("proxy-groups:");
         lines.Add("  - name: \"PROXY\"");
         lines.Add("    type: select");
-        lines.Add("    proxies:");
         var selected = valid.FirstOrDefault(n => n.Id == settings.SelectedNodeId) ?? valid[0];
-        if (emitSmart && settings.ProxyMode != "global")
+        var smartFirst = emitSmart && settings.ProxyMode != "global";
+        // 必须写出 now：内核没有 now 就默认取成员表的第一个，而我们排在第一位的是 ♻️ 自动选择 ——
+        // 于是「用户点了 A 节点，重启/热重载之后每条连接又交回模型挑」，查到的 IP 跟所选对不上
+        //（内核实测：配置里的 now 会被采纳，重载后停在选择的那个节点）。
+        var wantAuto = settings.SelectedNodeId.Length == 0 || settings.SelectedNodeId == AppSettings.AutoNodeId;
+        var egress = wantAuto && smartFirst ? SmartGroupName : selected.Name;
+        lines.Add($"    now: \"{Escape(egress)}\"");
+        lines.Add("    proxies:");
+        if (smartFirst)
         {
             lines.Add($"      - \"{Escape(SmartGroupName)}\"");
             lines.Add($"      - \"{Escape(selected.Name)}\"");

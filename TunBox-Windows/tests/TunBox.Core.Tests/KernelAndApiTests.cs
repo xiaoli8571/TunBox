@@ -166,7 +166,7 @@ public sealed class KernelE2ETests
         var s = new TunBox.Core.Models.AppSettings
         {
             HttpPort = 0, SocksPort = 0, MixedPort = FreePort(), ApiPort = apiPort,
-            ApiSecret = "e2e-secret", ProxyMode = "rule",
+            ApiSecret = "e2e-secret", ProxyMode = "rule", SelectedNodeId = "2",
         };
         var nodes = new List<TunBox.Core.Models.ProxyNode>
         {
@@ -205,12 +205,17 @@ public sealed class KernelE2ETests
             if (proxies.Count == 0) return;
 
             Assert.Equal("rule", await api.ModeAsync());
+            // 配置里写的 now 必须被采纳：不写 now 时内核取成员表第一个，用户选的节点就悄悄没了
+            Assert.True(proxies.ContainsKey("PROXY"), "内核没给出 PROXY 组。日志：\n" + string.Join("\n", lines.Take(20)));
+            Assert.Equal("SG 02", proxies["PROXY"].Now);
             s.ProxyMode = "global";
             var global = TunBox.Core.Config.ClashConfigGenerator.Generate(nodes,
                 Array.Empty<TunBox.Core.Models.ProxyGroup>(), s, new Workspace(home).DetectGates(), tunOverride: false);
             var (ok, error) = await api.UpdateConfigAsync(global);
             Assert.True(ok, "整份 payload 热应用被拒：" + error);
             Assert.Equal("global", await api.ModeAsync());
+            // 重载之后用户的选择还在（now 跟着配置走，不会被弹回成员表第一个）
+            Assert.Equal("SG 02", (await api.ProxiesAsync())["PROXY"].Now);
 
             Assert.True(await api.SelectNodeAsync("GLOBAL", "PROXY"), "内核不肯让 GLOBAL 走代理组");
             Assert.Equal("PROXY", (await api.ProxiesAsync())["GLOBAL"].Now);
@@ -487,6 +492,75 @@ public class WorkspaceDataTests
             Assert.Equal(17890, new Workspace(home).LoadSettings().MixedPort);
         }
         finally { try { Directory.Delete(home, true); } catch { } }
+    }
+}
+
+/// <summary>
+/// 首页出口信息卡的数据层。这张卡存在的理由就是用户报的「点的节点和查到的 IP 对不上」，
+/// 所以解析与「出口=本机」的判定必须钉住，接口被劫持时也要说清现象而不是空白一片。
+/// </summary>
+public class EgressProbeTests
+{
+    [Fact]
+    public void Parses_ip_api_success_and_collapses_repeated_place_parts()
+    {
+        const string json = """
+            {"status":"success","country":"美国","regionName":"明尼苏达","city":"梅纳哈",
+             "isp":"West Central Telephone Assn","as":"AS6434 West Central","query":"216.189.136.50"}
+            """;
+        var s = EgressProbe.Parse(json, connected: true, localIp: null, error: null);
+        Assert.Equal("216.189.136.50", s.EgressIp);
+        Assert.Equal("美国 · 明尼苏达 · 梅纳哈", s.Location);
+        Assert.Equal("West Central Telephone Assn", s.Carrier);
+        Assert.False(s.SameAsLocal);
+    }
+
+    /// <summary>国家与城市同名时不重复输出（ip-api 对城市级数据常这样回）。</summary>
+    [Fact]
+    public void Duplicate_place_parts_are_merged()
+    {
+        const string json = """
+            {"status":"success","country":"新加坡","regionName":"新加坡","city":"新加坡",
+             "isp":"AWS","as":"AS16509","query":"54.255.248.158"}
+            """;
+        Assert.Equal("新加坡", EgressProbe.Parse(json, true, null, null).Location);
+    }
+
+    /// <summary>运营商面板/认证门户劫持 DNS 时返回的是 HTML：要报「被劫持」并把前几个字符带出来。</summary>
+    [Fact]
+    public void Hijacked_html_response_is_reported_as_such()
+    {
+        var s = EgressProbe.Parse("<!DOCTYPE html><html><body>登录</body></html>", true, null, null);
+        Assert.Equal("", s.EgressIp);
+        Assert.Contains("劫持", s.Error);
+    }
+
+    [Fact]
+    public void Api_failure_and_unreachable_proxy_leave_a_reason_not_a_blank()
+    {
+        var s = EgressProbe.Parse("", connected: true, localIp: "1.2.3.4", error: "连接被中止");
+        Assert.Equal("连接被中止", s.Error);
+        Assert.Equal("1.2.3.4", s.LocalIp);   // 本机 IP 还是要留住
+
+        var denied = EgressProbe.Parse("""{"status":"fail","message":"reserved range"}""", true, null, null);
+        Assert.Contains("reserved range", denied.Error);
+    }
+
+    /// <summary>出口 IP 与本机 IP 相同 = 这条连接压根没走代理 —— 卡片要能把这句话说出来。</summary>
+    [Fact]
+    public void Same_ip_as_local_means_traffic_never_left_the_machine()
+    {
+        var s = new EgressSnapshot("1.2.3.4", "中国 · 上海", "China Telecom", "AS4134", "1.2.3.4", true, null, DateTime.Now);
+        Assert.True(s.SameAsLocal);
+        Assert.False((s with { LocalIp = "9.9.9.9" }).SameAsLocal);
+    }
+
+    /// <summary>查出口走的是内核的混合端口；端口没开就别瞎试，直接给原因。</summary>
+    [Fact]
+    public async Task No_proxy_port_is_an_explicit_refusal()
+    {
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await EgressProbe.FetchViaProxyAsync(0, CancellationToken.None));
     }
 }
 

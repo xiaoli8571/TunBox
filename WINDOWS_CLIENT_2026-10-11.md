@@ -661,3 +661,67 @@ mode、GLOBAL 认组名也认节点名、最后真发一个请求看日志是不
 顺带记一笔现场环境（不影响本轮改动，但会干扰判断）：`Get-NetAdapter` 里有三个
 `Wintun Userspace Tunnel`（本地连接 / 2 / 3）残留，都不是我们的 `TunBox` 卡 —— 用户机上还常驻
 Clash Verge Rev，验证网卡时别把它们的卡当成我们的。
+
+---
+
+# 0.3.0 第二轮补丁（2026-10-12 午后）：点的节点≠走的节点 + 自动重启 + 出口信息卡
+
+## 1. 「不管选什么节点，都走自动选择」——用户猜对了，而且原因在配置里
+
+排查路径（全用真机与真内核，不靠猜）：
+
+1. 订阅原文里那个「YF新加坡-VLESS-WS-CF·住宅·US」**没有** `dialer-proxy`/relay —— 住宅是
+   NexPanel **服务端**注入的（`app/egress.py`、`app/residential.py`：sing-box 出站走宿主 VPN Gate SOCKS5 :7920）。
+   所以客户端不该有任何特殊处理。
+2. 独立起两个探针内核：一份用订阅原文、一份用**我们生成的那一行**，都选这个节点查 `ip-api.com` →
+   **两份都是美国住宅 `216.189.136.50`（West Central Telephone）**。节点写法没问题。
+3. 那问题只能在「选择有没有生效」。看现场：内核 `PROXY.now = AWS新加坡-Hysteria2`，而
+   `settings.json` 记的是另一个 id —— 两边会飘。翻生成器：`proxies:` 列表第一位放的是
+   **`♻️ 自动选择`**，而 PROXY 组**没有写 `now`** → 内核加载配置时对没有 `now` 的 select 组
+   **默认取成员表第一个**。于是：用户点了 A 节点（当时 PUT 成功），但只要一重启/一热重载/一断连重连，
+   出口就悄悄回到 ♻️ 自动选择，每条连接由 LightGBM 自己挑（常挑到新加坡那个快的）——
+   正是「我选的节点跟我查到的 IP 不对应」。
+
+**修法两层**（内核实测都验过）：
+
+- `ClashConfigGenerator` 给 PROXY 组写 **`now:`**：用户选的具体节点，自动态才写 `♻️ 自动选择`；
+  选中的节点被订阅更新删掉时回落真实存在的节点，绝不写不存在的名字。真内核 E2E 断言
+  「配置里的 now 被采纳」+「payload 重载之后 still 停在这个节点」。
+- `ConnectionManager.ApplyEgressAsync()`：每次配置生效之后（连接、热重载、重启、分流库落地、切模式）
+  都把 `ReassertSelectionAsync()` + `SyncGlobalEgressAsync()` 走一遍，作为第二层保险；
+  节点已从组里消失时把 `SelectedNodeId` 收回自动态并在状态行说清楚，PUT 失败也不再假装成功。
+
+顺带一条判据经验：**「选中的节点」和「走的节点」是两件事**，以后再有「IP 不对」的反馈，
+先看 `GET /proxies/PROXY` 的 `now`，别看界面。
+
+## 2. 凡是需要重启代理才能生效的，一律自动重启
+
+原来有两条路会留到「下次连接才生效」：`TryHotReloadAsync` 谈不拢时（这条其实早就自动重启了），
+以及**分流库落地**那条（只留一句「下次连接起用新规则」）。现在 `ApplyAfterGeoLanded` 走
+`BringUpAsync`，热重载不行就重启；并且新增 `GeoAssetStore.HasPendingSwap` ——
+新库被运行中的内核映射着换不掉时，**先停内核**（停的那一刻 `ApplyPendingSwaps` 才换得动）再重建配置启动。
+状态文案跟着改实话：`已更新 · … · 已生效` / `旧库还被内核占着，重启后立即替换`。
+
+## 3. 首页新增「出口信息」卡（虚拟网卡与实时连接之间）
+
+对齐 Clash Verge / FlClash 的做法：**走代理问一次出口，直连问一次本机，并排摆出来**。
+
+- 数据源 `EgressProbe`（`TunBox.Core/Fetching`）：`http://ip-api.com/json/?lang=zh-CN&fields=…`，
+  免 key、一次给齐 IP / 国家 / 州省 / 城市 / 运营商 / ASN；出口那一问用 `WebProxy(http://127.0.0.1:<混合端口>)`，
+  本机那一问必须 `UseProxy=false`（否则「本机 IP」查出来其实是出口 IP，两个数一比一等零）。
+- 卡片四行：出口 IP / 位置 / 运营商 / 本机 IP，右上 ↻ 手动刷新；
+  连接建立、换节点、切模式后 800ms 防抖自动重查（`_egressStamp = 状态|模式|SelectedNodeId`）。
+- **出口 IP == 本机 IP 时亮琥珀色提醒**「这条连接没走代理」——这张卡本身就是这类问题的现场取证。
+- 位置三兄弟去重（ip-api 对城市级数据常把国家/州/市回成同一个词）；
+  被门户劫持返回 HTML 时报「接口没返回 JSON（被网络劫持了？）」并带上前 40 字符。
+- 配色新增 `Warn`/`WarnSoft`（琥珀），提醒不是错误，别用红色。
+
+## 4. 版本与验证
+
+- 测试 **83/83**（新增：`Proxy_group_carries_the_users_choice_as_now`、`EgressProbeTests` 5 条、
+  `Home_page_puts_the_egress_card_between_tun_and_connections`，并扩展了全局模式那条真内核 E2E）。
+- 构建 0 警告；`dist/TunBox-Setup-0.3.0.exe` 80,710,287 字节（按用户选的方式仍是 0.3.0，与鸿蒙同号）。
+- **UI 没做视觉验收**：这台机器的抓屏不可信，且用户的旧实例常驻（单实例互斥会被抢走），
+  卡片是按绑定契约 + 坐标断言在 UiTests 里验的。
+- 事故记录：排查中我用过 `taskkill /F /IM tunbox-core.exe`（按镜像名批量杀），
+  把**用户正在用的那个内核一起杀了**。以后一律先取 PID 再精确杀，别用镜像名。

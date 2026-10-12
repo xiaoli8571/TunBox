@@ -354,7 +354,7 @@ public sealed class ConnectionManager : IDisposable
             EnableSystemProxyIfWanted();
             // mode 已经写在那份配置里了，这次调用只是兜底；等它 = 在回环 HTTP 被拦的机器上
             // 白等一个 HttpClient 超时，所以放后台。全局模式还要顺手把 GLOBAL 钉到出口节点上。
-            Watch(ApplyModeAsync(ct));
+            Watch(ApplyEgressAsync(ct));
             TunActive = Settings.TunEnabled && TunAdapter.IsReady(ClashConfigGenerator.TunDeviceName);
             State = TunnelState.Connected;
             LastTiming = string.Join(" · ", phases) + $" · 已接管 {sw.ElapsedMilliseconds}ms";
@@ -604,7 +604,9 @@ public sealed class ConnectionManager : IDisposable
             return false;
         }
         if (!standby) State = TunnelState.Connected;
-        // 网卡核对放后台：拨一下开关先等满 8s 预算的话，「立刻接管」就白做了。
+        // 配置一重建，组选择就回到默认值：先按回用户的出口，再去核对网卡
+        await ApplyEgressAsync(ct).ConfigureAwait(false);
+        // 网卡核对放后台：拨一下开关先等满 30s 预算的话，「立刻接管」就白做了。
         _ = FinishTunCheckAsync(ct);
         Changed?.Invoke();
         return true;
@@ -665,21 +667,34 @@ public sealed class ConnectionManager : IDisposable
         }
     }
 
+    /// <summary>分流库落好了：立刻生效。热重载谈不拢就自动重启内核，绝不留到「下次连接」。</summary>
     private async Task ApplyAfterGeoLanded()
     {
         if (!CoreAlive) return;
-        var yaml = BuildConfig(tunForcedOff: State == TunnelState.Standby);
-        if (_host.IsRunningWith(yaml)) return;
-        var (ok, error) = await Api.UpdateConfigAsync(yaml).ConfigureAwait(false);
-        if (ok) { _host.SaveConfig(yaml); PendingConfigNote = null; await ApplyModeAsync().ConfigureAwait(false); }
-        else PendingConfigNote = "分流库已就位，但内核没接受这次热重载（" + error + "），下次连接起用新规则。";
+        try
+        {
+            // 新库换不掉是因为内核把它映射在内存里 —— 想马上生效就得先停它一下，
+            // 停掉的那一刻 BuildConfig 里的 ApplyPendingSwaps 才换得动。
+            var restartForSwap = _ws.GeoAssets.HasPendingSwap;
+            if (restartForSwap) _host.Stop();
+            var yaml = BuildConfig(tunForcedOff: State == TunnelState.Standby);
+            if (!restartForSwap && _host.IsRunningWith(yaml)) return;
+            LastApplyNote = await BringUpAsync(yaml, wasAlive: !restartForSwap, CancellationToken.None)
+                .ConfigureAwait(false);
+            if (State == TunnelState.Connected) await ApplyEgressAsync().ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            // 这里是后台触发，抛出去就是没人接的异常
+            LastError = "分流库就位后没能生效：" + e.Message;
+        }
         Changed?.Invoke();
     }
 
     // ── 模式与选点 ───────────────────────────────────────────────────────
 
     /// <summary>SelectedNodeId 的这个哨兵值 = 「出口交给 smart 组按每条连接自动择优」。</summary>
-    public const string AutoEgressId = "smart";
+    public const string AutoEgressId = AppSettings.AutoNodeId;
 
     /// <summary>正在后台等虚拟网卡建起来（内核会自己重试，别在此期间报「网卡没起来」）。</summary>
     public bool TunPending { get; private set; }
@@ -705,8 +720,8 @@ public sealed class ConnectionManager : IDisposable
             return true;
         }
         var ok = await ReapplyRunningConfigAsync().ConfigureAwait(false);
-        if (ok) await SyncGlobalEgressAsync().ConfigureAwait(false);
-        Changed?.Invoke();
+        if (ok) await ApplyEgressAsync().ConfigureAwait(false);
+        else Changed?.Invoke();
         return ok;
     }
 
@@ -745,11 +760,50 @@ public sealed class ConnectionManager : IDisposable
         if (name.Length > 0) await Api.SelectNodeAsync(GlobalGroup, name, ct).ConfigureAwait(false);
     }
 
-    /// <summary>连接/热重载之后把模式与出口对齐一次（配置重建会把 GLOBAL 的选择冲掉）。</summary>
-    private async Task ApplyModeAsync(CancellationToken ct = default)
+    /// <summary>
+    /// 每次配置生效之后都要走一遍。内核加载一份新配置时，PROXY 组里没有 `now` 就默认取第一个成员
+    /// —— 我们排在第一位的是 ♻️ 自动选择 —— 于是「用户点了 A 节点，实际每条连接由模型挑」，
+    /// 这就是「选的节点和查到的 IP 对不上」的根因。按回用户的选择，再让 GLOBAL 跟着走。
+    /// </summary>
+    private async Task ApplyEgressAsync(CancellationToken ct = default)
     {
+        await ReassertSelectionAsync(ct).ConfigureAwait(false);
         await SyncGlobalEgressAsync(ct).ConfigureAwait(false);
         Changed?.Invoke();
+    }
+
+    /// <summary>用户想要的出口名：具体节点，或「交给自动优选」；空 = 没什么要按的。</summary>
+    internal static string WantedEgress(string selectedNodeId, IReadOnlyList<ProxyNode> nodes, bool smartReady) =>
+        selectedNodeId.Length == 0 || selectedNodeId == AutoEgressId
+            ? smartReady ? ClashConfigGenerator.SmartGroupName : ""
+            : nodes.FirstOrDefault(n => n.Id == selectedNodeId)?.Name ?? "";
+
+    private async Task ReassertSelectionAsync(CancellationToken ct)
+    {
+        if (!CoreAlive) return;
+        var name = WantedEgress(Settings.SelectedNodeId, _lib.Nodes, SmartGroupReady);
+        if (name.Length == 0)
+        {
+            // 订阅更新把选中的节点删掉了：交回自动优选，别在设置里挂着一个已经不存在的 id
+            if (Settings.SelectedNodeId.Length > 0 && Settings.SelectedNodeId != AutoEgressId)
+            {
+                Settings.SelectedNodeId = AutoEgressId;
+                PersistSettings();
+            }
+            return;
+        }
+        var proxies = await Api.ProxiesAsync(ct).ConfigureAwait(false);
+        if (!proxies.TryGetValue(ProxyGroup, out var proxy) || proxy.Now == name) return;
+        if (!proxy.All.Contains(name, StringComparer.Ordinal))
+        {
+            // 订阅被删/重名整理之后这个节点已经不在这个组里：退回自动优选，并说清楚，别假装还选着它
+            Settings.SelectedNodeId = AutoEgressId;
+            PersistSettings();
+            LastError = $"之前选的「{name}」已经不在出口列表里，改走自动优选。";
+            return;
+        }
+        if (!await Api.SelectNodeAsync(ProxyGroup, name, ct).ConfigureAwait(false))
+            LastError = $"切到「{name}」没成功，流量还在走原来的出口。";
     }
 
     /// <summary>
@@ -776,6 +830,45 @@ public sealed class ConnectionManager : IDisposable
         return nodes.FirstOrDefault(n => Routed(n.Name) && n.Server.Length > 0
             && n.Kind != ProxyKind.Unknown)?.Name ?? "";
     }
+
+    /// <summary>能查出口了才有意义：内核活着且 HTTP 入口开着（混合端口优先）。</summary>
+    public bool EgressQueryable => CoreAlive && Settings.SystemProxyPort() > 0;
+
+    /// <summary>当前走的是哪个出口（PROXY 组在 kernel 里的 now），UI 拿来核对「选的是不是就是走的」。</summary>
+    public async Task<string> EgressNowAsync(CancellationToken ct = default)
+    {
+        if (!CoreAlive) return "";
+        var proxies = await Api.ProxiesAsync(ct).ConfigureAwait(false);
+        return proxies.TryGetValue(ProxyGroup, out var p) ? p.Now : "";
+    }
+
+    /// <summary>
+    /// 查一次出口信息：走内核的代理端口问 ip-api，同时（可选）直连问一次本机 IP ——
+    /// 两者相同就说明这个连接压根没走代理，这正是「点了节点但 IP 没变」最直接的判据。
+    /// </summary>
+    public async Task<EgressSnapshot> QueryEgressAsync(bool withLocal, CancellationToken ct = default)
+    {
+        var connected = State == TunnelState.Connected;
+        string egressJson = "", localJson = "";
+        string? error = null;
+        try { egressJson = await EgressProbe.FetchViaProxyAsync(Settings.SystemProxyPort(), ct).ConfigureAwait(false); }
+        catch (Exception e) { error = e.Message; }
+        if (withLocal)
+        {
+            try { localJson = await EgressProbe.FetchLocalAsync(ct).ConfigureAwait(false); }
+            catch { /* 本机 IP 拿不到不碍事，别把整张卡判死 */ }
+        }
+
+        var via = egressJson.Length > 0 || error != null
+            ? EgressProbe.Parse(egressJson, connected, null, error)
+            : EgressSnapshot.Empty;
+        var local = localJson.Length > 0 ? EgressProbe.Parse(localJson, connected, null, null).EgressIp : "";
+        var localIp = local.Length > 0 ? local : _localIp;
+        if (local.Length > 0) _localIp = local;
+        return via with { LocalIp = localIp, Connected = connected };
+    }
+
+    private string _localIp = "";
 
     /// <summary>组测速：结果写回模型，UI 靠状态上色。内核没跑先待命起来。</summary>
     public async Task<int> TestAllAsync(Action<DelayResult>? onEach = null, CancellationToken ct = default)

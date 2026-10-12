@@ -188,9 +188,36 @@ public class ClashConfigGeneratorTests
         Assert.Contains("fallback:", full);
     }
 
+    /// <summary>
+    /// PROXY 组必须把用户的选择写成 `now`。没有 now 时内核默认取成员表第一个，而我们第一位放的是
+    /// ♻️ 自动选择 —— 用户点了具体节点，一重启/热重载就悄悄变回「每条连接由模型挑」，
+    /// 查到的出口 IP 跟所选节点对不上（真机现象）。
+    /// </summary>
     [Fact]
-    public void Kernel_geo_auto_update_points_at_a_domestic_reachable_mirror()
+    public void Proxy_group_carries_the_users_choice_as_now()
     {
+        var nodes = new[] { Node("hk"), Node("sg") };
+        var gate = new ClashConfigGenerator.FeatureGate(true, true, true);
+
+        var s = Settings();
+        s.SelectedNodeId = "sg";
+        Assert.Contains("    now: \"sg\"", ClashConfigGenerator.Generate(nodes, Array.Empty<ProxyGroup>(), s, gate));
+
+        // 自动优选态（哨兵值，或从没选过）才把 now 交给 smart 组
+        s.SelectedNodeId = AppSettings.AutoNodeId;
+        Assert.Contains($"    now: \"{ClashConfigGenerator.SmartGroupName}\"",
+            ClashConfigGenerator.Generate(nodes, Array.Empty<ProxyGroup>(), s, gate));
+        Assert.Contains($"    now: \"{ClashConfigGenerator.SmartGroupName}\"",
+            ClashConfigGenerator.Generate(nodes, Array.Empty<ProxyGroup>(), Settings(), gate));
+
+        // 选中的节点被订阅更新删掉了：now 回落真实存在的节点，绝不写一个不存在的名字
+        var ghost = Settings();
+        ghost.SelectedNodeId = "does-not-exist";
+        Assert.Contains("    now: \"hk\"", ClashConfigGenerator.Generate(nodes, Array.Empty<ProxyGroup>(), ghost, gate));
+    }
+
+    [Fact]
+    public void Kernel_geo_auto_update_points_at_a_domestic_reachable_mirror()    {
         // 内核的 RegisterGeoUpdater 是后台 ticker，不参与启动路径，保鲜交给它；
         // 但默认地址是 GitHub release，国内直连多半下不动 —— 必须换成拿得到的镜像。
         var yaml = ClashConfigGenerator.Generate(new[] { Node("a") }, Array.Empty<ProxyGroup>(), Settings(),

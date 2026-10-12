@@ -251,7 +251,7 @@ public sealed class GeoAssetStore
                 File.Move(temp, path, overwrite: true);
                 Scan(d);
                 if (StatusOf(d.Key).State == GeoAssetState.Ready)
-                    SetState(d, GeoAssetState.Ready, $"已更新 · {Size(data.Length)} · 下次连接起用新库");
+                    SetState(d, GeoAssetState.Ready, $"已更新 · {Size(data.Length)} · 已生效");
                 return true;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -260,7 +260,7 @@ public sealed class GeoAssetStore
                 File.Move(temp, staged, overwrite: true);
                 var s = StatusOf(d.Key);
                 s.State = GeoAssetState.SwappedLater;
-                s.Detail = $"新库已下载（{Size(data.Length)}），内核正占着旧文件，下次连接时替换";
+                s.Detail = $"新库已下载（{Size(data.Length)}），旧库还被内核占着，重启后立即替换";
                 Changed?.Invoke();
                 return true;
             }
@@ -271,6 +271,9 @@ public sealed class GeoAssetStore
             return false;
         }
     }
+
+    /// <summary>有没有「下载好了但换不掉」的库：调用方据此决定要不要先停内核再启动。</summary>
+    public bool HasPendingSwap => Definitions.Any(d => File.Exists(Absolute(d) + ".new"));
 
     /// <summary>内核即将启动前调用：那一刻没人映射着库文件。</summary>
     public int ApplyPendingSwaps()

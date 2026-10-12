@@ -798,9 +798,58 @@ public class UiTests
         Assert.Null(failure);
     }
 
-    private static System.Windows.Controls.TabItem? FindTab(Window window, string header) =>
-        Descendants(window).OfType<System.Windows.Controls.TabItem>()
+    private static System.Windows.Controls.TabItem? FindTab(Window window, string header) =>        Descendants(window).OfType<System.Windows.Controls.TabItem>()
             .FirstOrDefault(t => (t.Header as string) == header);
+
+    /// <summary>
+    /// 首页的「出口信息」卡必须夹在虚拟网卡与实时连接之间（用户指定的位置），
+    /// 四行标签都要有值 —— 绑错名字的后果是卡片一片空白，用户只会以为程序坏了。
+    /// </summary>
+    [Fact]
+    public void Home_page_puts_the_egress_card_between_tun_and_connections()
+    {
+        var home = TempHome("egresscard");
+        var failure = WpfHost.OnUi<string?>(() =>
+        {
+            var vm = new MainViewModel(new Workspace(home));
+            var window = new MainWindow(vm);
+            window.Show();
+            WpfHost.PumpUntil(() => window.ActualWidth > 100);
+            try
+            {
+                double Y(string text) => Descendants(window).OfType<System.Windows.Controls.TextBlock>()
+                    .Where(t => t.Text == text)
+                    .Select(t => (double?)t.TranslatePoint(new Point(0, 0), window).Y)
+                    .FirstOrDefault() ?? -1;
+
+                var tun = Y("虚拟网卡（TUN）");
+                var card = Y("出口信息");
+                var conns = Descendants(window).OfType<System.Windows.Controls.Expander>()
+                    .Select(e => (double?)e.TranslatePoint(new Point(0, 0), window).Y)
+                    .FirstOrDefault() ?? -1;
+                if (tun < 0) return "找不到虚拟网卡卡";
+                if (card < 0) return "找不到「出口信息」卡";
+                if (conns < 0) return "找不到实时连接卡";
+                if (!(tun < card && card < conns))
+                    return $"卡片位置不对：网卡 y={tun:0} 出口 y={card:0} 连接 y={conns:0}";
+
+                foreach (var label in new[] { "出口 IP", "位置", "运营商", "本机 IP" })
+                {
+                    var found = Descendants(window).OfType<System.Windows.Controls.TextBlock>()
+                        .Any(t => t.Text == label);
+                    if (!found) return $"出口信息卡少了「{label}」这一行";
+                }
+                // 没连接时不许显示成「查到了」，但要有一句话解释为什么是空的
+                if (vm.EgressIpText.Length == 0) return "出口 IP 一格没有初值";
+                if (vm.EgressNote.Length == 0 && vm.IsConnected) return "已连接却没有说明文案";
+                return null;
+            }
+            finally { window.Close(); }
+        }).Result;
+
+        try { Directory.Delete(home, true); } catch { }
+        Assert.Null(failure);
+    }
 
     private static void PumpIdle(int ms) =>
         WpfHost.PumpUntil(() => false, ms);
