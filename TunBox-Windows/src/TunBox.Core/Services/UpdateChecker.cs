@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
@@ -9,11 +10,12 @@ using System.Threading.Tasks;
 namespace TunBox.Core.Services;
 
 /// <summary>
-/// 检查更新：查 GitHub Release（仓库 xiaoli8571/TunBox），只认 <c>windows-v</c> 前缀的 tag。
-/// 仓库里鸿蒙端（v0.2.0 这类）与 Windows 端（windows-v0.3.1 这类）共用一个 Releases 列表，
-/// 绝不能拿 /releases/latest 一把抓 —— 会抓到鸿蒙的 Release，版本号还不一定比 Windows 大。
-/// 网络路径：先直连 api.github.com；失败且本机混合端口在监听时，借自己的代理再试一次 ——
-/// 用户开着 TunBox 本来就是为了「能到 GitHub」。
+/// 检查更新：查 GitHub Release（仓库 xiaoli8571/TunBox）。
+/// 从 v0.3.1 起两端共用一个 Release：Windows 安装包与鸿蒙 .app 挂在同一个 <c>v*</c> tag 下，
+/// 所以标签同时认历史的 <c>windows-v*</c> 与统一的 <c>v*</c>，在列表里取版本号最大的那个。
+/// 仍然不拿 /releases/latest 一把抓 —— 旧线（windows-v0.3.0）与统一线并存时只有精确
+/// 匹配的 tag 才算数。网络路径：先直连 api.github.com；失败且本机混合端口在监听时，
+/// 借自己的代理再试一次 —— 用户开着 TunBox 本来就是为了「能到 GitHub」。
 /// </summary>
 public sealed class UpdateChecker
 {
@@ -21,11 +23,11 @@ public sealed class UpdateChecker
 
     public sealed record UpdateInfo(string Version, string Tag, string Url);
 
-    /// <summary>"windows-v0.3.1" → "0.3.1"；鸿蒙端的 tag（windows- 前缀之外的）一律不认。</summary>
-    public static string? ParseWindowsTag(string? tag)
+    /// <summary>"v0.3.1" / "windows-v0.3.1" → "0.3.1"；其余（beta 后缀、其他前缀）一律不认。</summary>
+    public static string? ParseReleaseTag(string? tag)
     {
         if (string.IsNullOrWhiteSpace(tag)) return null;
-        var m = Regex.Match(tag, @"^windows-v(\d+\.\d+\.\d+)$");
+        var m = Regex.Match(tag, @"^(?:windows-)?v(\d+\.\d+\.\d+)$");
         return m.Success ? m.Groups[1].Value : null;
     }
 
@@ -35,6 +37,26 @@ public sealed class UpdateChecker
         if (!Version.TryParse(candidate, out var c)) return false;
         if (!Version.TryParse(current, out var cur)) return true;
         return c > cur;
+    }
+
+    /// <summary>
+    /// 从一串 tag 里挑版本号最大的可识别项；全都不认识返回 null。
+    /// 列表按创建时间倒序不可靠（两端交替发版时会插队），必须显式比大小。
+    /// </summary>
+    public static (string Tag, string Version)? PickLatest(IEnumerable<string?> tags)
+    {
+        string? bestTag = null, bestVer = null;
+        foreach (var tag in tags)
+        {
+            var ver = ParseReleaseTag(tag);
+            if (ver is null) continue;
+            if (bestVer is null || Version.Parse(ver) > Version.Parse(bestVer))
+            {
+                bestTag = tag;
+                bestVer = ver;
+            }
+        }
+        return bestTag is null || bestVer is null ? null : (Tag: bestTag, Version: bestVer);
     }
 
     /// <summary>
@@ -63,20 +85,25 @@ public sealed class UpdateChecker
         using var resp = await http.SendAsync(req, ct).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
         await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: ct);
 
+        var tags = new List<string?>();
+        var urls = new Dictionary<string, string>();
         foreach (var rel in doc.RootElement.EnumerateArray())
         {
+            // 预发布版不推给正式用户
+            if (rel.TryGetProperty("prerelease", out var pre) && pre.GetBoolean()) continue;
             var tag = rel.TryGetProperty("tag_name", out var t) ? t.GetString() : null;
-            var ver = ParseWindowsTag(tag);
-            if (ver is null) continue;
-            // 列表按时间倒序：第一个 windows-v 条目就是 Windows 线的最新版
-            if (!IsNewer(currentVersion, ver)) return null;
-            var url = rel.TryGetProperty("html_url", out var u) && u.GetString() is { Length: > 0 } s
-                ? s
-                : $"https://github.com/{Repo}/releases";
-            return new UpdateInfo(ver, tag ?? $"windows-v{ver}", url);
+            if (ParseReleaseTag(tag) is null) continue;
+            tags.Add(tag);
+            var pageUrl = rel.TryGetProperty("html_url", out var u) && u.GetString() is { Length: > 0 } s
+                ? s : $"https://github.com/{Repo}/releases";
+            urls[tag!] = pageUrl;
         }
-        return null;
+
+        if (PickLatest(tags) is not { } best) return null;
+        if (!IsNewer(currentVersion, best.Version)) return null;
+        return new UpdateInfo(best.Version, best.Tag,
+            urls.TryGetValue(best.Tag, out var url) ? url : $"https://github.com/{Repo}/releases");
     }
 }
