@@ -4,7 +4,7 @@
         Title="导入订阅" Width="430" SizeToContent="Height" MaxHeight="620"
         WindowStartupLocation="CenterOwner" ResizeMode="NoResize" ShowInTaskbar="False"
         Background="White"
-        FontFamily="Segoe UI, Microsoft YaHei UI" FontSize="13"
+        FontFamily="Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI" FontSize="13"
         AllowDrop="True" Drop="OnDropFile">
     <Window.Resources>
         <!-- 样式合并进窗口自己（和主窗口同理）：对话框不能指望 App 级资源，
@@ -53,10 +53,10 @@
                 <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
-            <Separator Grid.Column="0" VerticalAlignment="Center" Background="#E5E9F0"/>
+            <Separator Grid.Column="0" VerticalAlignment="Center" Background="{StaticResource Line}"/>
             <TextBlock Grid.Column="1" Text="或者" Margin="10,0" VerticalAlignment="Center"
                        Foreground="{DynamicResource TextMuted}" FontSize="11.5"/>
-            <Separator Grid.Column="2" VerticalAlignment="Center" Background="#E5E9F0"/>
+            <Separator Grid.Column="2" VerticalAlignment="Center" Background="{StaticResource Line}"/>
         </Grid>
 
         <TextBlock Text="本地配置文件（yaml / conf）" Style="{StaticResource FieldLabel}"/>

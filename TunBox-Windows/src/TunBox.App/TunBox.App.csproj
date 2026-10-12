@@ -11,7 +11,7 @@
     <ApplicationIcon>Assets\tunbox.ico</ApplicationIcon>
     <AssemblyName>TunBox</AssemblyName>
     <RootNamespace>TunBox.App</RootNamespace>
-    <Version>0.3.0</Version>
+    <Version>0.3.1</Version>
     <Product>TunBox</Product>
     <AssemblyTitle>TunBox for Windows</AssemblyTitle>
     <SupportedOSPlatform>windows</SupportedOSPlatform>

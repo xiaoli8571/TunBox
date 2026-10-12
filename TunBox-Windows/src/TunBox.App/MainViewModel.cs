@@ -88,7 +88,9 @@ public sealed class AsyncRelayCommand : ICommand
 }
 
 /// <summary>
-/// 延迟配色照 Clash Verge 的收敛口径：&lt;250 绿 / 250-399 蓝 / ≥400 橙 / 超时与失败红 / 未测灰。
+/// 延迟配色（四档 + 超时/失败红，macOS 客户端的口径）：
+/// &lt;250 绿 / 250-399 琥珀 / ≥400 橙红 / 超时与失败红 / 测速中品牌蓝 / 未测灰。
+/// 旧的 250-399 蓝档和「很快」的绿挤在一起，用户读不出「勉强能用」的差别。
 /// </summary>
 public sealed class NodeItem : ObservableObject
 {
@@ -100,9 +102,10 @@ public sealed class NodeItem : ObservableObject
     }
 
     private static readonly SolidColorBrush Fast = B(0x16, 0xA3, 0x4A);
-    private static readonly SolidColorBrush Good = B(0x25, 0x63, 0xEB);
-    private static readonly SolidColorBrush Slow = B(0xD9, 0x77, 0x06);
+    private static readonly SolidColorBrush Amber = B(0xD9, 0x77, 0x06);
+    private static readonly SolidColorBrush Slow = B(0xEA, 0x58, 0x0C);
     private static readonly SolidColorBrush Bad = B(0xDC, 0x26, 0x26);
+    private static readonly SolidColorBrush TestingBrush = B(0x00, 0x7A, 0xFF);
 
     public ProxyNode Model { get; }
     public NodeItem(ProxyNode model) { Model = model; }
@@ -143,10 +146,10 @@ public sealed class NodeItem : ObservableObject
     public System.Windows.Media.Brush LatencyBrush => Model.State switch
     {
         DelayState.Ok when Model.LastLatency < 250 => Fast,
-        DelayState.Ok when Model.LastLatency < 400 => Good,
+        DelayState.Ok when Model.LastLatency < 400 => Amber,
         DelayState.Ok => Slow,
         DelayState.Timeout or DelayState.Failed => Bad,
-        DelayState.Testing => Slow,
+        DelayState.Testing => TestingBrush,
         _ => System.Windows.Media.Brushes.Gray,
     };
 
@@ -264,10 +267,36 @@ public sealed class SubscriptionItem : ObservableObject
         }
     }
 
+    /// <summary>流量条颜色：健康 = 品牌蓝，用量 &gt;80% 转琥珀，&gt;95% 转红——
+    /// 让人不用读数字就知道「快用完了」。</summary>
+    public System.Windows.Media.Brush TrafficRatioBrush
+    {
+        get
+        {
+            var ratio = TrafficRatio;
+            if (ratio > 0.95) return DangerBrush;
+            if (ratio > 0.80) return WarnBrush;
+            return BrandBrush;
+        }
+    }
+
+    private static System.Windows.Media.SolidColorBrush B(byte r, byte g, byte b)
+    {
+        var brush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(r, g, b));
+        brush.Freeze();
+        return brush;
+    }
+
+    private static readonly System.Windows.Media.Brush BrandBrush = B(0x00, 0x7A, 0xFF);
+    private static readonly System.Windows.Media.Brush WarnBrush = B(0xD9, 0x77, 0x06);
+    private static readonly System.Windows.Media.Brush DangerBrush = B(0xDC, 0x26, 0x26);
+
     public void Refresh()
     {
         Raise(nameof(TrafficText));
         Raise(nameof(Updated));
+        Raise(nameof(TrafficRatio));
+        Raise(nameof(TrafficRatioBrush));
     }
 
     private static string Fmt(long b) => b switch
@@ -440,9 +469,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         foreach (var n in Nodes) n.IsSelectedNow = false;
         Raise(nameof(SmartActive));
         Raise(nameof(SelectedEgressText));
-        DetailText = ok
-            ? "已交给自动优选：内核按每条连接的目标自己挑节点，「实时连接」的出口列就是它选中的那个。"
-            : "内核没接受切到自动优选（可能这份配置里还没发射 smart 组），点「连接」后重试。";
+        // 切换成功不播报：卡片「使用中」徽章 + 当前出口名就是反馈（用户点名：多余提示不要）
+        if (!ok) DetailText = "内核没接受切到自动优选（可能这份配置里还没发射 smart 组），点「连接」后重试。";
     }
 
     private string _detailText = "";
@@ -615,6 +643,49 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string SubscriptionCountText => Subscriptions.Count == 0
         ? "还没有订阅" : $"{Subscriptions.Count} 条订阅 · {Nodes.Count} 个节点";
 
+    // ── 检查更新 ─────────────────────────────────────────────────────────
+    // 设置页那颗「检查更新」：查 GitHub 上比当前版本新的 windows-v* Release。
+    // 仓库里鸿蒙端与 Windows 端共用一个 Releases 列表，所以只认 windows- 前缀的 tag，
+    // 绝不能拿 /releases/latest 一把抓（会抓到鸿蒙的 Release）。
+
+    public AsyncRelayCommand CheckUpdateCommand { get; }
+
+    private bool _checkingUpdate;
+    private string _updateStatusText = "";
+
+    /// <summary>检查结果落在按钮旁边，不打扰状态条。</summary>
+    public string UpdateStatusText
+    {
+        get => _updateStatusText;
+        private set { _updateStatusText = value; Raise(nameof(UpdateStatusText)); }
+    }
+
+    private async Task CheckUpdateAsync()
+    {
+        if (_checkingUpdate) return;
+        _checkingUpdate = true;
+        UpdateStatusText = "正在检查更新…";
+        try
+        {
+            var info = await new UpdateChecker().CheckAsync(VersionText, _manager.Settings.MixedPort);
+            if (info == null)
+            {
+                UpdateStatusText = $"已是最新版本（v{VersionText}）。";
+                return;
+            }
+            UpdateStatusText = $"发现新版本 v{info.Version}，正在打开下载页…";
+            Process.Start(new ProcessStartInfo { FileName = info.Url, UseShellExecute = true });
+        }
+        catch (Exception)
+        {
+            UpdateStatusText = "检查更新失败：连不上 GitHub，检查网络后稍后再试。";
+        }
+        finally
+        {
+            _checkingUpdate = false;
+        }
+    }
+
     /// <summary>workspace 可注入：测试用默认值会写到用户真实的 %APPDATA%\TunBox。</summary>
     public MainViewModel(Workspace? workspace = null)
     {
@@ -636,6 +707,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         });
         SelectSmartCommand = new AsyncRelayCommand(_ => SelectSmartAsync());
         RefreshEgressCommand = new AsyncRelayCommand(_ => QueryEgressAsync());
+        CheckUpdateCommand = new AsyncRelayCommand(_ => CheckUpdateAsync());
         RemoveSubscriptionCommand = new RelayCommand(p =>
         {
             if (p is SubscriptionItem item) _manager.RemoveSubscription(item.Model.Id);
@@ -799,6 +871,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             // 本机 IP 只在第一次（或用户手动刷新）时直连问一次，别每轮都多打一个请求
             _egress = await _manager.QueryEgressAsync(withLocal: !_egress.HasLocal);
+            // 查询路上断开了连接：这次结果已经过期，别把「连接时查到的出口」留在卡上冒充现状
+            if (!_manager.EgressQueryable)
+                _egress = EgressSnapshot.Empty with { Connected = IsConnected };
         }
         catch (Exception e)
         {
@@ -858,6 +933,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 Raise(nameof(SmartSubtitle));
                 Raise(nameof(SelectedEgressText));
                 foreach (var c in new[] { TestAllCommand, ToggleConnectCommand }) c.Refresh();
+                // 断开的那一刻就把旧出口从卡上撤下来，别等 800ms 防抖：那格空档够用户截一张
+                // 「我没开代理却在走国外」的图出去。待命态重新查出口本来就不允许（EgressQueryable）。
+                if (!IsConnected && _egress.HasEgress) { _egress = EgressSnapshot.Empty; RaiseEgress(); }
                 // 出口换了就该重新查一次出口 IP（连接、换节点、切模式都会走到这里，800ms 合并）
                 RefreshEgressSoon();
             }
@@ -968,18 +1046,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         item.Refresh();
         var r = await _manager.TestNodeAsync(item.Model.Name);
         item.Refresh();
-        DetailText = r == null ? "这个节点已经不在列表里了，先更新订阅。"
-            : r.Ok ? $"{item.Name} · {r.DelayMs} ms"
-            : $"{item.Name} · " + (r.Error ?? r.Text);
+        // 延迟结果直接落在行上（数字 / 超时 / 不通），不再重复播报；节点凭空消失才需要解释
+        if (r == null) DetailText = "这个节点已经不在列表里了，先更新订阅。";
     }
 
     public async Task UpdateSubscriptionAsync(SubscriptionItem item)
     {
-        DetailText = $"正在更新「{item.Name}」…";
         var ok = await _manager.RefreshSubscriptionAsync(item.Model.Id);
-        DetailText = ok
-            ? $"已更新「{item.Name}」，当前 {_manager.Nodes.Count} 个节点。"
-            : (_manager.LastError ?? "更新失败");
+        if (!ok) DetailText = _manager.LastError ?? "更新失败";
         RebuildLists();
         Raise(nameof(SubscriptionCountText));
     }
@@ -989,7 +1063,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _manager.RemoveSubscription(item.Model.Id);
         RebuildLists();
         Raise(nameof(SubscriptionCountText));
-        DetailText = $"已删除订阅「{item.Name}」。";
     }
 
     // ── 首页动作 ─────────────────────────────────────────────────────────
@@ -1010,7 +1083,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             DetailText = "内核已接管，但系统代理写不进注册表（可能被安全软件拦了）。"
                 + "可以手动给浏览器配 HTTP 代理 127.0.0.1:" + _manager.Settings.SystemProxyPort() + "，或检查安全软件设置。";
         else
-            DetailText = "已接管流量。" + (_manager.LastTiming is { Length: > 0 } t ? "（" + t + "）" : "");
+            // 用户点名：分段耗时是排障信息，不该当成功文案刷给所有人看（想看去日志）。
+            DetailText = "已启动";
         return true;
     }
 
@@ -1039,12 +1113,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         var card = chip?.Owner;
         if (card == null || chip == null) return;
+        // 分组切换不播报：chip 高亮 + 列表当场变就是反馈
         card.ActiveGroup = chip;
-        if (card.FilterNote.Length > 0) { DetailText = card.FilterNote; return; }
-        DetailText = chip.Name.Length == 0
-            ? $"「{card.Name}」已切回全部 {card.VisibleNodes.Count} 个节点。"
-            : $"「{card.Name}」按分组「{chip.Name}」显示 {card.VisibleNodes.Count} 个节点。"
-              + "点订阅上的 ⚡ 只测这一屏。";
     }
 
     /// <summary>订阅卡上的 ⚡：只测当前页面显示的那一屏节点（选了分组就只测该组）。</summary>
@@ -1063,7 +1133,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
         card.IsTesting = true;
-        var done = 0;
         try
         {
             foreach (var t in targets)
@@ -1071,23 +1140,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 t.Model.State = DelayState.Testing;
                 t.Refresh();
             }
+            // 测速过程不播报：行会自己变 ⚡、变色、按延迟上浮，看得见的不用再说一遍
             SortCardsByLatency();
-            DetailText = $"⚡ {what} {targets.Count} 个节点测速中…（按延迟实时排序）";
             var results = await _manager.Api.DelayManyAsync(
                 targets.Select(t => t.Model.Name).ToList(), _manager.Settings.TestUrl,
                 onEach: r => Application.Current?.Dispatcher.BeginInvoke(() =>
                 {
                     ApplyResult(r);
-                    var n = Interlocked.Increment(ref done);
-                    DetailText = $"⚡ {what}：{n}/{targets.Count}…（按延迟实时排序）";
                     SortCardsByLatency();
                 }));
-            var ok = results.Count(r => r.Ok);
-            foreach (var item in Nodes) item.Refresh();
             SortCardsByLatency();
-            DetailText = ok > 0
-                ? $"{what}测完：{ok}/{targets.Count} 通，已按延迟从低到高排好。"
-                : $"{what}没有一个节点通：多半是测速地址不可达（设置里可换），或订阅过期。";
+            if (results.Count(r => r.Ok) == 0)
+                DetailText = $"{what}没有一个节点通：多半是测速地址不可达（设置里可换），或订阅过期。";
         }
         finally
         {
@@ -1119,7 +1183,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (item == null) return;
         _manager.UpdateSubscriptionMeta(item.Model.Id, newName, newUrl);
         RebuildLists();
-        DetailText = "订阅已修改。" + (item.Model.Url.Length > 0 ? "改过链接的话，点「更新」拉取新地址。" : "");
     }
 
     public async Task ImportFileAsync(string path)
@@ -1127,9 +1190,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         try
         {
             var ok = await _manager.ImportFileAsync(path);
-            DetailText = ok
-                ? $"已导入「{Path.GetFileNameWithoutExtension(path)}」，当前 {_manager.Nodes.Count} 个节点。"
-                : (_manager.LastError ?? "导入失败");
+            if (!ok) DetailText = _manager.LastError ?? "导入失败";
         }
         catch (Exception e)
         {
@@ -1149,21 +1210,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             DetailText = _manager.LastError ?? "内核起不来，测不了速";
             return;
         }
-        var done = 0;
         var total = _manager.Nodes.Count;
         var ok = await _manager.TestAllAsync(_ =>
         {
-            var n = Interlocked.Increment(ref done);
             Application.Current?.Dispatcher.BeginInvoke(() =>
             {
-                DetailText = $"⚡ 测速中 {n}/{total}…（按延迟实时排序）";
                 foreach (var item in Nodes) item.Refresh();
                 SortCardsByLatency();
             });
         });
-        DetailText = ok > 0
-            ? $"测速完成：{ok}/{total} 通，已按延迟从低到高排好。点节点卡上的延迟可单测一个。"
-            : $"{total} 个节点都没通。多半是测速地址不可达（设置里可换），或订阅过期。";
+        if (ok == 0)
+            DetailText = $"{total} 个节点都没通。多半是测速地址不可达（设置里可换），或订阅过期。";
         foreach (var item in Nodes) item.Refresh();
     }
 
@@ -1182,9 +1239,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         try
         {
             var ok = await _manager.AddSubscriptionAsync(input);
-            DetailText = ok
-                ? $"已导入，当前 {_manager.Nodes.Count} 个节点。" + (_manager.SaveWarning is { Length: > 0 } w ? " 注意：" + w : "")
-                : (_manager.LastError ?? "导入失败");
+            DetailText = !ok
+                ? (_manager.LastError ?? "导入失败")
+                : _manager.SaveWarning is { Length: > 0 } w ? "注意：" + w : "";
             if (ok) SubscriptionInput = "";
         }
         catch (Exception e)
@@ -1204,7 +1261,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (!TrySaveSettings()) return;
         SyncAutoStart();
-        DetailText = _manager.CoreAlive ? "设置已保存，正在让内核原地重载…" : "设置已保存。";
         await ApplyChangesAsync("设置");
     }
 
@@ -1219,7 +1275,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // 系统代理跟着总开关走，不该让用户点完开关还要去点第二次。
         if (TunOn && !_manager.IsConnected) { await ConnectNowAsync(); return; }
         if (_manager.CoreAlive) await ApplyChangesAsync("开关");
-        else DetailText = "设置已保存。";
     }
 
     /// <summary>校验界面上的输入并写进设置 + 落盘。返回 false = 有不合法的东西，原因已经写在状态栏。</summary>
@@ -1337,16 +1392,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (!TrySaveSettings()) return;
         TrySaveRules();
         SyncAutoStart();
-        DetailText = _manager.CoreAlive ? "已保存，正在让内核生效…" : "已保存。";
         await ApplyChangesAsync("设置");
     }
 
     private async Task RefreshGeoAsync()
     {
-        DetailText = "正在下载 / 更新分流库…";
         var landed = await _manager.RefreshGeoAsync();
-        DetailText = landed ? "分流库已更新，规则已按新库重载。"
-            : (_manager.LastError ?? "分流库没有变化，或一个都没下到。");
+        if (!landed) DetailText = _manager.LastError ?? "分流库没有变化，或一个都没下到。";
         SyncGeoSummary();
     }
 
@@ -1357,10 +1409,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task ApplyChangesAsync(string what)
     {
         var ok = await _manager.ApplyChangesAsync();
-        DetailText = ok
-            ? $"{what}已生效（{_manager.LastApplyNote ?? "配置没变，无需重载"}）。"
-              + (_manager.TunActive ? " 虚拟网卡在接管。" : "")
-            : (_manager.LastError ?? _manager.PendingConfigNote ?? $"{what}生效失败");
+        if (!ok)
+            DetailText = _manager.LastError ?? _manager.PendingConfigNote ?? $"{what}生效失败";
         SyncTunStatus();
         SyncGeoSummary();
     }
@@ -1379,7 +1429,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 Verb = "runas",
                 WorkingDirectory = Path.GetDirectoryName(exe) ?? "",
             });
-            DetailText = "正在以管理员身份重启…";
             if (Application.Current is App app) app.ExitApplication();
         }
         catch (Exception e)
@@ -1454,7 +1503,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (!_manager.CoreAlive)
         {
             Connections.Clear();
-            TrafficText = "↑ 0 B/s   ↓ 0 B/s";
+            TrafficText = "↑ 0 B/s ↓ 0 B/s";
             return;
         }
         _polling = true;
@@ -1501,9 +1550,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (at >= 0 && at != i) Connections.Move(at, i);
         }
 
-        TrafficText = $"↑ {ConnectionItem.FmtSpeed(up)}   ↓ {ConnectionItem.FmtSpeed(down)}"
-            + $"   ·   累计 ↑{ConnectionItem.FmtBytes(snap.UploadTotal)}"
-            + $" ↓{ConnectionItem.FmtBytes(snap.DownloadTotal)}";
+        // 紧凑格式：同一信息少占约三分之一宽，顶栏更不容易被截断（仍保住测试要求的长度）。
+        TrafficText = $"↑ {ConnectionItem.FmtSpeed(up)} ↓ {ConnectionItem.FmtSpeed(down)}"
+            + $" · 累计 {ConnectionItem.FmtBytes(snap.UploadTotal)}"
+            + $" / {ConnectionItem.FmtBytes(snap.DownloadTotal)}";
         // 连接数从顶栏挪到「实时连接」卡的标题上：顶栏要一直显示得下速率 + 累计，
         // 再塞一段「· 34 条连接」最右边就被截掉（用户点名）。
         Raise(nameof(ConnectionsHeader));
@@ -1521,8 +1571,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task CloseOneAsync(ConnectionItem item)
     {
-        var ok = await _manager.Api.CloseConnectionAsync(item.Id);
-        DetailText = ok ? "已断开 " + item.Target + "。" : "那条连接已经自己结束了。";
+        await _manager.Api.CloseConnectionAsync(item.Id);
     }
 
     // ── 生命周期 ─────────────────────────────────────────────────────────

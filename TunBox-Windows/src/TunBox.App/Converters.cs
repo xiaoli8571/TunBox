@@ -17,7 +17,8 @@ public sealed class ConnectLabelConverter : IValueConverter
         => throw new NotSupportedException();
 }
 
-/// <summary>模式分段按钮底色：parameter 是这一档代表的模式，与当前 mode 相等即高亮。</summary>
+/// <summary>模式分段按钮底色：parameter 是这一档代表的模式，与当前 mode 相等即选中。
+/// macOS 分段控件：选中段 = 白色浮起片，未选中 = 透明（凹槽色由 SegTrack 提供）。</summary>
 public sealed class ModeChipConverter : IValueConverter
 {
     public static readonly ModeChipConverter Instance = new();
@@ -25,8 +26,8 @@ public sealed class ModeChipConverter : IValueConverter
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
         var selected = string.Equals(value as string, parameter as string, StringComparison.Ordinal);
-        var brush = Application.Current?.TryFindResource(selected ? "Brand" : "BrandSoft") as Brush
-                    ?? (selected ? Brushes.RoyalBlue : Brushes.LightGray);
+        var brush = Application.Current?.TryFindResource(selected ? "CardBg" : "SegTrack") as Brush
+                    ?? (selected ? Brushes.White : Brushes.Transparent);
         return brush;
     }
 
@@ -34,7 +35,7 @@ public sealed class ModeChipConverter : IValueConverter
         => throw new NotSupportedException();
 }
 
-/// <summary>模式分段按钮文字：选中的那档用白字，未选中的用主文本色。</summary>
+/// <summary>模式分段按钮文字：选中的那档用主文本色（白底黑字），未选中的用次级灰。</summary>
 public sealed class ModeChipTextConverter : IValueConverter
 {
     public static readonly ModeChipTextConverter Instance = new();
@@ -42,8 +43,8 @@ public sealed class ModeChipTextConverter : IValueConverter
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
     {
         var selected = string.Equals(value as string, parameter as string, StringComparison.Ordinal);
-        var brush = Application.Current?.TryFindResource(selected ? "CardBg" : "TextMuted") as Brush
-                    ?? (selected ? Brushes.White : Brushes.Gray);
+        var brush = Application.Current?.TryFindResource(selected ? "TextMain" : "TextMuted") as Brush
+                    ?? (selected ? Brushes.Black : Brushes.Gray);
         return brush;
     }
 

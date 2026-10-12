@@ -1,13 +1,18 @@
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <!-- 主窗口与对话框共用。配色对齐主流客户端：浅灰底 + 白卡 + 蓝色主操作。 -->
-    <SolidColorBrush x:Key="PageBg" Color="#F3F4F8"/>
+    <!-- 主窗口与对话框共用。视觉基准对齐 macOS 客户端（ClashX / Surge 一系）：
+         苹果灰底 #F5F5F7 + 白卡 + 系统蓝 #007AFF + 极细分隔线，阴影更轻更散。 -->
+    <SolidColorBrush x:Key="PageBg" Color="#F5F5F7"/>
     <SolidColorBrush x:Key="CardBg" Color="White"/>
-    <SolidColorBrush x:Key="Brand" Color="#3B82F6"/>
-    <SolidColorBrush x:Key="BrandSoft" Color="#EAF1FE"/>
-    <SolidColorBrush x:Key="TextMain" Color="#1F2937"/>
-    <SolidColorBrush x:Key="TextMuted" Color="#6B7280"/>
-    <SolidColorBrush x:Key="Line" Color="#E5E9F0"/>
+    <!-- 卡片自身的发丝描边：macOS 的卡片是「1px 描边 + 极轻阴影」，不是重投影 -->
+    <SolidColorBrush x:Key="CardLine" Color="#ECECEF"/>
+    <SolidColorBrush x:Key="Brand" Color="#007AFF"/>
+    <SolidColorBrush x:Key="BrandSoft" Color="#E9F2FF"/>
+    <SolidColorBrush x:Key="TextMain" Color="#1D1D1F"/>
+    <SolidColorBrush x:Key="TextMuted" Color="#6E6E73"/>
+    <SolidColorBrush x:Key="Line" Color="#E8E8ED"/>
+    <!-- 模式分段控件的凹槽（NSSegmentedControl 的 track） -->
+    <SolidColorBrush x:Key="SegTrack" Color="#ECEEF2"/>
     <SolidColorBrush x:Key="Danger" Color="#B91C1C"/>
     <!-- 提醒用琥珀色，不用红色：红色留给「出错了」，这里是「结果和你的预期不一致」。 -->
     <SolidColorBrush x:Key="Warn" Color="#B45309"/>
@@ -15,20 +20,23 @@
     <!-- 「正在接管」的绿：总开关用它和未接管的蓝色区分（同色看不出开没开）。 -->
     <SolidColorBrush x:Key="Running" Color="#16A34A"/>
     <!-- 电源环（照鸿蒙 StatusRing 的三层圆） -->
-    <SolidColorBrush x:Key="GlowIdle" Color="#1F2563EB"/>
-    <SolidColorBrush x:Key="GlowOn" Color="#3810B981"/>
-    <SolidColorBrush x:Key="RunningSoft" Color="#1F10B981"/>
-    <SolidColorBrush x:Key="RingBorder" Color="#E4E8F0"/>
-    <SolidColorBrush x:Key="IconBg" Color="#F1F5F9"/>
+    <SolidColorBrush x:Key="GlowIdle" Color="#26007AFF"/>
+    <SolidColorBrush x:Key="GlowOn" Color="#4A34C759"/>
+    <SolidColorBrush x:Key="RunningSoft" Color="#2634C759"/>
+    <SolidColorBrush x:Key="RingBorder" Color="#E6E8EE"/>
+    <SolidColorBrush x:Key="IconBg" Color="#F0F1F5"/>
 
+    <!-- 卡片：更大的连续圆角 + 1px 发丝线 + 轻投影，macOS 通知卡片的手感 -->
     <Style x:Key="Card" TargetType="Border">
         <Setter Property="Background" Value="{StaticResource CardBg}"/>
-        <Setter Property="CornerRadius" Value="14"/>
+        <Setter Property="CornerRadius" Value="16"/>
         <Setter Property="Padding" Value="16"/>
         <Setter Property="Margin" Value="0,0,0,12"/>
+        <Setter Property="BorderBrush" Value="{StaticResource CardLine}"/>
+        <Setter Property="BorderThickness" Value="1"/>
         <Setter Property="Effect">
             <Setter.Value>
-                <DropShadowEffect Color="#334155" Opacity="0.08" BlurRadius="14" ShadowDepth="2"/>
+                <DropShadowEffect Color="#334155" Opacity="0.06" BlurRadius="20" ShadowDepth="1" Direction="270"/>
             </Setter.Value>
         </Setter>
     </Style>
@@ -42,13 +50,16 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="Button">
-                    <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="9"
+                    <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="8"
                             Padding="{TemplateBinding Padding}">
                         <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Border>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsMouseOver" Value="True">
-                            <Setter TargetName="b" Property="Opacity" Value="0.88"/>
+                            <Setter TargetName="b" Property="Opacity" Value="0.9"/>
+                        </Trigger>
+                        <Trigger Property="IsPressed" Value="True">
+                            <Setter TargetName="b" Property="Opacity" Value="0.76"/>
                         </Trigger>
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter TargetName="b" Property="Opacity" Value="0.42"/>
@@ -64,8 +75,8 @@
         <Setter Property="Foreground" Value="{StaticResource Brand}"/>
     </Style>
     <Style x:Key="QuietButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
-        <Setter Property="Background" Value="#EEF1F5"/>
-        <Setter Property="Foreground" Value="#475569"/>
+        <Setter Property="Background" Value="#F0F1F5"/>
+        <Setter Property="Foreground" Value="#515154"/>
     </Style>
     <Style x:Key="DangerButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
         <Setter Property="Background" Value="#FEE2E2"/>
@@ -87,6 +98,9 @@
                                       VerticalAlignment="Center"/>
                     </Border>
                     <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="bd" Property="BorderBrush" Value="#D6D9E0"/>
+                        </Trigger>
                         <Trigger Property="IsKeyboardFocused" Value="True">
                             <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Brand}"/>
                         </Trigger>
@@ -105,7 +119,10 @@
                 <ControlTemplate TargetType="CheckBox">
                     <StackPanel Orientation="Horizontal" Background="Transparent">
                         <Border x:Name="box" Width="18" Height="18" CornerRadius="5" VerticalAlignment="Center"
-                                Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1">
+                                Background="White" BorderBrush="#D8DBE2" BorderThickness="1">
+                            <Border.Effect>
+                                <DropShadowEffect Color="#334155" Opacity="0.10" BlurRadius="4" ShadowDepth="1" Direction="270"/>
+                            </Border.Effect>
                             <TextBlock x:Name="tick" Text="&#x2713;" FontSize="12" FontWeight="Bold" Foreground="White"
                                        HorizontalAlignment="Center" VerticalAlignment="Center" Opacity="0"/>
                         </Border>
@@ -198,10 +215,10 @@
                         <Popup x:Name="pop" Placement="Bottom" Focusable="False" AllowsTransparency="True"
                                PopupAnimation="Fade" IsOpen="{TemplateBinding IsDropDownOpen}">
                             <Border Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1"
-                                    CornerRadius="10" Margin="0,4,0,10" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                                    CornerRadius="12" Margin="0,4,0,10" MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
                                     MaxHeight="{TemplateBinding MaxDropDownHeight}">
                                 <Border.Effect>
-                                    <DropShadowEffect Color="#334155" Opacity="0.18" BlurRadius="16" ShadowDepth="2"/>
+                                    <DropShadowEffect Color="#334155" Opacity="0.16" BlurRadius="24" ShadowDepth="2"/>
                                 </Border.Effect>
                                 <ScrollViewer Padding="0,4">
                                     <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
@@ -211,7 +228,7 @@
                     </Grid>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsMouseOver" Value="True">
-                            <Setter TargetName="bd" Property="BorderBrush" Value="#C6D2E4"/>
+                            <Setter TargetName="bd" Property="BorderBrush" Value="#C9D0DB"/>
                         </Trigger>
                         <Trigger Property="IsKeyboardFocused" Value="True">
                             <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Brand}"/>
@@ -233,9 +250,9 @@
             <Setter.Value>
                 <ControlTemplate TargetType="ProgressBar">
                     <Grid x:Name="TemplateRoot">
-                        <Border Background="{TemplateBinding Background}" CornerRadius="3"/>
+                        <Border Background="{TemplateBinding Background}" CornerRadius="2.5"/>
                         <Border x:Name="PART_Track"/>
-                        <Border x:Name="PART_Indicator" CornerRadius="3" HorizontalAlignment="Left"
+                        <Border x:Name="PART_Indicator" CornerRadius="2.5" HorizontalAlignment="Left"
                                 Background="{TemplateBinding Foreground}"/>
                     </Grid>
                 </ControlTemplate>
@@ -243,15 +260,85 @@
         </Setter>
     </Style>
 
-    <!-- 滚动条与提示气泡：默认的宽滚动条 + 系统色 ToolTip 是这套圆角卡片里最「老 Windows」的两块。 -->
+    <!-- 折叠节（设置四卡 + 订阅卡 + 连接卡共用）：
+         macOS 系统设置那一套——左侧品牌色小竖条 + 右侧旋转箭头，标题整行可点。 -->
+    <Style TargetType="Expander">
+        <Setter Property="Foreground" Value="{StaticResource TextMain}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="Expander">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <ToggleButton Grid.Row="0" Focusable="False" Cursor="Hand"
+                                      Content="{Binding Header, RelativeSource={RelativeSource TemplatedParent}}"
+                                      IsChecked="{Binding IsExpanded, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                            <ToggleButton.Template>
+                                <ControlTemplate TargetType="ToggleButton">
+                                    <Border Background="Transparent" Padding="0,2">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="Auto"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <Border Grid.Column="0" Width="3.5" Height="14" CornerRadius="2"
+                                                    Background="{StaticResource Brand}" Opacity="0.9"
+                                                    VerticalAlignment="Center"/>
+                                            <ContentPresenter Grid.Column="1" VerticalAlignment="Center"
+                                                              Margin="9,0,6,0"/>
+                                            <Path x:Name="chev" Grid.Column="2" VerticalAlignment="Center"
+                                                  Margin="2,1,2,0"
+                                                  Data="M 0,0 L 4.5,4.5 L 9,0"
+                                                  Stroke="{StaticResource TextMuted}" StrokeThickness="1.8"
+                                                  StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                                                  RenderTransformOrigin="0.5,0.5">
+                                                <Path.RenderTransform>
+                                                    <RotateTransform Angle="0"/>
+                                                </Path.RenderTransform>
+                                            </Path>
+                                        </Grid>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsChecked" Value="True">
+                                            <Setter TargetName="chev" Property="RenderTransform">
+                                                <Setter.Value>
+                                                    <RotateTransform Angle="180"/>
+                                                </Setter.Value>
+                                            </Setter>
+                                        </Trigger>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="chev" Property="Stroke" Value="{StaticResource Brand}"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </ToggleButton.Template>
+                        </ToggleButton>
+                        <ContentPresenter x:Name="body" Grid.Row="1" ContentSource="Content"
+                                          Visibility="Collapsed"/>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsExpanded" Value="True">
+                            <Setter TargetName="body" Property="Visibility" Value="Visible"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- 滚动条与提示气泡：默认的宽滚动条 + 系统色 ToolTip 是这套圆角卡片里最「老 Windows」的两块。
+         macOS 的滚动条是贴边细条，只在滚动时才显形，这里取它的宽度与配色。 -->
     <Style x:Key="ScrollThumb" TargetType="Thumb">
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="Thumb">
-                    <Border x:Name="t" Background="#C6D2E4" CornerRadius="4" Margin="2"/>
+                    <Border x:Name="t" Background="#C9CFDA" CornerRadius="3" Margin="2"/>
                     <ControlTemplate.Triggers>
                         <Trigger Property="IsMouseOver" Value="True">
-                            <Setter TargetName="t" Property="Background" Value="#9FB0C9"/>
+                            <Setter TargetName="t" Property="Background" Value="#A9B2C1"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -272,7 +359,7 @@
     </Style>
 
     <Style TargetType="ScrollBar">
-        <Setter Property="Width" Value="11"/>
+        <Setter Property="Width" Value="10"/>
         <Setter Property="Background" Value="Transparent"/>
         <Setter Property="Template">
             <Setter.Value>
@@ -297,7 +384,7 @@
                             <Setter TargetName="decr" Property="Command" Value="ScrollBar.PageLeftCommand"/>
                             <Setter TargetName="incr" Property="Command" Value="ScrollBar.PageRightCommand"/>
                             <Setter Property="Width" Value="Auto"/>
-                            <Setter Property="Height" Value="11"/>
+                            <Setter Property="Height" Value="10"/>
                         </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
@@ -312,7 +399,7 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="ToolTip">
-                    <Border Background="#1F2937" CornerRadius="8" Padding="{TemplateBinding Padding}" MaxWidth="340">
+                    <Border Background="#26262A" CornerRadius="8" Padding="{TemplateBinding Padding}" MaxWidth="340">
                         <ContentPresenter/>
                     </Border>
                 </ControlTemplate>

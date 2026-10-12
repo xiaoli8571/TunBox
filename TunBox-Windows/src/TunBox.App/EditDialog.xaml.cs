@@ -23,7 +23,7 @@ public sealed class EditDialog : Window
         Width = 430;
         SizeToContent = SizeToContent.Height;
         Background = TryFindResource("PageBg") as System.Windows.Media.Brush ?? System.Windows.Media.Brushes.White;
-        FontFamily = new System.Windows.Media.FontFamily("Segoe UI, Microsoft YaHei UI");
+        FontFamily = new System.Windows.Media.FontFamily("Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI");
         FontSize = 13;
 
         var panel = new StackPanel { Margin = new Thickness(20, 16, 20, 16) };

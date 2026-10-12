@@ -405,7 +405,8 @@ public sealed class ConnectionManager : IDisposable
         }
     }
 
-    /// <summary>最近一次点开关的分段耗时（毫秒）。状态栏和日志都读它——「慢」必须能被说清在哪一段。</summary>
+    /// <summary>最近一次点开关的分段耗时（毫秒）。排障字段：不再上状态栏（用户嫌吵），
+    /// 留给日志与诊断——「慢」必须能被说清在哪一段。</summary>
     public string? LastTiming { get; private set; }
 
     /// <summary>
@@ -882,8 +883,10 @@ public sealed class ConnectionManager : IDisposable
             && n.Kind != ProxyKind.Unknown)?.Name ?? "";
     }
 
-    /// <summary>能查出口了才有意义：内核活着且 HTTP 入口开着（混合端口优先）。</summary>
-    public bool EgressQueryable => CoreAlive && Settings.SystemProxyPort() > 0;
+    /// <summary>能查出口了才有意义：隧道真的接管流量（Connected）且 HTTP 入口开着。
+    /// 待命也算 CoreAlive，但系统代理与 TUN 都没开 —— 那时把「流量若走内核会从哪个节点出去」
+    /// 当结果摆出来，用户读成「我没开代理、流量却在走国外」，出口卡反而变成惊吓卡。</summary>
+    public bool EgressQueryable => State == TunnelState.Connected && Settings.SystemProxyPort() > 0;
 
     /// <summary>当前走的是哪个出口（PROXY 组在 kernel 里的 now），UI 拿来核对「选的是不是就是走的」。</summary>
     public async Task<string> EgressNowAsync(CancellationToken ct = default)

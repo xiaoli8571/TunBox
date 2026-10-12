@@ -4,8 +4,9 @@
         xmlns:local="clr-namespace:TunBox.App"
         Title="TunBox" Height="880" Width="470" MinHeight="620" MinWidth="400"
         WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
         Background="{DynamicResource PageBg}"
-        FontFamily="Segoe UI, Microsoft YaHei UI" FontSize="13">
+        FontFamily="Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI" FontSize="13">
     <Window.Resources>
         <!-- 样式合并进窗口自己：测试用裸 Application 直接 new 窗口，取不到应用级资源 -->
         <ResourceDictionary>
@@ -18,21 +19,25 @@
             <local:ModeChipTextConverter x:Key="ModeChipText"/>
             <local:NonEmptyToVisibilityConverter x:Key="HasText"/>
 
-            <!-- 开关（TUN 用） -->
+            <!-- 开关（TUN 用）：macOS/iOS 系统开关的比例与手感，开启 = #34C759 绿 -->
             <Style x:Key="Switch" TargetType="ToggleButton">
-                <Setter Property="Width" Value="42"/>
-                <Setter Property="Height" Value="22"/>
+                <Setter Property="Width" Value="44"/>
+                <Setter Property="Height" Value="26"/>
                 <Setter Property="Cursor" Value="Hand"/>
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="ToggleButton">
-                            <Border x:Name="track" CornerRadius="11" Background="#D3DAE3">
-                                <Ellipse x:Name="knob" Width="16" Height="16" Fill="White"
-                                         HorizontalAlignment="Left" Margin="3,0,0,0"/>
+                            <Border x:Name="track" CornerRadius="13" Background="#DFE3EA">
+                                <Ellipse x:Name="knob" Width="20" Height="20" Fill="White"
+                                         HorizontalAlignment="Left" Margin="3,0,0,0">
+                                    <Ellipse.Effect>
+                                        <DropShadowEffect Color="#334155" Opacity="0.18" BlurRadius="5" ShadowDepth="1" Direction="270"/>
+                                    </Ellipse.Effect>
+                                </Ellipse>
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsChecked" Value="True">
-                                    <Setter TargetName="track" Property="Background" Value="{StaticResource Brand}"/>
+                                    <Setter TargetName="track" Property="Background" Value="#34C759"/>
                                     <Setter TargetName="knob" Property="HorizontalAlignment" Value="Right"/>
                                     <Setter TargetName="knob" Property="Margin" Value="0,0,3,0"/>
                                 </Trigger>
@@ -47,10 +52,10 @@
                 <Setter Property="Template">
                     <Setter.Value>
                         <ControlTemplate TargetType="TabItem">
-                            <Border x:Name="t" Background="Transparent" Padding="6,8">
+                            <Border x:Name="t" Background="Transparent" CornerRadius="12" Padding="6,8">
                                 <StackPanel HorizontalAlignment="Center">
                                     <TextBlock x:Name="g" Text="{TemplateBinding Tag}" FontFamily="Segoe MDL2 Assets"
-                                               FontSize="19" HorizontalAlignment="Center"
+                                               FontSize="20" HorizontalAlignment="Center"
                                                Foreground="{StaticResource TextMuted}"/>
                                     <TextBlock x:Name="l" Text="{TemplateBinding Header}" FontSize="11.5"
                                                Margin="0,3,0,0" HorizontalAlignment="Center"
@@ -59,9 +64,10 @@
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="t" Property="Background" Value="#EFF2F8"/>
+                                    <Setter TargetName="t" Property="Background" Value="#F0F2F6"/>
                                 </Trigger>
                                 <Trigger Property="IsSelected" Value="True">
+                                    <Setter TargetName="t" Property="Background" Value="{StaticResource BrandSoft}"/>
                                     <Setter TargetName="g" Property="Foreground" Value="{StaticResource Brand}"/>
                                     <Setter TargetName="l" Property="Foreground" Value="{StaticResource Brand}"/>
                                     <Setter TargetName="l" Property="FontWeight" Value="Bold"/>
@@ -72,19 +78,24 @@
                 </Setter>
             </Style>
 
-            <!-- 节点行：竖屏下一行一个节点（名字 + 类型 + 延迟） -->
+            <!-- 节点行：竖屏下一行一个节点（名字 + 类型 + 延迟），悬停微亮反馈 -->
             <Style x:Key="NodeRow" TargetType="Border">
-                <Setter Property="Background" Value="#F7F8FB"/>
-                <Setter Property="BorderBrush" Value="#E5E9F0"/>
+                <Setter Property="Background" Value="#F6F7FA"/>
+                <Setter Property="BorderBrush" Value="#E8EAEE"/>
                 <Setter Property="BorderThickness" Value="1"/>
-                <Setter Property="CornerRadius" Value="9"/>
+                <Setter Property="CornerRadius" Value="10"/>
                 <Setter Property="Padding" Value="10,7"/>
                 <Setter Property="Margin" Value="0,0,0,6"/>
                 <Setter Property="Cursor" Value="Hand"/>
+                <Style.Triggers>
+                    <Trigger Property="IsMouseOver" Value="True">
+                        <Setter Property="Background" Value="#EFF2F7"/>
+                    </Trigger>
+                </Style.Triggers>
             </Style>
 
             <!-- 电源环：照鸿蒙端 StatusRing 的三层圆（外发光 / 白盘 / 图标底圆）+ ⏻ 字形。
-                 未启动 = 蓝色微光，已启动 = 绿色发光 + 1.2s 呼吸；按下整环缩到 0.97。 -->
+                 未启动 = 蓝色微光，已启动 = 绿色描边环 + 绿色发光 + 1.2s 呼吸；按下整环缩到 0.97。 -->
             <Style x:Key="PowerRing" TargetType="Button">
                 <Setter Property="Width" Value="196"/>
                 <Setter Property="Height" Value="196"/>
@@ -97,6 +108,9 @@
                                     <!-- 呼吸动画要一个现成的 ScaleTransform 当靶子，否则 Storyboard 找不到目标 -->
                                     <Ellipse.RenderTransform><ScaleTransform/></Ellipse.RenderTransform>
                                 </Ellipse>
+                                <!-- 状态描边环：一眼看色就知道开没开，不用读中间那行字 -->
+                                <Ellipse x:Name="ring" Width="184" Height="184" Stroke="Transparent" StrokeThickness="2.5"
+                                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
                                 <Ellipse Width="172" Height="172" Fill="{StaticResource CardBg}"
                                          Stroke="{StaticResource RingBorder}" StrokeThickness="1.5"
                                          HorizontalAlignment="Center" VerticalAlignment="Center"/>
@@ -114,7 +128,7 @@
                                                   StrokeStartLineCap="Round"/>
                                         </Grid>
                                     </Border>
-                                    <TextBlock Text="{Binding RingStateText}" FontSize="19" FontWeight="Bold"
+                                    <TextBlock x:Name="stateText" Text="{Binding RingStateText}" FontSize="19" FontWeight="Bold"
                                                Margin="0,10,0,0" HorizontalAlignment="Center"
                                                Foreground="{StaticResource TextMain}"/>
                                 </StackPanel>
@@ -122,9 +136,11 @@
                             <ControlTemplate.Triggers>
                                 <DataTrigger Binding="{Binding IsConnected}" Value="True">
                                     <Setter TargetName="glow" Property="Fill" Value="{StaticResource GlowOn}"/>
+                                    <Setter TargetName="ring" Property="Stroke" Value="{StaticResource Running}"/>
                                     <Setter TargetName="plate" Property="Background" Value="{StaticResource RunningSoft}"/>
                                     <Setter TargetName="arc" Property="Stroke" Value="{StaticResource Running}"/>
                                     <Setter TargetName="stem" Property="Stroke" Value="{StaticResource Running}"/>
+                                    <Setter TargetName="stateText" Property="Foreground" Value="{StaticResource Running}"/>
                                     <DataTrigger.EnterActions>
                                         <BeginStoryboard Name="breathe">
                                             <Storyboard>
@@ -155,6 +171,31 @@
                     </Setter.Value>
                 </Setter>
             </Style>
+
+            <!-- 模式分段控件的单个段：macOS NSSegmentedControl 的做法——
+                 凹槽是灰的，选中段浮起一块白色圆角片，没选中的段透明。
+                 背景/前景仍由 ModeChip/ModeChipText 转换器按 ProxyMode 决定。 -->
+            <Style x:Key="ModeSegment" TargetType="Button">
+                <Setter Property="BorderThickness" Value="0"/>
+                <Setter Property="Cursor" Value="Hand"/>
+                <Setter Property="FontSize" Value="12.5"/>
+                <Setter Property="FontWeight" Value="SemiBold"/>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="8"
+                                    Padding="{TemplateBinding Padding}">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="b" Property="Opacity" Value="0.82"/>
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
         </ResourceDictionary>
     </Window.Resources>
 
@@ -168,8 +209,10 @@
                         <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
-                    <!-- 顶栏：竖屏没有侧栏，全局动作（退出）和实时流量放这里 -->
-                    <Border Grid.Row="0" Background="White" Padding="16,12">
+                    <!-- 顶栏：竖屏没有侧栏，全局动作（退出）和实时流量放这里；
+                         底部一条发丝线把标题区和内容区分开（macOS 工具栏的分层） -->
+                    <Border Grid.Row="0" Background="White" BorderBrush="{StaticResource Line}"
+                            BorderThickness="0,0,0,1" Padding="16,12">
                         <Grid>
                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,64,0">
                                 <Image Source="/TunBox;component/Assets/logo.png" Width="30" Height="30"/>
@@ -177,8 +220,12 @@
                                     <StackPanel Orientation="Horizontal">
                                         <TextBlock Text="TunBox" FontWeight="Bold" FontSize="17"
                                                    Foreground="{StaticResource Brand}"/>
-                                        <TextBlock Text="{Binding VersionText, StringFormat=v{0}}" FontSize="11"
-                                                   Margin="7,4,0,0" Foreground="{StaticResource TextMuted}"/>
+                                        <!-- 版本号收进小胶囊，不再和标题抢排 -->
+                                        <Border Background="{StaticResource IconBg}" CornerRadius="6"
+                                                Padding="6,2" Margin="8,3,0,0" VerticalAlignment="Top">
+                                            <TextBlock Text="{Binding VersionText, StringFormat=v{0}}" FontSize="10.5"
+                                                       Foreground="{StaticResource TextMuted}"/>
+                                        </Border>
                                     </StackPanel>
                                     <!-- 流量串可以很长（速率 + 连接数 + 累计），必须截断，
                                          不然会把右上角的退出按钮盖住（用户截图反馈） -->
@@ -214,7 +261,8 @@
                             <ContentPresenter ContentSource="SelectedContent"/>
                         </ScrollViewer>
                         <!-- 全站唯一的反馈位：报完 3 秒自己消失，不会一直挂着 -->
-                        <Border Grid.Row="2" Background="#E7EBF3" Padding="14,7"
+                        <Border Grid.Row="2" Background="{StaticResource IconBg}"
+                                BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="14,7"
                                 Visibility="{Binding DetailText, Converter={StaticResource HasText}}">
                             <TextBlock Text="{Binding DetailText}" FontSize="12" TextWrapping="Wrap"
                                        Foreground="{StaticResource TextMain}"/>
@@ -237,18 +285,19 @@
                         <!-- 唯一的总开关：启动即接管，代理设置跟着一起写 -->
                         <Button Style="{StaticResource PowerRing}" Command="{Binding ToggleConnectCommand}"
                                 HorizontalAlignment="Center"/>
-                        <Border Background="#F1F5F9" CornerRadius="10" Padding="2" Margin="0,16,0,0"
+                        <!-- 模式切换 = macOS 分段控件：灰凹槽里浮一块白色选中段 -->
+                        <Border Background="{StaticResource SegTrack}" CornerRadius="10" Padding="3" Margin="0,16,0,0"
                                 HorizontalAlignment="Stretch">
                             <UniformGrid Columns="3">
-                                <Button Content="规则" Padding="0,7" BorderThickness="0"
+                                <Button Content="规则" Style="{StaticResource ModeSegment}" Padding="0,7"
                                         Command="{Binding SetModeCommand}" CommandParameter="rule"
                                         Background="{Binding ProxyMode, Converter={StaticResource ModeChip}, ConverterParameter=rule}"
                                         Foreground="{Binding ProxyMode, Converter={StaticResource ModeChipText}, ConverterParameter=rule}"/>
-                                <Button Content="全局" Padding="0,7" BorderThickness="0" Margin="2,0"
+                                <Button Content="全局" Style="{StaticResource ModeSegment}" Padding="0,7" Margin="2,0"
                                         Command="{Binding SetModeCommand}" CommandParameter="global"
                                         Background="{Binding ProxyMode, Converter={StaticResource ModeChip}, ConverterParameter=global}"
                                         Foreground="{Binding ProxyMode, Converter={StaticResource ModeChipText}, ConverterParameter=global}"/>
-                                <Button Content="直连" Padding="0,7" BorderThickness="0"
+                                <Button Content="直连" Style="{StaticResource ModeSegment}" Padding="0,7"
                                         Command="{Binding SetModeCommand}" CommandParameter="direct"
                                         Background="{Binding ProxyMode, Converter={StaticResource ModeChip}, ConverterParameter=direct}"
                                         Foreground="{Binding ProxyMode, Converter={StaticResource ModeChipText}, ConverterParameter=direct}"/>
@@ -335,26 +384,59 @@
                     <Expander IsExpanded="{Binding ConnectionsExpanded, Mode=TwoWay}"
                               Header="{Binding ConnectionsHeader}" FontSize="14" FontWeight="Bold"
                               Foreground="{StaticResource TextMain}">
-                        <ListView ItemsSource="{Binding Connections}" Margin="0,8,0,0" BorderThickness="0"
-                                  Background="Transparent" MaxHeight="240"
-                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                            <ListView.View>
-                                <GridView>
-                                    <GridViewColumn Header="目标" Width="150" DisplayMemberBinding="{Binding Target}"/>
-                                    <GridViewColumn Header="进程" Width="80" DisplayMemberBinding="{Binding Process}"/>
-                                    <GridViewColumn Header="出口" Width="80" DisplayMemberBinding="{Binding Chain}"/>
-                                    <GridViewColumn Header="已传输" Width="60" DisplayMemberBinding="{Binding DownloadText}"/>
-                                    <GridViewColumn Header="" Width="54">
-                                        <GridViewColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <Button Content="断开" Style="{StaticResource QuietButton}" Padding="6,2"
-                                                        FontSize="11.5" Click="OnCloseConnClick"/>
-                                            </DataTemplate>
-                                        </GridViewColumn.CellTemplate>
-                                    </GridViewColumn>
-                                </GridView>
-                            </ListView.View>
-                        </ListView>
+                        <!-- 连接列表不用 GridView 了：五列在 470 宽的竖屏里挤成一团，
+                             改成「目标一行 + 元信息一行」的双行卡（macOS 网络监视器的样子） -->
+                        <Grid Margin="0,8,0,0">
+                            <ListView ItemsSource="{Binding Connections}" BorderThickness="0"
+                                      Background="Transparent" MaxHeight="260"
+                                      ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1"
+                                                Padding="0,7">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel>
+                                                    <TextBlock Text="{Binding Target}" FontSize="12.5" FontWeight="SemiBold"
+                                                               Foreground="{StaticResource TextMain}"
+                                                               TextTrimming="CharacterEllipsis"/>
+                                                    <TextBlock FontSize="11" Margin="0,1,0,0"
+                                                               Foreground="{StaticResource TextMuted}"
+                                                               TextTrimming="CharacterEllipsis">
+                                                        <Run Text="{Binding Process, Mode=OneWay}"/><Run Text=" · "/><Run Text="{Binding Chain, Mode=OneWay}"/><Run Text=" · "/><Run Text="{Binding Protocol, Mode=OneWay}"/>
+                                                    </TextBlock>
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="1" Orientation="Horizontal"
+                                                            VerticalAlignment="Center" Margin="10,0,0,0">
+                                                    <TextBlock Text="{Binding DownloadText, Mode=OneWay}" FontSize="11.5"
+                                                               Foreground="{StaticResource TextMuted}"
+                                                               VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                                    <Button Content="断开" Style="{StaticResource QuietButton}" Padding="7,2"
+                                                            FontSize="11.5" Click="OnCloseConnClick"/>
+                                                </StackPanel>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                            <TextBlock Text="暂无活动连接：启动内核并开始上网后，这里会实时列出。"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center" Margin="0,10,0,0" TextAlignment="Center">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock" BasedOn="{StaticResource Hint}">
+                                        <Setter Property="Visibility" Value="Collapsed"/>
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding Connections.Count}" Value="0">
+                                                <Setter Property="Visibility" Value="Visible"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Grid>
                     </Expander>
                 </Border>
             </StackPanel>
@@ -445,9 +527,11 @@
                                         </Grid>
                                     </Expander.Header>
                                     <StackPanel Margin="14,4,14,12">
-                                        <ProgressBar Height="4" Minimum="0" Maximum="1"
+                                        <!-- 流量进度条随用量变色：健康=品牌蓝，>80% 琥珀，>95% 红（色值由 TrafficRatioBrush 算） -->
+                                        <ProgressBar Height="5" Minimum="0" Maximum="1"
                                                      Value="{Binding TrafficRatio, Mode=OneWay}"
-                                                     Foreground="{StaticResource Brand}" Background="#EEF1F5"/>
+                                                     Foreground="{Binding TrafficRatioBrush, Mode=OneWay}"
+                                                     Background="#EEF1F5"/>
                                         <!-- 分组 = 筛选器：点一下只看该组的节点（第一颗是「全部节点」） -->
                                         <ItemsControl ItemsSource="{Binding Groups}" Margin="0,8,0,0">
                                             <ItemsControl.ItemsPanel>
@@ -656,6 +740,15 @@
                             <ComboBoxItem Content="缩到系统托盘" Tag="tray"/>
                             <ComboBoxItem Content="直接退出 TunBox" Tag="exit"/>
                         </ComboBox>
+                        <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+                            <Button Content="检查更新" Style="{StaticResource GhostButton}"
+                                    Command="{Binding CheckUpdateCommand}"
+                                    ToolTip="连 GitHub 查一下有没有比当前版本新的 Windows 安装包"/>
+                            <TextBlock Text="{Binding UpdateStatusText}" FontSize="12"
+                                       Foreground="{StaticResource TextMuted}"
+                                       VerticalAlignment="Center" Margin="10,0,0,0"
+                                       TextTrimming="CharacterEllipsis"/>
+                        </StackPanel>
                     </StackPanel>
                     </Expander>
                 </Border>
