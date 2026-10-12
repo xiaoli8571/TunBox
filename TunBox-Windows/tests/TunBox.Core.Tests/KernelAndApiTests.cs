@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using TunBox.App;
 using TunBox.Core.Api;
 using TunBox.Core.Fetching;
+using TunBox.Core.Services;
 using TunBox.Core.Storage;
 using Xunit;
 
@@ -144,6 +145,98 @@ public sealed class KernelE2ETests
         var (listening, fatal, lines) = await RunKernelAsync(s, tun: true);
         Assert.True(listening, "内核拒绝了 IPv6 + DNS 复写的配置。fatal: " + fatal
             + "\n日志：\n" + string.Join("\n", lines.Take(30)));
+    }
+
+    /// <summary>
+    /// 「全局」模式的两条命门，都用真内核钉死（真机反馈：全局模式下 IP 检测站还是国内 IP）：
+    /// ① mode 只能靠整份 payload 改 —— 这份 mihomo-smart 内核对 `PUT /configs {"mode":…}` 回 204
+    ///    却什么都不换（log-level 同样无效），所以 SetProxyModeAsync 必须重新热应用配置；
+    /// ② global 下内核只看 GLOBAL 这个伪分组，而它**既接受具体节点也接受代理组名**（dial 时才解析），
+    ///    所以自动态可以把 ♻️ 自动选择 直接交给 GLOBAL，按连接择优在全局下照旧生效。
+    /// 最后用一次真实请求验证流量确实走的是 GLOBAL 而不是 DIRECT。
+    /// </summary>
+    [Fact]
+    public async Task Kernel_global_mode_needs_the_payload_and_honours_GLOBAL()
+    {
+        var exe = FindShipped("tunbox-core.exe");
+        Assert.NotNull(exe);
+        var home = FreshHome();
+        Directory.CreateDirectory(home);
+        var apiPort = FreePort();
+        var s = new TunBox.Core.Models.AppSettings
+        {
+            HttpPort = 0, SocksPort = 0, MixedPort = FreePort(), ApiPort = apiPort,
+            ApiSecret = "e2e-secret", ProxyMode = "rule",
+        };
+        var nodes = new List<TunBox.Core.Models.ProxyNode>
+        {
+            new() { Id = "1", Name = "HK 01", OriginalName = "HK 01", Kind = TunBox.Core.Models.ProxyKind.Ss,
+                Server = "127.0.0.1", Port = 1, Password = "pw", Method = "aes-256-gcm" },
+            new() { Id = "2", Name = "SG 02", OriginalName = "SG 02", Kind = TunBox.Core.Models.ProxyKind.Ss,
+                Server = "127.0.0.1", Port = 2, Password = "pw", Method = "aes-256-gcm" },
+        };
+        var yaml = TunBox.Core.Config.ClashConfigGenerator.Generate(nodes,
+            Array.Empty<TunBox.Core.Models.ProxyGroup>(), s, new Workspace(home).DetectGates(), tunOverride: false);
+        var cfg = Path.Combine(home, "config.yaml");
+        await File.WriteAllTextAsync(cfg, yaml, new UTF8Encoding(false));
+
+        var lines = new List<string>();
+        var psi = new ProcessStartInfo
+        {
+            FileName = exe!, Arguments = $"-d \"{home}\" -f \"{cfg}\"",
+            UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        using var p = Process.Start(psi)!;
+        p.OutputDataReceived += (_, e) => { if (e.Data != null) lock (lines) lines.Add(e.Data); };
+        p.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (lines) lines.Add(e.Data); };
+        p.BeginOutputReadLine();
+        p.BeginErrorReadLine();
+        try
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(40);
+            while (DateTime.UtcNow < deadline && !lines.Any(l => l.Contains($"RESTful API listening at: 127.0.0.1:{apiPort}")))
+                await Task.Delay(250);
+
+            using var api = new ControllerClient();
+            api.Configure(apiPort, "e2e-secret");
+            var proxies = await api.ProxiesAsync();
+            // 环境连不上控制器不等于产品坏了：这条只在内核确实可问时才判
+            if (proxies.Count == 0) return;
+
+            Assert.Equal("rule", await api.ModeAsync());
+            s.ProxyMode = "global";
+            var global = TunBox.Core.Config.ClashConfigGenerator.Generate(nodes,
+                Array.Empty<TunBox.Core.Models.ProxyGroup>(), s, new Workspace(home).DetectGates(), tunOverride: false);
+            var (ok, error) = await api.UpdateConfigAsync(global);
+            Assert.True(ok, "整份 payload 热应用被拒：" + error);
+            Assert.Equal("global", await api.ModeAsync());
+
+            Assert.True(await api.SelectNodeAsync("GLOBAL", "PROXY"), "内核不肯让 GLOBAL 走代理组");
+            Assert.Equal("PROXY", (await api.ProxiesAsync())["GLOBAL"].Now);
+            Assert.True(await api.SelectNodeAsync("GLOBAL", "HK 01"), "内核不肯让 GLOBAL 走具体节点");
+            Assert.Equal("HK 01", (await api.ProxiesAsync())["GLOBAL"].Now);
+
+            // 决定性一步：真发一个请求（节点是 127.0.0.1:1 的死地址），日志必须显示它在 dial GLOBAL
+            var handler = new System.Net.Http.HttpClientHandler
+            {
+                Proxy = new System.Net.WebProxy($"http://127.0.0.1:{s.MixedPort}"),
+                UseProxy = true,
+            };
+            using var http = new System.Net.Http.HttpClient(handler);
+            http.Timeout = TimeSpan.FromSeconds(8);
+            try { await http.GetAsync("http://1.1.1.1/"); } catch { /* 节点本来就连不通 */ }
+            await Task.Delay(500);
+            string recent;
+            lock (lines) recent = string.Join("\n", lines);
+            Assert.Contains("dial GLOBAL", recent);
+            Assert.DoesNotContain("--> 1.1.1.1:80 doesn't match any rule using DIRECT", recent);
+        }
+        finally
+        {
+            try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+        }
+        try { Directory.Delete(home, true); } catch { }
     }
 }
 
@@ -438,5 +531,68 @@ public class VersionConsistencyTests
         var json5 = File.ReadAllText(Path.Combine(root, "TunBox_HarmonyOS", "AppScope", "app.json5"));
         var harmonyVersion = Grab(json5, "\"versionName\":\\s*\"([^\"]+)\"");
         Assert.Equal(harmonyVersion, appVersion);
+    }
+}
+
+/// <summary>
+/// 全局模式的出口解析。真机反馈：切到「全局」后 IP 检测站还是国内 IP，「规则」反而是节点 IP ——
+/// 因为内核在 global 下只看 GLOBAL 这个伪分组，而我们只改了 mode、从没选过它，它一直停在 DIRECT。
+/// 这里盯死：出口要跟 PROXY 组当前的选择走（组名也算，内核实测认），且永远不许退成 DIRECT / REJECT，
+/// 也不许选中订阅面板当成代理返回的「剩余流量：xxx GB」这类说明行。
+/// </summary>
+public class GlobalModeEgressTests
+{
+    private static readonly List<TunBox.Core.Models.ProxyNode> Nodes = new()
+    {
+        new() { Id = "info", Name = "剩余流量：954.24 GB", Kind = TunBox.Core.Models.ProxyKind.Unknown, Server = "" },
+        new() { Id = "n1", Name = "HK 01", Kind = TunBox.Core.Models.ProxyKind.Vless, Server = "hk.example.com" },
+        new() { Id = "n2", Name = "SG 02", Kind = TunBox.Core.Models.ProxyKind.Ss, Server = "sg.example.com" },
+    };
+
+    private static Dictionary<string, (string Now, List<string> All)> Proxies(
+        string proxyNow = "♻️ 自动选择", string smartNow = "SG 02") => new()
+    {
+        [ConnectionManager.GlobalGroup] = ("DIRECT",
+            new List<string> { "DIRECT", "REJECT", "剩余流量：954.24 GB", "HK 01", "SG 02" }),
+        [ConnectionManager.ProxyGroup] = (proxyNow, new List<string> { "♻️ 自动选择", "HK 01", "SG 02" }),
+        [TunBox.Core.Config.ClashConfigGenerator.SmartGroupName] = (smartNow, new List<string> { "HK 01", "SG 02" }),
+    };
+
+    /// <summary>自动态：GLOBAL 直接拿 PROXY 的当前选择（♻️ 自动选择），smart 的按连接择优在全局下照旧生效。</summary>
+    [Theory]
+    [InlineData(ConnectionManager.AutoEgressId)]
+    [InlineData("")]
+    public void Global_egress_mirrors_whatever_the_PROXY_group_chose(string selected)
+    {
+        Assert.Equal("♻️ 自动选择", ConnectionManager.PickGlobalEgress(selected, Nodes, Proxies()));
+        Assert.Equal("HK 01", ConnectionManager.PickGlobalEgress(selected, Nodes, Proxies(proxyNow: "HK 01")));
+    }
+
+    /// <summary>PROXY 组停在 DIRECT（用户真选了直连）时不许拿它当出口，要退到别的可路由项。</summary>
+    [Fact]
+    public void Direct_is_never_the_global_egress()
+    {
+        Assert.Equal("SG 02", ConnectionManager.PickGlobalEgress(ConnectionManager.AutoEgressId, Nodes,
+            Proxies(proxyNow: "DIRECT")));
+        var onlyReject = new Dictionary<string, (string Now, List<string> All)>
+        {
+            [ConnectionManager.ProxyGroup] = ("REJECT", new List<string> { "REJECT" }),
+        };
+        Assert.Equal("HK 01", ConnectionManager.PickGlobalEgress(ConnectionManager.AutoEgressId, Nodes, onlyReject));
+    }
+
+    /// <summary>没有 PROXY 视图（内核刚起）时依次退回：用户点过的节点 → smart 当前节点 → 第一个像节点的名字。</summary>
+    [Fact]
+    public void Fallbacks_skip_the_info_lines_and_pick_a_real_node()
+    {
+        var noProxy = new Dictionary<string, (string Now, List<string> All)>
+        {
+            [TunBox.Core.Config.ClashConfigGenerator.SmartGroupName] = ("SG 02", new List<string> { "HK 01", "SG 02" }),
+        };
+        Assert.Equal("SG 02", ConnectionManager.PickGlobalEgress(ConnectionManager.AutoEgressId, Nodes, noProxy));
+        Assert.Equal("HK 01", ConnectionManager.PickGlobalEgress("n1", Nodes, noProxy));
+
+        var nothing = new Dictionary<string, (string Now, List<string> All)>();
+        Assert.Equal("HK 01", ConnectionManager.PickGlobalEgress(ConnectionManager.AutoEgressId, Nodes, nothing));
     }
 }

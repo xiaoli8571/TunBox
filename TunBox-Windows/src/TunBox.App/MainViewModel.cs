@@ -397,7 +397,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>SelectedNodeId 的这个取值表示「出口交给内核的 smart 组」，不是某个具体节点。</summary>
-    public const string SmartEgressId = "smart";
+    public const string SmartEgressId = ConnectionManager.AutoEgressId;
 
     /// <summary>模型在盘上 + 开了开关 + 至少两个节点，才有自动优选可选。</summary>
     public bool SmartAvailable => _manager.SmartGroupReady;
@@ -412,6 +412,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string SmartSubtitle => $"内核智能选点 · 按每条连接的目标自动择优 · {Nodes.Count} 个候选节点";
 
     /// <summary>首页「当前出口」：自动优选时显示组名，不假装是某个节点（内核的 now 也不会随每条连接变）。</summary>
+    /// <summary>首页「当前出口」：自动优选时显示组名，不假装是某个节点（内核的 now 也不会随每条连接变）。
+    /// 全局模式下 GLOBAL 跟着 PROXY 走（内核实测它也认代理组名），所以这个说法在两种模式下都成立。</summary>
     public string SelectedEgressText => SmartActive
         ? ClashConfigGenerator.SmartGroupName
         : SelectedNode?.Name ?? "还没选节点";
@@ -713,6 +715,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // 但这话不必说给用户听：他要的是状态，不是一段科普。
         TunStatusText = !TunOn ? "未启用"
             : _manager.TunActive ? "已接管"
+            : _manager.TunPending ? "内核正在建网卡…"
             : _manager.State == TunnelState.Connected
                 ? (_manager.TunAdapterPresent() ? "网卡在，但没拿到默认路由" : "网卡没起来（看内核日志）")
                 : !IsAdmin ? "需要管理员：点下方按钮重启"

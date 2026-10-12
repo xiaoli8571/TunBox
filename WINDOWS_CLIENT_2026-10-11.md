@@ -597,3 +597,67 @@ taskkill 会当成「没有可关的窗口」报错返回，看着像「进程�
 - Release `windows-v0.3.0`（id 409781893），附件 `TunBox-Setup-0.3.0.exe` 80,698,375 字节 `state=uploaded`。
 - 按要求删除 `windows-v0.4.6 / 0.4.7 / 0.4.8` 三个 Release **及各自的 tag**（删 Release 不会删 tag），
   全部 204；剩下的 Release 只有 `windows-v0.3.0` 与鸿蒙端 `v0.2.0`、`v0.1.0`。
+
+---
+
+# 0.3.0 补丁轮（2026-10-12 上午）：「全局模式反而不走代理」+「虚拟网卡没起来」误报
+
+## 0. 先说一件事：工作目录不见了
+
+`C:\Worker\TunBox\TunBox-Windows` 在本轮开始前**整个不存在**（`TunBox\` 下只剩鸿蒙端与文档），
+本机唯一一份代码是发布用的检出 `C:\Worker\_release\TunBox-repo\TunBox-Windows`（内容 = 远端 main）。
+已从它恢复工作树，并把内核二进制从已安装的
+`%LOCALAPPDATA%\Programs\TunBox\core\`（`tunbox-core.exe` 66MB + `Model.bin` 9.3MB，两者都不入库）
+复制回 `TunBox-Windows\core\`，否则 KernelE2ETests 找不到内核。恢复后基线 70/70 全绿。
+
+## 1. 全局模式：不是「选错节点」，是**两层都没生效**
+
+用户实测「全局模式 IP 检测站还是国内 IP，规则模式才是节点 IP」。拿他正在跑的那份内核（127.0.0.1:9090）
+直接看现场，两条都坐实了：
+
+1. **`PUT /configs {"mode":"global"}` 是空炮。** 返回 204，但 `GET /configs` 的 mode 照旧是 rule，
+   连 `{"log-level":…}` 同样不生效 —— 这份 mihomo-smart 内核只认**整份 `payload`**。
+   实测：整份 payload（配置里写 `mode: global`）PUT 进去，`GET /configs` 立刻变 global。
+   → 切模式必须走 `ReapplyRunningConfigAsync()`：按当前设置重新生成配置、`PUT /configs payload`、
+   `_host.SaveConfig` 对齐「正在跑的是哪份配置」。`ControllerClient.SetModeAsync` 直接删掉，
+   留着只会有人再踩。
+2. **就算 mode 真的成了 global，流量也不走我们的选点。** 内核在 global 下只看 `GLOBAL` 这个伪分组，
+   我们所有选点都写在 `PROXY` 组里，从没碰过 GLOBAL → 现场值 `GLOBAL.now = "DIRECT"`，
+   于是「全局」= 全部直连。真机日志两种情形一目了然：
+   - `mode=rule`：`[TCP] … --> 1.1.1.1:80 doesn't match any rule using DIRECT`
+   - `mode=global` + `GLOBAL=HK 01`：`[TCP] dial GLOBAL … error: 127.0.0.1:1 connect error`（真的去连节点了）
+
+**意外收获（改设计的那种）**：原以为 GLOBAL 只认具体节点（它的 `all` 里确实只有 DIRECT/REJECT + 节点），
+实测 `PUT /proxies/GLOBAL {"name":"PROXY"}` 也**接受**，而且是 dial 时才解析 —— 也就是说
+**代理组可以直接塞进 GLOBAL**。于是自动态不必退化成「固定一个节点」：
+`PickGlobalEgress` 就一句「跟着 PROXY 组当前的选择走」，
+`♻️ 自动选择` 在全局模式下继续按每条连接择优。退回顺序（拿不到 PROXY 时）：用户点过的节点 →
+smart 当前节点 → 第一个像节点的名字；任何情况下都不许退成 DIRECT/REJECT，也要避开
+订阅面板当成代理返回的「剩余流量：xxx GB」这类说明行。
+
+同步时机：切模式、点节点、连接/热重载之后（配置重建会把 GLOBAL 的选择冲掉）。
+
+测试：**75/75**。新增 `Kernel_global_mode_needs_the_payload_and_honours_GLOBAL`（真内核：payload 才改得动
+mode、GLOBAL 认组名也认节点名、最后真发一个请求看日志是不是 `dial GLOBAL`）与
+`GlobalModeEgressTests` 四条纯逻辑。这条 E2E 里「控制器不可达就 return」的静默跳过已单独改成硬断言跑过一遍，
+确认本机真的在断言而不是跳过。
+
+## 2. 「虚拟网卡没起来」是误报：内核重试成功了，我们只等 8 秒
+
+内核日志（`%APPDATA%\TunBox\runtime\core.log`）自己就把话说完了：
+
+```
+[10:20:50] warning Start Tun interface timeout: create adapter: Cannot create a file when that file
+              already exists. | open existing adapter: Element not found. [retrying 1/3]
+[10:20:51] info  [TUN] Tun adapter listening at: TunBox([198.18.0.1/30],[]), mtu: 1500, auto route: true
+```
+
+第一次建卡撞上残留的旧网卡（同名适配器还在、句柄已经没了），内核自己重试，**1 秒后就起来了**；
+而 `FinishTunCheckAsync` 的等待预算只有 8 秒，抢在内核重试之前判了失败。昨天 20:58 是同一幕。
+改法：预算 8 秒 → 30 秒（这段本来就是后台核对，不占用户那次点击），并且期间状态行显示
+「内核正在建网卡…」而不是直接甩「网卡没起来（看内核日志）」；新增 `ConnectionManager.TunPending`，
+断开/停止路径一起清零。
+
+顺带记一笔现场环境（不影响本轮改动，但会干扰判断）：`Get-NetAdapter` 里有三个
+`Wintun Userspace Tunnel`（本地连接 / 2 / 3）残留，都不是我们的 `TunBox` 卡 —— 用户机上还常驻
+Clash Verge Rev，验证网卡时别把它们的卡当成我们的。

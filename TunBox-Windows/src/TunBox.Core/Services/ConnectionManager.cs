@@ -353,8 +353,8 @@ public sealed class ConnectionManager : IDisposable
 
             EnableSystemProxyIfWanted();
             // mode 已经写在那份配置里了，这次调用只是兜底；等它 = 在回环 HTTP 被拦的机器上
-            // 白等一个 HttpClient 超时，所以放后台。
-            Watch(Api.SetModeAsync(Settings.ProxyMode, ct));
+            // 白等一个 HttpClient 超时，所以放后台。全局模式还要顺手把 GLOBAL 钉到出口节点上。
+            Watch(ApplyModeAsync(ct));
             TunActive = Settings.TunEnabled && TunAdapter.IsReady(ClashConfigGenerator.TunDeviceName);
             State = TunnelState.Connected;
             LastTiming = string.Join(" · ", phases) + $" · 已接管 {sw.ElapsedMilliseconds}ms";
@@ -428,19 +428,28 @@ public sealed class ConnectionManager : IDisposable
         if (!Settings.TunEnabled)
         {
             TunActive = false;
+            TunPending = false;
             return;
         }
         try
         {
+            // 预算要盖住内核自己的重试：真机日志里第一次建卡报
+            // 「create adapter: Cannot create a file when that file already exists | open existing adapter:
+            //  Element not found [retrying 1/3]」，1 秒后重试就成功了「Tun adapter listening at: TunBox」。
+            // 只等 8 秒的话，网卡明明起来了却被我们判成「没起来」。
+            TunPending = true;
+            Changed?.Invoke();
             var up = await Task.Run(() => TunAdapter.WaitFor(
-                ClashConfigGenerator.TunDeviceName, TimeSpan.FromSeconds(8), ct), ct).ConfigureAwait(false);
+                ClashConfigGenerator.TunDeviceName, TimeSpan.FromSeconds(30), ct), ct).ConfigureAwait(false);
             TunActive = up;
+            TunPending = false;
             // 内核建卡失败只打一行日志就静默关掉 TUN：不核对 + 不引用原话，用户就只能看到「已接管」。
             if (!up) LastError = "虚拟网卡没能创建：" + ExplainTunFailure(_host.TailLog(6))
                 + " 内核原话：" + TailLine(_host.TailLog(6));
         }
         catch (Exception e)
         {
+            TunPending = false;
             LastError = "虚拟网卡状态没核对成：" + e.Message;
         }
         Changed?.Invoke();
@@ -504,6 +513,7 @@ public sealed class ConnectionManager : IDisposable
         var wantedTun = TunActive || Settings.TunEnabled;
         var wasError = State == TunnelState.Error;
         TunActive = false;
+        TunPending = false;
         LastError = null;
 
         // 拆网卡不必杀进程：把「TUN 关掉」的那份配置热重载回去，内核自己把设备删掉，进程留在待命。
@@ -555,6 +565,7 @@ public sealed class ConnectionManager : IDisposable
         _host.Stop();
         TryDisableProxy();
         TunActive = false;
+        TunPending = false;
         State = TunnelState.Disconnected;
         Changed?.Invoke();
         await Task.CompletedTask;
@@ -660,29 +671,110 @@ public sealed class ConnectionManager : IDisposable
         var yaml = BuildConfig(tunForcedOff: State == TunnelState.Standby);
         if (_host.IsRunningWith(yaml)) return;
         var (ok, error) = await Api.UpdateConfigAsync(yaml).ConfigureAwait(false);
-        if (ok) { _host.SaveConfig(yaml); PendingConfigNote = null; }
+        if (ok) { _host.SaveConfig(yaml); PendingConfigNote = null; await ApplyModeAsync().ConfigureAwait(false); }
         else PendingConfigNote = "分流库已就位，但内核没接受这次热重载（" + error + "），下次连接起用新规则。";
         Changed?.Invoke();
     }
 
     // ── 模式与选点 ───────────────────────────────────────────────────────
 
+    /// <summary>SelectedNodeId 的这个哨兵值 = 「出口交给 smart 组按每条连接自动择优」。</summary>
+    public const string AutoEgressId = "smart";
+
+    /// <summary>正在后台等虚拟网卡建起来（内核会自己重试，别在此期间报「网卡没起来」）。</summary>
+    public bool TunPending { get; private set; }
+
+    /// <summary>内核的「全局」伪分组：mode=global 时所有流量只认它在选谁。</summary>
+    public const string GlobalGroup = "GLOBAL";
+
+    /// <summary>配置里始终跟着用户选择的代理组：「全局」的出口就是它当前选中的那一项。</summary>
+    public const string ProxyGroup = "PROXY";
+
+    /// <summary>
+    /// 切模式不是 `PUT /configs {"mode":…}` 就完事：这份 mihomo-smart 内核对单独的运行时字段回 204
+    /// 却什么都不改（实测 mode、log-level 都照旧），只认整份 payload。
+    /// 所以模式要跟着重新生成的配置热应用一遍，之后再把 GLOBAL 钉到出口上。
+    /// </summary>
     public async Task<bool> SetProxyModeAsync(string mode)
     {
         Settings.ProxyMode = mode is "global" or "direct" ? mode : "rule";
         SaveSettings();
-        if (!CoreAlive) return true;
-        var ok = await Api.SetModeAsync(Settings.ProxyMode).ConfigureAwait(false);
+        if (!CoreAlive)
+        {
+            Changed?.Invoke();
+            return true;
+        }
+        var ok = await ReapplyRunningConfigAsync().ConfigureAwait(false);
+        if (ok) await SyncGlobalEgressAsync().ConfigureAwait(false);
         Changed?.Invoke();
         return ok;
     }
 
-    public async Task<bool> SelectNodeAsync(string name, string group = "PROXY")
+    /// <summary>把当前设置生成的配置热应用回内核（模式就在这份配置里）；内核拒收时报出来，不静默。</summary>
+    private async Task<bool> ReapplyRunningConfigAsync(CancellationToken ct = default)
+    {
+        if (!CoreAlive) return true;
+        var yaml = BuildConfig(tunForcedOff: State == TunnelState.Standby);
+        if (_host.IsRunningWith(yaml)) return true;
+        var (ok, error) = await Api.UpdateConfigAsync(yaml, ct).ConfigureAwait(false);
+        if (ok) _host.SaveConfig(yaml);
+        else LastError = "模式没能应用到内核（" + error + "），流量走向还是旧的那份。";
+        return ok;
+    }
+
+    public async Task<bool> SelectNodeAsync(string name, string group = ProxyGroup)
     {
         Settings.SelectedNodeId = _lib.Nodes.FirstOrDefault(n => n.Name == name)?.Id ?? Settings.SelectedNodeId;
         PersistSettings();
         if (!CoreAlive) return true;
-        return await Api.SelectNodeAsync(group, name).ConfigureAwait(false);
+        var ok = await Api.SelectNodeAsync(group, name).ConfigureAwait(false);
+        // 全局模式下用户点的名片要同时落到 GLOBAL，否则切了节点流量照旧走 GLOBAL 里那个旧选择
+        await SyncGlobalEgressAsync().ConfigureAwait(false);
+        return ok;
+    }
+
+    /// <summary>
+    /// 全局模式光改 mode 还不够：内核在 global 下只看 GLOBAL 这个伪分组，而我们的选点全写在 PROXY 组里，
+    /// GLOBAL 会一直停在初始的 DIRECT —— 真机就是这样「全局模式 IP 检测站还是国内，规则模式才是节点 IP」。
+    /// </summary>
+    private async Task SyncGlobalEgressAsync(CancellationToken ct = default)
+    {
+        if (!CoreAlive || Settings.ProxyMode != "global") return;
+        var name = PickGlobalEgress(Settings.SelectedNodeId, _lib.Nodes,
+            await Api.ProxiesAsync(ct).ConfigureAwait(false));
+        if (name.Length > 0) await Api.SelectNodeAsync(GlobalGroup, name, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>连接/热重载之后把模式与出口对齐一次（配置重建会把 GLOBAL 的选择冲掉）。</summary>
+    private async Task ApplyModeAsync(CancellationToken ct = default)
+    {
+        await SyncGlobalEgressAsync(ct).ConfigureAwait(false);
+        Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// 「全局」的出口 = PROXY 组现在选中的那一项。内核实测 GLOBAL 既能选具体节点、也能选代理组名
+    /// （dial 时才解析），所以自动态直接把 ♻️ 自动选择 交给 GLOBAL，smart 的按连接择优在全局下照旧生效。
+    /// 拿不到 PROXY 时才依次退回：用户选过的节点 → smart 当前的节点 → 第一个像节点的名字；
+    /// 任何情况下都不许退成 DIRECT / REJECT。挑兜底名字时要避开订阅面板当成代理返回的
+    /// 「剩余流量：xxx GB」这类说明行（它们连不通）。
+    /// </summary>
+    internal static string PickGlobalEgress(string selectedNodeId, IReadOnlyList<ProxyNode> nodes,
+        Dictionary<string, (string Now, List<string> All)> proxies)
+    {
+        bool Routed(string n) => !string.IsNullOrEmpty(n) && n != "DIRECT" && n != "REJECT";
+
+        if (proxies.TryGetValue(ProxyGroup, out var proxy) && Routed(proxy.Now)) return proxy.Now;
+
+        if (selectedNodeId != AutoEgressId
+            && nodes.FirstOrDefault(n => n.Id == selectedNodeId) is { } picked && Routed(picked.Name))
+            return picked.Name;
+
+        if (proxies.TryGetValue(ClashConfigGenerator.SmartGroupName, out var smart) && Routed(smart.Now))
+            return smart.Now;
+
+        return nodes.FirstOrDefault(n => Routed(n.Name) && n.Server.Length > 0
+            && n.Kind != ProxyKind.Unknown)?.Name ?? "";
     }
 
     /// <summary>组测速：结果写回模型，UI 靠状态上色。内核没跑先待命起来。</summary>

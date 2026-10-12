@@ -122,20 +122,6 @@ public sealed class ControllerClient : IDisposable
         catch { return "rule"; }
     }
 
-    /// <summary>切换 规则/全局/直连。热更新，不重建内核。</summary>
-    public async Task<bool> SetModeAsync(string mode, CancellationToken ct = default)
-    {
-        try
-        {
-            var payload = JsonSerializer.Serialize(new { mode = mode == "global" ? "global" : mode == "direct" ? "direct" : "rule" });
-            var request = New(HttpMethod.Put, "/configs");
-            request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
-            using var resp = await _http.SendAsync(request, ct).ConfigureAwait(false);
-            return resp.IsSuccessStatusCode;
-        }
-        catch { return false; }
-    }
-
     /// <summary>
     /// 热应用一份新配置（PUT /configs 的 payload 形式）：内核 ParseWithBytes + ApplyConfig，
     /// 不重启进程、不断已有连接。内核拒收时返回原因，调用方退回重启。
