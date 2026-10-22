@@ -444,8 +444,11 @@ export struct HomePage {
     // LowMemoryKill 回收后守护立即撤销，后台彻底失去驻留凭证、再也拉不回来
     // （必须用户手动重进 App）。用户意图仍为连接时必须保持守护。
     if (this.isConnected && !UiGuardian.isRegistered()) {
-      UiGuardian.engage(getContext(this) as Context).catch((): void => {});
-    } else if (!this.isConnected && UiGuardian.isRegistered()
+      UiGuardian.engage(getContext(this) as Context, async (): Promise<boolean> => {
+        const authority = await this.orchestrator.authorityState();
+        return authority.connected && authority.desiredConnected;
+      }).catch((): void => {});
+    } else if (!this.isConnected && (UiGuardian.isRegistered() || UiGuardian.isWatching())
       && this.orchestrator.state !== ConnState.CONNECTING
       && this.orchestrator.state !== ConnState.DISCONNECTING
       && this.orchestrator.state !== ConnState.RECOVERING) {
@@ -559,14 +562,8 @@ export struct HomePage {
     LatencyStoreBridge.flushNow();
     const pm: string = this.settings.proxyMode;
     this.proxyMode = (pm === 'global' || pm === 'direct') ? pm : 'rule';
-    const authority = await this.orchestrator.authorityState();
-    const snapshot = await SettingsService.loadSnapshot();
-    if (authority.connected) {
-      this.orchestrator.state = ConnState.CONNECTED;
-      if (this.orchestrator.startedAt <= 0 && snapshot.startedAt > 0) {
-        this.orchestrator.startedAt = snapshot.startedAt;
-      }
-    }
+    // 会话接管由编排器统一校验代次；页面不得用异步读到的旧快照改写连接态。
+    await this.orchestrator.restoreKilledSession(ctx);
     if (!this.listenerBound) {
       this.listenerBound = true;
       this.orchestrator.addListener(this.connectionListener);

@@ -81,9 +81,7 @@ export default class EntryAbility extends UIAbility {
     // 订阅自动刷新（双轨触发之一）：注册 WorkScheduler 周期任务 + 冷启动兜底检查。
     // autoUpdateSubscription 开关此前无任何调度器消费，节点池会随机场更新逐渐失效。
     SubscriptionUpdateScheduler.instance().onAppStart(this.context);
-    // 后台被杀后被重新拉起（含桌面图标/卡片/快捷方式等任何入口）：只要磁盘上的
-    // 用户意图仍是"想连着"而隧道已经没了，就自动重建 —— 原来这里什么都不做，
-    // 用户只能看到"已断开"，得手动再点一次连接。
+    // 冷启动仅接管已存在的真实会话；证据不足时保留意图，不因打开应用拆建隧道。
     this.scheduleSelfHeal('cold-start');
   }
 
@@ -154,7 +152,10 @@ export default class EntryAbility extends UIAbility {
     }
     const authority = await ConnectionOrchestrator.instance().authorityState();
     if (authority.connected) {
-      await UiGuardian.engage(this.context);
+      await UiGuardian.engage(this.context, async (): Promise<boolean> => {
+        const current = await ConnectionOrchestrator.instance().authorityState();
+        return current.connected && current.desiredConnected;
+      });
     }
   }
 

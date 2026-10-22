@@ -236,14 +236,16 @@ await check('EXEC save cancellation and concurrent site modification preserve st
   B.dialogs.push(1); await p.save(); assert.equal(store.puts, 0); assert.equal(p.dirty, true);
   assert.deepEqual((await S.load()).forceDirectSites, ['external.org']);
 });
-for (const outcome of ['hot', 'reconnect', 'none', 'throw']) {
+for (const outcome of ['hot', 'reconnect', 'none', 'ad-unavailable', 'pending', 'throw']) {
   await check('EXEC save/apply boundary outcome ' + outcome + ' keeps saved data', async () => {
     const p = await fresh([], [], { proxyMode: 'global' }); p.add('a.com');
     B.outcome = outcome; B.applyError = outcome === 'throw'; B.dialogs.push(2); await p.save();
     assert.deepEqual(B.applies, ['forceSitesChanged']); assert.equal(store.puts, 1); assert.equal(p.dirty, false);
     assert.deepEqual((await S.load()).forceProxySites, ['a.com']); assert.equal(p.busy, false);
     assert.match(p.notice, /全局模式/);
-    assert.match(p.notice, outcome === 'hot' ? /热更新/ : outcome === 'reconnect' ? /重连/ : outcome === 'throw' ? /应用失败/ : /下次连接/);
+    assert.match(p.notice, outcome === 'hot' ? /热更新/ : outcome === 'reconnect' ? /重连/
+      : outcome === 'ad-unavailable' ? /广告规则尚未下载.*手动更新/ : outcome === 'pending' ? /另一规则更新进行中/
+      : outcome === 'throw' ? /应用失败/ : /下次连接/);
   });
 }
 await check('EXEC storage failure leaves draft dirty and does not call apply', async () => {
@@ -274,9 +276,12 @@ await check('SOURCE discard and hardware back are guarded and never persist', ()
   assert.match(page, /onBackPress\(\): boolean \{ this\.back\(\); return true; \}/);
 });
 await check('SOURCE hot reload attempted before reconnect fallback', () => {
-  const apply = method(orchestrator, 'applyRulesChanged');
+  assert.match(method(orchestrator, 'applyRulesChanged'), /this\.applyRulesChangedNow\(reason, seq, generation\)/);
+  const apply = method(orchestrator, 'applyRulesChangedNow');
   assert.ok(apply.indexOf('reloadRulesHot(reason)') < apply.indexOf('restartIfConnected(reason)'));
-  assert.match(apply, /if \(hot\) \{\s*return 'hot';/); assert.ok(apply.includes("'reconnect' : 'none'"));
+  assert.match(apply, /if \(hot\) \{\s*return adUnavailable \? 'ad-unavailable' : 'hot';/);
+  assert.ok(apply.indexOf('await this.reloadRulesHot(reason)') < apply.indexOf('await this.restartIfConnected(reason)'));
+  assert.ok(apply.includes("'reconnect' : 'none'"));
 });
 await check('SOURCE generator emits all three lists, direct before proxy, and suffix semantics', () => {
   assert.ok(generator.includes('normalizeDomains(settings.forceDirectSites)'));
@@ -299,7 +304,10 @@ await check('SOURCE network entries live in SettingsPage and target registered e
   const settingsPage = read('pages/SettingsPage.ets');
   assert.match(settingsPage, /router\.pushUrl\(\{ url: 'pages\/AppRoutingPage' \}\)/);
   assert.match(settingsPage, /router\.pushUrl\(\{ url: 'pages\/SiteRoutingPage' \}\)/);
-  assert.match(settingsPage, /router\.pushUrl\(\{ url: 'pages\/RulesPage' \}\)/);
+  assert.match(settingsPage, /\.onClick\(\(\) => \{ this\.openRulesPage\(\); \}\)/);
+  const openRules = method(settingsPage, 'openRulesPage');
+  assert.ok(openRules.indexOf('await SettingsService.load()') < openRules.indexOf('router.pushUrl('));
+  assert.match(openRules, /router\.pushUrl\(\{ url: 'pages\/RulesPage', params: params \}\)/);
   assert.match(settingsPage, /Text\('应用分流'\)/);
   // 三态切换与三份名单都在 SiteRoutingPage 内闭环
   assert.match(page, /private switchKind\(kind: string\): void \{/);

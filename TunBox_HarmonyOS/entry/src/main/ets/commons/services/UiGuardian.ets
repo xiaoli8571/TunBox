@@ -7,8 +7,7 @@
  * （表现为"启动没几分钟就被杀"）。
  *
  * 本服务在连接成功后用当前 UIAbility 上下文注册长时任务，断开/失败时释放。
- * 生命周期由页面驱动（不自带轮询）：HomePage 的 connectionListener 在状态变化时
- * engage/release。
+ * HomePage/EntryAbility 驱动 engage/release；会话有效期间每 30 秒核对实际后台任务。
  *
  * ── 合规边界（对照官方《Background Tasks Kit 接入规范》）──────────────────
  *  - **类型**：长时任务类型表里 DATA_TRANSFER =「非托管形式的上传、下载」，
@@ -44,8 +43,12 @@ import type { BusinessError } from '@kit.BasicServicesKit';
 import { AppLogger } from '../utils/AppLogger';
 import { TaskProgressUpdater, ContinuousTaskKind } from './TaskProgressUpdater';
 import type { ContinuousTaskVerdict } from './BackgroundTaskWatch';
+import { AudioKeepAlive } from './AudioKeepAlive';
+import { SettingsService } from './SettingsService';
 
 const TAG = 'UiGuardian';
+const WATCHDOG_INTERVAL_MS: number = 30000;
+const WATCHDOG_RETRY_LIMIT: number = 3;
 
 /**
  * 一次长时任务申请的结果。
@@ -86,6 +89,15 @@ export class UiGuardian {
   private static currentKind: ContinuousTaskKind = ContinuousTaskKind.NONE;
   /** 最近一次申请返回的长时任务通知 id（暂停恢复时用于把进度心跳接回来） */
   private static lastNotificationId: number = -1;
+  private static generation: number = 0;
+  private static taskWrites: Promise<void> = Promise.resolve();
+  private static watchdogTimer: number = -1;
+  private static watchdogContext: Context | null = null;
+  private static sessionCheck: (() => Promise<boolean>) | null = null;
+  private static watchdogBusy: boolean = false;
+  private static watchdogAttempts: number = 0;
+  private static missingSince: number = 0;
+  private static suspended: boolean = false;
 
   /**
    * **全工程唯一**的长时任务申请入口（唯一调用 startBackgroundRunning 的地方）。
@@ -101,6 +113,35 @@ export class UiGuardian {
    * （TaskProgressUpdater 按类型分叉）、清理退避门禁。
    */
   static async applyContinuousTask(context: Context): Promise<ContinuousTaskApplyResult> {
+    const generation = UiGuardian.generation;
+    const operation = UiGuardian.taskWrites.then(async (): Promise<ContinuousTaskApplyResult> => {
+      if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) {
+        const cancelled = new ContinuousTaskApplyResult();
+        cancelled.detail = 'session ended before registration';
+        return cancelled;
+      }
+      if (UiGuardian.missingSince > 0) {
+        if (UiGuardian.watchdogAttempts >= WATCHDOG_RETRY_LIMIT) {
+          const exhausted = new ContinuousTaskApplyResult();
+          exhausted.detail = 'automatic registration budget exhausted';
+          return exhausted;
+        }
+        // Shared by page refresh and watchdog: neither path bypasses the same budget.
+        UiGuardian.watchdogAttempts++;
+      }
+      const result = await UiGuardian.applyContinuousTaskNow(context, generation);
+      if (!result.ok && generation === UiGuardian.generation && !UiGuardian.autoEngageSuppressed) {
+        UiGuardian.earliestRearmAt = Math.max(UiGuardian.earliestRearmAt,
+          Date.now() + WATCHDOG_INTERVAL_MS);
+      }
+      return result;
+    });
+    UiGuardian.taskWrites = operation.then((): void => {}, (): void => {});
+    return await operation;
+  }
+
+  private static async applyContinuousTaskNow(context: Context,
+    generation: number): Promise<ContinuousTaskApplyResult> {
     const result: ContinuousTaskApplyResult = new ContinuousTaskApplyResult();
     let agent: WantAgent | null = null;
     try {
@@ -130,6 +171,37 @@ export class UiGuardian {
       return result;
     }
 
+    // Audio is opt-in. Never combine it with dataTransfer or its progress obligations.
+    let audioEnabled: boolean = false;
+    try { audioEnabled = (await SettingsService.load()).audioKeepAliveEnabled; } catch (e) {
+      AppLogger.warn(TAG, `audio preference unavailable; retaining default: ${AppLogger.errText(e)}`);
+    }
+    if (generation !== UiGuardian.generation) { return result; }
+    if (audioEnabled) {
+      const playing = await AudioKeepAlive.start(context, (): void => {
+        UiGuardian.onAudioInterrupted(context);
+      });
+      if (generation !== UiGuardian.generation) {
+        await AudioKeepAlive.stop();
+        return result;
+      }
+      if (playing) {
+        try {
+          const res = await backgroundTaskManager.startBackgroundRunning(context, ['audioPlayback'], agent);
+          result.ok = true;
+          result.kind = ContinuousTaskKind.AUDIO_PLAYBACK;
+          result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
+          result.detail = 'audioPlayback';
+          await UiGuardian.acceptApplication(context, generation, result);
+          return result;
+        } catch (e) {
+          AppLogger.warn(TAG, `audio task unavailable; retaining default: ${AppLogger.errText(e)}`);
+        }
+      }
+      await AudioKeepAlive.stop();
+    }
+    if (generation !== UiGuardian.generation) { return result; }
+
     // ① 优先 taskKeeping（VPN 隧道保活的正确类型）
     try {
       const request = new backgroundTaskManager.ContinuousTaskRequest();
@@ -141,7 +213,7 @@ export class UiGuardian {
       result.kind = ContinuousTaskKind.TASK_KEEPING;
       result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
       result.detail = 'taskKeeping';
-      UiGuardian.onApplied(result);
+      await UiGuardian.acceptApplication(context, generation, result);
       AppLogger.info(TAG, 'continuous task registered (type=taskKeeping submode=normalNotification)');
       return result;
     } catch (e) {
@@ -152,6 +224,7 @@ export class UiGuardian {
     }
 
     // ② 回退 dataTransfer（与改造前完全一致：实况窗 + 5 分钟进度心跳）
+    if (generation !== UiGuardian.generation) { return new ContinuousTaskApplyResult(); }
     try {
       const modes: string[] = ['dataTransfer'];
       const res = await backgroundTaskManager.startBackgroundRunning(context, modes, agent);
@@ -159,7 +232,7 @@ export class UiGuardian {
       result.kind = ContinuousTaskKind.DATA_TRANSFER;
       result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
       result.detail = 'dataTransfer';
-      UiGuardian.onApplied(result);
+      await UiGuardian.acceptApplication(context, generation, result);
       AppLogger.info(TAG, 'continuous task registered (type=dataTransfer, fallback path)');
       return result;
     } catch (e) {
@@ -171,6 +244,21 @@ export class UiGuardian {
     }
   }
 
+  private static async acceptApplication(context: Context, generation: number,
+    result: ContinuousTaskApplyResult): Promise<void> {
+    if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) {
+      await AudioKeepAlive.stop();
+      try { await backgroundTaskManager.stopBackgroundRunning(context); } catch (e) {
+        AppLogger.warn(TAG, `stale task cleanup failed: ${AppLogger.errText(e)}`);
+      }
+      result.ok = false;
+      result.kind = ContinuousTaskKind.NONE;
+      result.detail = 'session ended during registration';
+      return;
+    }
+    UiGuardian.onApplied(result);
+  }
+
   /** 申请成功后的统一记账与接线。 */
   private static onApplied(result: ContinuousTaskApplyResult): void {
     UiGuardian.registered = true;
@@ -178,6 +266,9 @@ export class UiGuardian {
     UiGuardian.lastNotificationId = result.notificationId;
     // 成功挂上即解除退避门禁（退避只针对"紧接着的重挂尝试"）
     UiGuardian.earliestRearmAt = 0;
+    UiGuardian.missingSince = 0;
+    UiGuardian.watchdogAttempts = 0;
+    UiGuardian.suspended = false;
     // 进度心跳按类型分叉：dataTransfer 接管通知 id 推实况窗；taskKeeping 不碰通知内容。
     TaskProgressUpdater.attach(result.notificationId, result.kind);
   }
@@ -189,9 +280,15 @@ export class UiGuardian {
    * clearExternalCancelSuppression() 解除抑制态与退避门禁。
    * 返回 true = 长时任务已挂上；false = 未挂（被抑制 / 退避未到 / 申请失败）。
    */
-  static async engage(context: Context): Promise<boolean> {
+  static async engage(context: Context, sessionCheck?: () => Promise<boolean>): Promise<boolean> {
+    if (sessionCheck !== undefined && !UiGuardian.autoEngageSuppressed) {
+      UiGuardian.watchSession(context, sessionCheck);
+    }
     if (UiGuardian.registered || UiGuardian.engaging) {
       return UiGuardian.registered;
+    }
+    if (UiGuardian.missingSince > 0 && UiGuardian.watchdogAttempts >= WATCHDOG_RETRY_LIMIT) {
+      return false;
     }
     if (UiGuardian.autoEngageSuppressed) {
       AppLogger.info(TAG,
@@ -216,6 +313,92 @@ export class UiGuardian {
     } finally {
       UiGuardian.engaging = false;
     }
+  }
+
+  /** A process-local check, not an OS wakeup or a promise to restart a killed process. */
+  static watchSession(context: Context, sessionCheck: () => Promise<boolean>): void {
+    UiGuardian.watchdogContext = context;
+    UiGuardian.sessionCheck = sessionCheck;
+    if (UiGuardian.watchdogTimer >= 0 || UiGuardian.autoEngageSuppressed) { return; }
+    UiGuardian.watchdogTimer = setInterval((): void => {
+      UiGuardian.checkBackgroundTask().catch((e: Error): void => {
+        AppLogger.warn(TAG, `background task check failed: ${AppLogger.errText(e)}`);
+      });
+    }, WATCHDOG_INTERVAL_MS);
+  }
+
+  static isWatching(): boolean {
+    return UiGuardian.watchdogTimer >= 0;
+  }
+
+  private static stopWatchdog(): void {
+    if (UiGuardian.watchdogTimer >= 0) { clearInterval(UiGuardian.watchdogTimer); }
+    UiGuardian.watchdogTimer = -1;
+    UiGuardian.watchdogContext = null;
+    UiGuardian.sessionCheck = null;
+  }
+
+  private static async checkBackgroundTask(): Promise<void> {
+    const context = UiGuardian.watchdogContext;
+    const check = UiGuardian.sessionCheck;
+    if (context === null || check === null || UiGuardian.watchdogBusy || UiGuardian.engaging
+      || UiGuardian.autoEngageSuppressed || UiGuardian.suspended) { return; }
+    const generation = UiGuardian.generation;
+    UiGuardian.watchdogBusy = true;
+    try {
+      if (!await check()) { return; }
+      if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
+      // Query failure is unknown, never proof that the task is missing.
+      const tasks = await backgroundTaskManager.getAllContinuousTasks(context);
+      if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
+      for (const task of tasks) {
+        const ownsTask = UiGuardian.lastNotificationId >= 0
+          ? task.notificationId === UiGuardian.lastNotificationId
+          : task.backgroundModes.includes(UiGuardian.currentKind);
+        if (!ownsTask) { continue; }
+        if (task.suspendState) {
+          UiGuardian.registered = false;
+          TaskProgressUpdater.detach();
+          await AudioKeepAlive.stop();
+          AppLogger.warn(TAG, 'background task is suspended; waiting for system/user action');
+          return;
+        }
+        if (UiGuardian.currentKind === ContinuousTaskKind.AUDIO_PLAYBACK && !AudioKeepAlive.isActive()) {
+          UiGuardian.onAudioInterrupted(context);
+          return;
+        }
+        UiGuardian.registered = true;
+        UiGuardian.missingSince = 0;
+        UiGuardian.watchdogAttempts = 0;
+        return;
+      }
+      UiGuardian.registered = false;
+      TaskProgressUpdater.detach();
+      await AudioKeepAlive.stop();
+      if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
+      if (UiGuardian.missingSince === 0) {
+        UiGuardian.missingSince = Date.now();
+        UiGuardian.earliestRearmAt = Math.max(UiGuardian.earliestRearmAt,
+          Date.now() + WATCHDOG_INTERVAL_MS);
+        AppLogger.warn(TAG, 'background task missing; waiting for recheck/backoff');
+        return;
+      }
+      if (!UiGuardian.backoffElapsed() || UiGuardian.watchdogAttempts >= WATCHDOG_RETRY_LIMIT) { return; }
+      if (!await check() || generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
+      await UiGuardian.rearm(context, true);
+    } finally {
+      UiGuardian.watchdogBusy = false;
+    }
+  }
+
+  private static onAudioInterrupted(context: Context): void {
+    if (UiGuardian.autoEngageSuppressed) { return; }
+    UiGuardian.autoEngageSuppressed = true;
+    UiGuardian.suppressReason = 'audio interrupted; reconnect explicitly to resume playback';
+    AppLogger.warn(TAG, UiGuardian.suppressReason);
+    UiGuardian.release(context).catch((e: Error): void => {
+      AppLogger.warn(TAG, `interrupted audio cleanup failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   /**
@@ -289,6 +472,8 @@ export class UiGuardian {
   static noteExternalCancel(verdict: ContinuousTaskVerdict): void {
     // 先记录"此前是否持有登记"再清账：监听者据此判断这次事件与本进程是否相关。
     verdict.hadRegistration = UiGuardian.registered;
+    UiGuardian.generation++;
+    AudioKeepAlive.stop().catch((): void => {});
     if (UiGuardian.registered) {
       AppLogger.warn(TAG, 'guardian registration cleared by external cancel');
     }
@@ -298,6 +483,7 @@ export class UiGuardian {
     TaskProgressUpdater.detach();
 
     if (verdict.requireUserAction) {
+      UiGuardian.stopWatchdog();
       UiGuardian.autoEngageSuppressed = true;
       UiGuardian.suppressReason = `${verdict.category}/${verdict.summary}`;
       UiGuardian.earliestRearmAt = 0;
@@ -331,10 +517,14 @@ export class UiGuardian {
    * 恢复时（suspendState=false）任务仍然存在，只需恢复记账。
    */
   static noteExternalSuspend(verdict: ContinuousTaskVerdict, suspended: boolean): void {
+    UiGuardian.suspended = suspended;
     if (suspended) {
+      UiGuardian.generation++;
+      AudioKeepAlive.stop().catch((): void => {});
       UiGuardian.registered = false;
       TaskProgressUpdater.detach();
       if (verdict.requireUserAction) {
+        UiGuardian.stopWatchdog();
         UiGuardian.autoEngageSuppressed = true;
         UiGuardian.suppressReason = `${verdict.category}/${verdict.summary}`;
       }
@@ -344,6 +534,11 @@ export class UiGuardian {
       return;
     }
     // 恢复：任务重新激活 → 重新记账（dataTransfer 还要把进度心跳接回来）
+    if (UiGuardian.currentKind === ContinuousTaskKind.AUDIO_PLAYBACK) {
+      // Playback was stopped on suspend. Do not claim active audio or seize audio focus on resume.
+      UiGuardian.registered = false;
+      return;
+    }
     UiGuardian.registered = true;
     if (UiGuardian.currentKind === ContinuousTaskKind.DATA_TRANSFER && UiGuardian.lastNotificationId >= 0) {
       TaskProgressUpdater.attach(UiGuardian.lastNotificationId, UiGuardian.currentKind);
@@ -353,18 +548,22 @@ export class UiGuardian {
 
   /** 断开/失败后调用：释放连续任务（幂等）。stopBackgroundRunning 必须 UIAbility 上下文。 */
   static async release(context: Context): Promise<void> {
-    if (!UiGuardian.registered) {
-      return;
-    }
-    try {
-      await backgroundTaskManager.stopBackgroundRunning(context);
-      AppLogger.info(TAG, 'guardian released');
-    } catch (e) {
-      const err = e as BusinessError;
-      AppLogger.warn(TAG, `guardian release failed (code=${err.code} ${err.message})`);
-    } finally {
-      UiGuardian.noteReleased();
-    }
+    const hadTask = UiGuardian.registered || UiGuardian.engaging;
+    UiGuardian.noteReleased();
+    // Serialized behind pending starts: a late platform reply cannot revive a disconnected session.
+    const operation = UiGuardian.taskWrites.then(async (): Promise<void> => {
+      await AudioKeepAlive.stop();
+      if (!hadTask) { return; }
+      try {
+        await backgroundTaskManager.stopBackgroundRunning(context);
+        AppLogger.info(TAG, 'guardian released');
+      } catch (e) {
+        const err = e as BusinessError;
+        AppLogger.warn(TAG, `guardian release failed (code=${err.code} ${err.message})`);
+      }
+    });
+    UiGuardian.taskWrites = operation.then((): void => {}, (): void => {});
+    await operation;
   }
 
   /**
@@ -372,6 +571,12 @@ export class UiGuardian {
    * 调用方执行）。QuickToggleAbility 在 onDestroy / releaseGuardian 里调用。
    */
   static noteReleased(): void {
+    UiGuardian.generation++;
+    UiGuardian.stopWatchdog();
+    UiGuardian.suspended = false;
+    UiGuardian.missingSince = 0;
+    UiGuardian.watchdogAttempts = 0;
+    AudioKeepAlive.stop().catch((): void => {});
     UiGuardian.registered = false;
     UiGuardian.currentKind = ContinuousTaskKind.NONE;
     UiGuardian.lastNotificationId = -1;
@@ -395,6 +600,8 @@ export class UiGuardian {
     UiGuardian.autoEngageSuppressed = false;
     UiGuardian.suppressReason = '';
     UiGuardian.earliestRearmAt = 0;
+    UiGuardian.missingSince = 0;
+    UiGuardian.watchdogAttempts = 0;
   }
 
   static isAutoEngageSuppressed(): boolean {

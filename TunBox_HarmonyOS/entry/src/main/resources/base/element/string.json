@@ -69,6 +69,7 @@
     { "name": "node_badge_untested", "value": "未测试" },
     { "name": "node_mode_manual_banner", "value": "手动固定：自动切换不会覆盖你选定的节点 · 长按节点可删除" },
     { "name": "node_mode_auto_banner", "value": "自动排序：列表按测速结果排序，仅当自动选点开启时才会自动切换节点 · 长按节点可删除" },
-    { "name": "settings_geo_title", "value": "数据与规则" }
+    { "name": "settings_geo_title", "value": "数据与规则" },
+    {"name": "settings_background_connection", "value": "后台连接"}
   ]
 }

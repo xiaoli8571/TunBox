@@ -11,8 +11,9 @@
  *    等运行期参数一律被 overlay 覆盖，绝不外泄）。
  *
  * 本实现的平台差异（不算偏离，原因写在这里）：
- *  · 设备侧没有 FlClash 的 provider 预取目录，原文 `proxy-providers` /
- *    `rule-providers` 段整段搬入（相对 path 由内核按自身 home 解析）；
+ *  · 设备侧没有 FlClash 的 provider 预取目录，原文 `proxy-providers` 整段搬入；
+ *    `rule-providers` 与 overlay 按名称合并，overlay 同名块优先
+ *    （相对 path 由内核按自身 home 解析）；
  *    只用 provider 不给静态 proxies 的订阅由调用方先做内联。
  *  · 原文 `dns.enable == true` 时整段 dns 用原文（对齐 FlClash
  *    `_makeRealProfileTask` 的 `isEnableDns` 语义）。
@@ -31,7 +32,6 @@ const PROFILE_KEYS: string[] = [
   'proxy-groups',
   'sub-rules',
   'proxy-providers',
-  'rule-providers',
   'tunnels',
   'listeners'
 ];
@@ -279,6 +279,26 @@ export class ProfileConfigMerger {
       applied.push(key);
     }
 
+    // overlay.rules 仍引用自产 hyper-adrules / rs-*，不能只保留原文的 providers。
+    // 按完整块合并；同名时 overlay 优先，与生成器的自产规则集优先级一致。
+    const providers = ProfileConfigMerger.ruleProviders(overlayYaml);
+    const profileProviders = ProfileConfigMerger.ruleProviders(profileYaml);
+    for (const entry of profileProviders) {
+      if (!providers.has(entry[0])) {
+        providers.set(entry[0], entry[1]);
+      }
+    }
+    if (providers.size > 0) {
+      const providerLines: string[] = ['rule-providers:'];
+      for (const entry of providers) {
+        for (const line of entry[1]) {
+          providerLines.push(line);
+        }
+      }
+      blocks.push(providerLines.join('\n'));
+      applied.push('rule-providers');
+    }
+
     // hosts / sniffer：overlay 未声明时搬入原文
     const extraKeys: string[] = ['hosts', 'sniffer'];
     for (const key of extraKeys) {
@@ -356,6 +376,65 @@ export class ProfileConfigMerger {
     out.applied = applied.join(',');
     out.profileProxyItems = ProfileConfigMerger.countProxyItems(profileYaml);
     return out;
+  }
+
+  /**
+   * 按 provider 顶层条目拆完整块，不重排字段或压平 payload / header 等嵌套内容。
+   * 这里直接取原始缩进；通用序列分节归一化会把嵌套 payload 当作分节基准。
+   */
+  private static ruleProviders(yaml: string): Map<string, string[]> {
+    const body: string[] = [];
+    let inSection = false;
+    let minIndent = 999999;
+    for (const raw of yaml.split('\n')) {
+      const line = raw.replace(/\r$/, '').replace(/^\uFEFF/, '');
+      const text = line.trim();
+      if (!line.startsWith(' ') && !line.startsWith('\t')) {
+        if (line.startsWith('rule-providers:')) {
+          inSection = true;
+          continue;
+        }
+        if (inSection && text.length > 0 && !text.startsWith('#')) {
+          break;
+        }
+      }
+      if (!inSection || text.length === 0 || text.startsWith('#')) {
+        continue;
+      }
+      const indent = line.length - line.trimStart().length;
+      minIndent = Math.min(minIndent, indent);
+      body.push(line);
+    }
+    const providers: Map<string, string[]> = new Map<string, string[]>();
+    let current: string[] = [];
+    for (const line of body) {
+      const indent = line.length - line.trimStart().length;
+      if (indent === minIndent) {
+        current = [];
+        const key = ProfileConfigMerger.providerKey(line.trimStart());
+        if (key.length > 0 && !providers.has(key)) {
+          providers.set(key, current);
+        }
+      }
+      current.push('  ' + line.substring(minIndent));
+    }
+    return providers;
+  }
+
+  /** provider 名支持带引号的冒号、点号、中文和 YAML 单引号转义。 */
+  private static providerKey(line: string): string {
+    const match = /^(?:"((?:\\.|[^"])*)"|'((?:''|[^'])*)'|([^:]+))\s*:/.exec(line);
+    if (match === null) {
+      return '';
+    }
+    if (match[1] !== undefined) {
+      try {
+        return JSON.parse('"' + match[1] + '"') as string;
+      } catch (e) {
+        return match[1];
+      }
+    }
+    return match[2] !== undefined ? match[2].split("''").join("'") : match[3].trim();
   }
 
   /** 取某段的主体行（带 2 空格缩进），去空行。 */

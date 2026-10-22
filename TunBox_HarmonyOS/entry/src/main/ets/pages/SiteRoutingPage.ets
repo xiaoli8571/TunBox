@@ -181,7 +181,9 @@ struct SiteRoutingPage {
         try {
           const outcome = await this.orchestrator.applyRulesChanged('forceSitesChanged');
           this.notice = outcome === 'hot' ? '已保存并热更新规则，未重建 VPN。'
-            : outcome === 'reconnect' ? '已保存并请求重连，请在主页确认连接状态。' : '已保存，下次连接生效。';
+            : outcome === 'reconnect' ? '已保存并请求重连，请在主页确认连接状态。'
+            : outcome === 'ad-unavailable' ? '已保存，广告规则尚未下载，请到设置的数据与规则手动更新。'
+            : outcome === 'pending' ? '已保存，另一规则更新进行中，请稍后重试立即应用。' : '已保存，下次连接生效。';
         } catch (e) { this.notice = '配置已保存，但立即应用失败，请到主页重新连接。'; }
       }
       if (settings.proxyMode === 'global') { this.notice += ' 当前全局模式，请切回智能规则模式使用网站规则。'; }

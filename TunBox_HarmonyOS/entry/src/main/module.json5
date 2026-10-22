@@ -63,7 +63,7 @@
         //   requestPermissions 数组；在此之前**不得**声明 —— 未获审批即声明受限
         //   权限会导致安装期 ACL 校验失败（装不上）。加了权限后两种模式仍都能工作
         //   （申请失败会自动回退）。
-        "backgroundModes": ["dataTransfer", "taskKeeping"],
+        "backgroundModes": ["dataTransfer", "taskKeeping", "audioPlayback"],
         "skills": [
           {
             "entities": ["entity.system.home"],
@@ -96,7 +96,7 @@
         // 类型说明同 EntryAbility：taskKeeping 为首选（隧道保活的正确类型），
         // dataTransfer 为未获 ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM
         // 受限权限时的回退类型；两种都声明，运行时才能按实际可用性选择。
-        "backgroundModes": ["dataTransfer", "taskKeeping"],
+        "backgroundModes": ["dataTransfer", "taskKeeping", "audioPlayback"],
         "exported": false
       }
     ],
