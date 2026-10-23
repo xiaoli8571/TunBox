@@ -84,6 +84,22 @@ const RULESET_SUBDIR = 'ruleset';
 /** 去广告规则集（rule-providers: hyper-adrules, type: http） */
 const HYPER_AD_RULES_FILE = 'hyper_adrules_ads.mrs';
 /**
+ * 去广告 MRS 体积下限（byte）。真源数 MB；这里只兜「空文件/半截下载」，
+ * 真正的格式判据是下面的 zstd 魔数（错误页也常大于 1KB，只查体积挡不住）。
+ */
+const RULE_SET_MIN_BYTES = 1024;
+/**
+ * MRS 的落盘形态是 **zstd frame**（内层才是 `MRS\x01 | behavior | count …`，
+ * 见 mihomo `rules/provider/mrs_converter.go`），所以合法 .mrs 的前 4 字节必为
+ * zstd 魔数 0x28 0xB5 0x2F 0xFD。用它把 GitHub 加速代理返回的 HTML/JSON 错误页挡住。
+ */
+const ZSTD_MAGIC: number[] = [0x28, 0xB5, 0x2F, 0xFD];
+/**
+ * 「上一次连接成功时那份规则集」的副本后缀：内核能成功加载 = 文件与当前配置的
+ * behavior/format 匹配。之后更新到坏文件导致启动失败时，用它回滚（见 healRuleSet）。
+ */
+const RULE_SET_GOOD_SUFFIX = '.good';
+/**
  * geo 资产候选镜像。tag 标记来源类型，供按用户偏好（assetSource）重排：
  * jsdelivr=CDN / ghproxy=加速前缀 / github=官方直链。auto 偏好 = 保持实测可达性排序。
  */
@@ -3687,6 +3703,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // 回滚到最后一份真正连上过的配置，用户下一次点连接就能起来，
         // 而不是每次都被同一份坏配置挡住（内核对坏配置是整份拒载）。
         const errorText = AppLogger.errText(startError);
+        // 规则集坏文件自愈（2026-10-23）：配置文本本身没问题、但 rule-provider 文件
+        // 解不开时，内核同样整份拒载。这类失败必须**隔离坏文件**而不是回滚配置，
+        // 否则回滚后的配置依旧引用同一个坏 .mrs，用户会一直连不上（用户实测：
+        // 手动更新去广告规则后必失败，删掉规则集就正常）。
+        if (this.looksLikeRuleSetFailure(errorText)) {
+          const outcome = this.healRuleSet('kernel rejected rule-provider');
+          if (outcome === 'restored') {
+            throw new Error(`${errorText}\n已回滚到上一份可用去广告规则集，再点一次连接即可。`);
+          }
+          if (outcome === 'quarantined') {
+            throw new Error(`${errorText}\n已自动隔离损坏的去广告规则集，再点一次连接即可`
+              + '（本次不带去广告规则；可在「设置 → 数据与规则」重新更新）。');
+          }
+        }
         if (errorText.indexOf('parse config') >= 0 || errorText.indexOf('unmarshal') >= 0) {
           if (this.restoreLastGoodConfig()) {
             throw new Error(`${errorText}\n已自动回滚到上一份可用配置，再点一次连接即可。`);
@@ -3696,6 +3726,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       tReady = Date.now() - connectT0;
       this.confirmProfileApplied('tunnel');
+      // 内核已经成功吃到这份配置（含 rule-provider）→ 当前规则集记为 last-good，
+      // 供下次更新到坏文件时回滚（见 healRuleSet / snapshotRuleSetGood）。
+      this.snapshotRuleSetGood();
 
       // ── 节点钉选：**必须**在 state=CONNECTED 之前完成（2026-10-19 稳定性回退）──
       //
@@ -4249,15 +4282,149 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     });
   }
 
-  /** 去掉广告规则集是否已落盘（内核 home 下的 ./ruleset/hyper_adrules_ads.mrs 非空） */  private isRuleProviderReady(): boolean {
+  /**
+   * 去广告规则集是否**可用**（存在 + 体积下限 + zstd 魔数）。
+   *
+   * 【2026-10-23 用户报障】手动更新去广告规则后 VPN 启动失败，删掉规则集就正常。
+   *
+   * 根因：手动更新走的是 GitHub 加速前缀（gh-proxy / ghfast），代理返回 **HTML/JSON
+   * 错误页**（都大于 1KB，旧校验只有 `size > 0` 与下载侧 `byteLength > 1024`），
+   * 坏内容被当成 .mrs 落盘。内核加载 rule-provider 时 `zstd` 解不开 / 内层头不是
+   * `MRS\x01` / behavior 不匹配 → **config.Parse 整份失败 → 隧道起不来**。
+   * 删掉文件后 `ruleProviderReady=false`，配置里不声明 RULE-SET，于是又能连。
+   *
+   * .mrs 的真实形态（mihomo `rules/provider/mrs_converter.go` + `mrs_reader.go`）：
+   *   zstd frame（首 4 字节 0x28 0xB5 0x2F 0xFD）→ 解压后才是 `MRS\x01 | behavior | count …`
+   * 所以「前 4 字节是 zstd 魔数」足以把错误页/半截下载挡在门外。
+   *
+   * 判据变了之后：文件损坏 = 视为未就绪 = 本轮配置不带 RULE-SET（隧道照常能起，
+   * 只是没有去广告），而不是「带着坏文件必起不来」。
+   */
+  private isRuleProviderReady(): boolean {
+    return this.ruleSetFileOk();
+  }
+
+  /**
+   * 内核启动错误文本是否指向「规则集/规则提供者」损坏。
+   *
+   * 覆盖 mihomo 侧可能的几类措辞：
+   *  · `initial rule provider ...` / `rule-provider` / `ruleset`
+   *  · `invalid MrsMagic bytes`、`invalid behavior`（mrs_reader.go 的两个显式报错）
+   *  · `zstd: ...` 解压失败、`unexpected EOF`（半截下载）
+   */
+  private looksLikeRuleSetFailure(errorText: string): boolean {
+    if (errorText.length === 0) {
+      return false;
+    }
+    const t = errorText.toLowerCase();
+    if (t.indexOf('mrs') >= 0 || t.indexOf('rule-provider') >= 0
+      || t.indexOf('rule provider') >= 0 || t.indexOf('ruleset') >= 0
+      || t.indexOf('rule-set') >= 0 || t.indexOf('invalid behavior') >= 0) {
+      return this.ruleSetFileExists();
+    }
+    // zstd 解压类报错只有在规则集文件存在时才可能是它
+    if (t.indexOf('zstd') >= 0 || t.indexOf('unexpected eof') >= 0) {
+      return this.ruleSetFileExists();
+    }
+    return false;
+  }
+
+  /** 规则集文件是否存在（不看是否有效：自愈要处理的就是无效文件） */
+  private ruleSetFileExists(): boolean {
     if (this.context === null) {
       return false;
     }
     try {
-      const p = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
-      return fs.statSync(p).size > 0;
+      fs.statSync(`${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`);
+      return true;
     } catch (e) {
       return false;
+    }
+  }
+
+  /** 规则集文件本体校验（stat 体积 + 头部 zstd 魔数），任何异常都按不可用处理 */
+  private ruleSetFileOk(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    const p = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
+    try {
+      const size = Number(fs.statSync(p).size);
+      if (!(size >= RULE_SET_MIN_BYTES)) {
+        return false;
+      }
+      const file = fs.openSync(p, fs.OpenMode.READ_ONLY);
+      try {
+        const head = new ArrayBuffer(ZSTD_MAGIC.length);
+        const read = fs.readSync(file.fd, head);
+        if (read < ZSTD_MAGIC.length) {
+          return false;
+        }
+        return ConnectionOrchestrator.bufferMagicOk(head, ZSTD_MAGIC);
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 内核因规则集起不来时的自愈（2026-10-23 用户报障）。
+   *
+   * 两级策略：
+   *  1) 有 `last-good` 副本 → **回滚**到上一份被内核成功加载过的规则集
+   *     （用户在「设置 → 数据与规则」更新后坏掉时，去广告能力不丢）；
+   *  2) 没有副本 → 把坏文件**隔离**成 `.bad-<时间戳>`（不删，便于排查），
+   *     下一次连接生成不带 RULE-SET 的配置。
+   *
+   * 为什么不能只靠回滚配置：坏的是 rule-provider 文件本身，配置文本是好的；
+   * 回滚后的配置照样引用同一个坏文件，用户会一直连不上（实测症状就是
+   * 「更新去广告规则后起不来，删掉规则集就好了」）。
+   */
+  private healRuleSet(reason: string): string {
+    if (this.context === null) {
+      return '';
+    }
+    const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
+    const p = `${dir}/${HYPER_AD_RULES_FILE}`;
+    const good = `${p}${RULE_SET_GOOD_SUFFIX}`;
+    try {
+      const goodSize = Number(fs.statSync(good).size);
+      if (goodSize >= RULE_SET_MIN_BYTES) {
+        fs.renameSync(good, p);
+        AppLogger.warn(TAG, `ad ruleset restored from last-good copy (${reason}, ${goodSize} bytes)`);
+        return 'restored';
+      }
+    } catch (e) {
+      // 没有 last-good 副本：走隔离
+    }
+    try {
+      fs.renameSync(p, `${p}.bad-${Date.now()}`);
+      AppLogger.warn(TAG, `ad ruleset quarantined (${reason}); next connect runs without RULE-SET`);
+      return 'quarantined';
+    } catch (e) {
+      AppLogger.warn(TAG, `ad ruleset quarantine failed: ${AppLogger.errText(e)}`);
+      return '';
+    }
+  }
+
+  /**
+   * 连接成功后把当前规则集留一份 last-good 副本（供 healRuleSet 回滚）。
+   * 只在规则集文件本体校验通过时快照，避免把坏文件当"good"存下来。
+   */
+  private snapshotRuleSetGood(): void {
+    if (this.context === null || !this.ruleSetFileOk()) {
+      return;
+    }
+    const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
+    const p = `${dir}/${HYPER_AD_RULES_FILE}`;
+    const tmp = `${p}${RULE_SET_GOOD_SUFFIX}.tmp`;
+    try {
+      fs.copyFileSync(p, tmp);
+      fs.renameSync(tmp, `${p}${RULE_SET_GOOD_SUFFIX}`);
+    } catch (e) {
+      AppLogger.warn(TAG, `ad ruleset last-good snapshot failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -4360,6 +4527,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       if (id === 'ruleset') {
         const path = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
+        try {/* 连同 last-good 副本一起删：否则下次启动失败时会被自愈逻辑"复活" */
+          fs.unlinkSync(`${path}${RULE_SET_GOOD_SUFFIX}`);
+        } catch (e) {
+          // 副本不存在属正常
+        }
         try {
           fs.unlinkSync(path);
         } catch (e) {
@@ -4392,8 +4564,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } catch (e) {
         AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
       }
-      return await this.downloadAsset(HYPER_AD_RULES_MIRRORS, dest, 1024,
-        (buf: ArrayBuffer): boolean => buf.byteLength > 1024, source, 'hyper-adrules');
+      // 体积下限 + zstd 魔数：加速代理的错误页（HTML/JSON）体积也常超 1KB，
+      // 只查体积会把坏内容写进内核 home，导致下次启动 config.Parse 整份失败。
+      return await this.downloadAsset(HYPER_AD_RULES_MIRRORS, dest, RULE_SET_MIN_BYTES - 1,
+        (buf: ArrayBuffer): boolean => buf.byteLength >= RULE_SET_MIN_BYTES
+          && ConnectionOrchestrator.bufferMagicOk(buf, ZSTD_MAGIC),
+        source, 'hyper-adrules');
     } finally {
       this.ruleProviderDownloading = false;
     }

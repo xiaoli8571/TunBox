@@ -36,7 +36,13 @@ const PROFILE_KEYS: string[] = [
   'listeners'
 ];
 
-/** overlay 里必须被原文替换掉的键（先删后追加）。 */
+/**
+ * overlay 里先从根文档删掉、随后重新拼回的键。
+ *
+ * ⚠ `proxy-providers` / `rule-providers` 虽然也在这里（删除是为了避免两份同名段
+ * 造成重复顶层键），但它们**不是**整段替换，而是按键取并集后重新拼回 ——
+ * 见 PROVIDER_MERGE_KEYS。
+ */
 const REPLACE_KEYS: string[] = [
   'proxies',
   'proxy-groups',
@@ -47,6 +53,30 @@ const REPLACE_KEYS: string[] = [
   'listeners',
   'rules'
 ];
+
+/**
+ * provider 段**不做整体替换**，而是按键取并集（overlay 优先）。
+ *
+ * 【2026-10-23 用户报障】「手动更新去广告规则后 VPN 启动失败，删掉规则集就正常」。
+ *
+ * 根因就在原来的「先删后追加」：overlay（App 生成的运行配置）里
+ *   · `rule-providers:` 声明着 `hyper-adrules`（去广告）与 `rs-*`（自定义规则集），
+ *   · `rules:` 里第一条是 `RULE-SET,hyper-adrules,REJECT`；
+ * 合并时 `rule-providers` 被从 overlay 删掉、而订阅原文根本没有 provider 段，
+ * 于是最终配置「引用在、声明丢」→ 内核整份拒载：
+ *   `parse config: rules[0] [RULE-SET,hyper-adrules,REJECT] error: rule set [hyper-adrules] not found`
+ * → 用户看到的就是「开了去广告就连不上，删掉规则集又能连」（删掉后 RULE-SET 行也不生成）。
+ *
+ * 正确语义与 `proxies` / `proxy-groups` 不同：provider 是**名字寻址**的命名空间，
+ * 两边各自声明的 provider 互不冲突即可共存，overlay 同名优先（与生成器 ①自产优先 一致）。
+ */
+const PROVIDER_MERGE_KEYS: string[] = ['proxy-providers', 'rule-providers'];
+
+/** provider 段里的一个命名块（key 行 + 其后的字段行） */
+class ProviderSectionBlock {
+  name: string = '';
+  lines: string[] = [];
+}
 
 export class ProfileMergeResult {
   ok: boolean = false;
@@ -243,6 +273,98 @@ export class ProfileConfigMerger {
   }
 
   /**
+   * 把 provider 段拆成命名块（key 行缩进 2、字段行缩进 >2；`sectionText` 已把缩进归一）。
+   * 解析不了的行按「并入当前块」处理，绝不丢字段（丢字段等于把 provider 改坏）。
+   */
+  private static parseProviderSectionBlocks(sectionText: string,
+    key: string): ProviderSectionBlock[] {
+    const out: ProviderSectionBlock[] = [];
+    if (sectionText.length === 0) {
+      return out;
+    }
+    const lines: string[] = sectionText.split('\n');
+    let current: ProviderSectionBlock | null = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line: string = lines[i];
+      const trimmed: string = line.trim();
+      if (i === 0) {
+        // 头行：`key:` / `key: []`
+        continue;
+      }
+      if (trimmed.length === 0) {
+        continue;
+      }
+      let indent = 0;
+      while (indent < line.length && line.charAt(indent) === ' ') {
+        indent++;
+      }
+      if (indent <= 2 && trimmed.endsWith(':')) {
+        current = new ProviderSectionBlock();
+        current.name = trimmed.substring(0, trimmed.length - 1).trim();
+        current.lines.push(`  ${current.name}:`);
+        if (current.name.length > 0) {
+          out.push(current);
+        } else {
+          current = null;
+        }
+        continue;
+      }
+      if (current !== null) {
+        current.lines.push(line);
+      }
+    }
+    const kept: ProviderSectionBlock[] = out.filter((b: ProviderSectionBlock): boolean =>
+      b.lines.length > 1);
+    return kept;
+  }
+
+  /**
+   * provider 段并集：overlay 的块全部保留，原文的块只补「overlay 未声明过的名字」。
+   *
+   * 为什么 overlay 优先：overlay 的 provider 是 App 自己生成/校验过的（去广告 MRS 的
+   * `path` 指向内核 home 下真实落盘的文件、自定义规则集的 URL 由用户填写），
+   * 原文同名块若反过来覆盖，就会出现「声明指向不存在的 path」或「行为不一致」。
+   *
+   * @returns '' = 两边都没有该段；否则为一段可直接拼进最终配置的 YAML 文本
+   */
+  static mergeProviderSection(key: string, overlayYaml: string,
+    profileYaml: string): string {
+    const overlayBlocks = ProfileConfigMerger.parseProviderSectionBlocks(
+      ProfileConfigMerger.sectionText(overlayYaml, key), key);
+    const profileBlocks = ProfileConfigMerger.parseProviderSectionBlocks(
+      ProfileConfigMerger.sectionText(profileYaml, key), key);
+    if (overlayBlocks.length === 0 && profileBlocks.length === 0) {
+      return '';
+    }
+    const seen: Set<string> = new Set<string>();
+    const lines: string[] = [`${key}:`];
+    for (const block of overlayBlocks) {
+      if (seen.has(block.name)) {
+        continue;
+      }
+      seen.add(block.name);
+      for (const line of block.lines) {
+        lines.push(line);
+      }
+    }
+    let dropped = 0;
+    for (const block of profileBlocks) {
+      if (seen.has(block.name)) {
+        dropped++;
+        continue;
+      }
+      seen.add(block.name);
+      for (const line of block.lines) {
+        lines.push(line);
+      }
+    }
+    if (dropped > 0) {
+      AppLogger.info(TAG, `${key}: ${dropped} profile provider(s) shadowed by overlay`);
+    }
+    return lines.length > 1 ? lines.join('\n') : '';
+  }
+
+  /**
    * 合并。overlay = TunBox 生成的完整运行配置，profile = 订阅原文。
    */
   static merge(overlayYaml: string, profileYaml: string): ProfileMergeResult {
@@ -271,11 +393,26 @@ export class ProfileConfigMerger {
     const blocks: string[] = [];
 
     for (const key of PROFILE_KEYS) {
+      // provider 段走下面的并集合并（overlay 优先），不能在这里整段追加
+      if (PROVIDER_MERGE_KEYS.indexOf(key) >= 0) {
+        continue;
+      }
       const section = ProfileConfigMerger.sectionText(profileYaml, key);
       if (section.length === 0) {
         continue;
       }
       blocks.push(section);
+      applied.push(key);
+    }
+
+    // provider 段：overlay 与原文按键取并集（overlay 同名优先），绝不整体替换。
+    // 见 PROVIDER_MERGE_KEYS 注释（2026-10-23 去广告开启后 VPN 起不来的根因）。
+    for (const key of PROVIDER_MERGE_KEYS) {
+      const merged = ProfileConfigMerger.mergeProviderSection(key, overlayYaml, profileYaml);
+      if (merged.length === 0) {
+        continue;
+      }
+      blocks.push(merged);
       applied.push(key);
     }
 
