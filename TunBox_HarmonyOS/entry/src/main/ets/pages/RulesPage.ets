@@ -315,12 +315,13 @@ export struct RulesView {
                       .padding({ left: 4, right: 4, top: 2, bottom: 2 })
                       .borderRadius(4)
                   }.alignItems(VerticalAlign.Center)
-                  Text('每日定时自动增量拉取规则集 · 来源：Lynricsy')
+                  // 独立开关（2026-10-23 用户口径）：不依赖上面的规则引擎；
+                  // 规则集随包内置，打开即用，后台再自动增量更新。
+                  Text('独立开关 · 内置规则集随包自带，开箱即用 · 来源：Lynricsy')
                     .fontSize(11).fontColor(TunBoxColors.textMuted)
                 }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.hyperAdRulesEnabled })
                   .selectedColor(TunBoxColors.primary)
-                  .enabled(this.rulesEnabled)
                   .onChange((value: boolean) => { this.hyperAdRulesEnabled = value; })
               }.width('100%').alignItems(VerticalAlign.Center)
             }

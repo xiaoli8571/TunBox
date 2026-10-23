@@ -779,7 +779,11 @@ export class ClashConfigGenerator {
     //    订阅里同名 provider 被丢弃，不会两个 provider 抢同一个名字）。
     //    声明与下方 RULE-SET 引用同受「本地 path 文件就绪」闸门约束：
     //    ruleProviderReady=false 时不声明、不引用，避免内核启动期联网下载阻塞。
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+    //
+    //    ⚠ 2026-10-23 产品口径：去广告是**独立开关**，不再受「启用规则路由引擎」
+    //    （settings.rulesEnabled）支配 —— 用户关掉规则引擎（只用全局/直连）时，
+    //    去广告规则照样该生效。所以这里只判 hyperAdRulesEnabled && ruleProviderReady。
+    if (settings.hyperAdRulesEnabled && ruleProviderReady) {
       const hyperBlock = new ProviderBlockEntry();
       hyperBlock.name = 'hyper-adrules';
       hyperBlock.keyLine = '  hyper-adrules:';
@@ -857,7 +861,10 @@ export class ClashConfigGenerator {
     }
     lines.push('');
     lines.push('rules:');
-    if (settings.rulesEnabled && settings.hyperAdRulesEnabled && ruleProviderReady) {
+    // 去广告 RULE-SET 与上面的 provider 声明**同闸门**（hyperAdRulesEnabled && 文件就绪），
+    // 与「启用规则路由引擎」解耦：规则引擎关掉时这段 fallback rules 仍会写
+    // GEOIP/DOMAIN-SUFFIX/MATCH，去广告规则照样能挂在这张表的第一条。
+    if (settings.hyperAdRulesEnabled && ruleProviderReady) {
       lines.push('  - RULE-SET,hyper-adrules,REJECT');
     }
     // 用户自定义远程规则集（P1-2）：与 hyper-adrules 同策略——provider 声明放 rule-providers

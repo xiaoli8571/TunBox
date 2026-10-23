@@ -1145,7 +1145,7 @@ export struct SubscriptionPage {
       return;
     }
     // 【2026-10-22 用户口径】订阅 URL 输入框只收「订阅地址」：
-    // 单节点链接一律拒绝，统一走「设置 → 订阅转换」（导出 YAML 再以文件导入）。
+    // 单节点链接一律拒绝，统一走「设置 → 订阅转换」（可保存到本地，也可一键导入）。
     // 旧实现会把这些链接解析成节点塞进「单节点」虚拟分组，那个分组已经退场。
     const nonEmptyLines = raw.split(/\r?\n/)
       .map((l: string): string => l.trim())
@@ -1153,7 +1153,7 @@ export struct SubscriptionPage {
     const hasNodeUri = nonEmptyLines.some((l: string): boolean => SubscriptionService.isNodeUri(l));
     if (hasNodeUri) {
       promptAction.showToast({
-        message: '单节点链接不支持在这里添加：请到「设置 → 订阅转换」生成 YAML 文件，再用「+ → 文件」导入'
+        message: '单节点链接不支持在这里添加：请到「设置 → 订阅转换」转换后点「一键导入」，或保存 YAML 再用「+ → 文件」导入'
       });
       return;
     }
@@ -1217,7 +1217,7 @@ export struct SubscriptionPage {
       }
       // 2026-10-21：二维码只支持 Clash 订阅，扫到单节点链接不再导入
       if (SubscriptionService.isNodeUri(raw)) {
-        this.showToast('扫码只支持 Clash 订阅二维码；单节点请到「设置 → 订阅转换」生成 YAML 再导入');
+        this.showToast('扫码只支持 Clash 订阅二维码；单节点请到「设置 → 订阅转换」用「一键导入」添加');
         return;
       }
       const lower = raw.toLowerCase();

@@ -179,7 +179,7 @@ export class RuntimeConfigOptions {
   useSmart: boolean = false;
   /** 去广告规则集是否可用（已含 adRulesOn 闸门）。 */
   ruleProviderReady: boolean = false;
-  /** 去广告总开关是否打开（rulesEnabled && hyperAdRulesEnabled）。 */
+  /** 去广告总开关是否打开（只看 hyperAdRulesEnabled，与规则引擎解耦）。 */
   adRulesOn: boolean = false;
   /** 是否生成 GEOIP 规则 / dns.fallback。 */
   useGeoip: boolean = false;
@@ -237,7 +237,9 @@ export class RuntimeConfigBuilder {
     options.useSmart = useSmart;
 
     // ── ruleProviderReady（含 adRulesOn 闸门，审计 F5）───────────────────────
-    const adRulesOn = settings.rulesEnabled && settings.hyperAdRulesEnabled;
+    // 2026-10-23：adRulesOn 只看去广告开关本体 —— 去广告是独立开关，
+    // 不再要求「启用规则路由引擎」也打开（规则引擎关掉时 fallback rules 仍在）。
+    const adRulesOn = settings.hyperAdRulesEnabled;
     options.adRulesOn = adRulesOn;
     const ruleProviderReady = adRulesOn && profile.ruleProviderFileReady;
     options.ruleProviderReady = ruleProviderReady;

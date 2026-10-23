@@ -19,6 +19,7 @@
  * `LatencyController` 不认识落盘仓 ✓。
  */
 import { LatencyGroupSummary, LatencyStore, PreferencesLatencyPersistence } from '../latency/LatencyStore';
+import { LatencyProbeKind } from '../latency/LatencyKinds';
 import { LatencyRecord, LatencyState } from './LatencyState';
 import { LatencyLiveView } from './LatencyLiveView';
 import { AppLogger } from '../utils/AppLogger';
@@ -162,10 +163,17 @@ export class LatencyStoreBridge {
    * 折叠规则：判定类失败 >= 2 个才显示 —— 「1 个节点失败」不需要一条组级
    * 诊断条（节点行已经写清楚了）；整组同因全败时，内核给的结论就是
    * 「N/M 个节点域名无法解析，疑似机场域名下线……」这样一句能直接行动的提示。
+   *
+   * 2026-10-23 用户口径（第三次强调）：**「N/M 节点超时」这类纯计数提示是噪音**，
+   * 节点行已经写明「超时」，再顶一条同样的汇总等于多此一举。所以超时档的
+   * 结论一律不展示；只保留能直接行动的结论（域名解析失败 / 不可达 / 未在内核生效）。
    */
   static groupDiagnosis(nodeNames: string[]): string {
     const summary: LatencyGroupSummary = LatencyStore.summarize(nodeNames);
     if (summary.failedCount < 2) {
+      return '';
+    }
+    if (summary.dominantKind === LatencyProbeKind.TIMEOUT) {
       return '';
     }
     return summary.conclusion;

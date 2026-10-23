@@ -100,6 +100,13 @@ const ZSTD_MAGIC: number[] = [0x28, 0xB5, 0x2F, 0xFD];
  */
 const RULE_SET_GOOD_SUFFIX = '.good';
 /**
+ * 随包内置的去广告规则集（`entry/src/main/resources/rawfile/` 下的名字）。
+ *
+ * 2026-10-23 用户口径：规则集不再作为「数据」页里的可更新资产暴露，安装包自带一份，
+ * 去广告开关打开即可用；需要更新时后台自动拉取覆盖（见 downloadRuleProviderInBackground）。
+ */
+const BUNDLED_RULE_SET_RAWFILE = 'hyper_adrules_ads.mrs';
+/**
  * geo 资产候选镜像。tag 标记来源类型，供按用户偏好（assetSource）重排：
  * jsdelivr=CDN / ghproxy=加速前缀 / github=官方直链。auto 偏好 = 保持实测可达性排序。
  */
@@ -3391,16 +3398,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // hyper-adrules(去广告) 是 type: http 的 rule-provider：本地文件缺失时内核会在
       // SsrvpnStart() 内同步联网拉取并阻塞启动协程（不返回、不报错 → 扩展 30s 静默）。
       // 与 GEOIP 同策略：文件未就绪就不声明该 provider，后台补齐后下次连接生效。
-      // 去广告开关默认关闭（见 AppSettings.hyperAdRulesEnabled）——关着时连后台下载
-      // 都省掉：既不占启动后的带宽，也不产生无意义的 GitHub 访问。
-      const adRulesOn = settings.rulesEnabled && settings.hyperAdRulesEnabled;
+      //
+      // 2026-10-23 产品口径变更：
+      //  ① 去广告是**独立开关**（只判 hyperAdRulesEnabled），不再要求「启用规则路由引擎」；
+      //  ② 规则集随安装包内置（rawfile → cacheDir/ruleset），开箱即用、不依赖首次联网；
+      //  ③ 仍未就绪时不阻塞连接：配置不带 RULE-SET，连接成功后台补一份。
+      const adRulesOn = settings.hyperAdRulesEnabled;
       const ruleProviderFileReady = this.isRuleProviderReady();
       if (adRulesOn && !ruleProviderFileReady) {
         AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
-        // 用户口径（2026-10-22）：去广告规则集与 smart 模型一样**不自动下载**，
-        // 需要用户自己到「设置 → 数据与规则」里点更新；成功后再连即生效。
-        // 理由：绝大多数用户不开去广告，自动拉 GitHub 既浪费流量又必然失败。
-        AppLogger.info(TAG, 'ruleset auto-download disabled by policy; update manually in settings');
+        this.downloadRuleProviderInBackground('auto');
       } else if (!adRulesOn) {
         AppLogger.info(TAG, 'ad-block rules disabled; skipping hyper-adrules ruleset provisioning');
       }
@@ -4301,7 +4308,72 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 只是没有去广告），而不是「带着坏文件必起不来」。
    */
   private isRuleProviderReady(): boolean {
+    // 内置规则集随包发布：首次（或文件被删/坏了）就地铺一份，去广告开箱即用，
+    // 不依赖「用户先手动点更新」也不依赖首次联网（2026-10-23 产品口径）。
+    this.seedRuleSetFromRawfile();
     return this.ruleSetFileOk();
+  }
+
+  /**
+   * 把随包内置的去广告规则集（rawfile/hyper_adrules_ads.mrs）铺到
+   * `cacheDir/ruleset/hyper_adrules_ads.mrs`。
+   *
+   * 为什么内置（2026-10-23 用户要求）：
+   *  · 规则集是去广告能力的**唯一必需品**，让它依赖一次 GitHub 下载 = 首次开开关
+   *    十有八九失败（真机实测加速代理限速严重）；
+   *  · 用户把「数据」页里的手动更新入口去掉后，更需要一个开箱即用的基线版本；
+   *  · 之后想更新仍可走后台自动拉取（`downloadRuleProviderInBackground`）。
+   *
+   * 只在「目标不存在或不合法」时才写盘；已就绪（可能是更新的版本）一律不动。
+   *
+   * @returns 目标文件当前是否可用（铺好或本来就在）
+   */
+  private seedRuleSetFromRawfile(): boolean {
+    if (this.context === null) {
+      return false;
+    }
+    if (this.ruleSetFileOk()) {
+      return true;
+    }
+    const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
+    const dst = `${dir}/${HYPER_AD_RULES_FILE}`;
+    let file: fs.File | null = null;
+    try {
+      try {
+        ensurePrivateDir(dir);
+      } catch (e) {
+        AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
+      }
+      const bytes: Uint8Array = this.context.resourceManager.getRawFileContentSync(BUNDLED_RULE_SET_RAWFILE);
+      if (bytes.byteLength < RULE_SET_MIN_BYTES) {
+        AppLogger.warn(TAG, `bundled ruleset too small (${bytes.byteLength} bytes); ignoring`);
+        return false;
+      }
+      // zstd 魔数与下载侧同一判据：坏文件比没文件更糟（内核会整份拒载）
+      const head = bytes.slice(0, ZSTD_MAGIC.length).buffer as ArrayBuffer;
+      if (!ConnectionOrchestrator.bufferMagicOk(head, ZSTD_MAGIC)) {
+        AppLogger.warn(TAG, 'bundled ruleset has wrong magic; ignoring');
+        return false;
+      }
+      file = fs.openSync(dst, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      const ab: ArrayBuffer = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
+        ? bytes.buffer as ArrayBuffer
+        : bytes.slice().buffer as ArrayBuffer;
+      fs.writeSync(file.fd, ab);
+      AppLogger.info(TAG, `ad ruleset seeded from bundle (${bytes.byteLength} bytes); ad-block ready offline`);
+      return true;
+    } catch (e) {
+      AppLogger.warn(TAG, `seed ad ruleset from bundle failed: ${AppLogger.errText(e)}`);
+      return false;
+    } finally {
+      if (file !== null) {
+        try {
+          fs.closeSync(file);
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
   }
 
   /**
@@ -4429,8 +4501,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
-   * geo 资产状态快照（设置页「数据与规则」）。就绪判定与连接路径同源：
-   * geoip/model 走魔数校验，ruleset 查体积；mtime 供「多久没更新」展示。
+   * geo 资产状态快照（设置页「数据」）。就绪判定与连接路径同源：
+   * geoip/model 走魔数校验；mtime 供「多久没更新」展示。
+   *
+   * 去广告规则集**不在这里**（2026-10-23）：它随安装包内置、开关打开即生效，
+   * 不再是需要用户手动更新/删除的独立资产 —— 用户口径「去广告规则集去掉，
+   * 默认自带这个数据」。
    */
   geoAssetStatuses(): GeoAssetStatus[] {
     const out: GeoAssetStatus[] = [];
@@ -4447,7 +4523,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     };
     const geoip = stat('geoip.metadb');
     const model = stat('Model.bin');
-    const ruleset = stat(`${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`);
     const item = (id: string, label: string, detail: string, info: number[],
       ready: boolean): GeoAssetStatus => {
       const g = new GeoAssetStatus();
@@ -4463,8 +4538,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.isGeoipReady()));
     out.push(item('model', 'Smart 选点模型', 'LightGBM 自动选点依赖（需手动更新）', model,
       this.ensureSmartModelReady()));
-    out.push(item('ruleset', '去广告规则集', 'HyperADRules MRS（需手动更新）', ruleset,
-      this.isRuleProviderReady()));
     return out;
   }
 

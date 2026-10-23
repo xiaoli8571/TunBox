@@ -604,9 +604,16 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   // 关键：老用户显式存过的 true 必须原样保留，所以兜底只能是 false，不能是 true。
   ok('adblock.legacy-choice-preserved', !settingsSrc.includes('j.hyperAdRulesEnabled === \'boolean\' ? j.hyperAdRulesEnabled : true'));
   has('adblock.rules-page-default-off', rulesSrc, 'hyperAdRulesEnabled: boolean = false');
-  // 关闭时连后台规则集下载都要省掉：省带宽，也避免无意义的 GitHub 访问。
-  has('adblock.connect-gated-by-toggle', orchSrc, 'settings.rulesEnabled && settings.hyperAdRulesEnabled');
+  // 去广告与规则引擎是**两个独立开关**（2026-10-23 用户口径）：闸门只看去广告开关本体，
+  // 不能再要求「启用规则路由引擎」也打开；但关闭时后台规则集下载仍要省掉。
+  has('adblock.connect-gated-by-toggle', orchSrc, 'const adRulesOn = settings.hyperAdRulesEnabled;');
+  ok('adblock.independent-of-rules-engine',
+    !orchSrc.includes('settings.rulesEnabled && settings.hyperAdRulesEnabled'));
   has('adblock.skip-provision-when-off', orchSrc, 'ad-block rules disabled; skipping hyper-adrules ruleset provisioning');
+  has('adblock.seed-from-bundle', orchSrc, 'seedRuleSetFromRawfile');
+  // 去广告规则集不再是「数据」页里可更新/可删除的独立资产（随包内置）
+  ok('adblock.ruleset-not-in-data-page', !orchSrc.includes("item('ruleset'"),
+    'geoAssetStatuses 仍在暴露 ruleset 资产');
 }
 
 // ── 后台保活自愈（2026-10）─────────────────────────────────────────────

@@ -500,3 +500,18 @@ verify-smart-e2e → smart 配置被内核接受 ❌  (proxy group[0]: ♻️ �
 | provider | `coveredNames` 过滤组内成员 + 补 `use:`；`planRawProviders` 新增「跨订阅重名 / 名字与原文不一致 → 回退内联」 | 订阅自带组按名引用已被 provider 覆盖的节点 ⇒ `proxy group[0]: ... not found` 整份拒载；名字不一致 ⇒ `/proxies/{name}/delay` 404 ⇒ 界面「未生效」 |
 | provider 默认值 | 回退 false（`providerOffV6` 一次性迁移） | 设备上 provider 载不出节点（桌面同文件正常），未定论前不让所有用户踩 |
 | 大订阅 | `deadlineForBatch` / `abortStreakFor` / `testGroupDetailedResult(expectedNodes)` / ≥120 节点走内核组测 | 547 节点真机 `measured=2 timeout=543` —— 四处算术/阈值把小批次的假设带进了大批次 |
+
+## 十六、2026-10-23 指纹变更说明（去广告开关独立 + provider 段并集合并）
+
+`sha256_16` 更新到 `cabba6616f9fad5d`。两批改动，都落在**配置生成侧**（规则表的第一条与
+provider 声明段），与延迟判定口径无关：
+
+| 批次 | 改动 | 为什么 |
+|---|---|---|
+| 去广告独立开关 | `generate()` 里 provider 声明与 `RULE-SET,hyper-adrules,REJECT` 的闸门由 `rulesEnabled && hyperAdRulesEnabled` 改为只判 `hyperAdRulesEnabled && ruleProviderReady` | 用户口径：去广告是独立开关，关掉「启用规则路由引擎」时它仍应生效；旧闸门会让去广告静默失效 |
+| provider 段并集 | 与 `ProfileConfigMerger` 配套：overlay 的 `rule-providers` 不再被整段替换，改为按键并集（由合并器实现，生成器侧只是不再假设「声明一定存在」） | 修「开去广告后 VPN 起不来」：引用在、声明丢 → 内核 `rule set [hyper-adrules] not found` 整份拒载 |
+
+回归：`verify-ad-rules-independence`（26 断言，含把闸门改回耦合的负对照）、
+`verify-profile-merge-providers`（8 断言 + 负对照精确复现报障）、
+`verify-config-generation-integrity`、`verify-vpn-architecture` 全绿；
+真机（MLR-AL00）去广告开启 + 1.29MB MRS 在位实测「已连接」，公网 IP 正常。

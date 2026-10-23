@@ -186,9 +186,11 @@ export struct SettingsView {
     } else if (this.settings.appRoutingMode === 'include') {
       summary = `仅所选应用 · 已选 ${this.settings.includedApps.length} 个`;
     }
-    this.adRulesSummary = this.settings.rulesEnabled
-      ? (this.settings.hyperAdRulesEnabled ? '拦截规则生效中 · HyperADRules 智能去广告' : '规则生效中')
-      : '规则已关闭';
+    // 规则引擎与去广告是**两个独立开关**（2026-10-23 用户口径）：分开写，
+    // 避免「去广告开、规则引擎关」被显示成「规则已关闭」。
+    const engine = this.settings.rulesEnabled ? '规则引擎开' : '规则引擎关';
+    const ad = this.settings.hyperAdRulesEnabled ? '去广告开' : '去广告关';
+    this.adRulesSummary = `${engine} · ${ad}`;
     this.appRoutingSummary = this.settings.appRoutingNeedsReview
       ? summary + ' · 待确认，请进入检查' : summary;
   }
@@ -310,11 +312,10 @@ export struct SettingsView {
 
   private geoStatusText(asset: GeoAssetStatus): string {
     if (!asset.ready) {
-      // 用户口径（2026-10-22）：Smart 选点模型不再随连接后台补齐，必须用户手动更新；
-      // 其余资产（GeoIP / 规则集）仍会在连接成功后自动补齐。
-      // 模型与去广告规则集都必须手动更新；只有 GeoIP 会在连接后台自动补齐
-      return (asset.id === 'model' || asset.id === 'ruleset')
-        ? '未就绪（需要手动更新）' : '未就绪（连接后自动补齐）';
+      // 用户口径（2026-10-22）：Smart 选点模型不随连接后台补齐，必须用户手动更新；
+      // GeoIP 仍会在连接成功后自动补齐。
+      // （去广告规则集已随包内置，不再是本页的资产，见 2026-10-23 口径。）
+      return asset.id === 'model' ? '未就绪（需要手动更新）' : '未就绪（连接后自动补齐）';
     }
     let age = '';
     if (asset.mtimeMs > 0) {
@@ -324,14 +325,14 @@ export struct SettingsView {
     return `就绪 · ${formatGeoSize(asset.sizeBytes)} · ${age}`;
   }
 
-  /** 只有 Smart 模型与去广告规则集允许删除（GeoIP/GeoSite 删了内核会起不来） */
+  /** 只有 Smart 模型允许删除（GeoIP/GeoSite 删了内核会起不来） */
   private canDeleteAsset(id: string): boolean {
-    return id === 'model' || id === 'ruleset';
+    return id === 'model';
   }
 
   /**
-   * 删除资产。规则集删除后**自动重启代理**（内核要用不含 RULE-SET 的新配置）；
-   * 模型删除后订阅页的「自动选择」入口会自动隐藏（走 smart_model_seq 信号）。
+   * 删除资产（目前只剩 Smart 选点模型）：删除后订阅页的「自动选择」入口会自动隐藏
+   * （走 smart_model_seq 信号）。去广告规则集已随包内置，不再提供删除入口。
    */
   private async deleteAsset(id: string): Promise<void> {
     const err = this.orchestrator.deleteGeoAsset(id);
@@ -340,12 +341,7 @@ export struct SettingsView {
       return;
     }
     this.refreshGeoStatuses();
-    if (id === 'ruleset') {
-      promptAction.showToast({ message: '已删除去广告规则集，正在重启代理…' });
-      await this.orchestrator.restartIfConnected('ruleset-deleted');
-    } else {
-      promptAction.showToast({ message: '已删除选点模型，自动选择入口已隐藏' });
-    }
+    promptAction.showToast({ message: '已删除选点模型，自动选择入口已隐藏' });
   }
 
   private async updateAsset(id: string): Promise<void> {
@@ -499,7 +495,7 @@ export struct SettingsView {
                 .width(28).height(28).borderRadius(8)
                 .backgroundColor(TunBoxColors.primaryLight)
                 .justifyContent(FlexAlign.Center)
-                Text('广告拦截规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Text('路由与规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)
@@ -670,8 +666,8 @@ export struct SettingsView {
                 Column({ space: 3 }) {
                   Text('订阅转换').fontSize(14).fontWeight(FontWeight.Bold)
                     .fontColor(TunBoxColors.textPrimary).width('100%')
-                  Text('粘贴分享链接（单条 / 一行一条 / 整体 base64），转换成 mihomo 配置并导出为 YAML 文件；'
-                    + '保存位置由你选择，内容不会上传。')
+                  Text('粘贴分享链接（单条 / 一行一条 / 整体 base64），转换成 mihomo 配置；'
+                    + '可「保存到本地」留档，或「一键导入」直接进订阅列表。内容不会上传。')
                     .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
                 }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                 Text('打开').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.primary)
@@ -843,6 +839,9 @@ struct SubConvertDialog {
   /** 转换成功后的提示（节点数 / 保存位置） */
   @State summary: string = '';
   @State errorText: string = '';
+  /** 最近一次转换结果（两个动作共用，避免重复请求订阅链接） */
+  private pendingYaml: string = '';
+  private pendingCount: number = 0;
 
   /**
    * 输入解析：既可以是**订阅链接**（http/https，拉下来再转），也可以是
@@ -866,8 +865,54 @@ struct SubConvertDialog {
     return fetched.body;
   }
 
-  /** 转换 → 系统文件选择器保存 → 写盘（用户取消就什么都不做） */
-  private async convertAndSave(): Promise<void> {
+  /** 文件名时间戳（本地时区，分钟精度：同一分钟内重复转换不覆盖上一个动作的语义） */
+  private stampName(): string {
+    const stat = new Date();
+    return `${stat.getFullYear()}${String(stat.getMonth() + 1).padStart(2, '0')}`
+      + `${String(stat.getDate()).padStart(2, '0')}-${String(stat.getHours()).padStart(2, '0')}`
+      + `${String(stat.getMinutes()).padStart(2, '0')}`;
+  }
+
+  /**
+   * 只做「解析 + 转换」，把结果放进 pendingYaml/pendingCount。
+   *
+   * 拆出来是为了「保存到本地」和「一键导入」共用同一份转换结果：
+   * 订阅链接只需拉一次，用户先点导入不满意还能接着存文件。
+   *
+   * @returns 成功返回 true；失败/空内容返回 false（errorText 已写）
+   */
+  private async prepareConverted(): Promise<boolean> {
+    try {
+      const body = await this.resolveSource();
+      if (body.trim().length === 0) {
+        this.errorText = '没有拿到内容：请检查订阅链接是否可用，或直接粘贴分享链接';
+        return false;
+      }
+      // 已经是 Clash 配置：原样保留（不重新序列化，字段一个不丢）
+      if (ProfileConfigMerger.isKernelLoadableConfig(body)) {
+        const merged = ProfileConfigMerger.merge('a: 1', body);
+        this.pendingYaml = body;
+        this.pendingCount = merged.profileProxyItems;
+        return true;
+      }
+      // 非 Clash（base64 / 分享链接列表）→ 与订阅解析同一条转换实现
+      const converted = SubConverter.convert(body);
+      if (!converted.ok) {
+        this.errorText = '无法识别内容：既不是 Clash 配置，也解析不出节点链接';
+        return false;
+      }
+      this.pendingYaml = converted.proxiesYaml;
+      this.pendingCount = converted.count;
+      return true;
+    } catch (e) {
+      this.errorText = '转换失败，请重试';
+      AppLogger.warn('SubConvertDialog', `convert failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
+  }
+
+  /** 动作①：转换 → 系统文件选择器保存（用户取消就什么都不做） */
+  private async saveToFile(): Promise<void> {
     if (this.busy) {
       return;
     }
@@ -875,35 +920,14 @@ struct SubConvertDialog {
     this.errorText = '';
     this.summary = '';
     try {
-      const body = await this.resolveSource();
-      if (body.trim().length === 0) {
-        this.errorText = '没有拿到内容：请检查订阅链接是否可用，或直接粘贴分享链接';
+      if (!(await this.prepareConverted())) {
         return;
       }
-      // 已经是 Clash 配置：原样导出（不重新序列化，字段一个不丢）
-      let yaml = body;
-      let count = 0;
-      let skipped = 0;
-      if (!ProfileConfigMerger.isKernelLoadableConfig(body)) {
-        // 非 Clash（base64 / 分享链接列表）→ 与订阅解析同一条转换实现
-        const converted = SubConverter.convert(body);
-        if (!converted.ok) {
-          this.errorText = '无法识别内容：既不是 Clash 配置，也解析不出节点链接';
-          return;
-        }
-        yaml = converted.proxiesYaml;
-        count = converted.count;
-      } else {
-        const merged = ProfileConfigMerger.merge('a: 1', body);
-        count = merged.profileProxyItems;
-      }
-      const stat = new Date();
-      const stamp = `${stat.getFullYear()}${String(stat.getMonth() + 1).padStart(2, '0')}`
-        + `${String(stat.getDate()).padStart(2, '0')}-${String(stat.getHours()).padStart(2, '0')}`
-        + `${String(stat.getMinutes()).padStart(2, '0')}`;
+      const yaml = this.pendingYaml;
+      const count = this.pendingCount;
       const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
       const opts = new picker.DocumentSaveOptions();
-      opts.newFileNames = [`TunBox订阅-${stamp}.yaml`];
+      opts.newFileNames = [`TunBox订阅-${this.stampName()}.yaml`];
       opts.fileSuffixChoices = ['YAML 文件|.yaml'];
       const uris = await docPicker.save(opts);
       if (uris.length === 0) {
@@ -921,8 +945,46 @@ struct SubConvertDialog {
       this.summary = `✓ 已保存 ${count} 个节点到 ${savedName}`;
       AppLogger.info('SubConvertDialog', `converted yaml saved: nodes=${count} uri=${uris[0]}`);
     } catch (e) {
-      this.errorText = '转换失败，请重试';
-      AppLogger.warn('SubConvertDialog', `convert/save failed: ${AppLogger.errText(e)}`);
+      this.errorText = '保存失败，请重试';
+      AppLogger.warn('SubConvertDialog', `save failed: ${AppLogger.errText(e)}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /**
+   * 动作②：转换 → **一键导入 TunBox**（落成一条本地订阅，不用绕文件选择器）。
+   *
+   * 走的是与「+ → 文件」完全相同的入库链路（`SubscriptionService.addLocalYaml`）：
+   * profile 原文落盘、凭据封存、规则/DNS 段落账、节点集变化通知 —— 一条都不少，
+   * 只是省掉了「先存到文件、再去订阅页找文件」的两步。
+   */
+  private async importToTunBox(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
+    this.busy = true;
+    this.errorText = '';
+    this.summary = '';
+    try {
+      if (!(await this.prepareConverted())) {
+        return;
+      }
+      const service = SubscriptionService.instance();
+      await service.init(getContext(this) as Context);
+      const fileName = `TunBox转换-${this.stampName()}.yaml`;
+      const count = await service.addLocalYaml(fileName, this.pendingYaml);
+      if (count <= 0) {
+        this.errorText = '转换出来的内容里没有可用节点（已过滤不支持的协议）';
+        return;
+      }
+      this.summary = `✓ 已导入 ${count} 个节点，到「订阅」页即可看到「本地:${fileName.replace(/\.yaml$/, '')}」`;
+      AppLogger.info('SubConvertDialog', `converted yaml imported: nodes=${count} file=${fileName}`);
+    } catch (e) {
+      const msg = AppLogger.errText(e);
+      this.errorText = msg.indexOf('请提供 YAML') >= 0
+        ? '转换结果不是可用的 Clash 配置，请检查内容' : '导入失败，请重试';
+      AppLogger.warn('SubConvertDialog', `import failed: ${AppLogger.errText(e)}`);
     } finally {
       this.busy = false;
     }
@@ -932,8 +994,8 @@ struct SubConvertDialog {
     Column({ space: 10 }) {
       Text('订阅转换').fontSize(16).fontWeight(FontWeight.Bold)
         .fontColor(TunBoxColors.textPrimary).width('100%')
-      Text('粘贴订阅链接（非 Clash 的 v2ray/base64 订阅也可以），或直接粘贴分享链接（一行一条、整体 base64 都行）；'
-        + '转换完弹保存位置，由你决定存在哪（不上传任何内容）。')
+      Text('粘贴订阅链接（非 Clash 的 v2ray/base64 订阅也可以），或直接粘贴分享链接（一行一条、整体 base64 都行）。'
+        + '转完可以「保存到本地」留档，也可以「一键导入」直接进订阅列表（全程本地处理，不上传任何内容）。')
         .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
       TextArea({ placeholder: 'https://… 订阅链接，或 vless://… / ss://…（一行一条）、整段 base64', text: this.input })
         .onChange((v: string): void => { this.input = v; })
@@ -955,9 +1017,13 @@ struct SubConvertDialog {
               this.controller.close();
             }
           })
-        Button(this.busy ? '转换中…' : '转换并保存').layoutWeight(1).borderRadius(8)
+        Button(this.busy ? '处理中…' : '保存到本地').layoutWeight(1).borderRadius(8)
+          .backgroundColor(TunBoxColors.surfaceSubtle).fontColor(TunBoxColors.primary).fontSize(13)
+          .border({ width: 1, color: TunBoxColors.primaryBorder })
+          .onClick(() => { this.saveToFile(); })
+        Button(this.busy ? '处理中…' : '一键导入').layoutWeight(1).borderRadius(8)
           .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
-          .onClick(() => { this.convertAndSave(); })
+          .onClick(() => { this.importToTunBox(); })
       }.width('100%').margin({ top: 2 })
     }
     .padding(20)
