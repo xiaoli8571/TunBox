@@ -18,7 +18,7 @@
     { "name": "notification_reason", "value": "显示 VPN 连接状态与流量速率" },
     { "name": "shortcut_start_vpn", "value": "启动代理" },
     { "name": "settings_geo_title", "value": "数据" },
-    { "name": "settings_appearance_network", "value": "外观与网络" },
+    { "name": "settings_system_title", "value": "系统" },
     {"name": "settings_background_connection", "value": "后台连接"}
   ]
 }

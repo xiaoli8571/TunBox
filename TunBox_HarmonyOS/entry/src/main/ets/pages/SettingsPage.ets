@@ -46,15 +46,6 @@ import { picker, fileIo as fs } from '@kit.CoreFileKit';
  */
 /** 内容列最大宽度（与原 UiTokens.pageMaxWidth 取值一致，平板/折叠屏防过宽） */
 
-/** geo 资产下载源偏好选项（与 AppSettings.assetSource 白名单一致） */
-const ASSET_SOURCE_OPTIONS: string[] = ['auto', 'jsdelivr', 'ghproxy', 'github'];
-const ASSET_SOURCE_LABELS: Record<string, string> = {
-  'auto': '默认',
-  'jsdelivr': 'CDN',
-  'ghproxy': '加速',
-  'github': '官方'
-};
-
 function formatGeoSize(bytes: number): string {
   if (bytes <= 0) {
     return '-';
@@ -88,7 +79,6 @@ export struct SettingsView {
   @State geoAssets: GeoAssetStatus[] = [];
   @State assetSource: string = 'auto';
   @State geoUpdatingId: string = '';
-  @State quotaNotifyEnabled: boolean = true;
   @State audioKeepAliveEnabled: boolean = false;
   // ── 网络（IPv6 双栈，产品默认开）──
   @State ipv6Enabled: boolean = true;
@@ -142,7 +132,6 @@ export struct SettingsView {
     this.refreshAppRoutingSummary();
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
-    this.quotaNotifyEnabled = this.settings.quotaNotifyEnabled;
     this.audioKeepAliveEnabled = this.settings.audioKeepAliveEnabled;
     this.ipv6Enabled = this.settings.ipv6Enabled;
     this.allowInsecureSubscriptionHttp = this.settings.allowInsecureSubscriptionHttp;
@@ -227,19 +216,7 @@ export struct SettingsView {
     this.switchTo = this.orchestrator.lastFailoverToName();
   }
 
-  /** 订阅配额提醒开关 */
-  private setQuotaNotify(v: boolean): void {
-    this.quotaNotifyEnabled = v;
-    this.settings.quotaNotifyEnabled = v;
-    // 字段级写：只改这一个字段（整单覆盖会把别的写者刚写的值盖回旧值）
-    SettingsService.patchSettings((s: AppSettings): void => {
-      s.quotaNotifyEnabled = v;
-    }).then((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
-    }).catch((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
-    });
-  }
+
 
   private setAudioKeepAlive(v: boolean): void {
     const previous = this.audioKeepAliveEnabled;
@@ -395,21 +372,6 @@ export struct SettingsView {
     }
   }
 
-  private setAssetSource(source: string): void {
-    if (this.assetSource === source) {
-      return;
-    }
-    this.assetSource = source;
-    this.settings.assetSource = source;
-    // 字段级写：只改这一个字段
-    SettingsService.patchSettings((s: AppSettings): void => {
-      s.assetSource = source;
-    }).then((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_saved_toast') });
-    }).catch((): void => {
-      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
-    });
-  }
 
   // ── 测速地址（前台批 / 后台批 / 生成器 smart 组共用同一真源）──
 
@@ -472,6 +434,36 @@ export struct SettingsView {
 
         Scroll() {
           Column({ space: 14 }) {
+            // ── 订阅转换（2026-10-22 用户要求：非 Clash 订阅 → mihomo 订阅）──
+            // 2026-10-23：补图标（ic_swap）—— 设置页所有卡片统一「图标 + 标题」抬头，
+            // 之前这张卡只有文字，跟下面几张一比就漏了。
+            Column({ space: 8 }) {
+              Row({ space: 10 }) {
+                Row() {
+                  Image($r('app.media.ic_swap'))
+                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLight)
+                .justifyContent(FlexAlign.Center)
+                Column({ space: 3 }) {
+                  Text('订阅转换').fontSize(15).fontWeight(FontWeight.Bold)
+                    .fontColor(TunBoxColors.textPrimary).width('100%')
+                  Text('分享链接转成 mihomo 配置，可保存到本地或一键导入订阅列表。')
+                    .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                Text('打开').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.primary)
+                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                  .borderRadius(12)
+                  .backgroundColor(TunBoxColors.primaryLight)
+                  .onClick(() => { this.subConvertDialog.open(); })
+              }.width('100%').alignItems(VerticalAlign.Center)
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard)
+            .border({ width: 1, color: TunBoxColors.cardBorder })
+
             // ── 应用分流：进入统一页面，不在设置页维护第二份编辑状态 ──
             Column({ space: 6 }) {
               Row({ space: 8 }) {
@@ -500,7 +492,7 @@ export struct SettingsView {
             Column({ space: 6 }) {
               Row({ space: 8 }) {
                 Row() {
-                  Image($r('app.media.ic_swap'))
+                  Image($r('app.media.ic_route'))
                     .width(16).height(16).fillColor(TunBoxColors.primary)
                 }
                 .width(28).height(28).borderRadius(8)
@@ -544,23 +536,11 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => { this.openRulesPage(); })
 
-            // ── 外观与网络（2026-10-23 用户要求「更简洁」：三张卡合成一张）──
-            // 主题跟随系统 / IPv6 双栈 / 测速地址，都是「一次性设定、平时不碰」的项目，
-            // 合成一张卡后设置页少两次视觉跳档；每条之间用 Divider 分隔，说明各压到一行。
+            // ── 系统（2026-10-23 用户口径：原「外观与网络」改名「系统」，音频保活并进来）──
+            // 卡片里放「一次性设定、平时不碰」的项目：IPv6、测速地址、明文 HTTP、音频保活。
+            // 主题跟随系统已移到「关于与隐私」卡（用户要求夹在版本与隐私政策之间）。
             Column({ space: 10 }) {
-              this.SectionHeader($r('app.media.ic_globe'), $r('app.string.settings_appearance_network'))
-
-              Row() {
-                Text('主题跟随系统')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-                Toggle({ type: ToggleType.Switch, isOn: this.themeMode === AppThemeMode.SYSTEM })
-                  .selectedColor(TunBoxColors.primary)
-                  .onChange((v: boolean): void => this.setFollowSystemTheme(v))
-              }.width('100%').alignItems(VerticalAlign.Center)
-              Text('关闭后由主页太阳按钮手动切换深浅色。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-
-              Divider().color(TunBoxColors.cardBorder)
+              this.SectionHeader($r('app.media.ic_settings'), $r('app.string.settings_system_title'))
 
               Row() {
                 Text('IPv6 双栈')
@@ -574,7 +554,25 @@ export struct SettingsView {
 
               Divider().color(TunBoxColors.cardBorder)
 
-              Text('测速地址').fontSize(14).fontColor(TunBoxColors.textPrimary).width('100%')
+              // 2026-10-23 用户口径：「保存 / 恢复」不独占一行，收到「测速地址」标题行右侧
+              // （行内小按钮，跟 IPv6、明文 HTTP 的开关行同一节奏）；「恢复默认」简称「恢复」。
+              Row({ space: 8 }) {
+                Text('测速地址').fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Text('恢复')
+                  .fontSize(13).fontWeight(FontWeight.Medium)
+                  .fontColor(TunBoxColors.textSecondary)
+                  .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+                  .borderRadius(10)
+                  .backgroundColor(TunBoxColors.surfaceSubtle)
+                  .onClick((): void => { this.resetTestUrl(); })
+                Text('保存')
+                  .fontSize(13).fontWeight(FontWeight.Bold)
+                  .fontColor(this.testUrlError.length > 0 ? TunBoxColors.textMuted : TunBoxColors.primary)
+                  .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+                  .borderRadius(10)
+                  .backgroundColor(TunBoxColors.primaryLight)
+                  .onClick((): void => { this.saveTestUrl(); })
+              }.width('100%').alignItems(VerticalAlign.Center)
               TextInput({ text: this.testLatencyUrl, placeholder: LatencyTestUrl.DEFAULT_URL })
                 .height(40)
                 .fontSize(13)
@@ -591,32 +589,24 @@ export struct SettingsView {
                 Text('留空＝默认 HTTPS 地址；自填 http 会原样使用。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }
-              Row({ space: 8 }) {
-                Text('保存')
-                  .fontSize(13).fontWeight(FontWeight.Bold)
-                  .fontColor(this.testUrlError.length > 0 ? TunBoxColors.textMuted : TunBoxColors.primary)
-                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                  .borderRadius(12)
-                  .backgroundColor(TunBoxColors.surfaceCard)
-                  .border({ width: 1, color: TunBoxColors.cardBorder })
-                  .onClick((): void => { this.saveTestUrl(); })
-                Text('恢复默认')
-                  .fontSize(13).fontWeight(FontWeight.Bold)
-                  .fontColor(TunBoxColors.textSecondary)
-                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                  .borderRadius(12)
-                  .backgroundColor(TunBoxColors.surfaceCard)
-                  .border({ width: 1, color: TunBoxColors.cardBorder })
-                  .onClick((): void => { this.resetTestUrl(); })
-              }.width('100%')
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
 
-Column({ space: 12 }) {
-              this.SectionHeader($r('app.media.ic_shield'), $r('app.string.settings_background_connection'))
+              // 2026-10-23 用户口径：明文 HTTP 订阅从「诊断」挪到这里（测速地址下面），
+              // 都属于「网络请求怎么发」这一类，跟主题/IPv6 放一张卡里更好找。
+              Divider().color(TunBoxColors.cardBorder)
+
+              Row() {
+                Text('允许明文 HTTP 订阅')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.allowInsecureSubscriptionHttp })
+                  .selectedColor(TunBoxColors.primary)
+                  .onChange((v: boolean): void => this.setAllowInsecureSubscriptionHttp(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('默认关闭；明文 http 不加密、可被篡改，仅自建面板无证书时临时开启。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+
+              // 音频保活（原「后台连接」卡，2026-10-23 用户要求并入「系统」）
+              Divider().color(TunBoxColors.cardBorder)
+
               Row() {
                 Text('音频保活（下次连接）')
                   .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
@@ -632,60 +622,6 @@ Column({ space: 12 }) {
             .backgroundColor(TunBoxColors.surfaceCard)
             .border({ width: 1, color: TunBoxColors.cardBorder })
 
-            // ── 诊断（保留订阅配额提醒）──
-            Column({ space: 12 }) {
-              this.SectionHeader($r('app.media.ic_shield'), $r('app.string.settings_diagnostics_title'))
-              Divider().color(TunBoxColors.cardBorder)
-              Column({ space: 4 }) {
-                Row() {
-                  Text('订阅配额提醒')
-                    .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-                  Toggle({ type: ToggleType.Switch, isOn: this.quotaNotifyEnabled })
-                    .selectedColor(TunBoxColors.primary)
-                    .onChange((v: boolean): void => this.setQuotaNotify(v))
-                }.width('100%').alignItems(VerticalAlign.Center)
-                Text('剩余 <10% 或 3 天内到期时通知，每天最多一次。')
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              }.width('100%')
-              Divider().color(TunBoxColors.cardBorder)
-              Column({ space: 4 }) {
-                Row() {
-                  Text('允许明文 HTTP 订阅')
-                    .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-                  Toggle({ type: ToggleType.Switch, isOn: this.allowInsecureSubscriptionHttp })
-                    .selectedColor(TunBoxColors.primary)
-                    .onChange((v: boolean): void => this.setAllowInsecureSubscriptionHttp(v))
-                }.width('100%').alignItems(VerticalAlign.Center)
-                Text('默认关闭；明文 http 不加密、可被篡改，仅自建面板无证书时临时开启。')
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              }.width('100%')
-              Divider().color(TunBoxColors.cardBorder)
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
-
-            // ── 订阅转换（2026-10-22 用户要求：非 Clash 订阅 → mihomo 订阅）──
-            Column({ space: 8 }) {
-              Row() {
-                Column({ space: 3 }) {
-                  Text('订阅转换').fontSize(14).fontWeight(FontWeight.Bold)
-                    .fontColor(TunBoxColors.textPrimary).width('100%')
-                  Text('分享链接转成 mihomo 配置，可保存到本地或一键导入订阅列表。')
-                    .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-                }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-                Text('打开').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.primary)
-                  .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                  .borderRadius(12)
-                  .backgroundColor(TunBoxColors.primaryLight)
-                  .onClick(() => { this.subConvertDialog.open(); })
-              }.width('100%').alignItems(VerticalAlign.Center)
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
 
             // ── 数据与规则 ──
             Column({ space: 12 }) {
@@ -739,30 +675,6 @@ Column({ space: 12 }) {
                 .backgroundColor(TunBoxColors.surfaceSubtle)
               }, (asset: GeoAssetStatus) => `${asset.id}-${asset.ready}-${asset.sizeBytes}`)
 
-              Column({ space: 8 }) {
-                Text('下载源偏好')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).width('100%')
-                Row({ space: 8 }) {
-                  ForEach(ASSET_SOURCE_OPTIONS, (src: string) => {
-                    Text(ASSET_SOURCE_LABELS[src] ?? src)
-                      .fontSize(13)
-                      .fontWeight(this.assetSource === src ? FontWeight.Bold : FontWeight.Normal)
-                      .fontColor(this.assetSource === src ? TunBoxColors.primary : TunBoxColors.textSecondary)
-                      .layoutWeight(1)
-                      .textAlign(TextAlign.Center)
-                      .padding({ top: 7, bottom: 7 })
-                      .borderRadius(12)
-                      .backgroundColor(this.assetSource === src ? TunBoxColors.primaryLight : TunBoxColors.surfaceSubtle)
-                      .border({
-                        width: 1,
-                        color: this.assetSource === src ? TunBoxColors.primaryBorder : TunBoxColors.cardBorder
-                      })
-                      .onClick(() => this.setAssetSource(src))
-                  }, (src: string) => src)
-                }.width('100%')
-                Text('默认按实测可达性排序；CDN=jsdelivr 优先，加速=gh-proxy 前缀优先，官方=GitHub 直链优先。偏好源失败仍自动回退其余源。')
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              }.width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -778,6 +690,17 @@ Column({ space: 12 }) {
                 Text(AppInfo.version())
                   .fontSize(13).fontColor(TunBoxColors.textSecondary)
               }.width('100%')
+              Divider().color(TunBoxColors.cardBorder)
+              // 2026-10-23 用户口径：主题跟随系统放在「版本」和「隐私政策」中间
+              Row() {
+                Text('主题跟随系统')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.themeMode === AppThemeMode.SYSTEM })
+                  .selectedColor(TunBoxColors.primary)
+                  .onChange((v: boolean): void => this.setFollowSystemTheme(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('关闭后由主页太阳按钮手动切换深浅色。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               Divider().color(TunBoxColors.cardBorder)
               Row() {
                 Text($r('app.string.settings_privacy_policy_row'))

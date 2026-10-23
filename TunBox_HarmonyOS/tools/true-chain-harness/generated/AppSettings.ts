@@ -537,7 +537,10 @@ export class AppSettings {
     // 只有显式 false 才关闭 —— 与「默认开」的产品口径一致。
     // DNS 接管已无开关（恒开），老配置里残留的 dnsOverrideEnabled 直接忽略。
     s.ipv6Enabled = j.ipv6Enabled === false ? false : true;
-    s.quotaNotifyEnabled = j.quotaNotifyEnabled === false ? false : true;
+    // 2026-10-23 用户口径：配额提醒恒开（设置页已去掉这个开关，默认就是开）。
+    // 旧配置里存过 false 的也一律置 true —— 否则升级后「开关没了却也不提醒」，
+    // 等于悄悄把功能弄丢。
+    s.quotaNotifyEnabled = true;
     s.audioKeepAliveEnabled = j.audioKeepAliveEnabled === true;
     const source = typeof j.assetSource === 'string' ? j.assetSource.trim().toLowerCase() : '';
     s.assetSource = (source === 'jsdelivr' || source === 'ghproxy' || source === 'github')
