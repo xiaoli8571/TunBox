@@ -22,6 +22,7 @@ import { ClashApiService } from '../services/ClashApiService';
 import { AppLogger } from '../utils/AppLogger';
 import { LatencyRecord, LatencyState, LatencyChannel } from '../services/LatencyState';
 import { LatencyLiveView } from '../services/LatencyLiveView';
+import { LatencyProbeKind } from '../latency/LatencyKinds';
 import {
   DelayResult, DelayTarget, FlclashDelayRun, FlclashDelaySummary,
   FLCLASH_DELAY_TIMED_OUT, FLCLASH_DELAY_FAILED, FLCLASH_DELAY_URL, delayTestKey
@@ -84,11 +85,22 @@ export class FlclashLatencySession {
 
   private apply(result: DelayResult): void {
     const now = Date.now();
+    // 【2026-10-22 真机 bug 修复】失败分类必须是 `LatencyProbeKind` 里的**真分类**：
+    // 旧实现写的是字面量 `'failed'`，而 `LatencyStore.describe()` 只认表内分类
+    // （timeout / network_unreachable / switch_failed / …），认不出就走 `else → '--'`。
+    // 真机表现就是「20 个节点测完，13 个失败的全部显示 --，不是超时/拨号失败」。
+    let failKind: string = LatencyProbeKind.TIMEOUT;
+    if (result.value !== FLCLASH_DELAY_TIMED_OUT) {
+      // 404 = 内核里没有这个节点（名字对不上/没进配置）→「未生效」，不是节点坏；
+      // 503/400/200-但-delay<=0 = 内核拨过但没拨通 →「拨号失败」。
+      failKind = result.httpCode === 404
+        ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.NETWORK_UNREACHABLE;
+    }
     const rec: LatencyRecord = result.value > 0
       ? LatencyRecord.measured(result.proxyName, result.value, LatencyChannel.CORE, now)
       : LatencyRecord.failed(result.proxyName,
         result.value === FLCLASH_DELAY_TIMED_OUT ? LatencyState.TIMEOUT : LatencyState.FAILED,
-        now, LatencyChannel.CORE, result.value === FLCLASH_DELAY_TIMED_OUT ? 'timeout' : 'failed');
+        now, LatencyChannel.CORE, failKind);
     rec.source = this.source;
     LatencyLiveView.setRecord(rec);
     this.progress.started = this.progress.started + 1;

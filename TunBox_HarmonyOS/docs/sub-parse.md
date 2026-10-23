@@ -9,6 +9,36 @@
 >
 > 闸门跑法：`node scripts/verify-sub-parse-fidelity.mjs` ／ 负对照 `node scripts/verify-sub-parse-fidelity.mjs --self-test`
 
+> ## ⚠ 2026-10-22 口径变更（FlClash 同构）：YAML 订阅不再有「定义不完整」
+>
+> 真机实证：`ermaozi` 订阅里 `47.238.210.5:13779` 同时挂了两条不同节点
+> （裸 vless `tls:false` + 同址 REALITY vless）。App 侧的 reality 旁挂表按
+> `server|port` 记账 ⇒ 两条互相串台 ⇒ 那条**内核完全能用**的节点被判
+> 「定义不完整：vless 缺少必填参数 reality-public-key」，整条踢出列表。
+>
+> 根因不是这一个地址，而是**架构上多了一份裁判**：订阅原文本来就整份进内核配置
+> （`RuntimeConfigBuilder` → `ProfileConfigMerger`，`proxies` 段由原文接管），
+> 内核自己解析、自己裁决；App 再给一份「定义完整/不完整」的结论 = 第二意见，
+> 必然与内核分叉。FlClash 从不产生这种分叉：它**不解析**订阅的 `proxies`
+> （`lib/models/core.dart` 的 `Proxy` 只有 name/type/now），节点列表来自内核
+> `getProxiesGroups`（Go 侧 `tunnel.AllProxies()`），字段级判断一律交回内核
+> `adapter.ParseProxy` 拿错误字符串。
+>
+> 因此从 2026-10-22 起：
+> - **YAML 订阅路径**：`YamlNodeAdapter.plan()` 只做映射与对账，**不再判可用性**；
+>   `mergedToNodes()` **全部保留**节点，不写「定义不完整」台账；
+>   订阅卡片与展开区的「N 条定义不完整 / N 条信息条目已跳过」角标与说明**删除**。
+> - **节点的可不可用只由内核决定**：`/proxies`（`CoreCatalogService`）里有没有、
+>   配置载入是否成功；测速目标同样来自内核目录。
+> - **单链接导入路径**（`UriNodeParser`）不受影响：那份链接只有 App 自己解析，
+>   没有"内核另有一份原文"可对照，缺参仍按整条 ParseError 处理（且无 UI 判词）。
+>
+> 下文第 4bis / 4ter 两节保留为**历史口径**（描述单链接路径与旧 YAML 判词），
+> 阅读时以本节的变更说明为准。
+>
+> 完整逐环节对照（含拉取层：UA / 超时 / gzip 解压 / Basic 鉴权 / `content-disposition`
+> 命名 / 计数口径 / 单链接 / 校验）见 [`docs/flclash-subscription-parity.md`](flclash-subscription-parity.md)。
+
 ---
 
 ## 0. 为什么要重做（事故背景）

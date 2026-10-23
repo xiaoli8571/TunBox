@@ -374,6 +374,20 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   has('orch.smart.seed-first', orchSrc,
     'this.seedSmartModelFromRawfile() || this.isSmartModelReady()');
   has('orch.smart.background-download', orchSrc, 'downloadSmartModelInBackground(source');
+  // ── 2026-10-22 真机回归：订阅页「自动选择」入口必须跟着模型文件实时显隐 ──────
+  // 旧实现：build 里直接调 isSmartModelAvailable()（方法调用，不读任何状态）⇒
+  // ArkUI 不把这个分支登记成依赖，用户在设置里删掉 Model.bin、回到订阅页，
+  // 卡片还挂着（用户实锤「我删了，没有隐藏」）。现在 seq 变化 ⇒ @Watch 重算 @State。
+  {
+    const subPageSrc = readFileSync(join(etsRoot, 'pages', 'SubscriptionPage.ets'), 'utf8');
+    has('sub.smart.seq-watch', subPageSrc, "@Watch('onSmartModelSeq')");
+    has('sub.smart.guard-reads-state', subPageSrc, 'return this.smartModelReady;');
+    has('sub.smart.state-recomputed', subPageSrc,
+      'this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();');
+    // 删除与下载成功都必须 bump 信号（只删不装 / 只装不删 都会让入口状态停在旧值）
+    const seqBumps = orchSrc.match(/setOrCreate<number>\('smart_model_seq'/g) ?? [];
+    ok('orch.smart.mutations-bump-seq', seqBumps.length >= 2, `${seqBumps.length} 处`);
+  }
   // 模型准备必须与 autoSelectMode 解耦：默认就是 manual，只在 auto 下准备
   // 会让用户切到 auto 后还要再多等一轮连接
   has('orch.smart.prep-any-mode', orchSrc, 'if (!smartReady) {');

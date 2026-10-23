@@ -18,8 +18,11 @@
  * 2. mihomoField → **规范键**：用参数表反查（`ProtocolParamTable` 里每个声明都带
  *    `mihomoField`），所以**两条导入路径共用同一张表、同一套必填口径**，
  *    不会出现"YAML 路径认 uuid、URI 路径认 id"这种两套真源。
- * 3. 规范键 → `NodeUsability.assess()`：**缺必填 ⇒ 整条 unusable + 原因**，
- *    绝不半条节点（半条节点进内核代理表 = 批量制造 mihomo 503）。
+ * 3. 规范键 → 只做**映射视图**（凭据/诊断用）。**不再**调用
+ *    `NodeUsability.assess()` 去判「定义不完整」——
+ *    2026-10-22 FlClash 同构：节点可用性只有内核有话语权（订阅原文进内核配置，
+ *    见 `ProfileConfigMerger`），App 侧的第二意见会与内核分叉（真机实证：
+ *    同 `server:port` 的两条节点互相串台 ⇒ 一条正常节点被误判踢出）。
  *
  * ## REALITY 的判定差异（两条路径的表达不同，但语义必须一致）
  *
@@ -39,7 +42,6 @@
  */
 import { MergedProxy, YamlMerger } from './YamlMerger.ts';
 import { ProtocolParamTable, ProtocolParamTableRegistry } from './ProtocolParamTable.ts';
-import { NodeAvailability, NodeUsability } from './NodeUsability.ts';
 
 /** 一个 YAML 节点的规范键视图 */
 export class YamlNodeCanonical {
@@ -47,8 +49,6 @@ export class YamlNodeCanonical {
   params: Map<string, string> = new Map<string, string>();
   /** 参数表未声明、但原文里有的 mihomo 字段（mihomoField → 值）：不丢，只是没有规范键 */
   extras: Map<string, string> = new Map<string, string>();
-  /** 可用性结论（定义层） */
-  availability: NodeAvailability = new NodeAvailability();
 }
 
 export class YamlNodeAdapter {
@@ -57,17 +57,13 @@ export class YamlNodeAdapter {
    *
    * @param merged 合并引擎产出的节点
    * @param realityDeclared 该节点是否**在原文里声明过** reality-opts 段
-   *        （结构化槽位为空但原文有该段 ⇒ 解析层把 public-key 丢了 ⇒ 整条不可用）
+   *        （结构化槽位为空但原文有该段时的补键依据；**不**代表节点不可用）
    */
   static canonical(merged: MergedProxy, realityDeclared: boolean): YamlNodeCanonical {
     const out = new YamlNodeCanonical();
     const protocol = YamlNodeAdapter.protocolOf(merged.type);
     const table = ProtocolParamTableRegistry.of(protocol);
     if (table === null) {
-      out.availability = new NodeAvailability();
-      out.availability.protocol = protocol;
-      out.availability.server = merged.server;
-      out.availability.category = 'ok';
       return out;
     }
 
@@ -145,10 +141,10 @@ export class YamlNodeAdapter {
       out.params.set('security', 'reality');
     }
 
-    // 5) 必填校验（与 URI 路径同一张表、同一套口径）
-    //    name 一起传：机场的「订阅信息条目」（剩余流量/到期/群链接）就是靠**名字内容**识别的，
-    //    它们参数齐全 ⇒ 缺参检测抓不到（2026-10-20 真机：35 个节点里混了 6 条信息）。
-    out.availability = NodeUsability.assess(protocol, out.params, merged.server, merged.name);
+    // 5) 到此为止：**只产出映射视图，不做必填校验**。
+    //    2026-10-22 FlClash 同构：节点能不能用由内核解析原文决定，App 不再出结论。
+    //    （历史：这里曾调 NodeUsability.assess 判「定义不完整」并整条排除 ——
+    //     真机实证该判词会与内核分叉，见本文件头与 plan() 的注释。）
     return out;
   }
 
@@ -335,7 +331,8 @@ export class YamlNodeAdapter {
    * 的条目**根本不会产出 MergedProxy**。如果只看合并结果，这些节点就"人间蒸发"：
    * 既不进代理表，也没有任何原因可查（用户只会看到"节点少了几个"）。
    * ⇒ 这里从原文把声明过的条目捞出来，和合并结果对账，差集就是
-   * 「原文有、合并没产出」的节点 —— 交由上层记成 unusable（带原因、UI 可见）。
+   * 「原文有、合并没产出」的节点 —— 只进**诊断账**（App 读不出来），
+   * 节点本身仍由内核按原文解析（FlClash 同构，App 不下不可用结论）。
    */
   static declaredItems(body: string): DeclaredItem[] {
     const out: DeclaredItem[] = [];
@@ -355,12 +352,22 @@ export class YamlNodeAdapter {
   }
 
   /**
-   * YAML 路径的节点判定计划（进代理表 / 判不可用 / 原文有但没产出）。
+   * YAML 路径的节点判定计划（App 能读到什么 / 原文有但没产出）。
    *
-   * 判定口径与分享链接路径**完全一致**（同一张参数表、同一套必填规则）：
-   * - 定义完整 ⇒ 进代理表（也就进了测速集合）；
-   * - 定义不完整（缺必填）⇒ **整条不可用**，带原因，不进代理表、不进测速集合；
-   * - 原文声明但合并阶段没产出 ⇒ 同样按"定义不完整"记账（带原因，UI 可见）。
+   * ## 2026-10-22 口径变更 · FlClash 同构：App **不再判**节点可用性
+   *
+   * 订阅原文是内核配置的基底（`RuntimeConfigBuilder` → `ProfileConfigMerger`，
+   * `proxies` 段由原文**整段接管**），节点能不能用由内核解析后的结果说了算。
+   * App 侧再出一份"定义完整/不完整"的结论 = **第二意见**，而第二意见必然与内核分叉：
+   * 2026-10-22 真机实证 —— 订阅在同一 `server:port` 上挂了两条不同节点
+   * （裸 vless + 同址 REALITY vless），按地址记的 reality 旁挂表串台 ⇒
+   * 一条**内核完全能用的节点**被 App 判成「定义不完整」并整条踢出列表。
+   *
+   * ⇒ 本函数只做**映射与对账**，不做裁决：
+   * - 每条合并结果都保留（`YamlNodeEntry` 没有"不可用"这个字段）；
+   * - 原文声明但合并阶段没产出的条目只进 `dropped`（**诊断用**），同样不判死刑。
+   *
+   * 与 FlClash 一致：判词只可能来自内核（`/proxies` 里有没有、配置载入是否成功）。
    */
   static plan(merged: MergedProxy[], body: string): YamlNodePlan {
     const out = new YamlNodePlan();
@@ -369,9 +376,6 @@ export class YamlNodeAdapter {
       const entry = new YamlNodeEntry();
       entry.merged = m;
       entry.canonical = YamlNodeAdapter.canonical(m, YamlNodeAdapter.declaredReality(flags, m));
-      entry.excluded = !entry.canonical.availability.usable();
-      entry.reason = entry.canonical.availability.reason;
-      entry.missing = entry.canonical.availability.missing;
       out.entries.push(entry);
     }
     // 原文声明 vs 合并产出：对账差集
@@ -388,8 +392,10 @@ export class YamlNodeAdapter {
       dropped.server = item.server;
       dropped.port = item.port;
       dropped.protocol = YamlNodeAdapter.protocolOf(item.type);
-      dropped.reason = `定义不完整：${dropped.protocol.length > 0 ? dropped.protocol : '未知协议'} `
-        + '在合并阶段未产出节点（凭据/地址不完整）';
+      // 只是「App 侧读不出来」的记账（诊断用），**不是**对节点下的结论：
+      // 节点本身仍在订阅原文里，内核照常解析它（FlClash 同构：判词归内核）。
+      dropped.reason = `App 未能解析：${dropped.protocol.length > 0 ? dropped.protocol : '未知协议'} `
+        + '在合并阶段未产出节点（凭据/地址不完整），内核仍按原文处理';
       out.dropped.push(dropped);
     }
     return out;
@@ -426,14 +432,16 @@ export class DroppedItem {
   reason: string = '';
 }
 
-/** 一条合并结果的判定 */
+/**
+ * 一条合并结果的视图（映射用，**不含**可用性结论）。
+ *
+ * 2026-10-22 FlClash 同构：App 不再给节点下「定义不完整」这类判词 ——
+ * 内核按订阅原文解析，节点在不在、能不能用由内核说了算（`/proxies`）。
+ */
 export class YamlNodeEntry {
   merged: MergedProxy = new MergedProxy();
+  /** 规范键视图（两条导入路径同一套键；凭据映射/诊断用，不参与裁决） */
   canonical: YamlNodeCanonical = new YamlNodeCanonical();
-  /** true = 定义不完整，整条不可用（不进代理表、不进测速集合） */
-  excluded: boolean = false;
-  reason: string = '';
-  missing: string[] = [];
 }
 
 /** 整份 YAML 订阅的节点判定计划 */

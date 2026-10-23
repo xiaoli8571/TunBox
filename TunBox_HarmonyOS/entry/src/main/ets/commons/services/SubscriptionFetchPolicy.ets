@@ -11,6 +11,7 @@ import { url, util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 import { AppInfo } from '../utils/AppInfo';
 import { LocalSubConverter } from './LocalSubConverter';
+import { HttpBodyCodec } from '../subscription/HttpBodyCodec';
 
 const TAG = 'SubscriptionFetchPolicy';
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -99,6 +100,12 @@ export function isEphemeralHost(server: string): boolean {
  */
 export const EPHEMERAL_SUBSCRIPTION_REFRESH_MS: number = 6 * 60 * 60 * 1000;
 
+/** `authTarget()` 的结果：剥掉 userinfo 后的地址 + 该带的 Authorization 头。 */
+export class FetchAuthTarget {
+  url: string = '';
+  header: string = '';
+}
+
 export class SubscriptionFetchResult {
   body: string = '';
   userInfo: SubscriptionUserInfo = new SubscriptionUserInfo();
@@ -112,6 +119,12 @@ export class SubscriptionFetchResult {
    * 调用方据此走「未变更」路径（沿用已落盘节点），而不是把空响应当成失败。
    */
   notModified: boolean = false;
+  /**
+   * `Content-Disposition` 原始头（FlClash 用它给订阅起名：
+   * `lib/models/profile.dart:186-198` 的 `getFileNameForDisposition(disposition)`）。
+   * 空串 = 服务端没给，调用方沿用现有名称。
+   */
+  disposition: string = '';
 }
 
 export enum SubscriptionFetchErrorKind {
@@ -176,9 +189,15 @@ export class SubscriptionFetchPolicy {
       local.etag = '';
       return local;
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
+    // ── FlClash 同构（`lib/common/request.dart:150-165` 的 `downloadTarget`）──
+    // 订阅地址带 `user:pass@` 时把它从 URL 里剥掉、转成 `Authorization: Basic`：
+    // 一部分面板用 HTTP Basic 鉴权而不是 token 路径，FlClash 支持这种写法。
+    // 必须在地址校验**之前**剥：校验规则不允许 authority 里出现 '@'。
+    const auth = SubscriptionFetchPolicy.authTarget(urlStr);
+    const fetchUrl = auth.url;
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(fetchUrl, allowInsecureHttp)) {
       // 明文 http 单独给可行动提示：它现在是「默认禁用」而不是「地址非法」。
-      if (!allowInsecureHttp && urlStr.toLowerCase().startsWith('http://')) {
+      if (!allowInsecureHttp && fetchUrl.toLowerCase().startsWith('http://')) {
         throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
           '该订阅是明文 HTTP 链接：默认已禁用。请改用机场提供的 https 链接，'
             + '或在「设置 → 允许明文 HTTP 订阅」中显式打开');
@@ -210,8 +229,11 @@ export class SubscriptionFetchPolicy {
         if (etag.length > 0) {
           headers['If-None-Match'] = etag;
         }
+        if (auth.header.length > 0) {
+          headers['Authorization'] = auth.header;
+        }
         const result = await SubscriptionFetchPolicy.requestWithRedirectValidation(
-          urlStr, headers, allowInsecureHttp, 0);
+          fetchUrl, headers, allowInsecureHttp, 0);
         if (result.notModified) {
           // 304：内容未变。与「响应为空」是完全不同的语义，必须原样返回给调用方，
           // 绝不能落到下面的 EMPTY_RESPONSE 分支（那会把「没变化」报成「拉取失败」）。
@@ -419,7 +441,8 @@ export class SubscriptionFetchPolicy {
         }
         const nextUrl = SubscriptionFetchPolicy.resolveRedirectUrl(urlStr, location);
         return SubscriptionFetchPolicy.requestWithRedirectValidation(
-          nextUrl, SubscriptionFetchPolicy.redirectHeaders(headers, nextUrl), allowInsecureHttp, redirectCount + 1);
+          nextUrl, SubscriptionFetchPolicy.redirectHeaders(headers, urlStr, nextUrl),
+          allowInsecureHttp, redirectCount + 1);
       }
       if (resp.responseCode === 304) {
         // 条件请求命中：内容未变，无响应体。etag 原样回传（服务端可能刷新了 ETag）。
@@ -428,6 +451,7 @@ export class SubscriptionFetchPolicy {
         notModified.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
         notModified.userInfo = SubscriptionFetchPolicy.parseUserInfo(
           SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
+        notModified.disposition = SubscriptionFetchPolicy.headerValue(resp.header, 'content-disposition');
         return notModified;
       }
       if (resp.responseCode !== 200) {
@@ -436,12 +460,28 @@ export class SubscriptionFetchPolicy {
       let bytes = 0;
       let body = '';
       if (resp.result instanceof ArrayBuffer) {
-        bytes = resp.result.byteLength;
+        const raw = new Uint8Array(resp.result);
+        bytes = raw.length;
         if (!SubscriptionFetchPolicy.isResponseSizeAllowed(bytes)) {
           throw new Error('订阅响应体超过 8 MiB 限制');
         }
+        // ── FlClash 同构（`lib/common/request.dart` 的 `decompressUnlabeled`）──
+        // 部分机场发的是**没有 Content-Encoding 头**的 gzip/zlib 流（内核读不了，
+        // 按 UTF-8 解码会变乱码）。按魔数识别并解压，与 FlClash 一致。
+        let payload: Uint8Array = raw;
+        if (HttpBodyCodec.looksCompressed(raw)) {
+          try {
+            payload = HttpBodyCodec.decompress(raw);
+          } catch (e) {
+            throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
+              `订阅响应解压失败（gzip/zlib 流损坏）：${AppLogger.errText(e)}`);
+          }
+          if (!SubscriptionFetchPolicy.isResponseSizeAllowed(payload.length)) {
+            throw new Error('订阅响应体解压后超过 8 MiB 限制');
+          }
+        }
         try {
-          body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
+          body = util.TextDecoder.create('utf-8').decodeToString(payload);
         } catch (e) {
           throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
             `响应 UTF-8 解码失败：${AppLogger.errText(e)}`);
@@ -458,6 +498,7 @@ export class SubscriptionFetchPolicy {
       out.userInfo = SubscriptionFetchPolicy.parseUserInfo(
         SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
       out.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
+      out.disposition = SubscriptionFetchPolicy.headerValue(resp.header, 'content-disposition');
       return out;
     } finally {
       req.destroy();
@@ -563,9 +604,161 @@ export class SubscriptionFetchPolicy {
     return origin + base + location;
   }
 
-  private static redirectHeaders(headers: Record<string, string>, nextUrl: string): Record<string, string> {
+  /**
+   * 把「URL 里的 userinfo」转成 Authorization 头（FlClash `downloadTarget` 等价实现）。
+   *
+   * `https://user:pass@panel.example/sub` 这类地址一部分机场当 HTTP Basic 凭据用；
+   * 直接带着 userinfo 请求会被部分 HTTP 实现拒绝或原样发出去。这里剥掉 userinfo、
+   * 生成 `Basic base64(user:pass)`，并把请求地址换成不带凭据的形态。
+   */
+  static authTarget(urlStr: string): FetchAuthTarget {
+    const out = new FetchAuthTarget();
+    out.url = urlStr;
+    const schemeAt = urlStr.indexOf('://');
+    if (schemeAt < 0) {
+      return out;
+    }
+    const authorityStart = schemeAt + 3;
+    let authorityEnd = urlStr.length;
+    const stops: string[] = ['/', '?', '#'];
+    for (const stop of stops) {
+      const index = urlStr.indexOf(stop, authorityStart);
+      if (index >= 0 && index < authorityEnd) {
+        authorityEnd = index;
+      }
+    }
+    const authority = urlStr.substring(authorityStart, authorityEnd);
+    const at = authority.lastIndexOf('@');
+    if (at < 0) {
+      return out;
+    }
+    const userinfo = authority.substring(0, at);
+    const hostPart = authority.substring(at + 1);
+    if (userinfo.length === 0 || hostPart.length === 0) {
+      return out;
+    }
+    const colon = userinfo.indexOf(':');
+    const user = SubscriptionFetchPolicy.percentDecode(colon >= 0 ? userinfo.substring(0, colon) : userinfo);
+    const password = colon >= 0 ? SubscriptionFetchPolicy.percentDecode(userinfo.substring(colon + 1)) : '';
+    const text = `${user}:${password}`;
+    const bytes = util.TextEncoder.create('utf-8').encodeInto(text);
+    out.header = `Basic ${new util.Base64Helper().encodeToStringSync(bytes)}`;
+    out.url = urlStr.substring(0, authorityStart) + hostPart + urlStr.substring(authorityEnd);
+    return out;
+  }
+
+  /**
+   * `Content-Disposition` → 订阅名（FlClash `getFileNameForDisposition` 等价实现）。
+   *
+   * FlClash 在**首次添加**订阅时用这个文件名当标题（`lib/models/profile.dart:186-198`）；
+   * 解析规则照抄：优先 `filename*=UTF-8''<pct-encoded>`（取 `''` 之后那段再解码），
+   * 其次 `filename="..."`。拿不到返回空串（调用方保留现有名称）。
+   */
+  static fileNameFromDisposition(disposition: string): string {
+    if (disposition.length === 0) {
+      return '';
+    }
+    // HeaderValue.parse 的简化版：按 ';' 切参数，引号内的 ';' 不切
+    const parts: string[] = [];
+    let buffer = '';
+    let quoted = false;
+    for (let i = 0; i < disposition.length; i++) {
+      const ch = disposition.charAt(i);
+      if (ch === '"') {
+        quoted = !quoted;
+        buffer = buffer + ch;
+        continue;
+      }
+      if (ch === ';' && !quoted) {
+        parts.push(buffer);
+        buffer = '';
+        continue;
+      }
+      buffer = buffer + ch;
+    }
+    parts.push(buffer);
+    let extended = '';
+    let plain = '';
+    for (let i = 1; i < parts.length; i++) {
+      const item = parts[i].trim();
+      const eq = item.indexOf('=');
+      if (eq <= 0) {
+        continue;
+      }
+      const key = item.substring(0, eq).trim().toLowerCase();
+      let value = item.substring(eq + 1).trim();
+      if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+        value = value.substring(1, value.length - 1);
+      }
+      if (key === 'filename*') {
+        extended = value;
+      } else if (key === 'filename') {
+        plain = value;
+      }
+    }
+    if (extended.length > 0) {
+      const sep = extended.indexOf("''");
+      if (sep >= 0) {
+        const decoded = SubscriptionFetchPolicy.percentDecode(extended.substring(sep + 2)).trim();
+        if (decoded.length > 0) {
+          return decoded;
+        }
+      } else if (extended.trim().length > 0) {
+        return extended.trim();
+      }
+    }
+    return plain.trim();
+  }
+
+  /** 百分号解码（只处理 `%XX`，其余按字节透传后统一按 UTF-8 还原） */
+  private static percentDecode(value: string): string {
+    if (value.indexOf('%') < 0) {
+      return value;
+    }
+    const bytes: number[] = [];
+    let i = 0;
+    while (i < value.length) {
+      const ch = value.charAt(i);
+      if (ch === '%' && i + 2 < value.length) {
+        const code = Number.parseInt(value.substring(i + 1, i + 3), 16);
+        if (!Number.isNaN(code)) {
+          bytes.push(code & 0xff);
+          i = i + 3;
+          continue;
+        }
+      }
+      bytes.push(value.charCodeAt(i) & 0xff);
+      i = i + 1;
+    }
+    try {
+      const buffer = new Uint8Array(bytes.length);
+      for (let k = 0; k < bytes.length; k++) {
+        buffer[k] = bytes[k];
+      }
+      return util.TextDecoder.create('utf-8').decodeToString(buffer);
+    } catch (e) {
+      return value;
+    }
+  }
+
+  /** 取 URL 的 host（解析失败返回空串，用于判断重定向是否跨主机） */
+  private static hostOf(value: string): string {
+    try {
+      return url.URL.parseURL(value).host;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  private static redirectHeaders(headers: Record<string, string>, fromUrl: string,
+    nextUrl: string): Record<string, string> {
     const out: Record<string, string> = {};
+    const crossHost = SubscriptionFetchPolicy.hostOf(nextUrl) !== SubscriptionFetchPolicy.hostOf(fromUrl);
     for (const key of Object.keys(headers)) {
+      // 跨主机重定向不许转发 Authorization（Basic 凭据只属于原面板）
+      if (crossHost && key.toLowerCase() === 'authorization') {
+        continue;
+      }
       if (SubscriptionFetchPolicy.maySendCustomHeader(nextUrl, key)) {
         out[key] = headers[key];
       }
@@ -722,7 +915,9 @@ export class SubscriptionFetchPolicy {
   /** URL 脱敏（只保留 host），配合 log_redactor */
   static redactUrl(urlStr: string): string {
     try {
-      return url.URL.parseURL(urlStr).host;
+      // 必须先剥 userinfo：ArkTS 的 `URL.host` 把 `user:pass@` 算在 host 里，
+      // 直接打印会把 Basic 凭据写进日志/诊断文本。
+      return url.URL.parseURL(SubscriptionFetchPolicy.authTarget(urlStr).url).host;
     } catch (e) {
       return '<invalid-url>';
     }
@@ -734,14 +929,17 @@ export class SubscriptionFetchPolicy {
     if (LocalSubConverter.isLocalUrl(urlStr)) {
       return LocalSubConverter.idOf(urlStr).length > 0;
     }
-    const lower = urlStr.toLowerCase();
-    if (urlStr.length === 0 || urlStr.length > 8192
+    // 带 `user:pass@` 的地址先剥掉 userinfo 再校验（fetch 时会转成 Authorization:
+    // Basic；校验规则本身不允许 authority 里出现 '@'）。
+    const target = SubscriptionFetchPolicy.authTarget(urlStr).url;
+    const lower = target.toLowerCase();
+    if (target.length === 0 || target.length > 8192
       || (!lower.startsWith('https://') && !(allowInsecureHttp && lower.startsWith('http://')))
-      || urlStr.includes('\n') || urlStr.includes('\r') || urlStr.includes('\t')) {
+      || target.includes('\n') || target.includes('\r') || target.includes('\t')) {
       return false;
     }
     try {
-      const parsed = url.URL.parseURL(urlStr);
+      const parsed = url.URL.parseURL(target);
       const proto = parsed.protocol.replace(/:/g, '').toLowerCase();
       let authority = parsed.host.toLowerCase();
       if ((proto !== 'https' && !(allowInsecureHttp && proto === 'http'))

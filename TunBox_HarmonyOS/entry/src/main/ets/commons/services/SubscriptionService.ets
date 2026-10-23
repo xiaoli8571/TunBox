@@ -58,10 +58,9 @@ import {
 } from './ConcurrentRefresh';
 import { BodyDispatch, BodyDispatchResult, BodyKind } from '../subscription/BodyDispatch';
 import { YamlNodeAdapter } from '../subscription/YamlNodeAdapter';
-import { NodeAvailability, UnusableCategory } from '../subscription/NodeUsability';
 // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退走**规范解析层**，不再走 ProxyNode.fromUri
 import { parse as parseUriNode, ParseError, ParsedNode } from '../subscription/UriNodeParser';
-import { UnusableLedger, UnusableRecord } from '../subscription/UnusableLedger';
+import { UnusableLedger } from '../subscription/UnusableLedger';
 
 const TAG = 'SubscriptionService';
 const PREF_NAME = 'ssrvpn_subscriptions';
@@ -76,9 +75,13 @@ const KEY_NODES = 'nodes_json';
 const KEY_HIDDEN = 'hidden_nodes_json';
 const KEY_GROUPS = 'proxy_groups_json';
 const KEY_ALIAS_CACHE = 'sealed_alias_cache_json';
+/**
+ * 旧版「单节点」虚拟分组的 id。分组本身已经退场（2026-10-22 用户口径：
+ * 单节点走「设置 → 订阅转换」），这个常量只剩两个用途：
+ *   1) 启动时清理旧版本遗留的直链节点/虚拟分组（purgeDirectGroup）；
+ *   2) 页面里对历史数据做兜底判断（不会再出现）。
+ */
 export const DIRECT_GROUP_ID = 'direct';
-const DIRECT_GROUP_NAME = '单节点';
-const DIRECT_GROUP_URL = 'local://direct';
 
 /**
  * 并发预取结果的存活上限。批次被中断（页面销毁 / 用户连点被拦）后残留的 body
@@ -132,13 +135,6 @@ class PrefetchedSubscription {
 /** 一次性回退源（rawUri）在偏好中的键；节点凭据加密写入成功后即删除 */
 function nodeUriKey(nodeId: string): string {
   return `rawuri|${nodeId}`;
-}
-
-/** 批量节点直链导入结果（addDirectNodesText 用），重复与无效逐条隔离不互相影响 */
-export class DirectBatchResult {
-  added: number = 0;
-  duplicate: number = 0;
-  invalid: number = 0;
 }
 
 export class SubscriptionService {
@@ -248,24 +244,10 @@ export class SubscriptionService {
    */
   lastProviderOrphanLineCount: number = 0;
 
-  /**
-   * 最近一次导入里的「不可用节点」清单（旁挂台账，供 UI 展示）。
-   *
-   * 口径（详见 docs/sub-parse.md 第 4 节）：
-   * - `unusableDefinitions()`：**定义不完整**（缺 uuid / reality public-key /
-   *   password / server / port）—— 这类节点**不进内核代理表、不进测速集合**，
-   *   但在这里**可见并带原因**（不伪装成"节点失败/网络不可达"）。
-   * - 「域名无法解析」**不在这里**：那是解析层的结论（机场侧入口域名下线），
-   *   由编排器的 hostSnapshot() 提供，不属于"节点定义有问题"。
-   */
-  public static unusableDefinitions(): UnusableRecord[] {
-    return UnusableLedger.excludedList();
-  }
-
-  /** 不可用节点的一句话汇总（UI 顶部提示用；空串表示没有） */
-  public static unusableSummary(): string {
-    return UnusableLedger.summary();
-  }
+  // 【2026-10-22 · FlClash 同构】原来这里导出了 `unusableDefinitions()` /
+  // `unusableSummary()`（"定义不完整 N 条"角标的数据源）。
+  // YAML 订阅不再产生这类判词（节点可用性归内核），UI 也不再展示；单链接路径
+  // 的台账由 `UriNodeParser` 直写、无 UI 消费者 ⇒ 两个导出已删除。
 
   /**
    * 网络性拉取失败待重试标记（订阅 id → 失败时刻）。
@@ -470,15 +452,10 @@ export class SubscriptionService {
     const groupsRebuilt = await this.rebuildGroupsFromCacheIfMissing();
     AppLogger.info(TAG, `[perf] stage3 groups done at +${Date.now() - t0}ms`);
 
-    let directGroup = this.subscriptions.find((s) => s.id === DIRECT_GROUP_ID);
-    let createdDirectGroup = false;
-    if (directGroup === undefined) {
-      directGroup = Subscription.newSubscription(DIRECT_GROUP_ID, DIRECT_GROUP_NAME, DIRECT_GROUP_URL);
-      directGroup.sortOrder = 0;
-      this.subscriptions.unshift(directGroup);
-      createdDirectGroup = true;
-    }
-    this.syncDirectGroup();
+    // 【2026-10-22 用户口径】「单节点」虚拟分组整体退场：单节点一律走
+    // 「设置 → 订阅转换」（导出 YAML 再以文件方式导入）。旧版本把直链节点
+    // 存在这个虚拟分组里，这里一并清掉 —— 否则界面上看不见它们，内核配置里却有。
+    const purgedDirectGroup = this.purgeDirectGroup();
 
     // 5) 双轨 provider 对账：清理孤儿落盘文件 + 回填每订阅 provider 状态
     //    （开关关闭时只清孤儿文件，绝不读订阅原文）
@@ -486,7 +463,7 @@ export class SubscriptionService {
 
     AppLogger.info(TAG, `loaded ${this.subscriptions.length} subscriptions, `
       + `${this.nodes.length} nodes, ${this.proxyGroups.length} proxy groups`);
-    if (renamed || createdDirectGroup || rawReconciled || groupsRebuilt) {
+    if (renamed || purgedDirectGroup || rawReconciled || groupsRebuilt) {
       await this.persist();
     }
   }
@@ -1217,7 +1194,6 @@ export class SubscriptionService {
     if (sub !== undefined) {
       sub.nodeCount = this.nodesOf(sub.id).length;
     }
-    this.syncDirectGroup();
     await this.persist();
     AppLogger.info(TAG, `node removed: ${n.name} (hidden total ${this.hiddenNodes.length})`);
     return true;
@@ -1683,39 +1659,31 @@ export class SubscriptionService {
    * 合并结果 → 节点模型（仅映射白名单结构化字段，proxyType 保留真实类型）。
    * server/port 缺失的条目必须计数并回报（漏洞 E：此前是静默丢弃）。
    *
-   * 【2026-10-20】加一道**必填闸门**（与分享链接路径同一张参数表）：
-   * 定义不完整（缺 uuid / reality public-key / password / server / port）的条目
-   * **整条不可用** —— 不进内核代理表、不进测速集合，但写进旁挂台账让 UI 可见并带原因。
-   * 半条节点进代理表 = 内核握手秒失败 = 整片测速 503（2026-10-20 mitce 事故的形状）。
+   * 【2026-10-22 · FlClash 同构】**App 不再判节点可用性**：
+   * 订阅原文是内核配置的基底（`RuntimeConfigBuilder` → `ProfileConfigMerger`，
+   * `proxies` 段整段由原文接管），节点在不在、能不能用由内核解析结果说话。
+   * 真机实证：同一 `server:port` 上挂两条不同节点时，App 侧「reality 旁挂表 +
+   * 必填闸门」会串台，把一条内核完全能用的节点判成「定义不完整」并踢出列表。
+   * ⇒ 这里**全部保留**：不再 `continue`、不再写「定义不完整」台账；
+   * 合并阶段没产出的条目只进诊断（App 读不出来 ≠ 节点有问题）。
    *
-   * @param sourceBody 订阅原文（用于判断某条是否**声明过** reality-opts：
-   *        结构化槽位为空但原文有该段 ⇒ 解析层把 public-key 丢了 ⇒ 整条不可用）
+   * @param sourceBody 订阅原文（对账用：原文声明过、合并却没产出的条目进诊断）
    */
   private static mergedToNodes(merged: MergedProxy[], subscriptionId: string,
     diagnostics?: SubscriptionImportDiagnostics, sourceBody?: string): ProxyNode[] {
     const out: ProxyNode[] = [];
     let counter = 0;
     let dropped = 0;
-    let unusable = 0;
-    // ── 保真 + 必填闸门（与分享链接路径同一张参数表、同一套口径）──
-    // plan 一次算清三件事：
-    //   ① 每条合并结果的规范键视图 + 可用性结论；
-    //   ② 定义不完整 ⇒ 整条不可用（不进代理表、不进测速集合）；
-    //   ③ 原文声明但合并阶段没产出的节点（缺凭据）—— 不让它"人间蒸发"，一并记账。
+    // ── 映射 + 对账（不做裁决）──
+    // plan 一次算清两件事：
+    //   ① 每条合并结果的规范键视图（凭据映射/诊断）；
+    //   ② 原文声明但合并阶段没产出的条目（App 读不出来 —— 只进诊断）。
     const plan = YamlNodeAdapter.plan(merged, sourceBody !== undefined ? sourceBody : '');
     for (const item of plan.dropped) {
-      unusable = unusable + 1;
-      SubscriptionService.recordUnusableText(item.reason, 'yaml', subscriptionId,
-        item.name, item.server, item.port, diagnostics);
+      AppLogger.warn(TAG, `yaml item not produced by App parser: ${item.reason}`);
     }
     for (const entry of plan.entries) {
       const m = entry.merged;
-      if (entry.excluded) {
-        unusable = unusable + 1;
-        SubscriptionService.recordUnusable(entry.canonical.availability, 'yaml', subscriptionId,
-          m.name, m.server, m.port, diagnostics);
-        continue;
-      }
       const n = new ProxyNode();
       n.id = `${subscriptionId}-m${counter++}`;
       n.subscriptionId = subscriptionId;
@@ -1770,64 +1738,7 @@ export class SubscriptionService {
       SubscriptionService.noteInvalid(diagnostics, `合并映射丢弃 ${dropped} 条（缺 server 或 port）`);
       AppLogger.warn(TAG, `mergedToNodes dropped ${dropped} node(s) without server/port`);
     }
-    if (unusable > 0) {
-      SubscriptionService.noteInvalid(diagnostics,
-        `定义不完整 ${unusable} 条（缺必填参数，整条不可用，不进代理表也不参与测速）`);
-      AppLogger.warn(TAG, `mergedToNodes marked ${unusable} node(s) unusable (missing required params)`);
-    }
     return out;
-  }
-
-  /**
-   * 记一条「定义不完整」的不可用节点（带明确原因文本的变体）。
-   *
-   * 用于「原文声明了、但合并阶段没产出」的节点 —— 它们连 NodeAvailability
-   * 都没有（根本没走到规范键那一步），但同样必须：
-   * **不进**内核代理表、**不进**测速集合、**UI 可见**且带原因。
-   */
-  private static recordUnusableText(reason: string, source: string, subscriptionId: string,
-    name: string, server: string, port: string,
-    diagnostics?: SubscriptionImportDiagnostics): void {
-    const record = new UnusableRecord();
-    record.subscriptionId = subscriptionId;
-    record.source = source;
-    record.name = name;
-    record.server = server;
-    record.port = parseInt(port);
-    record.category = UnusableCategory.INCOMPLETE;
-    record.excluded = true;
-    record.reason = reason;
-    record.detail = '定义不完整：合并阶段未能产出该节点（凭据/地址不完整）。'
-      + '该节点不会进入内核代理表，也不会参与测速。';
-    UnusableLedger.record(record);
-    SubscriptionService.noteInvalid(diagnostics, reason);
-  }
-
-  /**
-   * 记一条「定义不完整」的不可用节点。
-   *
-   * 口径（docs/sub-parse.md 第 4 节）：
-   * - **不进**内核代理表、**不进**测速集合（调用方已经 continue 掉了）；
-   * - **UI 可见**且带原因（旁挂台账 + diagnostics.invalidReasons）；
-   * - 绝不伪装成"节点失败/网络不可达" —— 这是参数问题，是我们的锅。
-   */
-  private static recordUnusable(availability: NodeAvailability, source: string, subscriptionId: string,
-    name: string, server: string, port: number,
-    diagnostics?: SubscriptionImportDiagnostics): void {
-    const record = new UnusableRecord();
-    record.subscriptionId = subscriptionId;
-    record.source = source;
-    record.protocol = availability.protocol;
-    record.name = name;
-    record.server = server;
-    record.port = port;
-    record.category = availability.category;
-    record.excluded = true;
-    record.reason = availability.reason;
-    record.detail = availability.detail;
-    record.missing = availability.missing;
-    UnusableLedger.record(record);
-    SubscriptionService.noteInvalid(diagnostics, availability.reason);
   }
 
   public static mapNodes(json: Object, diagnostics?: SubscriptionImportDiagnostics): ProxyNode[] {
@@ -2402,12 +2313,20 @@ export class SubscriptionService {
       sub.totalBytes = fetched.userInfo.totalBytes;
       sub.expireAt = fetched.userInfo.expireAt;
 
-      // 自动命名：订阅仍是默认名（"订阅 N"）时，从内容中提取机场名
+      // 自动命名（FlClash 同构，2026-10-22）：订阅仍是默认名时，先用服务端
+      // `Content-Disposition` 里的文件名（FlClash `lib/models/profile.dart:186-198`
+      // 就是拿它当标题），拿不到再从正文提取机场名（本端增强）。
       if (SubscriptionService.isDefaultName(sub.name)) {
-        const detected = SubscriptionService.detectProviderName(body);
-        if (detected.length > 0) {
-          sub.name = detected;
-          AppLogger.info(TAG, `auto-named subscription to "${detected}"`);
+        const fromHeader = SubscriptionFetchPolicy.fileNameFromDisposition(fetched.disposition);
+        if (fromHeader.length > 0) {
+          sub.name = fromHeader;
+          AppLogger.info(TAG, `subscription named from content-disposition: "${fromHeader}"`);
+        } else {
+          const detected = SubscriptionService.detectProviderName(body);
+          if (detected.length > 0) {
+            sub.name = detected;
+            AppLogger.info(TAG, `auto-named subscription to "${detected}"`);
+          }
         }
       }
 
@@ -2581,7 +2500,10 @@ export class SubscriptionService {
         this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
       }
       this.ensureUniqueNames();
-      sub.nodeCount = parsed.length > 0 ? parsed.length : sub.nodeCount;
+      // 【2026-10-22 · FlClash 同构】节点数 = **原文 proxies 条目数**（FlClash
+      // `configCountsOf(loadYaml(profile))` 的口径），不是 App 解析结果的长度：
+      // App 解析不了的协议（未支持类型）会被跳过，用它计数会比内核少，而内核照样加载。
+      sub.nodeCount = profileValidation.nodeCount > 0 ? profileValidation.nodeCount : parsed.length;
       sub.lastFetchedAt = Date.now();
       sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
       diagnostics.addedCount = parsed.length;
@@ -2801,7 +2723,9 @@ export class SubscriptionService {
       }
       this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
       this.ensureUniqueNames();
-      sub.nodeCount = parsed.length;
+      // 本地伪订阅：节点数同样取原文 proxies 条目数（与远程刷新/FlClash 同口径）
+      const declaredLocal = structuredYaml ? YamlMerger.proxyItemGroups(dispatch.body).length : 0;
+      sub.nodeCount = declaredLocal > 0 ? declaredLocal : parsed.length;
       sub.lastFetchedAt = Date.now();
       sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
       diagnostics.addedCount = parsed.length;
@@ -2931,7 +2855,8 @@ export class SubscriptionService {
     this.subscriptions.push(sub);
     this.nodes = this.nodes.concat(parsed);
     this.ensureUniqueNames();
-    sub.nodeCount = parsed.length;
+    // 【2026-10-22 · FlClash 同构】本地导入与远程刷新同口径：节点数取原文条目数
+    sub.nodeCount = localProfile.nodeCount > 0 ? localProfile.nodeCount : parsed.length;
     sub.lastFetchedAt = Date.now();
     sub.lastRefreshResult = SubscriptionRefreshStatus.OK;
     diagnostics.addedCount = parsed.length;
@@ -3289,16 +3214,25 @@ export class SubscriptionService {
   }
 
   /**
-   * 同步手动导入节点与「直接节点」虚拟订阅的计数。
-   * 所有增删、初始化和刷新后的 UI 都以此处计算结果为准，避免占位分组与实际节点池漂移。
+   * 清掉旧版的「单节点」虚拟分组与它名下的直链节点（幂等）。
+   *
+   * 【2026-10-22 用户口径】单节点不再有独立分组：单节点用户自己走
+   * 「设置 → 订阅转换」生成配置、再以文件方式导入。返回是否真的改动了
+   * 存储，调用方据此决定要不要 persist。
    */
-  syncDirectGroup(): number {
-    const count = this.nodes.filter((node: ProxyNode) => node.subscriptionId === DIRECT_GROUP_ID).length;
-    const directGroup = this.subscriptions.find((sub: Subscription) => sub.id === DIRECT_GROUP_ID);
-    if (directGroup !== undefined) {
-      directGroup.nodeCount = count;
+  private purgeDirectGroup(): boolean {
+    const nodeCountBefore = this.nodes.length;
+    const subCountBefore = this.subscriptions.length;
+    this.nodes = this.nodes.filter((n: ProxyNode): boolean => n.subscriptionId !== DIRECT_GROUP_ID);
+    this.subscriptions = this.subscriptions.filter((s: Subscription): boolean => s.id !== DIRECT_GROUP_ID);
+    const removedNodes = nodeCountBefore - this.nodes.length;
+    const removedSubs = subCountBefore - this.subscriptions.length;
+    if (removedNodes > 0 || removedSubs > 0) {
+      AppLogger.info(TAG, `purged legacy single-node group: `
+        + `${removedSubs} group(s), ${removedNodes} node(s)`);
+      return true;
     }
-    return count;
+    return false;
   }
 
   findNode(id: string): ProxyNode | null {
@@ -3320,140 +3254,11 @@ export class SubscriptionService {
     return null;
   }
 
-  /** 节点直链导入（对应 upstream SubscriptionAddStatus.singleNodeImported） */
-  async addDirectNode(uri: string): Promise<number> {
-    const diagnostics = new SubscriptionImportDiagnostics();
-    this.lastImportDiagnostics = diagnostics;
-    diagnostics.inputCount = 1;
-    let node: ProxyNode | null = null;
-    try {
-      // 2026-10-20（B6）：走规范解析层（旧解析器已退场）
-      const canonical: ParsedNode | ParseError = parseUriNode(uri, DIRECT_GROUP_ID);
-      if (!(canonical instanceof ParseError)) {
-        node = ProxyNode.fromCanonical(canonical, DIRECT_GROUP_ID, util.generateRandomUUID());
-      }
-    } catch (e) {
-      SubscriptionService.noteInvalid(diagnostics, `链接解析异常：${SubscriptionService.describeError(e)}`);
-      AppLogger.warn(TAG, `direct node parse failed: ${SubscriptionService.describeError(e)}`);
-      return 0;
-    }
-    if (node === null) {
-      SubscriptionService.noteInvalid(diagnostics, '链接无法解析为节点（协议不支持或字段缺失）');
-      return 0;
-    }
-    const key = `${node.server}:${node.port}:${node.proxyType.length > 0 ? node.proxyType : node.type}`
-      + `:${node.password}:${node.uuid}:${node.rawUri}`;
-    const exists = this.nodes.some((n) => {
-      const existingKey = `${n.server}:${n.port}:${n.proxyType.length > 0 ? n.proxyType : n.type}`
-        + `:${n.password}:${n.uuid}:${n.rawUri}`;
-      return existingKey === key;
-    });
-    if (exists) {
-      diagnostics.duplicateCount = diagnostics.duplicateCount + 1;
-      return -1;
-    }
-    this.nodes.push(node);
-    this.ensureUniqueNames();
-    this.syncDirectGroup();
-    diagnostics.addedCount = 1;
-    diagnostics.configMissingCredentialCount = this.credentialMissingCount;
-    let credentialFailed = 0;
-    try {
-      credentialFailed = await this.persist();
-    } catch (e) {
-      diagnostics.persistFailedCount = this.nodes.length;
-      AppLogger.warn(TAG, `direct node persist failed: ${SubscriptionService.describeError(e)}`);
-    }
-    if (credentialFailed > 0 && diagnostics.persistFailedCount === 0) {
-      diagnostics.persistFailedCount = credentialFailed;
-    }
-    this.noteConfigDrops(diagnostics);
-    return 1;
-  }
-
-  /** 批量节点直链导入：一行一个链接（vless/vmess/ss/trojan…，允许空行），重复/无效逐条隔离 */
-  async addDirectNodesText(text: string): Promise<DirectBatchResult> {
-    const out = new DirectBatchResult();
-    const uris: string[] = [];
-    for (const line of text.split(/\r?\n/)) {
-      const t = line.trim();
-      if (t.length > 0) {
-        uris.push(t);
-      }
-    }
-    if (uris.length === 0) {
-      return out;
-    }
-    const diagnostics = new SubscriptionImportDiagnostics();
-    this.lastImportDiagnostics = diagnostics;
-    diagnostics.inputCount = uris.length;
-    const keyOf = (n: ProxyNode): string => `${n.server}:${n.port}:${n.proxyType.length > 0 ? n.proxyType : n.type}`
-      + `:${n.password}:${n.uuid}:${n.rawUri}`;
-    const existing = new Set<string>();
-    for (const n of this.nodes) {
-      existing.add(keyOf(n));
-    }
-    const addedNodes: ProxyNode[] = [];
-    const batchSeen = new Set<string>();
-    for (const uri of uris) {
-      if (!SubscriptionService.isNodeUri(uri)) {
-        out.invalid = out.invalid + 1;
-        continue;
-      }
-      let node: ProxyNode | null = null;
-      try {
-        // 2026-10-20（B6）：走规范解析层（旧解析器已退场）
-        const canonical: ParsedNode | ParseError = parseUriNode(uri, DIRECT_GROUP_ID);
-        if (!(canonical instanceof ParseError)) {
-          node = ProxyNode.fromCanonical(canonical, DIRECT_GROUP_ID, util.generateRandomUUID());
-        }
-      } catch (e) {
-        node = null;
-      }
-      if (node === null) {
-        out.invalid = out.invalid + 1;
-        continue;
-      }
-      const key = keyOf(node);
-      if (existing.has(key) || batchSeen.has(key)) {
-        out.duplicate = out.duplicate + 1;
-        continue;
-      }
-      batchSeen.add(key);
-      addedNodes.push(node);
-    }
-    if (addedNodes.length > 0) {
-      for (const n of addedNodes) {
-        this.nodes.push(n);
-      }
-      this.ensureUniqueNames();
-      this.syncDirectGroup();
-      diagnostics.addedCount = addedNodes.length;
-      diagnostics.configMissingCredentialCount = this.credentialMissingCount;
-      try {
-        const credentialFailed = await this.persist();
-        if (credentialFailed > 0) {
-          diagnostics.persistFailedCount = credentialFailed;
-        }
-      } catch (e) {
-        diagnostics.persistFailedCount = this.nodes.length;
-        AppLogger.warn(TAG, `direct nodes batch persist failed: ${SubscriptionService.describeError(e)}`);
-      }
-      this.noteConfigDrops(diagnostics);
-    }
-    out.duplicate = out.duplicate + diagnostics.duplicateCount;
-    out.added = addedNodes.length;
-    return out;
-  }
-
   /** 更新订阅名称/URL（对应 upstream SubscriptionEditStatus.saved 持久化路径） */
   async updateSubscription(target: Subscription): Promise<void> {
     const index = this.subscriptions.findIndex((s) => s.id === target.id);
     if (index < 0) {
       return;
-    }
-    if (target.id === DIRECT_GROUP_ID) {
-      target.url = DIRECT_GROUP_URL;
     }
     this.subscriptions[index] = target;
     await this.persist();

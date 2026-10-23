@@ -4319,6 +4319,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } else {
       return '未知的数据项';
     }
+    // 【2026-10-22】模型下载成功后也要 bump 信号：订阅页的「自动选择」入口跟着
+    // `smart_model_seq` 重算（与删除对称）。否则用户点「更新」把模型装回来了、
+    // 入口却还藏着，得杀进程才会出现。
+    if (ok && id === 'model') {
+      const seq = AppStorage.get<number>('smart_model_seq');
+      AppStorage.setOrCreate<number>('smart_model_seq', (seq === undefined ? 0 : seq) + 1);
+    }
     return ok ? '' : '全部下载源均失败，请稍后重试或切换下载源';
   }
 

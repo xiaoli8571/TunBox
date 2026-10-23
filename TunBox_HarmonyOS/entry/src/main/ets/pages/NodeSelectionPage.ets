@@ -1390,11 +1390,7 @@ struct NodeSelectionPage {
         promptAction.showToast({ message: '没有可测速的节点：测速内核未就绪，请稍后重试' });
         return;
       }
-      let msg = `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
-      if (progress.failed > 0) {
-        msg += ` / 未生效 ${progress.failed}`;
-      }
-      promptAction.showToast({ message: msg });
+      promptAction.showToast({ message: '✓ 测速完成' });
     }
   }
 

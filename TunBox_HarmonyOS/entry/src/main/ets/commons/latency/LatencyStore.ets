@@ -477,15 +477,18 @@ export class LatencyStore {
    */
   static describe(failKind: string, delayMs: number, testedAt: number, nowMs: number): LatencyVerdictView {
     const view = new LatencyVerdictView();
-    view.isVerdict = LatencyStore.isVerdictKind(failKind);
-    if (failKind.length === 0 && delayMs >= 1) {
+    // 旧版测速把非超时失败写成表外字面量 'failed'（2026-10-22 修复前），
+    // 那批结论可能还在落盘快照里。认成「拨号失败」，避免升级后旧快照继续显示 `--`。
+    const kind: string = failKind === 'failed' ? LatencyProbeKind.NETWORK_UNREACHABLE : failKind;
+    view.isVerdict = LatencyStore.isVerdictKind(kind);
+    if (kind.length === 0 && delayMs >= 1) {
       view.text = '';
       view.level = LatencyViewLevel.OK;
       view.delayText = `${delayMs}ms`;
-    } else if (failKind === LatencyProbeKind.TIMEOUT) {
+    } else if (kind === LatencyProbeKind.TIMEOUT) {
       view.text = '超时';
       view.level = LatencyViewLevel.BAD;
-    } else if (failKind === LatencyProbeKind.NETWORK_UNREACHABLE) {
+    } else if (kind === LatencyProbeKind.NETWORK_UNREACHABLE) {
       // 「拨号失败」= 内核已经 dial 过这个节点但没拨通（有 dial 证据）。
       // ⚠ 不用「网络不可达」——那是用户点名过的糊弄说法（把三类失败压成一句）；
       // 也绝不能出现「域名」（域名问题有独立分类 dns_unresolved）。

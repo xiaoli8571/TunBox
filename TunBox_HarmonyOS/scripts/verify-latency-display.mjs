@@ -122,8 +122,13 @@ ok('页面层不再实现内核侧组测速（无 /group/ 端点、无 runGroupL
   !/runGroupLatency/.test(persistSrc) && !/\/group\//.test(persistSrc));
 ok('「测全部」统一走 LatencyEngine',
   /LatencyEngine\.start\(/.test(persistSrc));
-ok('测速完成提示单独报「未生效」计数',
-  /未生效 \$\{progress\.failed\}/.test(persistSrc));
+// 2026-10-22 用户口径：测速完成提示**不许带计数**（"可用 X / 超时 Y / 未生效 Z" 是自造噪音，
+// 用户点名「谁让你乱加的，赶快去掉」）。"没测成"的原因（过载/通道不可用）仍要单独说明。
+ok('测速完成提示不带计数（只有「✓ 测速完成」）',
+  /'✓ 测速完成'/.test(persistSrc)
+  && !/可用 \$\{progress\.measured\}/.test(persistSrc)
+  && !/可用 \$\{progress\.measured\}/.test(fs.readFileSync(
+    path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8')));
 
 // ── 「控制器过载」必须有界面出口（2026-10-22 迁到真实入口：订阅页闪电测速）────
 // 契约：过载路径下引擎**故意不给节点写结论**（保持未测）⇒ 用户看到「测速完成 + 一堆 --」。
@@ -162,6 +167,16 @@ const flcServiceSrc = fs.readFileSync(
 ok('组测/批量结果有可检索的完成日志（total/measured/timeout/failed/cancelled）',
   /delay batch done: total=\$\{summary\.total\} measured=\$\{summary\.measured\}/.test(flcServiceSrc)
   && /cancelled=\$\{summary\.cancelled\}/.test(flcServiceSrc));
+// ── 2026-10-22 真机 bug：失败节点显示 "--" 而不是「超时/拨号失败」 ─────────────
+// 根因：FlclashLatencyService.apply 把非超时失败写成表外字面量 `'failed'`，
+// 而 LatencyStore.describe() 只认 LatencyProbeKind 里的分类，认不出就 else → '--'。
+ok('失败结果写 LatencyProbeKind 真分类（timeout / switch_failed / network_unreachable）',
+  /LatencyProbeKind\.TIMEOUT/.test(flcServiceSrc)
+  && /LatencyProbeKind\.SWITCH_FAILED/.test(flcServiceSrc)
+  && /LatencyProbeKind\.NETWORK_UNREACHABLE/.test(flcServiceSrc)
+  && /import \{ LatencyProbeKind \}/.test(flcServiceSrc));
+ok('不再写表外失败分类字面量（: \'failed\' 会让 describe() 落到 --）',
+  !/result\.value === FLCLASH_DELAY_TIMED_OUT \? 'timeout' : 'failed'/.test(flcServiceSrc));
 ok('并发/超时/测速地址对齐 FlClash（32 / 5000ms / gstatic https）',
   /FLCLASH_DELAY_CONCURRENCY: number = 32/.test(flcSrc)
   && /FLCLASH_DELAY_TIMEOUT_MS: number = 5000/.test(flcSrc)

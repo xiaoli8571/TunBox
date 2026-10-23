@@ -822,85 +822,51 @@ function runYamlAndUsabilityChecks(dir, mods, ok) {
         `YAML ${expect.name} → 规范键 [${key}] 值保真（sha256:${digest8(want)}）`,
         `实际=${got ?? '(缺失)'} 期望=${want}`);
     }
-    // G3 可用性：完整定义必须判为可用
-    ok(entry.canonical.availability.usable(),
-      `YAML ${expect.name} → 定义完整，判为可用`,
-      entry.canonical.availability.reason);
-    ok(entry.excluded === false, `YAML ${expect.name} → 不被排除（进代理表/测速集合）`);
+    // G3 【2026-10-22 · FlClash 同构】展示视图里**没有**可用性判词：
+    // 节点能不能用只由内核决定（订阅原文进内核配置，内核 `/proxies` 说了算），
+    // App 侧只做映射（规范键/凭据），不再产出"定义完整/不完整"。
+    ok(entry.excluded === undefined,
+      `YAML ${expect.name} → 展示视图里没有"不可用"判词字段`);
+    ok(entry.canonical.availability === undefined,
+      `YAML ${expect.name} → 规范键视图不含可用性结论`);
     ok(entry.canonical.extras.size === 0,
       `YAML ${expect.name} → 没有"原文有但参数表没声明"的字段`,
       JSON.stringify(Array.from(entry.canonical.extras.keys())));
   }
 
-  // ── H. 缺必填 ⇒ 整条不可用（不进代理表/不进测速集合，UI 可见带原因）──
+  // ── H. 缺必填的节点：App **不再判死刑**（2026-10-22 FlClash 同构）──
+  //
+  // 旧口径（已废弃）：缺必填 ⇒ 整条不可用 + 进台账 + UI 角标。
+  // 新口径：订阅原文是内核配置的基底（`ProfileConfigMerger` 把 `proxies` 整段搬到
+  // 运行配置），节点在不在、能不能用**由内核解析决定**；App 侧的第二意见必然与
+  // 内核分叉（2026-10-22 真机实证：同一 server:port 上两条不同节点，地址键串台
+  // ⇒ 一条内核完全可用的节点被误标「定义不完整」并踢出列表）。
   YamlMerger.resetSkipStats();
   const brokenMerged = YamlMerger.merge([brokenYaml], 'fidelity-broken', '');
   const brokenPlan = YamlNodeAdapter.plan(brokenMerged, brokenYaml);
-  const excludedNames = new Set();
+  ok(brokenPlan.entries.length === brokenMerged.length,
+    `合并产出的每条节点都留在展示视图里（${brokenMerged.length} 条，实际 ${brokenPlan.entries.length}）`);
+  ok(brokenPlan.entries.some((e) => e.merged.name === 'Y-BAD-REALITY-NO-PBK'),
+    'Y-BAD-REALITY-NO-PBK（reality 缺 public-key）⇒ 仍在展示视图里（App 不判死刑）');
   for (const entry of brokenPlan.entries) {
-    if (!entry.excluded) continue;
-    excludedNames.add(entry.merged.name);
-    ok(entry.canonical.availability.category === 'incomplete',
-      `YAML ${entry.merged.name} → 判定类别是"定义不完整"`,
-      entry.canonical.availability.category);
-    ok(String(entry.reason).indexOf('定义不完整') >= 0,
-      `YAML ${entry.merged.name} → 原因写明"定义不完整"`, entry.reason);
-    ok(entry.missing.length > 0, `YAML ${entry.merged.name} → 列出了缺哪些必填参数`);
-    // 不许伪装成"节点失败/网络不可达"
-    const reasonText = String(entry.reason);
-    const disguised = ['不可达', '网络', '超时', '失败', 'ping', 'timeout'];
-    const hit = disguised.find((w) => reasonText.indexOf(w) >= 0);
-    ok(hit === undefined,
-      `YAML ${entry.merged.name} → 原因不伪装成"节点失败/网络不可达"`, reasonText);
+    ok(entry.excluded === undefined, `YAML ${entry.merged.name} → 没有"不可用"判词字段`);
+    ok(entry.reason === undefined, `YAML ${entry.merged.name} → 没有"定义不完整"原因文本`);
   }
-  ok(excludedNames.has('Y-BAD-REALITY-NO-PBK'),
-    'YAML reality 缺 public-key ⇒ 整条不可用（不是"有 short-id 的半条节点"）');
-  for (const entry of brokenPlan.entries) {
-    if (entry.merged.name === 'Y-BAD-REALITY-NO-PBK') {
-      ok(JSON.stringify(entry.missing) === JSON.stringify(['reality-public-key']),
-        'YAML reality 缺 public-key ⇒ 缺失键就是 reality-public-key',
-        JSON.stringify(entry.missing));
-    }
-  }
-  // 合并阶段就没产出的节点（缺 uuid / 缺 password）也要被记账，不许"人间蒸发"
+  // 合并阶段就没产出的条目（缺 uuid / 缺 password）只进**诊断账**：
+  // 它们在内核那边照样按原文解析 —— App 读不出来 ≠ 节点有问题。
   ok(brokenPlan.dropped.length === 3,
-    `YAML 缺凭据的 3 条被记为"原文有但没产出"（实际 ${brokenPlan.dropped.length}）`,
+    `YAML 缺凭据的 3 条被记为"App 未解析"（诊断用，实际 ${brokenPlan.dropped.length}）`,
     JSON.stringify(brokenPlan.dropped.map((d) => d.name)));
   for (const item of brokenPlan.dropped) {
-    ok(String(item.reason).indexOf('定义不完整') >= 0,
-      `YAML ${item.name} → 原因写明"定义不完整"`, item.reason);
+    ok(String(item.reason).indexOf('App 未能解析') >= 0,
+      `YAML ${item.name} → 诊断原因写明"App 未能解析"（不是对节点下结论）`, item.reason);
+    ok(String(item.reason).indexOf('定义不完整') < 0,
+      `YAML ${item.name} → 原因里不得再出现"定义不完整"判词`, item.reason);
   }
-  // "不进代理表/不进测速集合"：可进集合的名字里不得出现任何坏节点
-  const usableNames = new Set();
-  for (const entry of brokenPlan.entries) {
-    if (!entry.excluded) usableNames.add(entry.merged.name);
-  }
-  for (const bad of ['Y-BAD-NO-UUID', 'Y-BAD-NO-PASS', 'Y-BAD-HY2-NO-PASS', 'Y-BAD-REALITY-NO-PBK']) {
-    ok(!usableNames.has(bad), `YAML ${bad} ⇒ 不在代理表/测速集合里`);
-  }
-  // 台账：不可用节点进 excludedList，且带原因；DNS 类严格分开
+  // 台账：YAML 路径不再写「定义不完整」——判词只可能来自内核。
   UnusableLedger.clear();
-  for (const entry of brokenPlan.entries) {
-    if (!entry.excluded) continue;
-    const rec = new UnusableRecord();
-    rec.source = 'yaml';
-    rec.protocol = entry.canonical.availability.protocol;
-    rec.name = entry.merged.name;
-    rec.server = entry.merged.server;
-    rec.port = entry.merged.port;
-    rec.category = entry.canonical.availability.category;
-    rec.excluded = true;
-    rec.reason = entry.reason;
-    rec.detail = entry.canonical.availability.detail;
-    rec.missing = entry.missing;
-    UnusableLedger.record(rec);
-  }
-  const excluded = UnusableLedger.excludedList();
-  ok(excluded.length === 1, `台账里不可用节点 1 条（实际 ${excluded.length}）`);
-  ok(excluded.length > 0 && String(excluded[0].reason).indexOf('定义不完整') >= 0,
-    '台账条目带"定义不完整"的原因（UI 可见）');
-  ok(excluded.length > 0 && String(excluded[0].detail).indexOf('不会进入内核代理表') >= 0,
-    '台账条目说明它不进内核代理表、不参与测速');
+  ok(UnusableLedger.excludedList().length === 0,
+    'YAML 路径不产生「定义不完整」台账（App 不再对节点下结论）');
 
   // ── H2. 域名无法解析 ≠ 不可用（解析结论，不是定义问题）──
   const okAvail = NodeUsability.assess('vless', new Map([
@@ -921,15 +887,15 @@ function runYamlAndUsabilityChecks(dir, mods, ok) {
     '域名无法解析 ⇒ 不得混进"定义不完整"');
   ok(String(dnsAvail.detail).indexOf('不是 TunBox 的问题') >= 0,
     '域名无法解析 ⇒ 文案点明不是本端的问题', dnsAvail.detail);
-  ok(UnusableLedger.excludedList().length === 1,
-    'DNS 结论不进不可用台账（excludedList 只装定义不完整的节点）');
+  ok(UnusableLedger.excludedList().length === 0,
+    'DNS 结论不进不可用台账（YAML 路径也不再写台账）');
   ok(UnusableLedger.dnsList().length === 0, 'DNS 结论不混进不可用台账');
 
   // ── K. 订阅信息条目：机场把「剩余流量/到期/群链接」写成了节点（2026-10-20 真机）──
-  // 它们参数齐全 ⇒ 缺参检测抓不到 ⇒ 只能按**名字内容**判。
-  // 口径：不是节点 ⇒ 不进代理表/不进测速集合，但台账里留一条（用户看得见"跳过了几条信息"），
-  //       原因写「订阅信息条目，非节点」，**不许**伪装成「网络不可达/超时/失败」，
-  //       也不许混进 DNS 类（DNS = 节点定义正确、只是这次域名没解析出来）。
+  //
+  // 【2026-10-22 · FlClash 同构】App 不再把这类条目"跳过"或"判为非节点"：
+  // 它们是订阅原文 `proxies` 里的条目，内核照常解析成节点（FlClash 里同样会
+  // 出现在节点列表里）。App 侧只保证**不改写、不丢弃**（名字原样保留）。
   const infoPath = path.join(yamlFixtureDir, 'clash-info-entries.yaml');
   if (!fs.existsSync(infoPath)) {
     ok(false, 'YAML 样本存在（clash-info-entries.yaml）');
@@ -946,61 +912,17 @@ function runYamlAndUsabilityChecks(dir, mods, ok) {
       '电报群https://t.me/feiniaoyunjichang',
       '防失联页https://github.com/feiniaoyun',
     ];
-    const infoUsable = new Set();
-    for (const entry of infoPlan.entries) {
-      if (!entry.excluded) {
-        infoUsable.add(entry.merged.name);
-      }
-    }
     for (const infoName of INFO_NAMES) {
-      ok(!infoUsable.has(infoName),
-        `信息条目「${infoName}」⇒ 不在代理表/测速集合里`);
       const found = infoPlan.entries.find((e) => e.merged.name === infoName);
-      ok(found !== undefined, `信息条目「${infoName}」⇒ 仍被识别出来（不许人间蒸发）`);
+      ok(found !== undefined,
+        `信息条目「${infoName}」⇒ 仍在展示视图里（名字原样、不丢）`);
       if (found === undefined) continue;
-      ok(found.canonical.availability.category === 'info',
-        `信息条目「${infoName}」⇒ 类别是 info（不是 incomplete、不是 dns）`,
-        found.canonical.availability.category);
-      ok(found.canonical.availability.usable() === false,
-        `信息条目「${infoName}」⇒ 判为不可用（不进代理表/测速集合）`);
-      const infoReason = String(found.reason);
-      ok(infoReason.indexOf('非节点') >= 0,
-        `信息条目「${infoName}」⇒ 原因写明「非节点」`, infoReason);
-      const disguised = ['不可达', '网络', '超时', '失败', 'ping', 'timeout'];
-      const hit = disguised.find((w) => infoReason.indexOf(w) >= 0);
-      ok(hit === undefined,
-        `信息条目「${infoName}」⇒ 原因不伪装成"节点失败/网络不可达"`, infoReason);
+      ok(found.excluded === undefined,
+        `信息条目「${infoName}」⇒ 没有"非节点/不可用"判词字段（App 不下结论）`);
     }
-    // 真节点不许被误杀
-    ok(infoUsable.has('Y-HK-01'),
-      '正常节点名（Y-HK-01）⇒ 判据没有误杀，仍在代理表/测速集合里');
-    // 台账里必须有账（用户能看到"这个订阅里有 N 条信息被跳过"）
-    UnusableLedger.clear();
-    for (const entry of infoPlan.entries) {
-      if (!entry.excluded) continue;
-      const rec = new UnusableRecord();
-      rec.source = 'yaml';
-      rec.protocol = entry.canonical.availability.protocol;
-      rec.name = entry.merged.name;
-      rec.server = entry.merged.server;
-      rec.port = entry.merged.port;
-      rec.category = entry.canonical.availability.category;
-      rec.excluded = true;
-      rec.reason = entry.reason;
-      rec.detail = entry.canonical.availability.detail;
-      rec.missing = entry.missing;
-      UnusableLedger.record(rec);
-    }
-    const infoExcluded = UnusableLedger.excludedList();
-    ok(infoExcluded.length === INFO_NAMES.length,
-      `台账里留下 ${INFO_NAMES.length} 条信息条目（实际 ${infoExcluded.length}）`);
-    const infoRecords = infoExcluded.filter((r) => r.category === 'info');
-    ok(infoRecords.length === INFO_NAMES.length,
-      `台账里 ${INFO_NAMES.length} 条都是 info 类（实际 ${infoRecords.length}）`);
-    ok(UnusableLedger.dnsList().length === 0,
-      '信息条目不混进 DNS 类台账（DNS 类是"域名这次没解析出来"，不是"不是节点"）');
-    ok(infoRecords.every((r) => String(r.reason).indexOf('非节点') >= 0),
-      '台账里信息条目的原因都写明「非节点」');
+    // 真节点同样原样保留（判词消失后不存在"误杀"这一说，但仍要防止丢节点）
+    ok(infoPlan.entries.some((e) => e.merged.name === 'Y-HK-01'),
+      '正常节点（Y-HK-01）⇒ 仍在展示视图里');
   }
 
   // ── I. base64 包着的 Clash YAML 必须走 YAML 分支（不再掉进 URI 分支）──
@@ -1158,18 +1080,22 @@ async function main() {
     // 「YAML 路径与分享链接路径同一套口径」「缺必填整条不可用」「base64 包的 YAML 不掉进 URI 分支」。
     const pathMutations = [
       {
-        name: 'YAML 路径不再判"定义不完整"（缺必填的节点照旧进代理表）',
+        name: 'YAML 路径重新开始"判死刑"（App 把节点踢出展示视图）',
         file: 'YamlNodeAdapter.ets',
         apply: (text) => text.replace(
-          'entry.excluded = !entry.canonical.availability.usable();',
-          'entry.excluded = false;'),
+          '      out.entries.push(entry);',
+          "      if (m.name.indexOf('REALITY') < 0) { out.entries.push(entry); }"),
       },
       {
         name: '不可用口径把"DNS 结论"也算成不可用（DNS 节点被踢出代理表）',
         file: 'NodeUsability.ets',
         apply: (text) => text.replace(
-          '  usable(): boolean {\n    return this.defined();\n  }',
-          '  usable(): boolean {\n    return this.category === UnusableCategory.OK;\n  }'),
+          '  usable(): boolean {\n'
+          + '    return this.category === UnusableCategory.OK || this.category === UnusableCategory.DNS;\n'
+          + '  }',
+          '  usable(): boolean {\n'
+          + '    return this.category === UnusableCategory.OK;\n'
+          + '  }'),
       },
       {
         name: 'base64 分派退回旧口径（base64 包的 Clash YAML 掉进 URI 分支）',

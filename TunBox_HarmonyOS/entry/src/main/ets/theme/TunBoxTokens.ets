@@ -104,9 +104,11 @@ export class TunBoxColors {
     return ThemeService.isDark() ? '#0F131D' : '#F4F6FB';
   }
 
-  /** 系统全局大背景渐变：浅色 #F4F6FB → #EBF1FD；深色 #0A0E1A → #0F131D（用户 2026-10-17 规范） */
+  /** 系统全局大背景渐变：浅色 #F4F6FB → #EBF1FD；深色 #0B1220 → #0F131D
+   *  （深色起点 2026-10-23 由 #0A0E1A 调成 #0B1220：与 ui_background、
+   *   状态栏底色取同一个值，页面顶部与状态栏之间不再出现一条更深的色带 —— AGC 状态栏整改） */
   static get bgGradientStart(): ResourceColor {
-    return ThemeService.isDark() ? '#0A0E1A' : '#F4F6FB';
+    return ThemeService.isDark() ? '#0B1220' : '#F4F6FB';
   }
 
   static get bgGradientEnd(): ResourceColor {

@@ -64,16 +64,34 @@ export class ThemeService {
     }
   }
 
+  /**
+   * 状态栏 / 底部导航条适配（华为 AGC 审核意见 2026-10-23）。
+   *
+   * 审核原文：「采用沉浸一体化的背景设计，避免状态栏区域被单独切割；根据页面内
+   * 状态栏区域的背景色选择合适的状态栏颜色（黑/白）；避免左右半区对比差异过大」。
+   *
+   * 做法：
+   *  1) 状态栏底色 = **页面背景色本身**（浅 #F4F6FB / 深 #0F131D），整条单一颜色，
+   *     不再是透明让系统/窗口底色透出来的独立色条 —— 页面顶部与状态栏同色，
+   *     视觉上是一个整体，也不会出现左右半区深浅不一（整条一个色）。
+   *  2) 状态栏图标颜色跟随主题：浅色底用深色字 (#171B2A)，深色底用浅色字 (#F5F7FF)，
+   *     保证时间/电量/SIM 图标在每个主题下都清晰可读。
+   *  3) 底部导航条同色（页面底部渐变终点色），不出现底部白条。
+   */
   static async syncSystemBars(win: window.Window): Promise<void> {
     const dark = ThemeService.isDark();
-    // 窗口底色与页面背景同色：状态栏/底部系统导航区透出的就是这一层，
-    // 不同色会与页面内容形成分割感。
-    win.setWindowBackgroundColor(dark ? '#171B22' : '#F4F6FB');
+    // 深色底取 #0B1220：与 ui_background（平板/页面平色底）和渐变起点同值，
+    // 状态栏、页面顶部、平色页三者同色，整条不会被切成独立色带。
+    const pageBg = dark ? '#0B1220' : '#F4F6FB';
+    const bottomBg = dark ? '#0F131D' : '#EBF1FD';
+    const contentColor = dark ? '#F5F7FF' : '#171B2A';
+    // 窗口底色与页面同色：加载首帧/页面切换的缝隙也不会露出另一层颜色。
+    win.setWindowBackgroundColor(pageBg);
     await win.setWindowSystemBarProperties({
-      statusBarColor: '#00000000',
-      statusBarContentColor: dark ? '#F5F7FF' : '#171B2A',
-      navigationBarColor: '#00000000',
-      navigationBarContentColor: dark ? '#F5F7FF' : '#171B2A'
+      statusBarColor: pageBg,
+      statusBarContentColor: contentColor,
+      navigationBarColor: bottomBg,
+      navigationBarContentColor: contentColor
     });
   }
 

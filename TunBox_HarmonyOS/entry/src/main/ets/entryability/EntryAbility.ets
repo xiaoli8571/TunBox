@@ -32,13 +32,34 @@ export default class EntryAbility extends UIAbility {
    *
    * 英寸换算：vp = px / densityPixels；1 英寸 = 160vp（display 的 density 以 160 为基准）。
    */
+  /**
+   * 按屏幕对角线英寸设置转场时长的规范下限（AGC 审核意见 2026-10-23）：
+   * < 8.5" → 200ms；8.5~12" → 250ms；> 12" → 300ms。
+   * 实际时长由 TunBoxMotion.ms 取 max(260 设计基线, 该下限)。
+   *
+   * 英寸换算必须用**物理像素 + 真实 DPI**：
+   *   inches = sqrt(widthPx² + heightPx²) / densityDPI
+   * 旧实现用 densityPixels 把 px 折成 vp 再除 160，而 densityPixels 会被系统
+   * 显示缩放（字体/显示大小/折叠屏比例）改写——12.6" 平板会被算成 9.4"，
+   * 转场落在 250ms 档，低于 >12" 要求的 300ms，正是本次审核被点名的原因。
+   */
   private applyMotionFloorByScreenSize(): void {
     try {
       const d = display.getDefaultDisplaySync();
-      const density = d.densityPixels > 0 ? d.densityPixels : 3;
-      const wVp = d.width / density;
-      const hVp = d.height / density;
-      const inches = Math.sqrt(wVp * wVp + hVp * hVp) / 160;
+      let inches: number;
+      const dpi = d.densityDPI > 0 ? d.densityDPI : (d.xDPI > 0 ? d.xDPI : 0);
+      let basis: string;
+      if (dpi > 0) {
+        inches = Math.sqrt(d.width * d.width + d.height * d.height) / dpi;
+        basis = `${d.width}x${d.height}px @${dpi}dpi`;
+      } else {
+        // 极端兜底：DPI 拿不到时退回 vp/160（只用于老设备/模拟器）
+        const density = d.densityPixels > 0 ? d.densityPixels : 3;
+        const wVp = d.width / density;
+        const hVp = d.height / density;
+        inches = Math.sqrt(wVp * wVp + hVp * hVp) / 160;
+        basis = `${wVp.toFixed(0)}x${hVp.toFixed(0)}vp(兜底)`;
+      }
       let floor = 200;
       if (inches > 12) {
         floor = 300;
@@ -46,8 +67,7 @@ export default class EntryAbility extends UIAbility {
         floor = 250;
       }
       AppStorage.setOrCreate<number>('tb_motion_required_ms', floor);
-      AppLogger.info(TAG, `screen ${wVp.toFixed(0)}x${hVp.toFixed(0)}vp ≈ ${inches.toFixed(2)}in `
-        + `→ motion floor ${floor}ms`);
+      AppLogger.info(TAG, `screen ${basis} ≈ ${inches.toFixed(2)}in → motion floor ${floor}ms`);
     } catch (e) {
       // 拿不到 display 时保持设计基线（260ms），不阻断启动
       AppLogger.warn(TAG, `display probe failed: ${AppLogger.errText(e)}`);

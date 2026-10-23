@@ -29,10 +29,8 @@ import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
 
 
-import { UnusableRecord } from '../commons/subscription/UnusableLedger';
-// 台账里的**三类**条目要分开呈现：INCOMPLETE（缺参节点）/ DNS（域名类）/
-// INFO（订阅里混进来的流量/到期/官网等伪节点）⇒ 角标按 category 过滤。
-import { UnusableCategory } from '../commons/subscription/NodeUsability';
+// 【2026-10-22 · FlClash 同构】不再从 App 侧台账取"定义不完整/信息条目"判词
+// （`UnusableRecord` / `UnusableCategory` 的导入已删除 —— 节点可用性归内核）。
 import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import {
@@ -347,10 +345,14 @@ export struct SubscriptionPage {
    */
   @State smartModelReady: boolean = false;
   /**
-   * 模型删除信号：设置页删除 Model.bin 后自增，这里跟着重算入口是否显示。
-   * （@State 不会被别的页面改动，必须靠 AppStorage 信号驱动重渲染。）
+   * 模型删除/更新信号：设置页删除或更新 Model.bin 后自增。
+   *
+   * 【2026-10-22 真机 bug 修复】原来只在 build 里调 `smartModelOn()`（方法调用，
+   * 不读任何状态），ArkUI 不会把它登记成本组件的依赖 —— 用户在设置里删掉模型、
+   * 回到订阅页，卡片仍然挂着（用户实锤「我删了，没有隐藏」）。
+   * 现在：seq 变化 ⇒ @Watch 重算 @State smartModelReady ⇒ build 真的重跑。
    */
-  @StorageLink('smart_model_seq') smartModelSeq: number = 0;
+  @StorageLink('smart_model_seq') @Watch('onSmartModelSeq') smartModelSeq: number = 0;
   /** 节点排布列数（1=单列 2=双列），用户在订阅分组展开区手动切换，选择持久化 */
   @State nodeColumns: number = 1;
   @State latencyTick: number = 0;
@@ -613,73 +615,12 @@ export struct SubscriptionPage {
   }
 
 
-  /**
-   * 某订阅里**定义不完整**的节点数（订阅行的角标用）。
-   *
-   * ⚠ 与「域名无法解析」是**两件不同的事**，必须分开呈现（lead 2026-10-20 追加）：
-   *  - 定义不完整 = 这条订阅给过来的节点**字段就缺**（缺 uuid / reality 公钥 /
-   *    密码 / server / port）⇒ 是**订阅提供方（机场）**的数据问题，**不是 TunBox
-   *    的问题**；这类节点整条被排除，不进内核代理表、也不进测速集合。
-   *  - 域名无法解析 = 定义完整，但域名**真的下线了** ⇒ 来自测速内核的
-   *    `dns_unresolved` 结论（LatencyStore），是**机场线路**的问题。
-   * 两者来源不同（订阅侧台账 vs 测速结论），不许合成一句话，更不许都写成「失败」。
-   *
-   * ⚠⚠ **只数 INCOMPLETE 类**：`unusableDefinitions()` 返回的是台账里**所有被排除
-   * 的条目**（`excluded === true`），而台账里还有两类同样 excluded 的条目 ——
-   * **信息条目（INFO）**（订阅里的流量/到期/官网/群等伪节点）与 **DNS 类**
-   * （定义完整、只是这次域名没解析出来）。不按 category 过滤 ⇒ 用户会以为
-   * 「6 条信息条」是「6 条缺参的节点」⇒ 口径必须按 category 拆开
-   * （lead 2026-10-20 追加）。
-   */
-  private incompleteCount(subId: string): number {
-    const items: UnusableRecord[] = SubscriptionService.unusableDefinitions();
-    let count: number = 0;
-    for (const item of items) {
-      if (item.subscriptionId === subId && item.category === UnusableCategory.INCOMPLETE) {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  /** 「定义不完整」的一句话说明（空串 = 这条订阅没有这类问题） */
-  private incompleteHint(subId: string): string {
-    const count: number = this.incompleteCount(subId);
-    if (count === 0) {
-      return '';
-    }
-    return `${count} 条节点定义不完整：订阅里这些节点缺必填参数，已整条排除、未纳入测速。`
-      + '这是订阅提供方给的数据有问题，不是 TunBox 的问题；可以找机场补全或换一条线路。';
-  }
-
-  /**
-   * 某订阅里**信息条目**（INFO）的条数 —— 第三类，独立角标。
-   *
-   * 这是订阅里混进来的**伪节点**：流量/到期/官网/群链接之类（名字里含 http(s)
-   * URL 或这些关键词）⇒ 它们本来就不是节点，剔出代理表与测速集合是对的
-   * （yaml-sub 台账侧实现）。但**必须单独告诉用户「这 N 条是信息条目」** ——
-   * 混进「定义不完整」里，用户会以为机场给了一堆缺参的坏节点。
-   */
-  private infoCount(subId: string): number {
-    const items: UnusableRecord[] = SubscriptionService.unusableDefinitions();
-    let count: number = 0;
-    for (const item of items) {
-      if (item.subscriptionId === subId && item.category === UnusableCategory.INFO) {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  /** 「信息条目已跳过」的一句话说明（空串 = 这条订阅没有这类条目） */
-  private infoHint(subId: string): string {
-    const count: number = this.infoCount(subId);
-    if (count === 0) {
-      return '';
-    }
-    return `${count} 条信息条目已跳过：订阅里混进来的流量/到期/官网等说明行，本就不是节点，`
-      + '已剔出节点列表与测速，不影响可用节点。';
-  }
+  // 【2026-10-22 · FlClash 同构】这里原来有 `incompleteCount` / `incompleteHint` /
+  // `infoCount` / `infoHint`（"N 条定义不完整 / N 条信息条目已跳过"角标与说明）。
+  // 全部删除：**App 侧不再对节点下可用性判词** —— 订阅原文直接作为内核配置基底
+  // （`ProfileConfigMerger`），节点在不在、能不能用由内核 `/proxies` 说了算；
+  // App 再给一份结论必然与内核分叉（真机实证：同 server:port 两条节点串台，
+  // 一条内核能用的节点被误标「定义不完整」）。
 
   /**
    * 订阅的**组级诊断**（空串 = 没有同因失败）。
@@ -689,7 +630,12 @@ export struct SubscriptionPage {
    */
   /** 「自动选择」入口是否该显示：模型必须真的在盘上（删掉就隐藏，用户要求） */
   private smartModelOn(): boolean {
-    return ConnectionOrchestrator.instance().isSmartModelAvailable();
+    return this.smartModelReady;
+  }
+
+  /** 模型文件被更新/删除（设置页 bump smart_model_seq）：同步重算入口可见性 */
+  onSmartModelSeq(): void {
+    this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
   }
 
   private diagCache: Map<string, string> = new Map<string, string>();
@@ -711,7 +657,10 @@ export struct SubscriptionPage {
     if (cached !== undefined) {
       return cached;
     }
-    const nodes: ProxyNode[] = this.service.nodesOf(subId);
+    // 【2026-10-22 · FlClash 同构】诊断用**内核**节点名（组级结论本来就来自内核
+    // LatencyStore，名字必须是内核名）；内核目录不可用时才退回 App 解析列表。
+    const nodes: ProxyNode[] = (subId === ProfileStore.currentId() && this.coreNodesUsable())
+      ? this.coreNodes : this.service.nodesOf(subId);
     const names: string[] = [];
     for (const node of nodes) {
       names.push(node.name);
@@ -869,7 +818,17 @@ export struct SubscriptionPage {
     if (sub.id === ProfileStore.currentId() && this.coreNodesUsable()) {
       return this.coreNodes.length;
     }
-    return this.service.nodesOf(sub.id).length;
+    // 【2026-10-22 · FlClash 同构】节点数取**原文 proxies 条目数**
+    // （FlClash `configCountsOf(loadYaml(profile))` 的口径），不再用 App 解析结果：
+    // App 解析不了的协议会被跳过，用它计数会比内核加载的少。
+    if (sub.id === DIRECT_GROUP_ID) {
+      // 手工直链分组是 App 自己的节点（不在任何 profile 原文里），只能数 App 模型
+      return this.service.nodesOf(sub.id).length;
+    }
+    // 列表用的是 App 解析表（非当前订阅没有内核节点表），数量与列表保持一致，
+    // 否则会出现"N 个节点"和实际卡片数对不上（用户实锤 32 vs 23）。
+    const listed = this.service.nodesOf(sub.id).length;
+    return listed > 0 ? listed : sub.nodeCount;
   }
 
   /**
@@ -1020,6 +979,25 @@ export struct SubscriptionPage {
       await this.activateProfile(subId);
       const progress = await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
         (): void => { this.showToast('正在测速…'); });
+      // 【2026-10-22】测速结论立刻落盘。
+      // 此前只写进程内视图（LatencyLiveView），force-stop / 被系统清理后重启，
+      // 刚测出来的 24 个绿值全变回 `--`（真机复现：测完全绿 → 杀进程 → 全 `--`）。
+      // 落盘口径沿用本仓既有规则：只落判定类结论（静默批的失败不落），时间戳/
+      // 失败分类原样保留，冷启动恢复后照常显示「123ms」或「超时·旧」。
+      const testedNames: string[] = [];
+      for (const n of this.coreNodes) {
+        testedNames.push(n.name);
+      }
+      if (testedNames.length === 0) {
+        for (const n of this.service.nodesOf(subId)) {
+          testedNames.push(n.name);
+        }
+      }
+      try {
+        await LatencyStoreBridge.persistConclusions(testedNames);
+      } catch (e) {
+        AppLogger.warn(TAG, `persist latency conclusions failed: ${AppLogger.errText(e)}`);
+      }
       // 控制器过载必须有界面出口：过载路径下引擎**故意不给节点写结论**（保持未测），
       // 用户看到的会是「测速完成 + 一堆 --」。不单独说明就等于「跑完了没解释」——
       // 正是 0.4.4 过载鉴别要消灭的现象。文案要与「通道不可用」区分：通道是好的。
@@ -1075,11 +1053,7 @@ export struct SubscriptionPage {
         this.showToast('通道不可用，本轮结果无效，节点已恢复未测');
         return;
       }
-      let msg = `测速完成：可用 ${progress.measured} / 超时 ${progress.timeout}`;
-      if (progress.failed > 0) {
-        msg += ` / 未生效 ${progress.failed}`;
-      }
-      this.showToast(msg);
+      this.showToast('✓ 测速完成');
     } catch (e) {
       AppLogger.warn(TAG, `kernel group test failed: ${AppLogger.errText(e)}`);
       this.showToast('组测速失败，请重试');
@@ -1170,16 +1144,17 @@ export struct SubscriptionPage {
     if (raw.length === 0 || this.isAdding || this.isRefreshing) {
       return;
     }
-    // 多行输入（一行一个节点链接）走批量导入；单行保持原行为（节点/订阅二选一）
+    // 【2026-10-22 用户口径】订阅 URL 输入框只收「订阅地址」：
+    // 单节点链接一律拒绝，统一走「设置 → 订阅转换」（导出 YAML 再以文件导入）。
+    // 旧实现会把这些链接解析成节点塞进「单节点」虚拟分组，那个分组已经退场。
     const nonEmptyLines = raw.split(/\r?\n/)
       .map((l: string): string => l.trim())
       .filter((l: string): boolean => l.length > 0);
-    if (nonEmptyLines.length > 1) {
-      await this.importNodeUris(raw);
-      return;
-    }
-    if (SubscriptionService.isNodeUri(raw)) {
-      await this.importNodeUris(raw);
+    const hasNodeUri = nonEmptyLines.some((l: string): boolean => SubscriptionService.isNodeUri(l));
+    if (hasNodeUri) {
+      promptAction.showToast({
+        message: '单节点链接不支持在这里添加：请到「设置 → 订阅转换」生成 YAML 文件，再用「+ → 文件」导入'
+      });
       return;
     }
     if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(raw, this.settings.allowInsecureSubscriptionHttp)) {
@@ -1225,38 +1200,6 @@ export struct SubscriptionPage {
     this.isAdding = false;
   }
 
-  /** 节点链接导入：一行一个批量（vless/vmess/ss/trojan…），重复与无效逐条隔离 */
-  private async importNodeUris(raw: string): Promise<void> {
-    this.isAdding = true;
-    try {
-      const r = await this.service.addDirectNodesText(raw);
-      this.reload();
-      if (r.added > 0) {
-        let msg = r.added === 1
-          ? `节点链接已导入，当前共 ${this.service.nodes.length} 个节点`
-          : `✓ 已导入 ${r.added} 个节点，当前共 ${this.service.nodes.length} 个`;
-        const extra: string[] = [];
-        if (r.duplicate > 0) {
-          extra.push(`${r.duplicate} 条重复`);
-        }
-        if (r.invalid > 0) {
-          extra.push(`${r.invalid} 条无效`);
-        }
-        if (extra.length > 0) {
-          msg += `（${extra.join('，')}）`;
-        }
-        this.showToast(msg);
-      } else if (r.duplicate > 0 && r.invalid === 0) {
-        this.showToast(r.duplicate === 1 ? '该节点已存在，无需重复添加' : `${r.duplicate} 条链接均已存在，无需重复添加`);
-      } else {
-        this.showToast('导入失败，请检查链接是否有效');
-      }
-    } catch (e) {
-      this.showToast('导入失败，请检查链接是否有效');
-    }
-    this.isAdding = false;
-  }
-
   private async importFromQr(): Promise<void> {
     if (this.isScanning || this.isAdding || this.isRefreshing || this.isImporting) {
       return;
@@ -1274,7 +1217,7 @@ export struct SubscriptionPage {
       }
       // 2026-10-21：二维码只支持 Clash 订阅，扫到单节点链接不再导入
       if (SubscriptionService.isNodeUri(raw)) {
-        this.showToast('扫码只支持 Clash 订阅二维码，单节点请在「+ → URL」里粘贴');
+        this.showToast('扫码只支持 Clash 订阅二维码；单节点请到「设置 → 订阅转换」生成 YAML 再导入');
         return;
       }
       const lower = raw.toLowerCase();
@@ -1772,24 +1715,9 @@ export struct SubscriptionPage {
                         // —— 节点行已经逐条写着「域名无法解析（节点域名可能已下线）」，
                         // 卡片再挂一个计数是**重复信息**（用户：「你在节点上显示了，
                         // 这里就不允许显示了」）⇒ 卡片只保留与节点无关的统计。
-                        // 「定义不完整」单独一个角标（与上面的「域名无法解析」是两回事：
-                        // 这一条是订阅给的数据缺字段，不是线路问题、更不是网络问题）。
-                        if (this.incompleteCount(sub.id) > 0) {
-                          Text(`${this.incompleteCount(sub.id)} 条定义不完整`)
-                            .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.warning)
-                            .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-                            .borderRadius(TunBoxGeometry.pillRadius)
-                            .backgroundColor(TunBoxColors.surfaceSubtle)
-                            .flexShrink(0)
-                            .onClick(() => {
-                              if (!this.isOpen(sub.id)) {
-                                this.toggleOpen(sub.id);
-                              }
-                            })
-                        }
-                        // 2026-10-20 用户要求：订阅卡片上**不再显示**「N 条信息条目已跳过」
-                        // —— 与上面同一条理由：卡片不重复节点级结论；信息条目在展开区
-                        // 的说明里能看到（那里才是它的位置）。
+                        //
+                        // 【2026-10-22 · FlClash 同构】「N 条定义不完整」角标已删除：
+                        // App 侧不再对节点下可用性判词（节点可用性归内核 `/proxies`）。
                       }.width('100%')
                       Row({ space: 6 }) {
                         // 旧格式角标：非 Clash 内容已被停止刷新，但节点仍可用（策略 2）
@@ -1862,26 +1790,8 @@ export struct SubscriptionPage {
                         .borderWidth(1)
                         .borderColor(TunBoxColors.warning)
                       }
-                      // 「定义不完整」单独一条（**不与域名无法解析合并**）：
-                      // 订阅给的数据缺字段 ⇒ 机场/线路提供方的问题，不是 TunBox 的问题。
-                      if (this.incompleteHint(sub.id).length > 0) {
-                        Row({ space: 8 }) {
-                          Image($r('app.media.ic_warning'))
-                            .width(15).height(15)
-                            .fillColor(TunBoxColors.textSecondary)
-                          Text(this.incompleteHint(sub.id))
-                            .fontSize(12)
-                            .fontColor(TunBoxColors.textSecondary)
-                            .layoutWeight(1)
-                            .maxLines(4)
-                        }
-                        .width('100%')
-                        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-                        .borderRadius(10)
-                        .backgroundColor(TunBoxColors.surfaceSubtle)
-                        .borderWidth(1)
-                        .borderColor(TunBoxColors.cardBorder)
-                      }
+                      // 【2026-10-22 · FlClash 同构】「定义不完整」说明条已删除 ——
+                      // App 不判节点可用性；节点能不用用只由内核决定（见卡片头注释）。
                       // 2026-10-19 用户要求：原「点击选用节点 · 长按可删除单个节点 ·
                       // 点行头闪电图标测速」提示行**去掉**，这一行改放操作按钮：
                       // 闪电测速 / 编辑 / 删除（闪电在编辑左边）。
