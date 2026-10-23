@@ -57,6 +57,7 @@ const KNOWN_BASELINE_FAILURES = {
 /** 需要额外参数的脚本：给它们准备好参数，否则它们会因为"用法错误"失败。 */
 const ARG_BUILDERS = {
   'verify-shipped-dns-fix.mjs': (hap) => (hap === null ? null : [hap]),
+  'verify-flclash-profile.mjs': (_hap, args) => (args.strict ? ['--require-mihomo'] : []),
   'verify-smart-active-chains.mjs': () => [] // 无设备时脚本自身会打印 SKIP 并 exit 0
 };
 
@@ -115,7 +116,7 @@ function main() {
 
   const results = [];
   for (const name of scripts) {
-    const extra = ARG_BUILDERS[name] !== undefined ? ARG_BUILDERS[name](hap) : [];
+    const extra = ARG_BUILDERS[name] !== undefined ? ARG_BUILDERS[name](hap, args) : [];
     if (extra === null) {
       results.push({ name, code: 0, skipped: true, tail: '未提供 HAP，跳过' });
       console.log(`SKIP ${name}（未提供 HAP）`);

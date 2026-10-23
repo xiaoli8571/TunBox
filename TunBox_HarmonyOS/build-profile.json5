@@ -8,7 +8,21 @@
     //   ①换机/CI 构建直接失败或签名不匹配；②凭据类材料入库；③与文件内注释矛盾。
     //   DevEco「自动生成签名」写进来的 signingConfigs 只允许留在本地工作区，
     //   提交前必须恢复为空数组（scripts/verify-build-profile.mjs 会拦截）。
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\Administrator\\.ohos\\config\\default_TunBox_HarmonyOS_dxKCNw3ssq7dB3_GqPmpFO39lRyYOC8zNAj-A_ubn-Y=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B7AAF62F08F00E9DF5C1132E321DDB58AD426AB2E5FA888BD087977DF95773DB41EBAC65EF70C7F",
+          "profile": "C:\\Users\\Administrator\\.ohos\\config\\default_TunBox_HarmonyOS_dxKCNw3ssq7dB3_GqPmpFO39lRyYOC8zNAj-A_ubn-Y=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\Administrator\\.ohos\\config\\default_TunBox_HarmonyOS_dxKCNw3ssq7dB3_GqPmpFO39lRyYOC8zNAj-A_ubn-Y=.p12",
+          "storePassword": "0000001BCE3C344DA55B022C78AB04AD95E2A78F45C181994993FF8A2BBB9592FAD891F0A032A1A85D13AA"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
@@ -18,7 +32,8 @@
         // 「开启沉浸光感，要确保应用的targetSDKVersion不低于26.0.0」）。
         // 本机 SDK 为 HarmonyOS 26.0.0(105)，compatibleSdkVersion 保持 6.1.1(24) 向下兼容。
         "targetSdkVersion": "26.0.0",
-        "runtimeOS": "HarmonyOS"
+        "runtimeOS": "HarmonyOS",
+      "signingConfig": "default"
       }
     ],
     "buildModeSet": [

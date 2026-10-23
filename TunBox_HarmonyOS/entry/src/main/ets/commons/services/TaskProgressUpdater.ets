@@ -62,7 +62,9 @@ export enum ContinuousTaskKind {
   /** 数据传输类型：允许周期更新实况窗进度 */
   DATA_TRANSFER = 'dataTransfer',
   /** 计算任务类型：不得修改长时任务通知内容 */
-  TASK_KEEPING = 'taskKeeping'
+  TASK_KEEPING = 'taskKeeping',
+  /** Audio task: AVSession/renderer own playback; no live-view progress. */
+  AUDIO_PLAYBACK = 'audioPlayback'
 }
 
 /** 更新周期：官方窗口为 10 分钟，这里 5 分钟留一倍冗余 */
@@ -128,13 +130,13 @@ export class TaskProgressUpdater {
    */
   static attach(notificationId: number, kind: ContinuousTaskKind): void {
     TaskProgressUpdater.detach();
-    if (kind === ContinuousTaskKind.TASK_KEEPING) {
+    if (kind !== ContinuousTaskKind.DATA_TRANSFER) {
       // taskKeeping：接入规范「不得修改长时任务通知内容（数据传输任务除外）」——
       // 因此既不推实况窗进度、也不接管通知 id、更**不撤**应用自有常驻通知
       // （速率/运行时长继续由 SsrvpnNotifier 承载：updateLive 在没有长时任务
       // 通知 id 时会自动回落到应用自有通知）。
       AppLogger.info(TAG,
-        'taskKeeping mode: live-view progress disabled (non-dataTransfer long-running task notification must not be modified)');
+        `${kind} mode: live-view progress disabled (non-dataTransfer long-running task notification must not be modified)`);
       return;
     }
     if (typeof notificationId !== 'number' || notificationId < 0) {

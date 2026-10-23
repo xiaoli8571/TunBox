@@ -200,12 +200,12 @@ const HEARTBEAT_STALE_MS = 15000;
  * 连续多少次「非存活」观测才升级为内核死亡并触发自愈。
  *
  * 观测分两档：
- *  - STALE（心跳过期）：强证据 —— 刷新方已失联 ≥15s，一次顶满；
- *  - UNKNOWN（心跳读不到：文件缺失/空/损坏）：弱证据 —— 可能只是一次读失败，
- *    只记 1 票，要连续 3 票才升级。
- * 旧实现把 UNKNOWN 直接等同于「已死」：一次读失败就拆隧道重连。
+ *  - STALE / UNKNOWN 都必须先复探真实 controller，再跨至少 6s 连续确认 3 次。
+ *    锁屏可能暂停 ArkTS 的租约定时器，而原生代理仍在转发；旧心跳不是死亡证明。
  */
 const CORE_DEATH_CONFIRMATIONS = 3;
+const CORE_LIVENESS_POLL_MS = 3000;
+const CORE_DEATH_CONFIRM_MS = (CORE_DEATH_CONFIRMATIONS - 1) * CORE_LIVENESS_POLL_MS;
 
 /** 心跳观测的三态判定结果 */
 enum LivenessVerdict {
@@ -480,6 +480,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private coreLossHandling: boolean = false;
   /** 连续「非存活」观测票数（累计到 CORE_DEATH_CONFIRMATIONS 才升级为内核死亡）。 */
   private coreDeathStrikes: number = 0;
+  private coreDeathFirstAt: number = 0;
+  private coreDeathLastAt: number = 0;
+  private monitorGeneration: number = 0;
+  private livenessPollRunning: boolean = false;
   private inRepairConnect: boolean = false;
 
   // ── 第二阶段：连续失败 → 自动切换节点 ──────────────────────────────
@@ -635,18 +639,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /**
    * 进程被杀 / 回前台时的状态自愈入口。
    *
-   * **不再自动拉起 VPN（用户明确要求）**：判定到"用户分层意图是想连着、但隧道确实
-   * 已经没了"时，只把磁盘上残留的意图落盘为"已断开"，让首页/卡片/快捷方式显示的
-   * 状态与真实一致，然后返回 —— 绝不代用户建连。用户必须自己在界面上点连接。
+   * 只接管现有会话，不自动拉起 VPN。租约过期时先检查认证 controller；证据不足
+   * 也不改写用户意图。真正失联交给已有监控的有限确认/修复，或用户主动连接。
    *
    * 判定链（任一命中即不动）：
    *  1. 磁盘上没有"用户想连"的意图 → 用户从未连过，或已明确断开
    *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束
    *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话，仅复用真实状态
    *  4. 本进程已有连接在途（CONNECTING/RECOVERING）→ 让在途流程自己走完
-   *  5. 以上都不是 → 清掉残留意图，等待用户手动连接（auto-connect-disabled）
+   *  5. 以上都不是 → 运行态尚未确认，保留意图，等待监控复核或用户操作。
+   *     打开页面本身不应清除会话意图，更不应启动/拆除隧道。
    *
-   * 返回判定原因字符串供日志观察；内部已吞掉所有异常，调用方不应 await。
+   * 返回判定原因字符串供日志观察；页面可 await 以同步完成状态接管。
    */
   async restoreKilledSession(context: Context): Promise<string> {
     try {
@@ -660,19 +664,33 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, `restore skipped: snapshot phase=${snap.phase}`);
         return `phase-${snap.phase}`;
       }
-      const authority = await this.authorityState();
-      if (authority.connected) {
-        return 'already-connected';
-      }
-      if (this.state === ConnState.CONNECTING || this.state === ConnState.RECOVERING) {
+      const seq = this.connectSeq;
+      if (this.state === ConnState.CONNECTING || this.state === ConnState.RECOVERING
+        || this.state === ConnState.DISCONNECTING) {
         return 'operation-in-flight';
       }
-      // 隧道确实没了：把残留的"想连着"意图落盘为断开。
-      // 不清会把 UI/卡片拖进"显示想连但实际没连"的错位状态（用户会以为已经连上）。
-      AppLogger.warn(TAG, `self-heal: intent=${snap.phase} but tunnel is gone`
-        + ` (${authority.reason}); auto-connect disabled by policy — waiting for user gesture`);
-      await this.clearSessionIntent(snap.sessionGeneration);
-      return 'auto-connect-disabled';
+      const authority = await this.authorityState();
+      if (authority.connected) {
+        // UI 进程重建只接管仍在运行的会话，不调用 connect()，不刷新 startedAt。
+        await this.restoreTunnelController(snap, false);
+        if (seq !== this.connectSeq || this.disconnectRequested
+          || !await this.isCurrentSession(snap.sessionGeneration)) {
+          return 'session-changed';
+        }
+        const changedSession = this.sessionGeneration !== snap.sessionGeneration;
+        this.sessionGeneration = snap.sessionGeneration;
+        if (changedSession || this.startedAt <= 0) { this.startedAt = snap.startedAt; }
+        this.lastNodeName = snap.nodeName;
+        this.lastSubs = SubscriptionService.instance();
+        this.lastNode = this.lastSubs.nodes.find((node: ProxyNode): boolean => node.name === snap.nodeName) ?? null;
+        this.state = ConnState.CONNECTED;
+        if (changedSession || this.monitorTimer < 0) { this.startMonitors(); }
+        this.notify();
+        return 'already-connected';
+      }
+      AppLogger.warn(TAG, `foreground inspection: runtime unconfirmed (${authority.reason}); `
+        + 'preserve session intent; no connect/disconnect from opening the app');
+      return 'runtime-unconfirmed';
     } catch (e) {
       AppLogger.warn(TAG, `self-heal error: ${AppLogger.errText(e)}`);
       return 'error';
@@ -711,21 +729,73 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    */
   async authorityState(): Promise<TunnelAuthorityState> {
     let desired = false;
+    let snapshot: ConnectionSnapshot | null = null;
+    const seq = this.connectSeq;
     try {
       const snap = await SettingsService.loadSnapshot();
+      snapshot = snap;
       desired = snap.desiredConnected;
     } catch (e) {
       desired = false;
     }
-    // START_OK_FILE 仅用于启动握手，不能作为长期存活证据。稳态权威状态只认
-    // Extension 持续刷新的低频存活租约，避免 Core 已退出后旧标记造成假连接。
-    const state = resolveAuthority(desired, this.readHeartbeatAge(), false);
-    // 进程内已确认为连接中/恢复中时，仍以内存态优先（避免广播空窗期闪烁）
-    if (this.state === ConnState.CONNECTED && state.coreAlive) {
+    // START_OK_FILE 仅用于启动握手，不能作为长期存活证据。
+    const state = resolveAuthority(desired, await this.readHeartbeatAgeAsync(), false);
+    // 租约可能只是锁屏时停更。先用该会话的私有端口 + AssetStore secret 认证探活。
+    // 启动标记、旧 status 文件、无认证的端口响应都不作为此处的存活证明。
+    if (desired && !state.coreAlive && snapshot !== null && !this.disconnectRequested
+      && await this.restoreTunnelController(snapshot, true)) {
+      state.coreAlive = true;
       state.connected = true;
-      state.reason = 'core-alive';
+      state.reason = 'controller-alive';
+    }
+    if (seq !== this.connectSeq
+      || !await this.isCurrentSession(snapshot === null ? -1 : snapshot.sessionGeneration, false)) {
+      return resolveAuthority(false, -1, false);
     }
     return state;
+  }
+
+  /** 恢复真实隧道的 controller；只读本机配置头，凭据仍只从 AssetStore 获取。 */
+  private async restoreTunnelController(snapshot: ConnectionSnapshot, verifyResponse: boolean): Promise<boolean> {
+    if (this.context === null || !snapshot.desiredConnected
+      || (snapshot.phase !== 'connected' && snapshot.phase !== 'recovering')
+      || this.state === ConnState.CONNECTING || this.state === ConnState.DISCONNECTING
+      || (this.testCoreFlight !== null && this.testCoreFlight.isActive())) {
+      return false;
+    }
+    const seq = this.connectSeq;
+    try {
+      // 生成器把 external-controller 放在第二行；只取 4 KiB，不扫描/记录整份订阅配置。
+      const header = await privateFs.readCappedAsync(`${this.context.cacheDir}/${CONFIG_FILE}`, 4096);
+      const match = header.ok
+        ? /^external-controller:[ \t]*127\.0\.0\.1:(\d{1,5})[ \t]*\r?$/m.exec(header.text) : null;
+      const port = match === null ? 0 : Number(match[1]);
+      if (port <= 0 || port > 65535) { return false; }
+      const secret = await SettingsService.getApiSecret();
+      if (secret.length === 0) { return false; }
+      const probe = new ClashApiService();
+      probe.setEndpoint(port, secret);
+      if (verifyResponse && !await probe.healthProbe()) { return false; }
+      if (seq !== this.connectSeq || this.disconnectRequested
+        || !await this.isCurrentSession(snapshot.sessionGeneration)) {
+        return false;
+      }
+      this.apiPort = port;
+      const mixed = /^mixed-port:[ \t]*(\d{1,5})[ \t]*\r?$/m.exec(header.text);
+      const dns = /^  listen:[ \t]*127\.0\.0\.1:(\d{1,5})[ \t]*\r?$/m.exec(header.text);
+      if (mixed !== null && Number(mixed[1]) > 0 && Number(mixed[1]) <= 65535) {
+        this.mixedPort = Number(mixed[1]);
+      }
+      if (dns !== null && Number(dns[1]) > 0 && Number(dns[1]) <= 65535) {
+        this.dnsPort = Number(dns[1]);
+      }
+      this.apiSecret = secret;
+      this.api.setEndpoint(port, secret);
+      return true;
+    } catch (e) {
+      AppLogger.warn(TAG, `runtime controller restore failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
   }
 
   /**
@@ -978,8 +1048,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return false;
     }
     this.reloading = true;
+    const seq = this.connectSeq;
+    const generation = this.sessionGeneration;
     try {
       const settings: AppSettings = await SettingsService.load();
+      const ruleProviderFileReady = this.isRuleProviderReady();
       // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
       // 唯一配置生成入口：热重载与隧道/测速核走同一条生成路径（决策一处、事实同源）。
       const hotPorts = new RuntimePorts();
@@ -987,8 +1060,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       hotPorts.mixedPort = this.mixedPort;
       hotPorts.dnsPort = this.dnsPort;
       const hotProfile = await this.hydrateAndBuildProfile(subs, settings, node.name, hotPorts, this.apiSecret,
-        this.lastProxyHosts, this.lastSmartModelReady, this.lastGeoipReady, this.lastRuleProviderFileReady);
+        this.lastProxyHosts, this.lastSmartModelReady, this.lastGeoipReady, ruleProviderFileReady);
       const hotBuilt = await RuntimeConfigBuilder.buildRuntimeConfig(hotProfile, RuntimeConfigMode.TUNNEL);
+      if (!this.isRuleSessionCurrent(seq, generation)) {
+        return false;
+      }
       const yaml = hotBuilt.yaml;
       // 写盘前闸门：坏配置绝不落盘（内核对重复键是整份拒载）
       const safeYaml = this.prepareConfigYaml(yaml, 'hot-reload');
@@ -1000,6 +1076,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const stagedPath = `${configPath}.next`;
       privateFs.writePrivate(stagedPath, safeYaml);
       const reloaded = await this.api.reloadFromPath(stagedPath);
+      if (!this.isRuleSessionCurrent(seq, generation)) {
+        return false;
+      }
       if (reloaded) {
         this.confirmProfileApplied('hot-reload');
       }
@@ -1021,8 +1100,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 隧道配置已按当前节点集重写 → 登记新指纹（测速前的过期判定用）
       this.tunnelConfigFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
+      this.lastRuleProviderFileReady = ruleProviderFileReady;
       // 热重载会把代理组重置为默认首节点，恢复用户当前选择。
       await this.api.selectNode(this.lastNodeName);
+      if (!this.isRuleSessionCurrent(seq, generation)) {
+        return false;
+      }
       this.applyProxyModeSilent(settings.proxyMode);
       AppLogger.info(TAG, `[hot-reload] rules applied without TUN rebuild (${reason})`);
       this.notify();
@@ -1073,7 +1156,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /**
    * 规则变更统一入口：优先热重载，失败回退完整重连（保证最终生效）。
    * 应用排除/白名单（包名级）变更仍需重建 TUN，不走此路径。
-   * @returns 'hot'=内核热重载未重建隧道；'reconnect'=已断开重连；'none'=未连接下次生效
+   * @returns hot / reconnect / none；ad-unavailable=需手动下载规则集；pending=另一热更进行中
    */
   /**
    * 确保「内核里的配置」就是 `ProfileStore.currentId()` 指向的那份。
@@ -1125,10 +1208,47 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   async applyRulesChanged(reason: string): Promise<string> {
-    const hot = await this.reloadRulesHot(reason);
-    if (hot) {
-      return 'hot';
+    const seq = this.connectSeq;
+    const generation = this.sessionGeneration;
+    const task = this.ruleApplyQueue.then((): Promise<string> =>
+      this.applyRulesChangedNow(reason, seq, generation));
+    this.ruleApplyQueue = task.catch((e: Object): string => {
+      AppLogger.warn(TAG, `apply rules failed: ${AppLogger.errText(e)}`);
+      return 'none';
+    });
+    return task;
+  }
+
+  private ruleApplyQueue: Promise<string> = Promise.resolve('none');
+
+  private isRuleSessionCurrent(seq: number, generation: number): boolean {
+    return this.state === ConnState.CONNECTED && !this.disconnectRequested
+      && seq === this.connectSeq && generation === this.sessionGeneration;
+  }
+
+  private async applyRulesChangedNow(reason: string, seq: number, generation: number): Promise<string> {
+    if (!this.isRuleSessionCurrent(seq, generation)) {
+      return 'none';
     }
+    const settings = await SettingsService.load();
+    if (!this.isRuleSessionCurrent(seq, generation)) {
+      return 'none';
+    }
+    // 资产仅由手动下载/内置副本来源；缺文件也要应用其余规则，并移除旧 provider。
+    // 去广告是独立开关（2026-10-23 用户口径）：这里只看 hyperAdRulesEnabled，
+    // 不能因为「规则引擎关着」就把去广告判定成不可用。
+    const adUnavailable = settings.hyperAdRulesEnabled && !this.isRuleProviderReady();
+    if (this.reloading) {
+      return 'pending';
+    }
+    const hot = await this.reloadRulesHot(reason);
+    if (!this.isRuleSessionCurrent(seq, generation)) {
+      return 'none';
+    }
+    if (hot) {
+      return adUnavailable ? 'ad-unavailable' : 'hot';
+    }
+    if (adUnavailable) { return 'ad-unavailable'; }
     const did = await this.restartIfConnected(reason);
     return did ? 'reconnect' : 'none';
   }
@@ -2572,6 +2692,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, `ensureTestCore skipped: real tunnel is authoritative (${authority.reason})`);
         return false;
       }
+      const snapshot = await SettingsService.loadSnapshot();
+      if (snapshot.desiredConnected
+        && ['connecting', 'connected', 'recovering'].includes(snapshot.phase)) {
+        // 冷启动暂未确认存活时，也不能让预热测速核 stop 掉可能仍在转发的真实隧道。
+        AppLogger.info(TAG, 'ensureTestCore skipped: real session intent is still active/unconfirmed');
+        return false;
+      }
     } catch (error) {
       // 读不到持久化意图时按「未连接」继续：不能因一次读盘失败就永久禁用测速内核。
       AppLogger.warn(TAG,
@@ -3407,7 +3534,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const ruleProviderFileReady = this.isRuleProviderReady();
       if (adRulesOn && !ruleProviderFileReady) {
         AppLogger.info(TAG, 'ruleset/hyper_adrules_ads.mrs missing; generate config without RULE-SET');
-        this.downloadRuleProviderInBackground('auto');
+        this.downloadRuleProviderAsset('auto').catch((e: Object): void => {
+          AppLogger.warn(TAG, `hyper-adrules background download error: ${e}`);
+        });
       } else if (!adRulesOn) {
         AppLogger.info(TAG, 'ad-block rules disabled; skipping hyper-adrules ruleset provisioning');
       }
@@ -4549,6 +4678,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.context === null) {
       return '应用尚未初始化完成';
     }
+    const seq = this.connectSeq;
+    const generation = this.sessionGeneration;
     let ok = false;
     if (id === 'geoip') {
       ok = await this.downloadGeoipAsset(source);
@@ -4559,12 +4690,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } else {
       return '未知的数据项';
     }
+    // 去广告规则集更新成功 → 热加载新规则（失败由 applyRulesChanged 内部回退重连）。
+    // 会话代次不符说明用户已重连/断开：迟到的下载结果不能改写新会话的配置。
+    if (ok && id === 'ruleset' && this.isRuleSessionCurrent(seq, generation)) {
+      await this.applyRulesChanged('ruleset-updated');
+    }
     // 【2026-10-22】模型下载成功后也要 bump 信号：订阅页的「自动选择」入口跟着
     // `smart_model_seq` 重算（与删除对称）。否则用户点「更新」把模型装回来了、
     // 入口却还藏着，得杀进程才会出现。
     if (ok && id === 'model') {
       const seq = AppStorage.get<number>('smart_model_seq');
-      AppStorage.setOrCreate<number>('smart_model_seq', (seq === undefined ? 0 : seq) + 1);
+      AppStorage.setOrCreate<number>('smart_model_seq', (seq ?? 0) + 1);
     }
     return ok ? '' : '全部下载源均失败，请稍后重试或切换下载源';
   }
@@ -4610,7 +4746,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         } catch (e) {
           // 同上
         }
-        AppLogger.info(TAG, 'ad-block ruleset deleted; tunnel needs restart to drop RULE-SET');
+        this.lastRuleProviderFileReady = false;
+        AppLogger.info(TAG, 'ad-block ruleset deleted; next rules reload drops RULE-SET');
         return '';
       }
       return '该数据项不支持删除（删掉会导致内核无法启动）';
@@ -4619,15 +4756,35 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /** 后台补齐去广告规则集；成功后再连即时生效（失败下次连接重试） */
-  private ruleProviderDownloading: boolean = false;
+  /** 多个入口共享同一下载，避免重复写入和把「正在下载」误判为失败。 */
+  private ruleProviderDownloadTask: Promise<boolean> | null = null;
 
   /** 等待型去广告规则集下载 */
   private async downloadRuleProviderAsset(source: string): Promise<boolean> {
-    if (this.ruleProviderDownloading || this.context === null) {
+    if (this.context === null) {
       return false;
     }
-    this.ruleProviderDownloading = true;
+    if (this.ruleProviderDownloadTask !== null) {
+      return this.ruleProviderDownloadTask;
+    }
+    const task = this.performRuleProviderDownload(source);
+    this.ruleProviderDownloadTask = task;
+    try {
+      return await task;
+    } catch (e) {
+      AppLogger.warn(TAG, `hyper-adrules download task error: ${AppLogger.errText(e)}`);
+      return false;
+    } finally {
+      if (this.ruleProviderDownloadTask === task) {
+        this.ruleProviderDownloadTask = null;
+      }
+    }
+  }
+
+  private async performRuleProviderDownload(source: string): Promise<boolean> {
+    if (this.context === null) {
+      return false;
+    }
     try {
       const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
       const dest = `${dir}/${HYPER_AD_RULES_FILE}`;
@@ -4643,19 +4800,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         (buf: ArrayBuffer): boolean => buf.byteLength >= RULE_SET_MIN_BYTES
           && ConnectionOrchestrator.bufferMagicOk(buf, ZSTD_MAGIC),
         source, 'hyper-adrules');
-    } finally {
-      this.ruleProviderDownloading = false;
+    } catch (e) {
+      AppLogger.warn(TAG, `hyper-adrules download failed: ${AppLogger.errText(e)}`);
+      return false;
     }
-  }
-
-  private downloadRuleProviderInBackground(source: string = 'auto'): void {
-    this.downloadRuleProviderAsset(source).then((ok: boolean): void => {
-      if (!ok) {
-        AppLogger.warn(TAG, 'hyper-adrules download failed from all mirrors; will retry on next connect');
-      }
-    }).catch((e: Object): void => {
-      AppLogger.warn(TAG, `hyper-adrules download task error: ${e}`);
-    });
   }
 
   /**
@@ -4727,47 +4875,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** 存活监控 + 流量轮询 + 常驻通知（对应 CoreLivenessMonitor / VpnTrafficTracker / NotificationUpdatePolicy） */
   private startMonitors(): void {
     this.stopMonitors();
+    const generation = this.monitorGeneration;
     this.monitorTimer = setInterval(() => {
-      // 内核跑在 VPN 扩展进程里，UI 进程的 coreBridge.isCoreAlive() 永远为 false，
-      // 只能依据扩展进程心跳文件判断存活（心跳新鲜 = 内核活着）。
-      //
-      // 2026-10-19 保活整改（真机取证 THREAD_BLOCK_3S）：原实现在本定时器里调用
-      // 同步版 isCoreAliveByHeartbeat()，内含 statSync + 同步读文件，每 3 秒阻塞
-      // 主线程一次；主线程一旦卡住，跑在它上面的自愈/重连就跟着失效。改为异步。
-      //
-      // 2026-10-20 自动断开整改：判死改为**连续多票**制。
-      // 旧实现只要探针不是"活着"就立刻升级为内核死亡 → 拆隧道重连；而
-      // 「心跳读不到」（文件刚被清、一次读失败）与「心跳过期」被当成同一件事。
-      // 现在：STALE 一次顶满，UNKNOWN 需连续 3 票；观测到 ALIVE 即清零。
-      this.probeLivenessAsync().then((verdict: LivenessVerdict): void => {
-        if (this.state !== ConnState.CONNECTED) {
-          this.coreDeathStrikes = 0;
-          return;
-        }
-        if (verdict === LivenessVerdict.ALIVE) {
-          this.coreDeathStrikes = 0;
-          return;
-        }
-        this.coreDeathStrikes = this.coreDeathStrikes
-          + (verdict === LivenessVerdict.STALE ? CORE_DEATH_CONFIRMATIONS : 1);
-        const reasonText: string = verdict === LivenessVerdict.STALE ? 'stale' : 'absent';
-        if (this.coreDeathStrikes < CORE_DEATH_CONFIRMATIONS) {
-          AppLogger.info(TAG, `liveness suspect (${reasonText}), `
-            + `strikes=${this.coreDeathStrikes}/${CORE_DEATH_CONFIRMATIONS}`);
-          return;
-        }
-        this.coreDeathStrikes = 0;
-        // 内核死亡：权威判据为「心跳过期（已连续确认）」→ 升级到链路自检 + 有限修复
-        // （对应 core_recovery_policy；healthCheckEnabled=false 时退回既有有界恢复）
-        this.state = ConnState.RECOVERING;
-        this.notify();
-        AppLogger.warn(TAG, `core died (authority: heartbeat ${reasonText} confirmed `
-          + `${CORE_DEATH_CONFIRMATIONS}x); escalating to health self-check`);
-        this.handleCoreLoss();
-      }).catch((e: Error): void => {
+      this.pollRuntimeLiveness(generation).catch((e: Error): void => {
         AppLogger.warn(TAG, `liveness probe failed: ${AppLogger.errText(e)}`);
       });
-    }, 3000);
+    }, CORE_LIVENESS_POLL_MS);
     this.trafficPollRunning = false;
     this.trafficTimer = setInterval(() => {
       if (this.trafficPollRunning || this.state !== ConnState.CONNECTED) {
@@ -4791,7 +4904,80 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }, TRAFFIC_POLL_INTERVAL_MS);
   }
 
+  /** 慢探针不得并发投票；旧监控/旧会话的晚到结果不得修复新会话。 */
+  private async pollRuntimeLiveness(generation: number): Promise<void> {
+    if (generation !== this.monitorGeneration || this.livenessPollRunning
+      || this.state !== ConnState.CONNECTED || this.disconnectRequested) {
+      return;
+    }
+    this.livenessPollRunning = true;
+    const seq = this.connectSeq;
+    try {
+      let verdict = await this.probeLivenessAsync();
+      if (!this.isCurrentMonitor(generation, seq)) { return; }
+      if (verdict !== LivenessVerdict.ALIVE) {
+        // Go 转发可能仍在运行，而 ArkTS 租约定时器刚从锁屏暂停中恢复。
+        // 本地认证探活通过时，保留 TUN/Core 与原始连接时刻。
+        const responsive = await this.api.healthProbe();
+        if (!this.isCurrentMonitor(generation, seq)) { return; }
+        if (responsive) {
+          verdict = LivenessVerdict.ALIVE;
+        } else {
+          // HTTP 探测期间扩展可能已补写租约，读一次新值再决定是否记负票。
+          this.invalidateStateProbeCache();
+          verdict = await this.probeLivenessAsync();
+          if (!this.isCurrentMonitor(generation, seq)) { return; }
+        }
+      }
+      if (verdict === LivenessVerdict.ALIVE) {
+        this.resetCoreDeathConfirmation();
+        return;
+      }
+      const now = Date.now();
+      if (this.coreDeathStrikes > 0 && now - this.coreDeathLastAt < CORE_LIVENESS_POLL_MS) {
+        return; // 解锁后的积压定时器不能在同一瞬间投满三票。
+      }
+      if (this.coreDeathStrikes === 0) { this.coreDeathFirstAt = now; }
+      this.coreDeathLastAt = now;
+      this.coreDeathStrikes++;
+      if (this.coreDeathStrikes < CORE_DEATH_CONFIRMATIONS
+        || now - this.coreDeathFirstAt < CORE_DEATH_CONFIRM_MS) {
+        AppLogger.info(TAG, `runtime unconfirmed (${verdict}); `
+          + `strikes=${this.coreDeathStrikes}/${CORE_DEATH_CONFIRMATIONS}`);
+        return;
+      }
+      // 最后再核对持久化意图；用户可能从另一 Ability/进程停止了 VPN。
+      if (!await this.isCurrentSession(this.sessionGeneration)
+        || !this.isCurrentMonitor(generation, seq)) {
+        this.resetCoreDeathConfirmation();
+        return;
+      }
+      this.resetCoreDeathConfirmation();
+      this.state = ConnState.RECOVERING;
+      this.notify();
+      AppLogger.warn(TAG, 'runtime unresponsive: lease and authenticated controller '
+        + `failed ${CORE_DEATH_CONFIRMATIONS} spaced checks; escalating to health self-check`);
+      this.handleCoreLoss();
+    } finally {
+      if (generation === this.monitorGeneration) { this.livenessPollRunning = false; }
+    }
+  }
+
+  private isCurrentMonitor(generation: number, seq: number): boolean {
+    return generation === this.monitorGeneration && seq === this.connectSeq
+      && this.state === ConnState.CONNECTED && !this.disconnectRequested;
+  }
+
+  private resetCoreDeathConfirmation(): void {
+    this.coreDeathStrikes = 0;
+    this.coreDeathFirstAt = 0;
+    this.coreDeathLastAt = 0;
+  }
+
   private stopMonitors(): void {
+    this.monitorGeneration++;
+    this.livenessPollRunning = false;
+    this.resetCoreDeathConfirmation();
     if (this.monitorTimer >= 0) {
       clearInterval(this.monitorTimer);
       this.monitorTimer = -1;

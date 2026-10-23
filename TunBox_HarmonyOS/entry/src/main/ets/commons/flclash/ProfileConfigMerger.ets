@@ -11,8 +11,9 @@
  *    等运行期参数一律被 overlay 覆盖，绝不外泄）。
  *
  * 本实现的平台差异（不算偏离，原因写在这里）：
- *  · 设备侧没有 FlClash 的 provider 预取目录，原文 `proxy-providers` /
- *    `rule-providers` 段整段搬入（相对 path 由内核按自身 home 解析）；
+ *  · 设备侧没有 FlClash 的 provider 预取目录，原文 `proxy-providers` 整段搬入；
+ *    `rule-providers` 与 overlay 按名称合并，overlay 同名块优先
+ *    （相对 path 由内核按自身 home 解析）；
  *    只用 provider 不给静态 proxies 的订阅由调用方先做内联。
  *  · 原文 `dns.enable == true` 时整段 dns 用原文（对齐 FlClash
  *    `_makeRealProfileTask` 的 `isEnableDns` 语义）。
@@ -25,24 +26,26 @@ import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'ProfileConfigMerger';
 
+/**
+ * 需要「按键并集」而不是「整段替换」的 provider 段。
+ *
+ * 为什么两个都要：provider 是**按名字寻址的命名空间** —— overlay 的 rules 里有
+ * `RULE-SET,hyper-adrules`、原文 rules 里也可能引用自己的 provider 名；声明段
+ * 少一个，内核就整份拒载（`rule set [x] not found`，2026-10-23 真机报障）。
+ * 所以两段都是「overlay 优先 + 原文补齐」的并集，而不是二选一。
+ */
+const PROVIDER_MERGE_KEYS: string[] = ['proxy-providers', 'rule-providers'];
+
 /** 原文里允许进入运行配置的顶层键（其余一律丢弃，由 overlay 决定）。 */
 const PROFILE_KEYS: string[] = [
   'proxies',
   'proxy-groups',
   'sub-rules',
-  'proxy-providers',
-  'rule-providers',
   'tunnels',
   'listeners'
 ];
 
-/**
- * overlay 里先从根文档删掉、随后重新拼回的键。
- *
- * ⚠ `proxy-providers` / `rule-providers` 虽然也在这里（删除是为了避免两份同名段
- * 造成重复顶层键），但它们**不是**整段替换，而是按键取并集后重新拼回 ——
- * 见 PROVIDER_MERGE_KEYS。
- */
+/** overlay 里必须被原文替换掉的键（先删后追加）。 */
 const REPLACE_KEYS: string[] = [
   'proxies',
   'proxy-groups',
@@ -53,30 +56,6 @@ const REPLACE_KEYS: string[] = [
   'listeners',
   'rules'
 ];
-
-/**
- * provider 段**不做整体替换**，而是按键取并集（overlay 优先）。
- *
- * 【2026-10-23 用户报障】「手动更新去广告规则后 VPN 启动失败，删掉规则集就正常」。
- *
- * 根因就在原来的「先删后追加」：overlay（App 生成的运行配置）里
- *   · `rule-providers:` 声明着 `hyper-adrules`（去广告）与 `rs-*`（自定义规则集），
- *   · `rules:` 里第一条是 `RULE-SET,hyper-adrules,REJECT`；
- * 合并时 `rule-providers` 被从 overlay 删掉、而订阅原文根本没有 provider 段，
- * 于是最终配置「引用在、声明丢」→ 内核整份拒载：
- *   `parse config: rules[0] [RULE-SET,hyper-adrules,REJECT] error: rule set [hyper-adrules] not found`
- * → 用户看到的就是「开了去广告就连不上，删掉规则集又能连」（删掉后 RULE-SET 行也不生成）。
- *
- * 正确语义与 `proxies` / `proxy-groups` 不同：provider 是**名字寻址**的命名空间，
- * 两边各自声明的 provider 互不冲突即可共存，overlay 同名优先（与生成器 ①自产优先 一致）。
- */
-const PROVIDER_MERGE_KEYS: string[] = ['proxy-providers', 'rule-providers'];
-
-/** provider 段里的一个命名块（key 行 + 其后的字段行） */
-class ProviderSectionBlock {
-  name: string = '';
-  lines: string[] = [];
-}
 
 export class ProfileMergeResult {
   ok: boolean = false;
@@ -273,98 +252,6 @@ export class ProfileConfigMerger {
   }
 
   /**
-   * 把 provider 段拆成命名块（key 行缩进 2、字段行缩进 >2；`sectionText` 已把缩进归一）。
-   * 解析不了的行按「并入当前块」处理，绝不丢字段（丢字段等于把 provider 改坏）。
-   */
-  private static parseProviderSectionBlocks(sectionText: string,
-    key: string): ProviderSectionBlock[] {
-    const out: ProviderSectionBlock[] = [];
-    if (sectionText.length === 0) {
-      return out;
-    }
-    const lines: string[] = sectionText.split('\n');
-    let current: ProviderSectionBlock | null = null;
-    for (let i = 0; i < lines.length; i++) {
-      const line: string = lines[i];
-      const trimmed: string = line.trim();
-      if (i === 0) {
-        // 头行：`key:` / `key: []`
-        continue;
-      }
-      if (trimmed.length === 0) {
-        continue;
-      }
-      let indent = 0;
-      while (indent < line.length && line.charAt(indent) === ' ') {
-        indent++;
-      }
-      if (indent <= 2 && trimmed.endsWith(':')) {
-        current = new ProviderSectionBlock();
-        current.name = trimmed.substring(0, trimmed.length - 1).trim();
-        current.lines.push(`  ${current.name}:`);
-        if (current.name.length > 0) {
-          out.push(current);
-        } else {
-          current = null;
-        }
-        continue;
-      }
-      if (current !== null) {
-        current.lines.push(line);
-      }
-    }
-    const kept: ProviderSectionBlock[] = out.filter((b: ProviderSectionBlock): boolean =>
-      b.lines.length > 1);
-    return kept;
-  }
-
-  /**
-   * provider 段并集：overlay 的块全部保留，原文的块只补「overlay 未声明过的名字」。
-   *
-   * 为什么 overlay 优先：overlay 的 provider 是 App 自己生成/校验过的（去广告 MRS 的
-   * `path` 指向内核 home 下真实落盘的文件、自定义规则集的 URL 由用户填写），
-   * 原文同名块若反过来覆盖，就会出现「声明指向不存在的 path」或「行为不一致」。
-   *
-   * @returns '' = 两边都没有该段；否则为一段可直接拼进最终配置的 YAML 文本
-   */
-  static mergeProviderSection(key: string, overlayYaml: string,
-    profileYaml: string): string {
-    const overlayBlocks = ProfileConfigMerger.parseProviderSectionBlocks(
-      ProfileConfigMerger.sectionText(overlayYaml, key), key);
-    const profileBlocks = ProfileConfigMerger.parseProviderSectionBlocks(
-      ProfileConfigMerger.sectionText(profileYaml, key), key);
-    if (overlayBlocks.length === 0 && profileBlocks.length === 0) {
-      return '';
-    }
-    const seen: Set<string> = new Set<string>();
-    const lines: string[] = [`${key}:`];
-    for (const block of overlayBlocks) {
-      if (seen.has(block.name)) {
-        continue;
-      }
-      seen.add(block.name);
-      for (const line of block.lines) {
-        lines.push(line);
-      }
-    }
-    let dropped = 0;
-    for (const block of profileBlocks) {
-      if (seen.has(block.name)) {
-        dropped++;
-        continue;
-      }
-      seen.add(block.name);
-      for (const line of block.lines) {
-        lines.push(line);
-      }
-    }
-    if (dropped > 0) {
-      AppLogger.info(TAG, `${key}: ${dropped} profile provider(s) shadowed by overlay`);
-    }
-    return lines.length > 1 ? lines.join('\n') : '';
-  }
-
-  /**
    * 合并。overlay = TunBox 生成的完整运行配置，profile = 订阅原文。
    */
   static merge(overlayYaml: string, profileYaml: string): ProfileMergeResult {
@@ -393,10 +280,6 @@ export class ProfileConfigMerger {
     const blocks: string[] = [];
 
     for (const key of PROFILE_KEYS) {
-      // provider 段走下面的并集合并（overlay 优先），不能在这里整段追加
-      if (PROVIDER_MERGE_KEYS.indexOf(key) >= 0) {
-        continue;
-      }
       const section = ProfileConfigMerger.sectionText(profileYaml, key);
       if (section.length === 0) {
         continue;
@@ -405,15 +288,28 @@ export class ProfileConfigMerger {
       applied.push(key);
     }
 
-    // provider 段：overlay 与原文按键取并集（overlay 同名优先），绝不整体替换。
-    // 见 PROVIDER_MERGE_KEYS 注释（2026-10-23 去广告开启后 VPN 起不来的根因）。
-    for (const key of PROVIDER_MERGE_KEYS) {
-      const merged = ProfileConfigMerger.mergeProviderSection(key, overlayYaml, profileYaml);
-      if (merged.length === 0) {
+    // overlay.rules 仍引用自产 hyper-adrules / rs-*；原文 rules 也可能引用自己的 provider。
+    // provider 是名字寻址的命名空间：声明缺一个 = 内核整份拒载。两个段都按**完整块并集**，
+    // 同名时 overlay 优先（与生成器「自产规则集优先」口径一致）。
+    for (const providerKey of PROVIDER_MERGE_KEYS) {
+      const providers = ProfileConfigMerger.providerBlocks(providerKey, overlayYaml);
+      const profileProviders = ProfileConfigMerger.providerBlocks(providerKey, profileYaml);
+      for (const entry of profileProviders) {
+        if (!providers.has(entry[0])) {
+          providers.set(entry[0], entry[1]);
+        }
+      }
+      if (providers.size === 0) {
         continue;
       }
-      blocks.push(merged);
-      applied.push(key);
+      const providerLines: string[] = [`${providerKey}:`];
+      for (const entry of providers) {
+        for (const line of entry[1]) {
+          providerLines.push(line);
+        }
+      }
+      blocks.push(providerLines.join('\n'));
+      applied.push(providerKey);
     }
 
     // hosts / sniffer：overlay 未声明时搬入原文
@@ -493,6 +389,67 @@ export class ProfileConfigMerger {
     out.applied = applied.join(',');
     out.profileProxyItems = ProfileConfigMerger.countProxyItems(profileYaml);
     return out;
+  }
+
+  /**
+   * 按 provider 顶层条目拆完整块，不重排字段或压平 payload / header 等嵌套内容。
+   * 这里直接取原始缩进；通用序列分节归一化会把嵌套 payload 当作分节基准。
+   *
+   * @param key 顶层段名（`proxy-providers` / `rule-providers`）
+   */
+  private static providerBlocks(key: string, yaml: string): Map<string, string[]> {
+    const body: string[] = [];
+    let inSection = false;
+    let minIndent = 999999;
+    for (const raw of yaml.split('\n')) {
+      const line = raw.replace(/\r$/, '').replace(/^\uFEFF/, '');
+      const text = line.trim();
+      if (!line.startsWith(' ') && !line.startsWith('\t')) {
+        if (line.startsWith(`${key}:`)) {
+          inSection = true;
+          continue;
+        }
+        if (inSection && text.length > 0 && !text.startsWith('#')) {
+          break;
+        }
+      }
+      if (!inSection || text.length === 0 || text.startsWith('#')) {
+        continue;
+      }
+      const indent = line.length - line.trimStart().length;
+      minIndent = Math.min(minIndent, indent);
+      body.push(line);
+    }
+    const providers: Map<string, string[]> = new Map<string, string[]>();
+    let current: string[] = [];
+    for (const line of body) {
+      const indent = line.length - line.trimStart().length;
+      if (indent === minIndent) {
+        current = [];
+        const key = ProfileConfigMerger.providerKey(line.trimStart());
+        if (key.length > 0 && !providers.has(key)) {
+          providers.set(key, current);
+        }
+      }
+      current.push('  ' + line.substring(minIndent));
+    }
+    return providers;
+  }
+
+  /** provider 名支持带引号的冒号、点号、中文和 YAML 单引号转义。 */
+  private static providerKey(line: string): string {
+    const match = /^(?:"((?:\\.|[^"])*)"|'((?:''|[^'])*)'|([^:]+))\s*:/.exec(line);
+    if (match === null) {
+      return '';
+    }
+    if (match[1] !== undefined) {
+      try {
+        return JSON.parse('"' + match[1] + '"') as string;
+      } catch (e) {
+        return match[1];
+      }
+    }
+    return match[2] !== undefined ? match[2].split("''").join("'") : match[3].trim();
   }
 
   /** 取某段的主体行（带 2 空格缩进），去空行。 */

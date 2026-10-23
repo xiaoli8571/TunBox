@@ -83,7 +83,9 @@ function checkSource(src) {
     'zstd 魔数常量（合法 .mrs 是 zstd frame）');
   ok(/const RULE_SET_GOOD_SUFFIX = '\.good';/.test(src), 'last-good 副本后缀常量存在');
 
-  const download = methodBody(src, 'private async downloadRuleProviderAsset(source: string): Promise<boolean>');
+  // 2026-10-23：下载实现按 PR #5 拆成「单航班入口 + 真正执行体」，校验逻辑在后者的方法体里。
+  const download = methodBody(src, 'private async performRuleProviderDownload(source: string): Promise<boolean>')
+    || methodBody(src, 'private async downloadRuleProviderAsset(source: string): Promise<boolean>');
   ok(download.length > 0, '找到 downloadRuleProviderAsset 方法');
   ok(/bufferMagicOk\(buf, ZSTD_MAGIC\)/.test(download),
     '下载校验必须检查 zstd 魔数（挡住代理错误页）');

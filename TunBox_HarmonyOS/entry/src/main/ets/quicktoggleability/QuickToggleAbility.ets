@@ -376,6 +376,10 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
         return;
       }
       this.bgTaskRegistered = true;
+      UiGuardian.watchSession(this.context, async (): Promise<boolean> => {
+        const authority = await ConnectionOrchestrator.instance().authorityState();
+        return authority.connected && authority.desiredConnected;
+      });
       this.guardianActive = true;
       this.guardianMisses = 0;
       this.armGuardianPoll();
