@@ -69,6 +69,7 @@
     { "name": "node_mode_manual_banner", "value": "Pinned manual: auto failover will not override your choice. Long-press a node to delete it" },
     { "name": "node_mode_auto_banner", "value": "Auto order: list sorted by test results; nodes switch only when auto-select is on. Long-press a node to delete it" },
     { "name": "settings_geo_title", "value": "Data" },
+    { "name": "settings_appearance_network", "value": "Appearance & Network" },
     {"name": "settings_background_connection", "value": "Background connection"}
   ]
 }

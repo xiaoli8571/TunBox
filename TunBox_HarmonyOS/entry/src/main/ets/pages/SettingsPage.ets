@@ -544,19 +544,11 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => { this.openRulesPage(); })
 
-            // ── 主题：跟随系统（2026-10-20 新增，默认跟随）──
+            // ── 外观与网络（2026-10-23 用户要求「更简洁」：三张卡合成一张）──
+            // 主题跟随系统 / IPv6 双栈 / 测速地址，都是「一次性设定、平时不碰」的项目，
+            // 合成一张卡后设置页少两次视觉跳档；每条之间用 Divider 分隔，说明各压到一行。
             Column({ space: 10 }) {
-              Row({ space: 8 }) {
-                Row() {
-                  Image($r('app.media.ic_globe'))
-                    .width(16).height(16).fillColor(TunBoxColors.primary)
-                }
-                .width(28).height(28).borderRadius(8)
-                .backgroundColor(TunBoxColors.primaryLight)
-                .justifyContent(FlexAlign.Center)
-                Text('主题').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
-                Blank()
-              }.width('100%').alignItems(VerticalAlign.Center)
+              this.SectionHeader($r('app.media.ic_globe'), $r('app.string.settings_appearance_network'))
 
               Row() {
                 Text('主题跟随系统')
@@ -565,30 +557,10 @@ export struct SettingsView {
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setFollowSystemTheme(v))
               }.width('100%').alignItems(VerticalAlign.Center)
-              Text('开启时系统切换深色/浅色，App 自动跟着变（默认开启）；'
-                + '关闭后固定当前主题，可用主页太阳按钮在浅色/深色之间切换。')
+              Text('关闭后由主页太阳按钮手动切换深浅色。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
 
-            // ── 网络：IPv6 双栈（2026-10-20 新增，默认开）──
-            // 改变 TUN 与内核配置，改完会触发一次自动重连（见 applyNetworkSwitch）。
-            // DNS 已不在设置页：内核 DNS 恒接管，没有可配的开关（2026-10-21 定案）。
-            Column({ space: 10 }) {
-              Row({ space: 8 }) {
-                Row() {
-                  Image($r('app.media.ic_network'))
-                    .width(16).height(16).fillColor(TunBoxColors.primary)
-                }
-                .width(28).height(28).borderRadius(8)
-                .backgroundColor(TunBoxColors.primaryLight)
-                .justifyContent(FlexAlign.Center)
-                Text('网络').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
-                Blank()
-              }.width('100%').alignItems(VerticalAlign.Center)
+              Divider().color(TunBoxColors.cardBorder)
 
               Row() {
                 Text('IPv6 双栈')
@@ -597,27 +569,12 @@ export struct SettingsView {
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setIpv6Enabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
-              Text('开启后 IPv6 与 IPv4 一样走代理（AAAA 返回隧道内地址，不直连）；关闭则纯 IPv4。改动会自动重连生效。')
+              Text('IPv6 也走代理；关闭则纯 IPv4。改动会自动重连。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-            }
-            .width('100%').padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
 
-            // ── 测速地址（前台批 / 后台批 / 生成器 smart 组共用同一真源）──
-            Column({ space: 10 }) {
-              Row({ space: 8 }) {
-                Row() {
-                  Image($r('app.media.ic_radar'))
-                    .width(16).height(16).fillColor(TunBoxColors.primary)
-                }
-                .width(28).height(28).borderRadius(8)
-                .backgroundColor(TunBoxColors.primaryLight)
-                .justifyContent(FlexAlign.Center)
-                Text('测速地址').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
-                Blank()
-              }.width('100%').alignItems(VerticalAlign.Center)
+              Divider().color(TunBoxColors.cardBorder)
+
+              Text('测速地址').fontSize(14).fontColor(TunBoxColors.textPrimary).width('100%')
               TextInput({ text: this.testLatencyUrl, placeholder: LatencyTestUrl.DEFAULT_URL })
                 .height(40)
                 .fontSize(13)
@@ -631,8 +588,7 @@ export struct SettingsView {
                 Text(this.testUrlError)
                   .fontSize(11).fontColor(TunBoxColors.danger).width('100%')
               } else {
-                Text('留空＝使用默认地址。默认走 HTTPS：明文测速地址容易被机场/落地劫持，'
-                  + '会让整批测速变红。自填的 http 会原样使用（个别出口掐 TLS SNI，http 才测得通）。')
+                Text('留空＝默认 HTTPS 地址；自填 http 会原样使用。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }
               Row({ space: 8 }) {
@@ -659,7 +615,7 @@ export struct SettingsView {
             .backgroundColor(TunBoxColors.surfaceCard)
             .border({ width: 1, color: TunBoxColors.cardBorder })
 
-            Column({ space: 12 }) {
+Column({ space: 12 }) {
               this.SectionHeader($r('app.media.ic_shield'), $r('app.string.settings_background_connection'))
               Row() {
                 Text('音频保活（下次连接）')
@@ -668,9 +624,7 @@ export struct SettingsView {
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setAudioKeepAlive(v))
               }.width('100%').alignItems(VerticalAlign.Center)
-              Text('可选：持续播放低音量音频并显示媒体卡片，会增加耗电；电话或其他音频可能中断保活。更改后请重新连接。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              Text('连接期间每 30 秒检查后台任务；系统暂停、用户停止时不会强制重启。')
+              Text('小音量播放 + 媒体卡片维持后台（会增加耗电）；连接期间每 30 秒自检一次。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
@@ -690,7 +644,7 @@ export struct SettingsView {
                     .selectedColor(TunBoxColors.primary)
                     .onChange((v: boolean): void => this.setQuotaNotify(v))
                 }.width('100%').alignItems(VerticalAlign.Center)
-                Text('订阅流量剩余不足 10% 或 3 天内到期时发送系统通知（每次刷新订阅后检查，每天最多提醒一次）')
+                Text('剩余 <10% 或 3 天内到期时通知，每天最多一次。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
               Divider().color(TunBoxColors.cardBorder)
@@ -702,9 +656,7 @@ export struct SettingsView {
                     .selectedColor(TunBoxColors.primary)
                     .onChange((v: boolean): void => this.setAllowInsecureSubscriptionHttp(v))
                 }.width('100%').alignItems(VerticalAlign.Center)
-                Text('默认关闭：只接受 https 订阅链接。明文 http 既无加密也不防篡改——'
-                  + '面板被劫持或被中间人替换时，返回的节点表可以把你的流量导向任意服务器。'
-                  + '仅在自建面板确实没有证书时临时开启，用完建议关掉。')
+                Text('默认关闭；明文 http 不加密、可被篡改，仅自建面板无证书时临时开启。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }.width('100%')
               Divider().color(TunBoxColors.cardBorder)
@@ -720,8 +672,7 @@ export struct SettingsView {
                 Column({ space: 3 }) {
                   Text('订阅转换').fontSize(14).fontWeight(FontWeight.Bold)
                     .fontColor(TunBoxColors.textPrimary).width('100%')
-                  Text('粘贴分享链接（单条 / 一行一条 / 整体 base64），转换成 mihomo 配置；'
-                    + '可「保存到本地」留档，或「一键导入」直接进订阅列表。内容不会上传。')
+                  Text('分享链接转成 mihomo 配置，可保存到本地或一键导入订阅列表。')
                     .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
                 }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                 Text('打开').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.primary)

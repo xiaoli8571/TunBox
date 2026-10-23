@@ -203,20 +203,34 @@ struct SiteRoutingPage {
   }
   onBackPress(): boolean { this.back(); return true; }
 
-  /** 三态策略胶囊（文档 §3.5：圆点 + 数量；选中 primaryLight 底 + primary 加粗，
-   * 未选中 surfaceSubtle 底 + textSecondary；kind 值与判定逻辑不变） */
+  /**
+   * 三态策略分段（2026-10-23 用户口径：**样式与应用分流页的三段条一致**——
+   * 同宽 92% 轨道 / controlTrackSoft 底 / 圆角 12 / padding 4，选中块
+   * surfaceCard 底 + primary Bold，未选中 textSecondary）。
+   *
+   * 与应用分流唯一的差别是**保留数量**（`强制代理 3`）：网站名单是多份并行生效的，
+   * 数量是这一页最关键的上下文，去掉就只剩名字。kind 值与判定逻辑不变。
+   */
   @Builder
-  KindChip(kind: string, label: string, count: number) {
-    Row({ space: 6 }) {
+  KindTab(kind: string, label: string, count: number) {
+    Row({ space: 5 }) {
       Circle({ width: 6, height: 6 })
         .fill(kind === 'direct' ? TunBoxColors.success : kind === 'block' ? TunBoxColors.danger : TunBoxColors.primary)
-      Text(`${label} ${count}`).fontSize(12)
+        .opacity(this.kind === kind ? 1 : 0.45)
+      Text(label).fontSize(13)
         .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
         .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textSecondary)
+        .maxLines(1)
+      Text(`${count}`).fontSize(12)
+        .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
+        .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textMuted)
+        .maxLines(1)
     }
-    .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-    .borderRadius(12)
-    .backgroundColor(this.kind === kind ? TunBoxColors.primaryLight : TunBoxColors.surfaceSubtle)
+    .padding({ top: 8, bottom: 8 })
+    .layoutWeight(1)
+    .justifyContent(FlexAlign.Center)
+    .borderRadius(8)
+    .backgroundColor(this.kind === kind ? TunBoxColors.surfaceCard : Color.Transparent)
     .onClick(() => this.switchKind(kind))
   }
 
@@ -245,12 +259,12 @@ struct SiteRoutingPage {
           }
         }
         Column({ space: 12 }) {
-          // 三态策略胶囊（文档 §3.5：强制代理 N / 强制直连 N / 强制拦截 N，N 为真实数量）
-          Row({ space: 8 }) {
-            this.KindChip('proxy', '强制代理', this.proxy.length)
-            this.KindChip('direct', '强制直连', this.direct.length)
-            this.KindChip('block', '强制拦截', this.block.length)
-          }.width('92%')
+          // 三态策略分段条（样式对齐应用分流页：92% 轨道 + controlTrackSoft + 圆角 12 + padding 4）
+          Row({ space: 4 }) {
+            this.KindTab('proxy', '强制代理', this.proxy.length)
+            this.KindTab('direct', '强制直连', this.direct.length)
+            this.KindTab('block', '强制拦截', this.block.length)
+          }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft)
             .alignSelf(ItemAlign.Center)
             .enabled(this.ready && !this.busy)
           // 既有说明卡（文案与判定不变；视觉换成描边卡配方，去掉玻璃/模糊/backgroundEffect/阴影）
