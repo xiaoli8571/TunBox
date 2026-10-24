@@ -62,6 +62,7 @@ import { YamlNodeAdapter } from '../subscription/YamlNodeAdapter';
 // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退走**规范解析层**，不再走 ProxyNode.fromUri
 import { parse as parseUriNode, ParseError, ParsedNode } from '../subscription/UriNodeParser';
 import { UnusableLedger } from '../subscription/UnusableLedger';
+import { NodeUsability } from '../subscription/NodeUsability';
 
 const TAG = 'SubscriptionService';
 const PREF_NAME = 'tunbox_subscriptions';
@@ -3294,7 +3295,10 @@ export class SubscriptionService {
 
   fallbackConnectionNode(): ProxyNode | null {
     const current = ProfileStore.currentId();
-    const local = this.nodes.find((node: ProxyNode): boolean => node.subscriptionId === current);
+    // 【2026-10-24 加固】存量节点表可能残留订阅信息条目（「剩余流量：xxx GB」这类，
+    // 旧解析混入、刷新后清除）——绝不能当连接目标（内核里没有这个名字，钉选必失败）。
+    const local = this.nodes.find((node: ProxyNode): boolean =>
+      node.subscriptionId === current && !NodeUsability.isInfoEntry(node.name));
     if (local !== undefined) { return local; }
     if (this.hasUsableProfile()) {
       const node = new ProxyNode();
@@ -3303,7 +3307,8 @@ export class SubscriptionService {
       node.subscriptionId = current;
       return node;
     }
-    return this.nodes.length > 0 ? this.nodes[0] : null;
+    const anyReal = this.nodes.find((node: ProxyNode): boolean => !NodeUsability.isInfoEntry(node.name));
+    return anyReal !== undefined ? anyReal : (this.nodes.length > 0 ? this.nodes[0] : null);
   }
 
   findNode(id: string): ProxyNode | null {

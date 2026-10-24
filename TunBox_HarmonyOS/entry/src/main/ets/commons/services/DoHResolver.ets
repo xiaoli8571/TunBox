@@ -114,6 +114,11 @@ export class DoHResolver {
   private static cache: Map<string, DoHPin> = new Map<string, DoHPin>();
   /** 最近一次 resolveMany 的过程报告（供测速侧判定 DNS 结论）。 */
   static lastReport: DoHResolveReport = new DoHResolveReport();
+  /**
+   * DoH 上游判死的负缓存截止时间（0 = 未判死）。判死条件与收益见 resolveMany
+   * 头注释（蜂窝下 86 域名陪跑超时、每次连接重复全灭）。TTL 3 分钟，到期自动重试。
+   */
+  private static dohDownUntil: number = 0;
   private static readonly CACHE_MAX_ENTRIES: number = 512;
   private static readonly WORKERS: number = 16;
   private static loaded: boolean = false;
@@ -270,6 +275,12 @@ export class DoHResolver {
   static async resolveMany(domains: string[], budgetMs: number = 6000,
     priorityDomains: string[] = []): Promise<Record<string, string>> {
     await DoHResolver.ensureLoaded();
+    // 【2026-10-24 蜂窝启动慢修复】DoH 上游判死负缓存：蜂窝网络下 doh.pub/alidns 的
+    // DoH 端点常被运营商拦截，一轮 86 个域名全部陪跑超时（真机 2.7s，最坏 6s 预算
+    // 全吃满），且每次连接都重复同样的全灭。判死条件 = 本轮前 6 个查询全部失败且
+    // 0 成功 —— 此时取消剩余查询并封 3 分钟（TTL 内 resolveMany 只走 pin 缓存、
+    // 不再联网；到期自动重试，用户切回 WiFi 即恢复）。
+    const upstreamDown = Date.now() < DoHResolver.dohDownUntil;
     const result: Record<string, string> = {};
     const report: DoHResolveReport = new DoHResolveReport();
     const seen = new Set<string>();
@@ -301,19 +312,33 @@ export class DoHResolver {
       // 它会被写进 hosts 就会钉住会轮换的 IP，而内核自己按 TTL 解析是对的。
     }
     pending = DoHResolver.sortByPriority(pending, priority);
+    if (upstreamDown) {
+      // 负缓存窗口内不发任何 DoH 查询：域名全部如实记 failed（运行期内核自己走
+      // proxy-server-nameserver 解析，与现有 unpinned 回退路径完全一致）。
+      for (const d of pending) {
+        report.failed.push(d);
+      }
+      DoHResolver.lastReport = report;
+      return result;
+    }
     const deadline = Date.now() + Math.max(0, budgetMs);
-    for (let pass = 0; pass < 2 && pending.length > 0; pass++) {
+    let consecutiveFailures = 0;
+    let anySuccess = false;
+    let abortedUpstream = false;
+    for (let pass = 0; pass < 2 && pending.length > 0 && !abortedUpstream; pass++) {
       const current = pending;
       const remaining: string[] = [];
       const workers: Promise<void>[] = [];
       let idx = 0;
       for (let w = 0; w < DoHResolver.WORKERS; w++) {
         workers.push((async (): Promise<void> => {
-          while (Date.now() < deadline && idx < current.length) {
+          while (Date.now() < deadline && idx < current.length && !abortedUpstream) {
             const d = current[idx++];
             report.queried.push(d);
             const ip = await DoHResolver.resolveANoCache(d, deadline);
             if (ip.length > 0) {
+              anySuccess = true;
+              consecutiveFailures = 0;
               report.resolved.push(d);
               // 只有**真的被 pin 住**的域名才允许进 hosts（短 TTL 的 cachePut 会
               // 直接拒收，此时 cachedIp 为空 → 该域名不进结果，交给内核现解析）。
@@ -324,12 +349,23 @@ export class DoHResolver {
             } else {
               report.failed.push(d);
               remaining.push(d);
+              consecutiveFailures++;
+              // 前 6 个查询全灭且零成功 = DoH 上游不可达（不是个别域名问题）：
+              // 剩余域名不再陪跑，封 3 分钟。阈值取 6（>WORKERS，覆盖首组并发）
+              // 足以区分「上游死」与「个别域名 NXDOMAIN」。
+              if (!anySuccess && consecutiveFailures >= 6) {
+                abortedUpstream = true;
+                DoHResolver.dohDownUntil = Date.now() + 180000;
+                AppLogger.warn(TAG, 'DoH upstream unreachable ('
+                  + `${consecutiveFailures} consecutive failures, 0 success); `
+                  + 'skipping remaining domains for 3 minutes');
+              }
             }
           }
         })());
       }
       await Promise.all(workers);
-      if (Date.now() >= deadline) {
+      if (Date.now() >= deadline || abortedUpstream) {
         break;
       }
       pending = remaining;

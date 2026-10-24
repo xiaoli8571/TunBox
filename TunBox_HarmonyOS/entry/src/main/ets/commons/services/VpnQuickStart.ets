@@ -9,6 +9,7 @@ import { SubscriptionService } from './SubscriptionService';
 import { ConnectionOrchestrator, ConnState } from './ConnectionOrchestrator';
 import { FormStateSync, FormStateSnapshot } from './FormStateSync';
 import { ProxyNode } from '../models/ProxyNode';
+import { NodeUsability } from '../subscription/NodeUsability';
 import { AppLogger } from '../utils/AppLogger';
 import { FormInfoMetrics } from './FormInfoMetrics';
 import { TunBoxNotifier } from './TunBoxNotifier';
@@ -77,8 +78,12 @@ export class VpnQuickStart {
       const orchestrator = ConnectionOrchestrator.instance();
       orchestrator.init(context);
 
-      const node: ProxyNode | null = subscriptions.findNode(settings.preferredNodeId)
-        ?? subscriptions.fallbackConnectionNode();
+      // 【2026-10-24 加固】首选节点可能是存量节点表里的订阅信息条目（「剩余流量：xxx」
+      // 这类，内核里无此名、钉选必失败）—— 视为未选中，回落到 fallback 的真节点。
+      const preferred = subscriptions.findNode(settings.preferredNodeId);
+      const node: ProxyNode | null = (preferred !== null && !NodeUsability.isInfoEntry(preferred.name))
+        ? preferred
+        : subscriptions.fallbackConnectionNode();
       const nodeName = node === null ? '' : node.name;
       // 权威判据：持久化意图 ∧ 内核存活证据。旧版只看进程内 state 与心跳，
       // 新进程(卡片/快捷方式)state 恒为 DISCONNECTED、心跳过期即 alive=false，
