@@ -313,8 +313,11 @@ export class ProxyNode {
       || node.alterId < 0 || !Number.isInteger(node.alterId)) {
       return null;
     }
+    // 2026-10-24 修正：旧正则强制 RFC-4122 v4（版本位 [1-5]、variant 位 [89ABab]），
+    // 比 mihomo 严格 —— 面板下发 version 位为 0/6-9/f 或 variant 位为 c 的 UUID 时
+    // 整条静默丢弃（invalid 计数里看不出原因）。内核只要求 UUID 形态，此处对齐。
     if ((node.proxyType === 'vless' || node.proxyType === 'vmess')
-      && !/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$/.test(node.uuid)) {
+      && !/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(node.uuid)) {
       return null;
     }
     // 支持的 network 取值必须与 mihomo 对齐：`httpupgrade` 是合法传输方式

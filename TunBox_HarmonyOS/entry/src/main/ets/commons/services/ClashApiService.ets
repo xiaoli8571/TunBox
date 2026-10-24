@@ -314,10 +314,12 @@ export class ClashApiService {
   async selectNode(nodeName: string): Promise<boolean> {
     // 「失败时重试一次」（本函数头注释承诺但旧实现缺失）：内核刚起时首个 PUT 偶发
     // 400/超时是已知瞬态，connect 恰恰在内核刚起时调用本函数 —— 不重试会把瞬态
-    // 当永久失败。第二次失败才如实返回 false（调用方按宽松语义降级）。
+    // 当永久失败。重试前给 300ms 让内核 controller 收敛（立即重试大概率还是 400）；
+    // 第二次失败才如实返回 false（调用方 fail-fast，见 b9.no-fake-success 契约）。
     if (await this.selectNodeOnce(nodeName)) {
       return true;
     }
+    await new Promise<void>((resolve) => setTimeout(() => resolve(), 300));
     return this.selectNodeOnce(nodeName);
   }
 

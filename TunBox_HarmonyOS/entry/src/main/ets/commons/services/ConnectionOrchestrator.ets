@@ -3555,6 +3555,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.lastSubs = subs;
     this.lastNodeName = node.name;
     this.notify();
+    // 【P2-11 修复】try 从这里开始：state 已置 CONNECTING，下面的 stopTestCore /
+    // advanceSessionIntent（preferences IO 可 reject）任一抛异常都必须走统一回滚
+    // （disconnectInternal + 置回 DISCONNECTED），否则状态永久卡在 CONNECTING，
+    // 后续所有按 state 门禁的逻辑持续误判「orchestrator busy」。
+    let intentGeneration: number = 0;
+    try {
     // 先作废并等待测速启动/清理结算，再把共享扩展交给真实隧道。
     this.cancelTestCoreRecycle();
     this.testCoreLaunchGeneration++;
@@ -3578,14 +3584,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // desiredConnected，一旦在这段窗口里被杀，磁盘上的意图仍是 false ——
     // 冷启动/回前台时无从判断"用户本来是想连着的"，只能让用户手动再点一次。
     // 写入点前移后：任何时刻被杀，磁盘上的意图都是诚实的。
-    const intentGeneration = await this.advanceSessionIntent(true, 'connecting', node.name, 0);
+    intentGeneration = await this.advanceSessionIntent(true, 'connecting', node.name, 0);
     if (seq !== this.connectSeq || this.disconnectRequested) {
       await this.clearSessionIntent(intentGeneration);
       return false;
     }
 
-    try {
-      if (this.context === null) {
+    if (this.context === null) {
         throw new Error('orchestrator 未初始化（init(context) 缺失）');
       }
       // 节点有效性检查：旧版本持久化的节点缺 rawYaml 且非 ss/ssr 字段不完整时无法生成配置。

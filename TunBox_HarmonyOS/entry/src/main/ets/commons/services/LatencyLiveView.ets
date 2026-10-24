@@ -259,8 +259,14 @@ export class LatencyLiveView {
   }
 
   static notify(): void {
+    // 监听者循环必须逐个隔离：任一 listener 抛异常会中断其余 listener，且异常
+    // 发生在 200ms 合并定时器回调里时成为未处理异常（可致 ability 崩溃）。
     for (const l of LatencyLiveView.listeners) {
-      l();
+      try {
+        l();
+      } catch (e) {
+        // 单个监听者（页面已销毁/状态异常）不允许影响其它监听者与通知链
+      }
     }
   }
 
