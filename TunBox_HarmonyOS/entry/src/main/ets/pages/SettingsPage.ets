@@ -488,7 +488,7 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => router.pushUrl({ url: 'pages/AppRoutingPage' }))
 
-            // ── 网站分流策略：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
+            // ── 网站分流：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
             Column({ space: 6 }) {
               Row({ space: 8 }) {
                 Row() {
@@ -498,7 +498,7 @@ export struct SettingsView {
                 .width(28).height(28).borderRadius(8)
                 .backgroundColor(TunBoxColors.primaryLight)
                 .justifyContent(FlexAlign.Center)
-                Text('网站分流策略').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Text('网站分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)

@@ -250,7 +250,7 @@ struct SiteRoutingPage {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
         // 顶部导航（文档 §2.1）：返回接既有 back()（含未保存草稿确认），rightSlot 承载既有「保存」按钮
-        TopNavBar({ title: '网站分流策略', hasBack: true, onBack: (): void => { this.back(); } }) {
+        TopNavBar({ title: '网站分流', hasBack: true, onBack: (): void => { this.back(); } }) {
           Row({ space: 8 }) {
             Button(this.busy ? '请稍候' : '保存').fontSize(14)
               .backgroundColor(TunBoxColors.primary).fontColor(TunBoxColors.textOnPrimary)
