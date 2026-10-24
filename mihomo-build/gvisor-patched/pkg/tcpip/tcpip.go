@@ -49,10 +49,8 @@ import (
 
 // Using the header package here would cause an import cycle.
 const (
-	ipv4AddressSize    = 4
-	ipv4ProtocolNumber = 0x0800
-	ipv6AddressSize    = 16
-	ipv6ProtocolNumber = 0x86dd
+	ipv4AddressSize = 4
+	ipv6AddressSize = 16
 )
 
 const (
@@ -712,6 +710,10 @@ type ReadOptions struct {
 	// NeedLinkPacketInfo indicates whether to return the link-layer information,
 	// if supported.
 	NeedLinkPacketInfo bool
+
+	// NeedRecvdExperimentOption indicates whether to return the experiment
+	// option value from the last received packet, if supported.
+	NeedReceivedExperimentOption bool
 }
 
 // ReadResult represents result for a successful Endpoint.Read.
@@ -732,6 +734,10 @@ type ReadResult struct {
 	// LinkPacketInfo is the link-layer information of the received packet if
 	// ReadOptions.NeedLinkPacketInfo is true.
 	LinkPacketInfo LinkPacketInfo
+
+	// ReceivedExperimentOption is the experiment option value from the last
+	// received packet if ReadOptions.NeedReceivedExperimentOption is true.
+	ReceivedExperimentOption uint16
 }
 
 // Endpoint is the interface implemented by transport protocols (e.g., tcp, udp)
@@ -949,9 +955,8 @@ const (
 
 	// MTUDiscoverOption is used to set/get the path MTU discovery setting.
 	//
-	// NOTE: Setting this option to any other value than PMTUDiscoveryDont
-	// is not supported and will fail as such, and getting this option will
-	// always return PMTUDiscoveryDont.
+	// The value controls whether the Don't Fragment (DF) bit is set on
+	// outgoing IPv4 packets.
 	MTUDiscoverOption
 
 	// MulticastTTLOption is used by SetSockOptInt/GetSockOptInt to control
@@ -1003,6 +1008,10 @@ const (
 	// PacketMMapReserveOption is used to set the packet mmap reserved space
 	// between the aligned header and the payload.
 	PacketMMapReserveOption
+
+	// IPv6MulticastInterfaceOption is used to set/get the NIC used for
+	// IPv6 multicast Tx.
+	IPv6MulticastInterfaceOption
 )
 
 const (

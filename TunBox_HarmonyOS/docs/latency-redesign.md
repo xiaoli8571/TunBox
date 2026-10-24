@@ -515,3 +515,16 @@ provider 声明段），与延迟判定口径无关：
 `verify-profile-merge-providers`（8 断言 + 负对照精确复现报障）、
 `verify-config-generation-integrity`、`verify-vpn-architecture` 全绿；
 真机（MLR-AL00）去广告开启 + 1.29MB MRS 在位实测「已连接」，公网 IP 正常。
+
+## 十七、2026-10-23 指纹变更说明（0.6.0 品牌注释同步）
+
+本轮全面回归发现既有品牌改名把生成器首部溯源注释 `ssrvpn_shared` 改成 `tunbox_shared`，但未同步字节指纹。已核对 git diff：仅该注释一行发生变化，运行逻辑未变。将 `sha256_16` 从 `cabba6616f9fad5d` 更新为 `80d36845f2ff0236`。本轮订阅/VPN 修复位于 RuntimeConfigBuilder、ProfileStore、原生 profile 校验器及编排器，不改变此生成器。
+
+
+### 2026-10-23 / 0.6.0 (526) 指纹变更说明
+
+自定义 GEOIP 规则过去漏过了 `useGeoip` 闸门，导致缺少 MMDB 的首次连接仍在内核 Parse 阶段联网下载。已对齐订阅规则：数据库未就绪时仅跳过本次发射，不修改用户保存的规则；就绪后恢复。真实同源 Mihomo 复现：引擎关时加载通过，引擎开且 GEOIP 规则存在、MMDB 下载失败时整份拒载。配置生成器指纹更新为 `bcc4d2095e111c25`。规则引擎的产品默认值同时改为关闭，去广告仍保持独立开关。
+
+## 十八、2026-10-24 指纹变更说明（稳定性审查：hysteria v1 带宽/混淆键补发射）
+
+全链路稳定性审查发现 hysteria v1（`hysteria://`）存在四处连环缺陷并修复：① `UriNodeParser.splitAuthority` 强制要求 userinfo@（hysteria v1 标准链接凭据在 `?auth=`、无 userinfo）⇒ v1 链接整条静默丢弃，且无 userinfo 的 trojan/anytls/hysteria2 转换形态同遭殃——已改为 userinfo 可选；② URI 布尔参数只认字面 `true`（`allow_insecure=1`/`insecure=0` 数字形态不归一）⇒ 自签证书机场节点全部握手失败——已接受 `'1'`；③ 生成器 hysteria v1 分支漏发 `up`/`down` 带宽与 `obfs` 混淆键（内核 `HysteriaOption` 的 `Up`/`Down`/`Obfs` 同键名）——本次指纹变更即此项，与延迟测试引擎无关，仅节点行生成；④ `parseDetailed` 的 YAML 分支覆盖式重算诊断计数，明文链接全部解析失败时 invalidCount 归零（用户无从得知节点为何变少）——已改增量聚合。harness 侧同步修复 `protocol-regression.mjs` 从未跑通的四段（auth-str 键名按内核权威修正、REALITY 测试数据补 43 字符合法公钥、CredentialStore/fileIo/AppStorage 桩补全）。配置生成器指纹更新为 `244EE3123FADECB7`。

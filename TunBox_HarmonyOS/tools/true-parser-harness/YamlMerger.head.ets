@@ -1,7 +1,7 @@
 ﻿/**
  * 订阅 YAML 合并引擎
- * 移植自 upstream: packages/ssrvpn_shared/lib/services/subscription_yaml_merger.dart
- *                packages/ssrvpn_shared/lib/utils/bounded_yaml.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/services/subscription_yaml_merger.dart
+ *                packages/tunbox_shared/lib/utils/bounded_yaml.dart
  *
  * 语义对齐：proxies 分节提取与缩进规整、条目切分、按内容指纹跨订阅去重（保留归属）、
  *           与 previousYaml 的同名节点保留（刷新不重排名称）、唯一名 "(n)" 后缀、全部限额。

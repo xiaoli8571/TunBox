@@ -16,6 +16,7 @@ package nvgpu
 
 import (
 	"fmt"
+	"github.com/metacubex/gvisor/pkg/common/structs"
 )
 
 // ClassID is a client class ID, in the sense of
@@ -58,7 +59,10 @@ const (
 	NV01_DEVICE_0                    = 0x00000080
 	NV_SEMAPHORE_SURFACE             = 0x000000da
 	RM_USER_SHARED_DATA              = 0x000000de
+	NV_MEMORY_EXPORT                 = 0x000000e0
+	NV_IMEX_SESSION                  = 0x000000f1
 	NV_MEMORY_FABRIC                 = 0x000000f8
+	NV_MEMORY_FABRIC_IMPORTED_REF    = 0x000000fb
 	NV_MEMORY_MULTICAST_FABRIC       = 0x000000fd
 	NV_MEMORY_MAPPER                 = 0x000000fe
 	NV20_SUBDEVICE_0                 = 0x00002080
@@ -67,56 +71,72 @@ const (
 	NV50_THIRD_PARTY_P2P             = 0x0000503c
 	NV50_MEMORY_VIRTUAL              = 0x000050a0
 	GT200_DEBUGGER                   = 0x000083de
+	MPS_COMPUTE                      = 0x0000900e
 	FERMI_TWOD_A                     = 0x0000902d
 	FERMI_CONTEXT_SHARE_A            = 0x00009067
 	GF100_DISP_SW                    = 0x00009072
 	GF100_ZBC_CLEAR                  = 0x00009096
+	GF100_SUBDEVICE_INFOROM          = 0x000090e7
 	GF100_PROFILER                   = 0x000090cc
+	MAXWELL_PROFILER_DEVICE          = 0x0000b2cc
+	NV_COUNTER_COLLECTION_UNIT       = 0x0000cbca
 	GF100_SUBDEVICE_MASTER           = 0x000090e6
 	FERMI_VASPACE_A                  = 0x000090f1
 	KEPLER_CHANNEL_GROUP_A           = 0x0000a06c
 	NVENC_SW_SESSION                 = 0x0000a0bc
 	KEPLER_INLINE_TO_MEMORY_B        = 0x0000a140
+	NVB8B0_VIDEO_DECODER             = 0x0000b8b0
+	NVB8D1_VIDEO_NVJPG               = 0x0000b8d1
+	NVB8FA_VIDEO_OFA                 = 0x0000b8fa
 	VOLTA_USERMODE_A                 = 0x0000c361
 	TURING_USERMODE_A                = 0x0000c461
 	TURING_CHANNEL_GPFIFO_A          = 0x0000c46f
-	NVB8B0_VIDEO_DECODER             = 0x0000b8b0 // Hopper
-	NVC4B0_VIDEO_DECODER             = 0x0000c4b0 // Turing
-	NVC6B0_VIDEO_DECODER             = 0x0000c6b0 // Ampere
-	NVC7B0_VIDEO_DECODER             = 0x0000c7b0 // Ampere
-	NVC9B0_VIDEO_DECODER             = 0x0000c9b0 // Ada
-	NVCDB0_VIDEO_DECODER             = 0x0000cdb0 // Blackwell
+	NVC4B0_VIDEO_DECODER             = 0x0000c4b0
 	NVC4B7_VIDEO_ENCODER             = 0x0000c4b7
-	NVC7B7_VIDEO_ENCODER             = 0x0000c7b7
-	NVC9B7_VIDEO_ENCODER             = 0x0000c9b7
+	NVC4D1_VIDEO_NVJPG               = 0x0000c4d1
 	AMPERE_CHANNEL_GPFIFO_A          = 0x0000c56f
 	TURING_A                         = 0x0000c597
 	TURING_DMA_COPY_A                = 0x0000c5b5
 	TURING_COMPUTE_A                 = 0x0000c5c0
 	HOPPER_USERMODE_A                = 0x0000c661
-	BLACKWELL_USERMODE_A             = 0x0000c761
 	AMPERE_A                         = 0x0000c697
+	NVC6B0_VIDEO_DECODER             = 0x0000c6b0
 	AMPERE_DMA_COPY_A                = 0x0000c6b5
 	AMPERE_COMPUTE_A                 = 0x0000c6c0
+	NVC6FA_VIDEO_OFA                 = 0x0000c6fa
+	BLACKWELL_USERMODE_A             = 0x0000c761
+	NVC7B0_VIDEO_DECODER             = 0x0000c7b0
 	AMPERE_DMA_COPY_B                = 0x0000c7b5
+	NVC7B7_VIDEO_ENCODER             = 0x0000c7b7
 	AMPERE_COMPUTE_B                 = 0x0000c7c0
+	NVC7FA_VIDEO_OFA                 = 0x0000c7fa
 	HOPPER_CHANNEL_GPFIFO_A          = 0x0000c86f
 	HOPPER_DMA_COPY_A                = 0x0000c8b5
 	BLACKWELL_CHANNEL_GPFIFO_A       = 0x0000c96f
+	ADA_A                            = 0x0000c997
+	NVC9B0_VIDEO_DECODER             = 0x0000c9b0
 	BLACKWELL_DMA_COPY_A             = 0x0000c9b5
+	NVC9B7_VIDEO_ENCODER             = 0x0000c9b7
+	ADA_COMPUTE_A                    = 0x0000c9c0
+	NVC9D1_VIDEO_NVJPG               = 0x0000c9d1
+	NVC9FA_VIDEO_OFA                 = 0x0000c9fa
 	BLACKWELL_CHANNEL_GPFIFO_B       = 0x0000ca6f
 	BLACKWELL_DMA_COPY_B             = 0x0000cab5
-	ADA_A                            = 0x0000c997
-	ADA_COMPUTE_A                    = 0x0000c9c0
 	NV_CONFIDENTIAL_COMPUTE          = 0x0000cb33
 	HOPPER_A                         = 0x0000cb97
 	HOPPER_SEC2_WORK_LAUNCH_A        = 0x0000cba2
 	HOPPER_COMPUTE_A                 = 0x0000cbc0
 	BLACKWELL_INLINE_TO_MEMORY_A     = 0x0000cd40
 	BLACKWELL_A                      = 0x0000cd97
+	NVCDB0_VIDEO_DECODER             = 0x0000cdb0
 	BLACKWELL_COMPUTE_A              = 0x0000cdc0
+	NVCDD1_VIDEO_NVJPG               = 0x0000cdd1
+	NVCDFA_VIDEO_OFA                 = 0x0000cdfa
 	BLACKWELL_B                      = 0x0000ce97
+	NVCEB7_VIDEO_ENCODER             = 0x0000ceb7
 	BLACKWELL_COMPUTE_B              = 0x0000cec0
+	NVCFB7_VIDEO_ENCODER             = 0x0000cfb7
+	NVD1B7_VIDEO_ENCODER             = 0x0000d1b7
 )
 
 // From src/common/sdk/nvidia/inc/class/cl0000.h:
@@ -129,6 +149,7 @@ const (
 //
 // +marshal
 type NV2081_ALLOC_PARAMETERS struct {
+	_        structs.HostLayout
 	Reserved uint32
 }
 
@@ -137,6 +158,7 @@ type NV2081_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV0005_ALLOC_PARAMETERS struct {
+	_             structs.HostLayout
 	HParentClient Handle
 	HSrcResource  Handle
 	HClass        ClassID
@@ -159,6 +181,7 @@ const (
 //
 // +marshal
 type NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS struct {
+	_        structs.HostLayout
 	Offset   uint64
 	Limit    uint64
 	HVASpace Handle
@@ -175,6 +198,7 @@ const (
 //
 // +marshal
 type NV0080_ALLOC_PARAMETERS struct {
+	_               structs.HostLayout
 	DeviceID        uint32
 	HClientShare    Handle
 	HTargetClient   Handle
@@ -193,6 +217,7 @@ type NV0080_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS struct {
+	_                structs.HostLayout
 	HSemaphoreMem    Handle
 	HMaxSubmittedMem Handle
 	flags            uint64
@@ -203,6 +228,7 @@ type NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV2080_ALLOC_PARAMETERS struct {
+	_           structs.HostLayout
 	SubDeviceID uint32
 }
 
@@ -211,6 +237,7 @@ type NV2080_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV_CONTEXT_DMA_ALLOCATION_PARAMS struct {
+	_          structs.HostLayout
 	HSubDevice Handle
 	Flags      uint32
 	HMemory    Handle
@@ -224,6 +251,7 @@ type NV_CONTEXT_DMA_ALLOCATION_PARAMS struct {
 //
 // +marshal
 type NV_MEMORY_ALLOCATION_PARAMS struct {
+	_             structs.HostLayout
 	Owner         uint32
 	Type          uint32
 	Flags         uint32
@@ -254,6 +282,7 @@ type NV_MEMORY_ALLOCATION_PARAMS struct {
 //
 // +marshal
 type NV_MEMORY_ALLOCATION_PARAMS_V545 struct {
+	_ structs.HostLayout
 	NV_MEMORY_ALLOCATION_PARAMS
 	NumaNode int32
 	_        uint32
@@ -263,6 +292,7 @@ type NV_MEMORY_ALLOCATION_PARAMS_V545 struct {
 //
 // +marshal
 type NV503B_BAR1_P2P_DMA_INFO struct {
+	_          structs.HostLayout
 	DmaAddress uint64
 	DmaSize    uint64
 }
@@ -272,6 +302,7 @@ type NV503B_BAR1_P2P_DMA_INFO struct {
 //
 // +marshal
 type NV503B_ALLOC_PARAMETERS struct {
+	_                          structs.HostLayout
 	HSubDevice                 Handle
 	HPeerSubDevice             Handle
 	SubDevicePeerIDMask        uint32
@@ -285,11 +316,31 @@ type NV503B_ALLOC_PARAMETERS struct {
 	P2lBar1P2PDmaInfo          NV503B_BAR1_P2P_DMA_INFO
 }
 
+// NV503B_FABRIC_P2P_DMA_INFO from src/common/sdk/nvidia/inc/class/cl503b.h.
+//
+// +marshal
+type NV503B_FABRIC_P2P_DMA_INFO struct {
+	_   structs.HostLayout
+	Gpa uint64
+}
+
+// NV503B_ALLOC_PARAMETERS_V590 is the updated version of
+// NV503B_ALLOC_PARAMETERS since 590.44.01.
+//
+// +marshal
+type NV503B_ALLOC_PARAMETERS_V590 struct {
+	_ structs.HostLayout
+	NV503B_ALLOC_PARAMETERS
+	L2pFabricP2PInfo NV503B_FABRIC_P2P_DMA_INFO
+	P2lFabricP2PInfo NV503B_FABRIC_P2P_DMA_INFO
+}
+
 // NV503C_ALLOC_PARAMETERS is the alloc params type for NV50_THIRD_PARTY_P2P,
 // from src/common/sdk/nvidia/inc/class/cl503c.h.
 //
 // +marshal
 type NV503C_ALLOC_PARAMETERS struct {
+	_     structs.HostLayout
 	Flags uint32
 }
 
@@ -298,6 +349,7 @@ type NV503C_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV83DE_ALLOC_PARAMETERS struct {
+	_                        structs.HostLayout
 	HDebuggerClient_Obsolete Handle
 	HAppClient               Handle
 	HClass3DObject           Handle
@@ -308,6 +360,7 @@ type NV83DE_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV_CTXSHARE_ALLOCATION_PARAMETERS struct {
+	_        structs.HostLayout
 	HVASpace Handle
 	Flags    uint32
 	SubctxID uint32
@@ -318,6 +371,7 @@ type NV_CTXSHARE_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_VASPACE_ALLOCATION_PARAMETERS struct {
+	_               structs.HostLayout
 	Index           uint32
 	Flags           uint32
 	VASize          uint64
@@ -333,6 +387,7 @@ type NV_VASPACE_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_VASPACE_ALLOCATION_PARAMETERS_V580 struct {
+	_ structs.HostLayout
 	NV_VASPACE_ALLOCATION_PARAMETERS
 	Pasid uint32
 	Pad1  [4]byte
@@ -343,6 +398,7 @@ type NV_VASPACE_ALLOCATION_PARAMETERS_V580 struct {
 //
 // +marshal
 type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS struct {
+	_                           structs.HostLayout
 	HObjectError                Handle
 	HObjectECCError             Handle
 	HVASpace                    Handle
@@ -356,6 +412,7 @@ type NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_MEMORY_DESC_PARAMS struct {
+	_            structs.HostLayout
 	Base         uint64
 	Size         uint64
 	AddressSpace uint32
@@ -365,8 +422,12 @@ type NV_MEMORY_DESC_PARAMS struct {
 // NV_BSP_ALLOCATION_PARAMETERS is the alloc params type for
 // NV*VIDEO_DECODER, from src/common/sdk/nvidia/inc/nvos.h.
 //
+// It is also used to represent the following driver structs:
+// - NV_NVDEC_ALLOCATION_PARAMETERS
+//
 // +marshal
 type NV_BSP_ALLOCATION_PARAMETERS struct {
+	_                         structs.HostLayout
 	Size                      uint32
 	ProhibitMultipleInstances uint32
 	EngineInstance            uint32
@@ -375,8 +436,12 @@ type NV_BSP_ALLOCATION_PARAMETERS struct {
 // NV_MSENC_ALLOCATION_PARAMETERS is the alloc params type for
 // NV*_VIDEO_ENCODER, from src/common/sdk/nvidia/inc/nvos.h.
 //
+// It is also used to represent the following driver structs:
+// - NV_NVENC_ALLOCATION_PARAMETERS
+//
 // +marshal
 type NV_MSENC_ALLOCATION_PARAMETERS struct {
+	_                         structs.HostLayout
 	Size                      uint32
 	ProhibitMultipleInstances uint32
 	EngineInstance            uint32
@@ -388,6 +453,7 @@ type NV_MSENC_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_CHANNEL_ALLOC_PARAMS struct {
+	_                   structs.HostLayout
 	HObjectError        Handle
 	HObjectBuffer       Handle
 	GPFIFOOffset        uint64
@@ -421,9 +487,48 @@ type NV_CHANNEL_ALLOC_PARAMS struct {
 //
 // +marshal
 type NV_CHANNEL_ALLOC_PARAMS_V570 struct {
+	_ structs.HostLayout
 	NV_CHANNEL_ALLOC_PARAMS
 	TPCConfigID uint32
 	_           uint32
+}
+
+// NV_CHANNEL_ALLOC_PARAMS_V610 is the updated version of
+// NV_CHANNEL_ALLOC_PARAMS since 610.43.02.
+//
+// +marshal
+type NV_CHANNEL_ALLOC_PARAMS_V610 struct {
+	_                   structs.HostLayout
+	HObjectError        Handle
+	HObjectBuffer       Handle
+	GPFIFOOffset        uint64
+	GPFIFOEntries       uint32
+	Flags               uint32
+	HContextShare       Handle
+	HVASpace            Handle
+	HHandleVASpace      Handle
+	HUserdMemory        [NV_MAX_SUBDEVICES]Handle
+	_                   uint32
+	UserdOffset         [NV_MAX_SUBDEVICES]uint64
+	EngineType          uint32
+	CID                 uint32
+	SubDeviceID         uint32
+	HObjectECCError     Handle
+	InstanceMem         NV_MEMORY_DESC_PARAMS
+	UserdMem            NV_MEMORY_DESC_PARAMS
+	RamfcMem            NV_MEMORY_DESC_PARAMS
+	MthdbufMem          NV_MEMORY_DESC_PARAMS
+	HPhysChannelGroup   Handle
+	InternalFlags       uint32
+	ErrorNotifierMem    NV_MEMORY_DESC_PARAMS
+	ECCErrorNotifierMem NV_MEMORY_DESC_PARAMS
+	ProcessID           uint32
+	SubProcessID        uint32
+	EncryptIv           [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
+	DecryptIv           [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
+	HmacNonce           [CC_CHAN_ALLOC_NONCE_SIZE_DWORD]uint32
+	TPCConfigID         uint32
+	_                   uint32
 }
 
 // NVB0B5_ALLOCATION_PARAMETERS is the alloc param type for TURING_DMA_COPY_A,
@@ -432,6 +537,7 @@ type NV_CHANNEL_ALLOC_PARAMS_V570 struct {
 //
 // +marshal
 type NVB0B5_ALLOCATION_PARAMETERS struct {
+	_          structs.HostLayout
 	Version    uint32
 	EngineType uint32
 }
@@ -441,6 +547,7 @@ type NVB0B5_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_GR_ALLOCATION_PARAMETERS struct {
+	_       structs.HostLayout
 	Version uint32
 	Flags   uint32
 	Size    uint32
@@ -452,6 +559,7 @@ type NV_GR_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV_HOPPER_USERMODE_A_PARAMS struct {
+	_           structs.HostLayout
 	Bar1Mapping uint8
 	Priv        uint8
 }
@@ -461,6 +569,7 @@ type NV_HOPPER_USERMODE_A_PARAMS struct {
 //
 // +marshal
 type NV9072_ALLOCATION_PARAMETERS struct {
+	_             structs.HostLayout
 	LogicalHeadID uint32
 	DisplayMask   uint32
 	Caps          uint32
@@ -471,6 +580,7 @@ type NV9072_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV00DE_ALLOC_PARAMETERS struct {
+	_        structs.HostLayout
 	Reserved uint32
 }
 
@@ -479,14 +589,68 @@ type NV00DE_ALLOC_PARAMETERS struct {
 //
 // +marshal
 type NV00DE_ALLOC_PARAMETERS_V545 struct {
+	_              structs.HostLayout
 	PolledDataMask uint64
 }
 
 // +marshal
 type nv00f8Map struct {
+	_       structs.HostLayout
 	offset  uint64
 	hVidMem Handle
 	flags   uint32
+}
+
+// From src/common/sdk/nvidia/inc/class/cl00e0.h:
+const (
+	NV_MEM_EXPORT_UUID_LEN     = 16
+	NV_MEM_EXPORT_METADATA_LEN = 64
+)
+
+// NV_EXPORT_MEM_PACKET is from
+// src/common/sdk/nvidia/inc/class/cl00e0.h
+//
+// +marshal
+type NV_EXPORT_MEM_PACKET struct {
+	_      structs.HostLayout
+	UUID   [NV_MEM_EXPORT_UUID_LEN]uint8
+	Opaque [16]uint8
+}
+
+// NV00E0_ALLOCATION_PARAMETERS is the alloc params type for NV_MEMORY_EXPORT,
+// from src/common/sdk/nvidia/inc/class/cl00e0.h.
+//
+// +marshal
+type NV00E0_ALLOCATION_PARAMETERS struct {
+	_                  structs.HostLayout
+	IMEXChannel        uint32
+	Packet             NV_EXPORT_MEM_PACKET
+	NumMaxHandles      uint16
+	Pad0               [2]byte
+	Flags              uint32
+	Metadata           [NV_MEM_EXPORT_METADATA_LEN]uint8
+	DeviceInstanceMask uint32
+	GIIDMasks          [NV_MAX_DEVICES]uint32
+	NumCurHandles      uint16
+	Pad1               [2]byte
+}
+
+// NV00F1_ALLOCATION_PARAMETERS is the alloc params type for NV_IMEX_SESSION,
+// from src/common/sdk/nvidia/inc/class/cl00f1.h.
+//
+// +marshal
+type NV00F1_ALLOCATION_PARAMETERS struct {
+	_             structs.HostLayout
+	CapDescriptor uint64
+	Flags         uint32
+	Pad0          [4]byte
+	// Despite being P64-typed by the driver, pOsEvent is a file descriptor
+	// whose numerical value is used by the driver. See
+	// src/nvidia/src/kernel/compute/imex_session_api.c:imexsessionapiConstruct_IMPL()
+	// => src/nvidia/arch/nvalloc/unix/src/os.c:osUserHandleToKernelPtr().
+	POsEvent P64
+	NodeID   uint16
+	Pad1     [6]byte
 }
 
 // NV00F8_ALLOCATION_PARAMETERS is the alloc param type for NV_MEMORY_FABRIC,
@@ -494,6 +658,7 @@ type nv00f8Map struct {
 //
 // +marshal
 type NV00F8_ALLOCATION_PARAMETERS struct {
+	_          structs.HostLayout
 	Alignment  uint64
 	AllocSize  uint64
 	PageSize   uint64
@@ -502,18 +667,32 @@ type NV00F8_ALLOCATION_PARAMETERS struct {
 	Map        nv00f8Map
 }
 
-// From src/common/sdk/nvidia/inc/class/cl00e0.h
-const (
-	NV_MEM_EXPORT_UUID_LEN = 16
-)
-
-// NV_EXPORT_MEM_PACKET is from
-// src/common/sdk/nvidia/inc/class/cl00e0.h
+// NV00FB_ALLOCATION_PARAMETERS is the alloc param type for
+// NV_MEMORY_FABRIC_IMPORTED_REF, from
+// src/common/sdk/nvidia/inc/class/cl00fb.h.
 //
 // +marshal
-type NV_EXPORT_MEM_PACKET struct {
-	UUID   [NV_MEM_EXPORT_UUID_LEN]uint8
-	Opaque [16]uint8
+type NV00FB_ALLOCATION_PARAMETERS struct {
+	_          structs.HostLayout
+	ExportUUID [NV_MEM_EXPORT_UUID_LEN]uint8
+	Index      uint16
+	Pad0       [2]byte
+	Flags      uint32
+	ID         uint64
+}
+
+// HasPOsEvent is a type constraint for allocation parameter structs containing
+// an optional pOsEvent field. Despite being P64-typed by the driver, pOsEvent
+// is a file descriptor whose numerical value is resolved by the driver. So it
+// must be translated from a sandbox FD to a host FD. See
+// src/nvidia/src/kernel/mem_mgr/mem_multicast_fabric.c:_memMulticastFabricDescriptorEnqueueWait()
+// => src/nvidia/arch/nvalloc/unix/src/os.c:osUserHandleToKernelPtr().
+//
+// This is necessary because, as of this writing (Go 1.20), there is no way to
+// enable field access using a Go type constraint.
+type HasPOsEvent interface {
+	GetPOsEvent() P64
+	SetPOsEvent(P64)
 }
 
 // NV00FD_ALLOCATION_PARAMETERS is the alloc param type for NV_MEMORY_MULTICAST_FABRIC
@@ -521,13 +700,25 @@ type NV_EXPORT_MEM_PACKET struct {
 //
 // +marshal
 type NV00FD_ALLOCATION_PARAMETERS struct {
+	_          structs.HostLayout
 	Alignment  uint64
 	AllocSize  uint64
 	PageSize   uint32
 	AllocFlags uint32
 	NumGPUs    uint32
 	_          uint32
-	POsEvent   P64
+	// POsEvent is an optional file descriptor; see HasPOsEvent.
+	POsEvent P64
+}
+
+// GetPOsEvent implements HasPOsEvent.GetPOsEvent.
+func (p *NV00FD_ALLOCATION_PARAMETERS) GetPOsEvent() P64 {
+	return p.POsEvent
+}
+
+// SetPOsEvent implements HasPOsEvent.SetPOsEvent.
+func (p *NV00FD_ALLOCATION_PARAMETERS) SetPOsEvent(posEvent P64) {
+	p.POsEvent = posEvent
 }
 
 // NV00FD_ALLOCATION_PARAMETERS_V545 is the updated version of
@@ -535,10 +726,39 @@ type NV00FD_ALLOCATION_PARAMETERS struct {
 //
 // +marshal
 type NV00FD_ALLOCATION_PARAMETERS_V545 struct {
+	_         structs.HostLayout
 	ExpPacket NV_EXPORT_MEM_PACKET
 	Index     uint16
 	_         [6]byte
 	NV00FD_ALLOCATION_PARAMETERS
+}
+
+// NV00FD_ALLOCATION_PARAMETERS_V590 is the updated version of
+// NV00FD_ALLOCATION_PARAMETERS since 590.44.01.
+//
+// +marshal
+type NV00FD_ALLOCATION_PARAMETERS_V590 struct {
+	_          structs.HostLayout
+	ExpPacket  NV_EXPORT_MEM_PACKET
+	Index      uint16
+	_          [6]byte
+	Alignment  uint64
+	AllocSize  uint64
+	PageSize   uint64
+	AllocFlags uint32
+	NumGPUs    uint32
+	// POsEvent is an optional file descriptor; see HasPOsEvent.
+	POsEvent P64
+}
+
+// GetPOsEvent implements HasPOsEvent.GetPOsEvent.
+func (p *NV00FD_ALLOCATION_PARAMETERS_V590) GetPOsEvent() P64 {
+	return p.POsEvent
+}
+
+// SetPOsEvent implements HasPOsEvent.SetPOsEvent.
+func (p *NV00FD_ALLOCATION_PARAMETERS_V590) SetPOsEvent(posEvent P64) {
+	p.POsEvent = posEvent
 }
 
 // NV_MEMORY_MAPPER_ALLOCATION_PARAMS is the alloc param type for
@@ -546,6 +766,7 @@ type NV00FD_ALLOCATION_PARAMETERS_V545 struct {
 //
 // +marshal
 type NV_MEMORY_MAPPER_ALLOCATION_PARAMS struct {
+	_      structs.HostLayout
 	unused uint8
 }
 
@@ -554,6 +775,7 @@ type NV_MEMORY_MAPPER_ALLOCATION_PARAMS struct {
 //
 // +marshal
 type NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V550 struct {
+	_                 structs.HostLayout
 	HSemaphoreSurface Handle
 	MaxQueueSize      uint32
 }
@@ -563,6 +785,7 @@ type NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V550 struct {
 //
 // +marshal
 type NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V555 struct {
+	_ structs.HostLayout
 	NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V550
 	HNotificationMemory Handle
 	_                   uint32
@@ -574,6 +797,7 @@ type NV_MEMORY_MAPPER_ALLOCATION_PARAMS_V555 struct {
 //
 // +marshal
 type NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS struct {
+	_      structs.HostLayout
 	Handle Handle
 }
 
@@ -582,9 +806,51 @@ type NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS struct {
 //
 // +marshal
 type NVA0BC_ALLOC_PARAMETERS struct {
+	_           structs.HostLayout
 	CodecType   uint32
 	HResolution uint32
 	VResolution uint32
 	Version     uint32
 	HMem        Handle
+}
+
+// NV_NVJPG_ALLOCATION_PARAMETERS is the alloc params type for
+// NVxxD1_VIDEO_NVJPG classes, from src/common/sdk/nvidia/inc/nvos.h.
+//
+// +marshal
+type NV_NVJPG_ALLOCATION_PARAMETERS struct {
+	_                         structs.HostLayout
+	Size                      uint32
+	ProhibitMultipleInstances uint32
+	EngineInstance            uint32
+}
+
+// NV_OFA_ALLOCATION_PARAMETERS is the alloc params type for
+// NVxxFA_VIDEO_OFA classes, from src/common/sdk/nvidia/inc/nvos.h.
+//
+// +marshal
+type NV_OFA_ALLOCATION_PARAMETERS struct {
+	_                         structs.HostLayout
+	Size                      uint32
+	ProhibitMultipleInstances uint32
+}
+
+// NV_OFA_ALLOCATION_PARAMETERS_V545 is the updated version of
+// NV_OFA_ALLOCATION_PARAMETERS since 545.23.06.
+//
+// +marshal
+type NV_OFA_ALLOCATION_PARAMETERS_V545 struct {
+	_ structs.HostLayout
+	NV_OFA_ALLOCATION_PARAMETERS
+	EngineInstance uint32
+}
+
+// NVB2CC_ALLOC_PARAMETERS is the alloc params type for MAXWELL_PROFILER_DEVICE,
+// from src/common/sdk/nvidia/inc/class/clb2cc.h.
+//
+// +marshal
+type NVB2CC_ALLOC_PARAMETERS struct {
+	_              structs.HostLayout
+	HClientTarget  Handle
+	HContextTarget Handle
 }

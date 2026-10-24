@@ -14,6 +14,10 @@
 
 package linux
 
+import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+)
+
 const (
 	// NumControlCharacters is the number of control characters in Termios.
 	NumControlCharacters = 19
@@ -24,8 +28,10 @@ const (
 
 // Winsize is struct winsize, defined in uapi/asm-generic/termios.h.
 //
+// +stateify savable
 // +marshal
 type Winsize struct {
+	_      structs.HostLayout
 	Row    uint16
 	Col    uint16
 	Xpixel uint16
@@ -36,6 +42,7 @@ type Winsize struct {
 //
 // +marshal
 type Termios struct {
+	_                 structs.HostLayout
 	InputFlags        uint32
 	OutputFlags       uint32
 	ControlFlags      uint32
@@ -48,7 +55,9 @@ type Termios struct {
 // uapi/asm-generic/termbits.h.
 //
 // +stateify savable
+// +marshal
 type KernelTermios struct {
+	_                 structs.HostLayout
 	InputFlags        uint32
 	OutputFlags       uint32
 	ControlFlags      uint32
@@ -335,15 +344,4 @@ var DefaultReplicaTermios = KernelTermios{
 	ControlCharacters: DefaultControlCharacters,
 	InputSpeed:        38400,
 	OutputSpeed:       38400,
-}
-
-// WindowSize corresponds to struct winsize defined in
-// include/uapi/asm-generic/termios.h.
-//
-// +stateify savable
-// +marshal
-type WindowSize struct {
-	Rows uint16
-	Cols uint16
-	_    [4]byte // Padding for 2 unused shorts.
 }

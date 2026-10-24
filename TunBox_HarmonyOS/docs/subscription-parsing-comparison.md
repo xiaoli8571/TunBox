@@ -93,7 +93,7 @@
 - 链接 scheme：mihomo 支持 `hysteria / hysteria2 / hy2 / tuic / trojan / vless / vmess /
   ss / ssr / socks* / http(s) / anytls / mieru`；本 App 的 `ProxyNode` 里同样覆盖
   `hysteria2:// / tuic:// / anytls:// / mieru / wireguard`（源码可查）。
-- UA 链 `clash-verge/v2.4.2 → clash.meta/v1.19.32 → SSRVPN/x → v2rayN/6.23 →
+- UA 链 `clash-verge/v2.4.2 → clash.meta/v1.19.32 → TunBox/x → v2rayN/6.23 →
   Shadowrocket/2077` 与主流一致（2026-10-20 上调版本号：面板按 UA 版本做内容协商，
   v1.7.7 只给 20 个节点/无 anytls，v2.4.2 给 36 个；实测见 diag/code-parse.md），**优先 Clash UA** 让面板直接返回 YAML —— 这正是
   Verge Rev（`clash-verge/v{version}`）和 CMFA（`ClashMetaForAndroid/<version>`）的做法。

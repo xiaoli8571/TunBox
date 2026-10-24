@@ -107,7 +107,7 @@ class FakePrivateFs implements PrivateFs {
 }
 
 export default function logicTest() {
-  describe('ssrvpnLogicTest', () => {
+  describe('tunboxLogicTest', () => {
     it('ssr_parse', 0, () => {
       // ssr:// 1.2.3.4:8388:origin:aes-256-cfb:plain:<base64("pass")>/?remarks=<base64("测试")>
       const pass = 'cGFzcw==';
@@ -852,7 +852,7 @@ export default function logicTest() {
   // ══════════════════════════════════════════════════════════════════
   // 第二阶段纯逻辑：NetworkStateWatcher / LinkHealthChecker / SmartSelector
   // ══════════════════════════════════════════════════════════════════
-  describe('ssrvpnPhase2PureLogic', () => {
+  describe('tunboxPhase2PureLogic', () => {
     // ── NetworkStateWatcher：normalizeNetType 全分支 ────────────────
     it('net_type_normalize_all_branches', 0, () => {
       // bearer 数值常量必须与 SDK connection.NetBearType 对齐

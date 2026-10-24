@@ -74,8 +74,11 @@ type congestionControl interface {
 	// Update is invoked when processing inbound acks. It's passed the
 	// number of packet's that were acked by the most recent cumulative
 	// acknowledgement.  rtt is the round-trip time, or is set to unknownRTT
-	// (above) to indicate the time is unknown.
-	Update(packetsAcked int, rtt time.Duration)
+	// (above) to indicate the time is unknown. ackTime is the time the
+	// processed ACK arrived at the stack (its ingress timestamp), used for
+	// arrival-anchored timing such as CUBIC HyStart's ACK-train detection so
+	// that an ACK delayed inside the stack does not distort it.
+	Update(packetsAcked int, rtt time.Duration, ackTime tcpip.MonotonicTime)
 
 	// PostRecovery is invoked when the sender is exiting a fast retransmit/
 	// recovery phase. This provides congestion control algorithms a way
@@ -96,12 +99,18 @@ type lossRecovery interface {
 
 // sender holds the state necessary to send TCP segments.
 //
+// +checklocksalias:rc.snd.ep.mu=ep.mu
 // +stateify savable
 type sender struct {
 	// +checklocks:ep.mu
 	TCPSenderState
 
 	ep *Endpoint
+
+	// finSent is set when the FIN segment is actually transmitted.
+	// The endpoint may be in FIN_WAIT1/LAST_ACK while the FIN is still
+	// queued behind blocked data; finSent guards closing ACK completions.
+	finSent bool
 
 	// lr is the loss recovery algorithm used by the sender.
 	lr lossRecovery
@@ -242,13 +251,13 @@ type rtt struct {
 }
 
 // +checklocks:ep.mu
-func newSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint16, sndWndScale int) *sender {
+func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint16, sndWndScale int) {
 	// The sender MUST reduce the TCP data length to account for any IP or
 	// TCP options that it is including in the packets that it sends.
 	// See: https://tools.ietf.org/html/rfc6691#section-2
 	maxPayloadSize := int(mss) - ep.maxOptionSize()
 
-	s := &sender{
+	ep.snd = &sender{
 		ep: ep,
 		TCPSenderState: TCPSenderState{
 			SndWnd:           sndWnd,
@@ -271,59 +280,50 @@ func newSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 			set: make(map[*segment]struct{}),
 		},
 	}
-	return newSenderHelper(ep, iss, irs, sndWnd, mss, sndWndScale, maxPayloadSize, s)
-}
 
-// newSenderHelper exists to sate checklocks.
-//
-// +checklocks:ep.mu
-// +checklocksalias:s.ep.mu=ep.mu
-func newSenderHelper(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint16, sndWndScale int, maxPayloadSize int, s *sender) *sender {
-	if s.gso {
-		s.ep.gso.MSS = uint16(maxPayloadSize)
+	if ep.snd.gso {
+		ep.snd.ep.gso.MSS = uint16(maxPayloadSize)
 	}
 
-	s.cc = s.initCongestionControl(ep.cc)
-	s.lr = s.initLossRecovery()
-	s.rc.init(s, iss)
+	ep.snd.cc = ep.snd.initCongestionControl(ep.cc)
+	ep.snd.lr = ep.snd.initLossRecovery()
+	ep.snd.rc.init(ep.snd, iss)
 
 	// A negative sndWndScale means that no scaling is in use, otherwise we
 	// store the scaling value.
 	if sndWndScale > 0 {
-		s.SndWndScale = uint8(sndWndScale)
+		ep.snd.SndWndScale = uint8(sndWndScale)
 	}
 
-	s.resendTimer.init(s.ep.stack.Clock(), timerHandler(s.ep, s.retransmitTimerExpired))
-	s.reorderTimer.init(s.ep.stack.Clock(), timerHandler(s.ep, s.rc.reorderTimerExpired))
-	s.probeTimer.init(s.ep.stack.Clock(), timerHandler(s.ep, s.probeTimerExpired))
-	s.corkTimer.init(s.ep.stack.Clock(), timerHandler(s.ep, s.corkTimerExpired))
+	ep.snd.resendTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.retransmitTimerExpired))
+	ep.snd.reorderTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.rc.reorderTimerExpired))
+	ep.snd.probeTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.probeTimerExpired))
+	ep.snd.corkTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.corkTimerExpired))
 
-	s.updateMaxPayloadSize(int(ep.route.MTU()), 0)
+	ep.snd.updateMaxPayloadSize(int(ep.snd.ep.route.MTU()), 0)
 	// Initialize SACK Scoreboard after updating max payload size as we use
 	// the maxPayloadSize as the smss when determining if a segment is lost
 	// etc.
-	s.ep.scoreboard = NewSACKScoreboard(uint16(s.MaxPayloadSize), iss)
+	ep.snd.ep.scoreboard = NewSACKScoreboard(uint16(ep.snd.MaxPayloadSize), iss)
 
 	// Get Stack wide config.
 	var minRTO tcpip.TCPMinRTOOption
-	if err := ep.stack.TransportProtocolOption(ProtocolNumber, &minRTO); err != nil {
+	if err := ep.snd.ep.stack.TransportProtocolOption(ProtocolNumber, &minRTO); err != nil {
 		panic(fmt.Sprintf("unable to get minRTO from stack: %s", err))
 	}
-	s.minRTO = time.Duration(minRTO)
+	ep.snd.minRTO = time.Duration(minRTO)
 
 	var maxRTO tcpip.TCPMaxRTOOption
-	if err := ep.stack.TransportProtocolOption(ProtocolNumber, &maxRTO); err != nil {
+	if err := ep.snd.ep.stack.TransportProtocolOption(ProtocolNumber, &maxRTO); err != nil {
 		panic(fmt.Sprintf("unable to get maxRTO from stack: %s", err))
 	}
-	s.maxRTO = time.Duration(maxRTO)
+	ep.snd.maxRTO = time.Duration(maxRTO)
 
 	var maxRetries tcpip.TCPMaxRetriesOption
-	if err := ep.stack.TransportProtocolOption(ProtocolNumber, &maxRetries); err != nil {
+	if err := ep.snd.ep.stack.TransportProtocolOption(ProtocolNumber, &maxRetries); err != nil {
 		panic(fmt.Sprintf("unable to get maxRetries from stack: %s", err))
 	}
-	s.maxRetries = uint32(maxRetries)
-
-	return s
+	ep.snd.maxRetries = uint32(maxRetries)
 }
 
 // initCongestionControl initializes the specified congestion control module and
@@ -434,6 +434,13 @@ func (s *sender) sendAck() {
 //
 // +checklocks:s.ep.mu
 func (s *sender) updateRTO(rtt time.Duration) {
+	// A negative RTT sample is nonsensical and would skew SRTT/RTTVar (and thus
+	// RTO). RTT samples are now anchored to a segment's ingress time, which is
+	// monotonic and never after the corresponding send time, so this should not
+	// occur; guard defensively rather than corrupt the estimator.
+	if rtt < 0 {
+		return
+	}
 	s.rtt.Lock()
 	if !s.rtt.TCPRTTState.SRTTInited {
 		s.rtt.TCPRTTState.RTTVar = rtt / 2
@@ -902,15 +909,9 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 		}
 		seg.flags = header.TCPFlagAck | header.TCPFlagFin
 		segEnd = seg.sequenceNumber.Add(1)
-		// Update the state to reflect that we have now
-		// queued a FIN.
-		s.ep.updateConnDirectionState(connDirectionStateSndClosed)
-		switch s.ep.EndpointState() {
-		case StateCloseWait:
-			s.ep.setEndpointState(StateLastAck)
-		default:
-			s.ep.setEndpointState(StateFinWait1)
-		}
+		// FIN is now being transmitted; mark it so the receiver can tell
+		// a data-only ACK apart from one that acknowledges our FIN.
+		s.finSent = true
 	} else {
 		// We're sending a non-FIN segment.
 		if seg.flags&header.TCPFlagFin != 0 {
@@ -1013,6 +1014,7 @@ func (s *sender) sendZeroWindowProbe() {
 	// we re-send an ACKed byte to goad the receiver into responding.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(zeroProbeJunk),
+		Mark:    s.ep.ops.GetMark(),
 	})
 	defer pkt.DecRef()
 	s.sendSegmentFromPacketBuffer(pkt, header.TCPFlagAck, s.SndUna-1)
@@ -1518,13 +1520,16 @@ func (s *sender) inRecovery() bool {
 // handleRcvdSegment is called when a segment is received; it is responsible for
 // updating the send-related state.
 // +checklocks:s.ep.mu
-// +checklocksalias:s.rc.snd.ep.mu=s.ep.mu
 func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 	bestRTT := unknownRTT
 
-	// Check if we can extract an RTT measurement from this ack.
+	// Check if we can extract an RTT measurement from this ack. Measure against
+	// the ACK's ingress time (rcvdSeg.rcvdTime), not the current clock: if the
+	// ACK was delayed inside the stack before being processed (e.g. queued while
+	// the application held the endpoint lock during a Write), using the
+	// processing time would inflate the RTT sample and thus SRTT/RTO.
 	if !rcvdSeg.parsedOptions.TS && s.RTTMeasureSeqNum.LessThan(rcvdSeg.ackNumber) {
-		bestRTT = s.ep.stack.Clock().NowMonotonic().Sub(s.RTTMeasureTime)
+		bestRTT = rcvdSeg.rcvdTime.Sub(s.RTTMeasureTime)
 		s.updateRTO(bestRTT)
 		s.RTTMeasureSeqNum = s.SndNxt
 	}
@@ -1627,7 +1632,10 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		//    some new data, i.e., only if it advances the left edge of
 		//    the send window.
 		if s.ep.SendTSOk && rcvdSeg.parsedOptions.TSEcr != 0 {
-			tsRTT := s.ep.elapsed(s.ep.stack.Clock().NowMonotonic(), rcvdSeg.parsedOptions.TSEcr)
+			// Compute elapsed time from the ACK's ingress time, not the current
+			// clock, so an ACK delayed inside the stack before processing does
+			// not inflate the timestamp-based RTT sample (and thus SRTT/RTO).
+			tsRTT := s.ep.elapsed(rcvdSeg.rcvdTime, rcvdSeg.parsedOptions.TSEcr)
 			s.updateRTO(tsRTT)
 			// Following Linux, prefer RTT computed from ACKs to TSEcr because,
 			// "broken middle-boxes or peers may corrupt TS-ECR fields"
@@ -1707,7 +1715,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		// If we are not in fast recovery then update the congestion
 		// window based on the number of acknowledged packets.
 		if !s.FastRecovery.Active {
-			s.cc.Update(originalOutstanding-s.Outstanding, bestRTT)
+			s.cc.Update(originalOutstanding-s.Outstanding, bestRTT, rcvdSeg.rcvdTime)
 			if s.FastRecovery.Last.LessThan(s.SndUna) {
 				s.state = tcpip.Open
 				// Update RACK when we are exiting fast or RTO
@@ -1822,8 +1830,6 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 // sendSegmentFromPacketBuffer sends a new segment containing the given payload,
 // flags and sequence number.
 // +checklocks:s.ep.mu
-// +checklocksalias:s.ep.rcv.ep.mu=s.ep.mu
-// +checklocksalias:s.ep.rcv.ep.snd.ep.mu=s.ep.mu
 func (s *sender) sendSegmentFromPacketBuffer(pkt *stack.PacketBuffer, flags header.TCPFlags, seq seqnum.Value) tcpip.Error {
 	s.LastSendTime = s.ep.stack.Clock().NowMonotonic()
 	if seq == s.RTTMeasureSeqNum {
@@ -1845,9 +1851,6 @@ func (s *sender) sendSegmentFromPacketBuffer(pkt *stack.PacketBuffer, flags head
 
 // sendEmptySegment sends a new empty segment, flags and sequence number.
 // +checklocks:s.ep.mu
-// +checklocksalias:s.ep.rcv.ep.snd.ep.mu=s.ep.mu
-// +checklocksalias:s.ep.rcv.ep.mu=s.ep.mu
-// +checklocksalias:s.ep.snd.ep.mu=s.ep.mu
 func (s *sender) sendEmptySegment(flags header.TCPFlags, seq seqnum.Value) tcpip.Error {
 	s.LastSendTime = s.ep.stack.Clock().NowMonotonic()
 	if seq == s.RTTMeasureSeqNum {

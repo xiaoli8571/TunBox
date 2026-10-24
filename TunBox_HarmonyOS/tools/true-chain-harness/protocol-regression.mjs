@@ -63,7 +63,8 @@ const anytlsLine = ClashConfigGenerator.proxyYamlLine(anytls);
 assert.ok(anytlsLine.includes('type: anytls'), anytlsLine);
 assert.ok(anytlsLine.includes('password: "anytls-pass"'), anytlsLine);
 
-// hysteria v1: auth 进 password，up/down 通过 extraOpts 回写（生成端仅对 hy2 用结构化 up/down）
+// hysteria v1: auth 进 password 槽，生成端以 auth-str 键发射（内核 HysteriaOption 的
+// proxy tag 是 auth-str 连字符；password 键仅为兼容别名），up/down 也结构化发射
 const hy1 = byType.get('hysteria');
 assert.equal(hy1.password, 'hy-auth-str');
 assert.equal(hy1.servername, 'hy1.example.invalid');
@@ -72,10 +73,10 @@ assert.equal(hy1.hyDown, '200');
 assert.equal(ClashConfigGenerator.dropReasonFor(hy1), ProxyDropReason.NONE);
 const hy1Line = ClashConfigGenerator.proxyYamlLine(hy1);
 assert.ok(hy1Line.includes('type: hysteria'), hy1Line);
-assert.ok(hy1Line.includes('auth_str'), hy1Line);
+assert.ok(hy1Line.includes('auth-str'), hy1Line);
 assert.ok(hy1Line.includes('hy-auth-str'), hy1Line);
-assert.ok(hy1Line.includes('up: 30'), hy1Line);
-assert.ok(hy1Line.includes('down: 200'), hy1Line);
+assert.ok(hy1Line.includes('up: "30"'), hy1Line);
+assert.ok(hy1Line.includes('down: "200"'), hy1Line);
 
 // hy2 原有能力不回归
 const hy2 = byType.get('hysteria2');
@@ -198,7 +199,7 @@ assert.ok(!directLine.includes('server:'), directLine);
 // direct 节点跨重启恢复不丢（server 空 + port 0 校验豁免）
 const directSvc = new SubscriptionService();
 directSvc.nodes = SubscriptionService['mapNodes'](
-  JSON.parse(JSON.stringify(SubscriptionService['nodesToJson'](dp.nodes))));
+  JSON.parse(JSON.stringify(SubscriptionService['nodesToJson'](dp.nodes, null))));
 assert.equal(directSvc.nodes.length, 2, 'direct node survives restore round-trip');
 
 // ── 8) 本地 YAML 的 proxy-providers 拉取（对齐 mihomo include-all 语义）──
@@ -220,7 +221,9 @@ proxy-groups:
     type: select
     include-all: true
 `;
-const { harnessPrefs } = await import(generated('stubs.ts'));
+const { harnessPrefs, coreBridge } = await import(generated('stubs.ts'));
+// 本场景只验证 provider 拉取/展开语义，profile 校验直通（与 verify-stability-remediation-runtime 同款注入法）
+coreBridge.prepareProfile = async (text) => text;
 const gSave = globalThis.__HARNESS_BODY__;
 globalThis.__HARNESS_BODY__ = fakeProviderBody;
 try {
@@ -333,7 +336,7 @@ const matrixYaml = `
 proxies:
   - {name: SS+plugin, type: ss, server: ss.example.invalid, port: 8388, cipher: aes-256-gcm, password: REDACTED, plugin: obfs, plugin-opts: {mode: http, host: m.example.invalid}}
   - {name: VMess-WS-early, type: vmess, server: vm.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345678, alterId: 0, cipher: auto, udp: true, tls: true, servername: vm.example.invalid, network: ws, ws-opts: {path: /vm, headers: {Host: vm.example.invalid}, max-early-data: 2560, early-data-header-name: Sec-WebSocket-Protocol, v2ray-http-upgrade: true}}
-  - {name: VLESS-REALITY-grpc, type: vless, server: vl.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345679, udp: true, tls: true, servername: vl.example.invalid, client-fingerprint: chrome, network: grpc, grpc-opts: {grpc-service-name: svc}, reality-opts: {public-key: pb-key-example, short-id: "0123"}}
+  - {name: VLESS-REALITY-grpc, type: vless, server: vl.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345679, udp: true, tls: true, servername: vl.example.invalid, client-fingerprint: chrome, network: grpc, grpc-opts: {grpc-service-name: svc}, reality-opts: {public-key: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE, short-id: "0123"}}
   - {name: VMess-H2, type: vmess, server: h2.example.invalid, port: 443, uuid: 2DD1E417-8A1D-4B7F-9E32-DEAD12345680, alterId: 0, cipher: auto, tls: true, network: h2, h2-opts: {host: [h2a.example.invalid], path: /h2}}
   - {name: Trojan-WS, type: trojan, server: tr.example.invalid, port: 443, password: REDACTED, network: ws, ws-opts: {path: /tr}}
   - {name: Hysteria2, type: hysteria2, server: hy.example.invalid, port: 443, password: REDACTED, obfs: salamander, obfs-password: REDACTED2, up: 30, down: 200}
@@ -362,7 +365,7 @@ assert.ok(ml.includes('max-early-data: 2560'), ml);
 assert.ok(ml.includes('v2ray-http-upgrade: true'), ml);
 assert.ok(ml.includes('early-data-header-name: "Sec-WebSocket-Protocol"'), ml);
 ml = matrixLine('VLESS-REALITY-grpc');
-assert.ok(ml.includes('reality-opts: {public-key: "pb-key-example", short-id: "0123"}'), ml);
+assert.ok(ml.includes('reality-opts: {public-key: "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE", short-id: "0123"}'), ml);
 assert.ok(ml.includes('grpc-service-name: "svc"'), ml);
 ml = matrixLine('VMess-H2');
 assert.ok(ml.includes('h2-opts: {host: [h2a.example.invalid], path: /h2}'), ml);

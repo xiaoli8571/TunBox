@@ -1,5 +1,5 @@
 /**
- * SSRVPN 2x2 桌面服务卡片。
+ * TunBox 2x2 桌面服务卡片。
  * 使用结构化 BindingData 展示真实状态、当前节点和动态操作；忙碌时禁用重复点击。
  */
 let storage = new LocalStorage();

@@ -82,7 +82,7 @@ const (
 type IPTables struct {
 	connections ConnTrack
 
-	reaper tcpip.Timer
+	reaper tcpip.Timer `state:"nosave"`
 
 	mu ipTablesRWMutex `state:"nosave"`
 	// v4Tables and v6tables map tableIDs to tables. They hold builtin
@@ -283,7 +283,9 @@ func (fl IPHeaderFilter) match(pkt *PacketBuffer, hook Hook, inNicName, outNicNa
 
 	case header.IPv6ProtocolNumber:
 		hdr := header.IPv6(pkt.NetworkHeader().Slice())
-		transProto = hdr.TransportProtocol()
+		// The transport protocol may be preceded by IPv6 extension headers, so
+		// use the protocol from parsing (see IPv6.TransportProtocol).
+		transProto = pkt.TransportProtocolNumber
 		dstAddr = hdr.DestinationAddress()
 		srcAddr = hdr.SourceAddress()
 

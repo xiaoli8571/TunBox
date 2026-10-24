@@ -1,6 +1,6 @@
 /**
  * 国家旗帜图标
- * 移植自 upstream: packages/ssrvpn_shared/lib/widgets/country_flag_icon.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/widgets/country_flag_icon.dart
  */
 import { NodeCountryPolicy } from '../commons/services/PublicIpService';
 

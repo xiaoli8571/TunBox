@@ -1,7 +1,7 @@
 /**
  * 连接编排器：管理连接状态机、VPN 能力拉起、Clash API 就绪等待
- * 移植自 upstream: SSRVPN_Android/lib/services/connection_orchestrator.dart
- *                packages/ssrvpn_shared/lib/utils/connection_intent_tracker.dart
+ * 移植自 upstream: TunBox_Android/lib/services/connection_orchestrator.dart
+ *                packages/tunbox_shared/lib/utils/connection_intent_tracker.dart
  *                connection_transition_queue.dart / core_recovery_policy.dart
  *
  * 链路（API 26 实测形态）：
@@ -26,7 +26,7 @@ import { DoHResolver } from './DoHResolver';
 import { SubscriptionService } from './SubscriptionService';
 import { SubscriptionRefreshStatus } from '../models/Subscription';
 import { SettingsService, ConnectionSnapshot, AppRoutingSnapshot } from './SettingsService';
-import { SsrvpnNotifier } from './SsrvpnNotifier';
+import { TunBoxNotifier } from './TunBoxNotifier';
 import { TaskProgressUpdater } from './TaskProgressUpdater';
 import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
@@ -206,6 +206,11 @@ const HEARTBEAT_STALE_MS = 15000;
 const CORE_DEATH_CONFIRMATIONS = 3;
 const CORE_LIVENESS_POLL_MS = 3000;
 const CORE_DEATH_CONFIRM_MS = (CORE_DEATH_CONFIRMATIONS - 1) * CORE_LIVENESS_POLL_MS;
+/**
+ * 扩展侧恢复「卡死」阈值：recovering 相位下 status 文件 ts 停更超过该时长即视为
+ * 恢复编排不再前进（有界预算耗尽后的终态）。须大于扩展最大恢复退避间隔。
+ */
+const CORE_RECOVERY_STUCK_MS = 90000;
 
 /** 心跳观测的三态判定结果 */
 enum LivenessVerdict {
@@ -387,6 +392,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private disconnectRequested: boolean = false;
   /** 重复 Form 事件复用同一停止 Promise，避免重复停止扩展和 native core。 */
   private disconnectTask: Promise<void> | null = null;
+  /** 真实会话启停和热加载共用资源队列；恢复逻辑在事务释放后运行。 */
+  private lifecycleWrites: Promise<void> = Promise.resolve();
+  private failedConnectSeq: number = -1;
   private context: Context | null = null;
   private apiSecret: string = '';
   private stateProbeCachedAt: number = 0;
@@ -456,6 +464,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private appliedProfileId: string = '';
   /** 最近一次**生成**配置用的 profile id（还没被内核确认）。 */
   private pendingProfileId: string = '';
+  private pendingProfileRevision: string = '';
+  private appliedProfileRevision: string = '';
   private recoveryAttempts: number = 0; // 内核恢复退避计数（对应 core_recovery_policy）
   private lastNodeName: string = '';
 
@@ -482,6 +492,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private coreDeathStrikes: number = 0;
   private coreDeathFirstAt: number = 0;
   private coreDeathLastAt: number = 0;
+  /**
+   * 「心跳新鲜但内核已死」（终态黑洞）观测票（2026-10-24 P1 修复，独立于上面的
+   * 心跳死亡三票）：扩展侧恢复预算（3 热恢复 + 2 重建）耗尽后 scheduleCoreRecovery/
+   * scheduleTunnelRebuild 静默 no-op，TUN 因 Kill Switch 保留、租约定时器照刷 ——
+   * UI 停在 CONNECTED、流量黑洞、健康自检永不触发（它只由心跳丢失唤醒）。
+   * 凭 vpn_status.json 的 coreAlive=false + 本地 API 探针确认后，走既有 handleCoreLoss
+   * 自愈（disconnect+connect），把黑洞变成可恢复。
+   */
+  private coreDownStrikes: number = 0;
+  private coreDownFirstAt: number = 0;
+  private coreDownLastAt: number = 0;
   private monitorGeneration: number = 0;
   private livenessPollRunning: boolean = false;
   private inRepairConnect: boolean = false;
@@ -553,6 +574,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.invalidateStateProbeCache();
     this.disconnectRequested = true;
     this.connectSeq = this.connectSeq + 1;
+    this.testCoreLaunchGeneration++;
     // 用户主动断开 → 取消一切挂起的退避重连（禁止重连风暴）
     this.reconnectAttempts = 0;
     this.cancelReconnect('user-disconnect');
@@ -936,7 +958,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * @param scene 场景标签（main / hot-reload / test-core），只进日志
    * @returns 可以安全写盘的配置文本
    */
-  private prepareConfigYaml(yaml: string, scene: string): string {
+  private async prepareConfigYaml(yaml: string, scene: string): Promise<string> {
     const result = ConfigValidator.repair(yaml);
     if (result.issues.length > 0) {
       AppLogger.warn(TAG, `[config-gate/${scene}] ${result.summary()}`);
@@ -950,27 +972,35 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       throw new Error(`配置校验未通过（${head}）：${result.summary()}。`
         + '已保留上一份可用配置未覆盖；请更新订阅后重试，或反馈该订阅链接');
     }
-    return result.text.length > 0 ? result.text : yaml;
+    const candidate = result.text.length > 0 ? result.text : yaml;
+    // 订阅原文通过校验，不代表与本地规则/覆盖合并后的引用仍然有效。
+    // 原生校验器不应用配置、不建立监听，也不初始化/下载 provider。
+    // 它只验证最终文档结构；Geo 文件等设备依赖仍由资源就绪检查负责。
+    try {
+      await coreBridge.prepareProfile(candidate);
+    } catch (e) {
+      throw new Error(`配置校验未通过：最终配置未通过内核检查（${AppLogger.errText(e)}）。已保留原配置`);
+    }
+    return candidate;
   }
 
   /**
    * 记下最后一份「内核接受并成功连上」的配置。
    *
-   * 冷启动路径没有可用的预校验通道（设备侧 core 只有 controller 接口，没有 `-t` CLI），
-   * 所以改用「成功即快照、被拒载即回滚」来达成与 FlClash 相同的保证：
-   * 磁盘上永远留着至少一份真正连上过的配置。
+   * 文档预检不能证明设备资源和真实会话已经可用，快照仍须在真实就绪之后提交。
+   * 记录本次被接受的字节；正式文件提升失败时也不能误把更旧的磁盘内容记成可用版本。
    */
-  private snapshotLastGoodConfig(): void {
+  private snapshotLastGoodConfig(content: string = ''): void {
     if (this.context === null) {
       return;
     }
     try {
       const src = `${this.context.cacheDir}/${CONFIG_FILE}`;
-      if (!privateFs.exists(src)) {
-        return;
-      }
+      const snapshot = content.length > 0 ? content : privateFs.readCapped(src, 8 * 1024 * 1024).text;
+      if (snapshot.length === 0) { return; }
       const dst = `${this.context.cacheDir}/${LAST_GOOD_CONFIG_FILE}`;
-      fs.copyFileSync(src, dst);
+      privateFs.writePrivate(`${dst}.tmp`, snapshot);
+      fs.renameSync(`${dst}.tmp`, dst);
       chmodPrivate(dst, 0o600);
     } catch (e) {
       AppLogger.warn(TAG, `last-good snapshot failed: ${AppLogger.errText(e)}`);
@@ -1023,7 +1053,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (!privateFs.exists(snapshot)) {
         return false;
       }
-      fs.copyFileSync(snapshot, `${this.context.cacheDir}/${CONFIG_FILE}`);
+      const stored = privateFs.readCapped(snapshot, 8 * 1024 * 1024);
+      if (!stored.ok || stored.truncated || stored.text.length === 0) { return false; }
+      const target = `${this.context.cacheDir}/${CONFIG_FILE}`;
+      privateFs.writePrivate(`${target}.tmp`, stored.text);
+      fs.renameSync(`${target}.tmp`, target);
+      chmodPrivate(target, 0o600);
       AppLogger.warn(TAG, 'kernel rejected generated config; restored last-good snapshot');
       return true;
     } catch (e) {
@@ -1036,9 +1071,21 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 规则/强制站点/DNS 等变更的热重载：重写当前节点的 YAML 到同一配置路径，
    * 通过 Mihomo controller 的 PUT /configs?path= 在内核内重建规则链，保持 VPN/TUN
    * 与既有连接不被拆除（对应文档"减少 TUN/Core 重建"）。仅当内核可控时生效；
-   * 任何前置条件不满足或热重载失败，返回 false 由调用方回退完整重连。
+   * 未确认应用时返回 false；不以重连重试坏配置，避免拆掉可用会话。
    */
   async reloadRulesHot(reason: string): Promise<boolean> {
+    if (this.reloading) { return false; }
+    const seq = this.connectSeq;
+    const generation = this.sessionGeneration;
+    const task = this.lifecycleWrites.then((): Promise<boolean> => {
+      if (!this.isRuleSessionCurrent(seq, generation)) { return Promise.resolve(false); }
+      return this.reloadRulesHotExclusive(reason);
+    });
+    this.lifecycleWrites = task.then((): void => {}, (): void => {});
+    return task;
+  }
+
+  private async reloadRulesHotExclusive(reason: string): Promise<boolean> {
     const subs = this.lastSubs;
     const node = this.lastNode;
     if (this.state !== ConnState.CONNECTED || subs === null || node === null || this.context === null) {
@@ -1052,6 +1099,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     const generation = this.sessionGeneration;
     try {
       const settings: AppSettings = await SettingsService.load();
+      let target = node;
+      const requestedProfile = ProfileStore.currentId();
+      if (requestedProfile.length > 0 && requestedProfile !== this.appliedProfileId) {
+        const preferred = subs.findNode(settings.preferredNodeId);
+        const fallback = subs.fallbackConnectionNode();
+        target = preferred !== null && preferred.subscriptionId === requestedProfile
+          ? preferred : (fallback !== null ? fallback : node);
+      }
       const ruleProviderFileReady = this.isRuleProviderReady();
       // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
       // 唯一配置生成入口：热重载与隧道/测速核走同一条生成路径（决策一处、事实同源）。
@@ -1059,7 +1114,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       hotPorts.apiPort = this.apiPort;
       hotPorts.mixedPort = this.mixedPort;
       hotPorts.dnsPort = this.dnsPort;
-      const hotProfile = await this.hydrateAndBuildProfile(subs, settings, node.name, hotPorts, this.apiSecret,
+      const hotProfile = await this.hydrateAndBuildProfile(subs, settings, target.name, hotPorts, this.apiSecret,
         this.lastProxyHosts, this.lastSmartModelReady, this.lastGeoipReady, ruleProviderFileReady);
       const hotBuilt = await RuntimeConfigBuilder.buildRuntimeConfig(hotProfile, RuntimeConfigMode.TUNNEL);
       if (!this.isRuleSessionCurrent(seq, generation)) {
@@ -1067,8 +1122,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       const yaml = hotBuilt.yaml;
       // 写盘前闸门：坏配置绝不落盘（内核对重复键是整份拒载）
-      const safeYaml = this.prepareConfigYaml(yaml, 'hot-reload');
+      const safeYaml = await this.prepareConfigYaml(yaml, 'hot-reload');
+      if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
       const configPath = `${this.context.cacheDir}/${CONFIG_FILE}`;
+      const lastGoodPath = `${this.context.cacheDir}/${LAST_GOOD_CONFIG_FILE}`;
+      const rollbackPath = privateFs.exists(lastGoodPath) ? lastGoodPath : configPath;
       ensurePrivateDir(this.context.cacheDir);
       // 两步落盘（对齐 FlClash：临时文件 → 内核校验 → 成功才替换）：
       // 先把新配置写成 .next 暂存文件，让内核加载校验；只有内核接受才原子替换正式配置。
@@ -1079,18 +1137,27 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (!this.isRuleSessionCurrent(seq, generation)) {
         return false;
       }
-      if (reloaded) {
-        this.confirmProfileApplied('hot-reload');
-      }
       if (!reloaded) {
         try {
           fs.unlinkSync(stagedPath);
         } catch (cleanupError) {
           // 暂存文件已不存在属正常
         }
-        AppLogger.warn(TAG, `[hot-reload] kernel rejected staged config; previous config kept (${reason})`);
+        // HTTP 超时也会返回 false，不能据此宣称内核一定没有应用。
+        AppLogger.warn(TAG, `[hot-reload] candidate not confirmed; accepted file kept (${reason})`);
         return false;
       }
+      // 热重载会重置 select 组；选点确认前不能提交新的 Profile 身份或磁盘基准。
+      const pinned = target.id.startsWith('profile:') || await this.api.selectNode(target.name);
+      if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
+      if (!pinned) {
+        const restored = await this.api.reloadFromPath(rollbackPath);
+        if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
+        if (restored) { await this.api.selectNode(this.lastNodeName); }
+        AppLogger.warn(TAG, `[hot-reload] selection failed; rollback accepted=${restored}`);
+        return false;
+      }
+      this.confirmProfileApplied('hot-reload');
       // 内核已接受暂存配置 → 原子替换正式配置（同目录 rename）。
       // 即便这一步失败，内核已按暂存文件生效，本轮功能不受影响，只是下次连接会重写。
       try {
@@ -1101,12 +1168,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 隧道配置已按当前节点集重写 → 登记新指纹（测速前的过期判定用）
       this.tunnelConfigFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
       this.lastRuleProviderFileReady = ruleProviderFileReady;
-      // 热重载会把代理组重置为默认首节点，恢复用户当前选择。
-      await this.api.selectNode(this.lastNodeName);
-      if (!this.isRuleSessionCurrent(seq, generation)) {
-        return false;
-      }
-      this.applyProxyModeSilent(settings.proxyMode);
+      this.lastNode = target;
+      this.lastNodeName = target.name;
+      this.snapshotLastGoodConfig(safeYaml);
+      await this.updateSessionSnapshot(generation, true, 'connected', target.name, this.startedAt);
+      if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
+      // mode 已在本次最终 YAML 中，不额外发送一个可能迟到的异步模式更新。
       AppLogger.info(TAG, `[hot-reload] rules applied without TUN rebuild (${reason})`);
       this.notify();
       return true;
@@ -1178,11 +1245,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * （用户实锤：来回切订阅后节点串到别的订阅下面）。
    */
   private confirmProfileApplied(stage: string): void {
-    if (this.pendingProfileId.length === 0 || this.pendingProfileId === this.appliedProfileId) {
+    if (this.pendingProfileId.length === 0) {
       return;
     }
     AppLogger.info(TAG, `profile applied: ${this.appliedProfileId || '<none>'} -> ${this.pendingProfileId} (${stage})`);
     this.appliedProfileId = this.pendingProfileId;
+    this.appliedProfileRevision = this.pendingProfileRevision;
   }
 
   async ensureProfileApplied(reason: string): Promise<boolean> {
@@ -1190,7 +1258,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (current.length === 0 || !ProfileStore.exists(current)) {
       return false;
     }
-    if (this.appliedProfileId === current) {
+    if (this.appliedProfileId === current
+      && this.appliedProfileRevision === ProfileStore.revisionOf(current)) {
       return true;
     }
     if (this.state !== ConnState.CONNECTED && this.state !== ConnState.CONNECTING) {
@@ -1202,7 +1271,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     AppLogger.info(TAG, `profile changed (${this.appliedProfileId} -> ${current}); hot reload for ${reason}`);
     const result = await this.applyRulesChanged(reason);
-    const ok = result.length === 0;
+    const ok = result === 'hot' || result === 'reconnect' || result === 'ad-unavailable';
     // applied 由 reloadFromPath 成功时的 confirmProfileApplied('hot-reload') 落定
     return ok;
   }
@@ -1248,9 +1317,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (hot) {
       return adUnavailable ? 'ad-unavailable' : 'hot';
     }
-    if (adUnavailable) { return 'ad-unavailable'; }
-    const did = await this.restartIfConnected(reason);
-    return did ? 'reconnect' : 'none';
+    // 坏配置、资源错误和控制器暂时不可用均不能通过拆掉现有会话来重试。
+    // 真正的会话失效由存活监控按独立证据和用户意图处理。
+    return 'apply-failed';
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -1304,6 +1373,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.lastNetType = netType;
       AppLogger.info(TAG, `[reconnect] net change gen=${generation} ${prev.length === 0 ? '(init)' : prev} -> ${netType}`);
       if (netType === NetTypes.NONE) {
+        this.cancelReconnect('network-lost');
         AppLogger.info(TAG, '[reconnect] network lost; wait for recovery (no reconnect)');
         return;
       }
@@ -1332,15 +1402,19 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   /** 请求一次（可能退避延后的）重连；单航班：已有挂起定时器则合并 */
   private requestReconnect(reason: string): void {
-    this.evaluateIntentThenSchedule(reason);
+    this.evaluateIntentThenSchedule(reason).catch((e: Object): void => {
+      AppLogger.warn(TAG, `reconnect scheduling failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   private async evaluateIntentThenSchedule(reason: string): Promise<void> {
+    const seq = this.connectSeq;
     if (this.disconnectRequested) {
       AppLogger.info(TAG, `[reconnect] user-disconnected; skip (${reason})`);
       return;
     }
     const intent = await this.isUserIntentConnected();
+    if (seq !== this.connectSeq || this.disconnectRequested || this.lastNetType === NetTypes.NONE) { return; }
     if (!intent) {
       AppLogger.info(TAG, `[reconnect] intent=disconnected; skip (${reason})`);
       return;
@@ -1373,11 +1447,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = -1;
       this.reconnectPendingDelayMs = 0;
-      this.runScheduledReconnect(reason);
+      this.runScheduledReconnect(reason).catch((e: Object): void => {
+        AppLogger.warn(TAG, `scheduled reconnect failed: ${AppLogger.errText(e)}`);
+      });
     }, delay);
   }
 
   private async runScheduledReconnect(reason: string): Promise<void> {
+    const seq = this.connectSeq;
     if (this.disconnectRequested) {
       AppLogger.info(TAG, '[reconnect] cancelled by user disconnect before attempt');
       this.reconnectAttempts = 0;
@@ -1390,6 +1467,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return;
     }
     const intent = await this.isUserIntentConnected();
+    if (seq !== this.connectSeq || this.disconnectRequested || this.lastNetType === NetTypes.NONE) { return; }
     if (!intent) {
       AppLogger.info(TAG, '[reconnect] intent disconnected; abort');
       this.reconnectAttempts = 0;
@@ -1405,6 +1483,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return;
     }
     AppLogger.info(TAG, `[reconnect] attempt ${this.reconnectAttempts}/${this.reconnectMaxAttempts} (${reason})`);
+    const attemptSeq = this.connectSeq + 1;
     const ok = await this.connect(node, subs);
     if (ok) {
       AppLogger.info(TAG, `[reconnect] success (${reason})`);
@@ -1413,6 +1492,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return;
     }
     AppLogger.warn(TAG, `[reconnect] attempt failed (${reason})`);
+    if (attemptSeq !== this.connectSeq) { return; }
     if (this.disconnectRequested) {
       this.reconnectAttempts = 0;
       return;
@@ -1797,7 +1877,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return CoreNodeBridge.toProxyNode(entry);
       }
     }
-    return subs.nodes.length > 0 ? subs.nodes[0] : null;
+    return subs.fallbackConnectionNode();
   }
 
   /** 连接成功：复位该节点连续失败计数（复用 NodeSortPersistence 快照记录） */
@@ -2353,6 +2433,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 404 → UI 整屏「未生效」）。指纹口径见 SubscriptionService.nodeSetFingerprint。
    */
   private testCoreNodeFingerprint: string = '';
+  /** 超时/停止后，即使 DoH 或原生校验晚到，也不能继续拉起共享扩展。 */
+  private testCoreLaunchGeneration: number = 0;
 
   /** 懒建状态机（依赖 this.context，调用前须已 init） */
   private getTestCoreFlight(): SingleFlightTestCore {
@@ -2432,7 +2514,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 两条都不可用时返回 **null** —— 调用方必须据此走「离线粗略通道」或明确提示，
    * **绝不能把 null 当成"全部节点超时"**（旧实现的 143 节点全超时就是这么来的）。
    */
-  async ensureLatencyApi(): Promise<ClashApiService | null> {
+  async ensureLatencyApi(manual: boolean = false): Promise<ClashApiService | null> {
     // 1) 真实隧道优先：它已经带着完整节点表，且是唯一权威的运行时配置
     if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING) {
       if (await this.api.healthProbe()) {
@@ -2450,9 +2532,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     //    没连接过（lastSubs 为 null），此时仍应能测速，否则未连接测速会退化成离线粗略值。
     const subs: SubscriptionService = this.lastSubs !== null
       ? this.lastSubs : SubscriptionService.instance();
-    if (this.context !== null && subs.nodes.length > 0) {
+    if (this.context !== null && (subs.nodes.length > 0 || subs.hasUsableProfile())) {
       try {
-        const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency());
+        const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency(), manual);
         if (ready) {
           AppLogger.info(TAG, 'latency channel: headless test core ready');
           // 预热等待（2026-10-20 整改）：不再是「无条件睡 1500ms」，
@@ -2638,8 +2720,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 只有第一次真正走 stop→start，其余复用同一 Promise，
    * 避免「后到的启动把先到的扩展停掉」的互相 stop。
    */
-  async ensureTestCore(subs: SubscriptionService, settings: AppSettings): Promise<boolean> {
-    if (this.context === null || subs.nodes.length === 0) {
+  async ensureTestCore(subs: SubscriptionService, settings: AppSettings, manual: boolean = false): Promise<boolean> {
+    if (this.context === null || (subs.nodes.length === 0 && !subs.hasUsableProfile())) {
       return false;
     }
     const flight = this.getTestCoreFlight();
@@ -2649,7 +2731,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // /delay 全 404 → UI「未生效」（真机：导入新订阅后测速整屏未生效）。
       // 不一致就重建（配置按当前节点集重新生成），再谈探活。
       const staleConfig: boolean = this.testCoreNodeFingerprint.length > 0
-        && this.testCoreNodeFingerprint !== SubscriptionService.nodeSetFingerprint(subs.nodes);
+        && (this.testCoreNodeFingerprint !== SubscriptionService.nodeSetFingerprint(subs.nodes)
+          || this.appliedProfileId !== ProfileStore.currentId()
+          || this.appliedProfileRevision !== ProfileStore.revisionOf(ProfileStore.currentId()));
       if (staleConfig) {
         AppLogger.info(TAG, 'test core config is stale (node set changed); rebuilding test core');
         await this.stopTestCore();
@@ -2696,8 +2780,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (snapshot.desiredConnected
         && ['connecting', 'connected', 'recovering'].includes(snapshot.phase)) {
         // 冷启动暂未确认存活时，也不能让预热测速核 stop 掉可能仍在转发的真实隧道。
-        AppLogger.info(TAG, 'ensureTestCore skipped: real session intent is still active/unconfirmed');
-        return false;
+        if (!manual || snapshot.phase !== 'connected' || Date.now() - snapshot.savedAt < 30000) {
+          AppLogger.info(TAG, 'ensureTestCore skipped: real session intent is still active/unconfirmed');
+          return false;
+        }
+        // Only an explicit test may recover an abandoned upgrade session.
+        // Never stop a responding controller, including one rejecting our secret.
+        if (!await this.restoreTunnelController(snapshot, false)) { return false; }
+        const probe = await this.api.probeController(1000);
+        if (probe.reachable) { return false; }
+        await new Promise<void>((resolve) => setTimeout(resolve, 250));
+        const confirmed = await this.authorityState();
+        if (confirmed.coreAlive || !await this.isCurrentSession(snapshot.sessionGeneration)
+          || this.state !== ConnState.DISCONNECTED) { return false; }
+        AppLogger.info(TAG, 'manual delay: abandoned session has no controller; starting headless core');
       }
     } catch (error) {
       // 读不到持久化意图时按「未连接」继续：不能因一次读盘失败就永久禁用测速内核。
@@ -2823,6 +2919,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.context === null || subs === null || settings === null) {
       return false;
     }
+    const generation = ++this.testCoreLaunchGeneration;
+    const seq = this.connectSeq;
     try {
 
       let hosts: Record<string, string> = {};
@@ -2836,6 +2934,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } catch (e) {
         AppLogger.warn(TAG, `test-core DoH pre-resolve failed: ${AppLogger.errText(e)}`);
       }
+      if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       // 与隧道**共用同一份「节点域名 → 固定 IP」状态**：隧道建立时已经解析成功的
       // 域名直接复用（lastProxyHosts）。隧道里能连上的节点，测速核必须也能连上 ——
       // 两边各自解析 = 同一节点在两条路径上表现不同（真机 2026-10-20：DoH 在当前
@@ -2862,6 +2961,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 测速核用**自己探测的**端口，且**不写回**共享端口字段（审计 F1）：
       // 写回会让隧道 YAML 里的端口与客户端 setEndpoint 用的端口对不上。
       const testPorts = await this.pickPorts(this.apiPort);
+      if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       // 测速核不启用 smart 组：它只做延迟探测，多一层内核选点会让测速结果失真
       // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
       // 唯一配置生成入口：测速核与隧道共用同一份事实与同一处决策，
@@ -2869,6 +2969,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const testProfile = await this.hydrateAndBuildProfile(subs, settings, this.lastNodeName, testPorts,
         this.testCoreSecret, hosts, this.isSmartModelReady(), this.isGeoipReady(), this.isRuleProviderReady());
       const testBuilt = await RuntimeConfigBuilder.buildRuntimeConfig(testProfile, RuntimeConfigMode.TEST);
+      if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       const yaml = testBuilt.yaml;
       // 登记「这份配置对应哪个节点集」：复用测速核前要比对，不一致就重建。
       this.testCoreNodeFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
@@ -2876,7 +2977,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
       // 写盘前闸门：测速核用的是同一套生成器，坏配置同样会让内核整份拒载
-      privateFs.writePrivate(configPath, this.prepareConfigYaml(yaml, 'test-core'));
+      const preparedConfig = await this.prepareConfigYaml(yaml, 'test-core');
+      if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
+      privateFs.writePrivate(configPath, preparedConfig);
       this.clearStartError();
       const stopWant: Want = {
         bundleName: 'com.tunbox.client',
@@ -2898,6 +3001,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } else {
         AppLogger.info(TAG, 'test core: no running extension to tear down; skip 600ms exit grace');
       }
+      if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       const launchParams: Record<string, string | number> = {};
       launchParams['configPath'] = configPath;
       launchParams['headless'] = 1;
@@ -2907,17 +3011,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         parameters: launchParams
       };
       await vpnExtension.startVpnExtensionAbility(want);
+      if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       this.invalidateStateProbeCache();
       this.testCoreApiPort = testPorts.apiPort;
       this.api.setEndpoint(this.testCoreApiPort, this.testCoreSecret);
       const deadline = Date.now() + 20000;
       let readinessDelayMs = 0;
       while (Date.now() < deadline) {
+        if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
         const extErr = this.readStartError();
         if (extErr.length > 0) {
           throw new Error(`测速内核启动失败: ${extErr}`);
         }
         if (this.readStartOk() && await this.api.healthProbe()) {
+          if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
           AppLogger.info(TAG, 'headless test core ready');
           this.confirmProfileApplied('test-core');
           // 挂载内核日志流: 拨号失败的真实原因(DNS/握手/路由)只在内核日志里,
@@ -2953,11 +3060,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
+  private isCurrentTestCoreLaunch(generation: number, seq: number): boolean {
+    return generation === this.testCoreLaunchGeneration && seq === this.connectSeq;
+  }
+
   /**
    * 释放测速内核：停扩展 + 删除测速配置（含 secret）+ 抹掉内存 secret。
    * 扩展未运行时 stopVpnExtensionAbility 抛错属正常，配置删除逐文件独立容错。
    */
   private async teardownTestCore(): Promise<void> {
+    this.testCoreLaunchGeneration++;
     this.stopCoreLogStream();
     const stopWant: Want = {
       bundleName: 'com.tunbox.client',
@@ -3032,6 +3144,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * secret）。必须显式复位，否则下次测速会因状态机仍 ACTIVE 而跳过重建。
    */
   invalidateTestCoreAfterRealTunnel(): void {
+    this.testCoreLaunchGeneration++;
     this.testCoreNegativeUntil = 0;
     this.testCoreSecret = '';
     this.testCoreActive = false;
@@ -3054,10 +3167,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     const subs: SubscriptionService = this.lastSubs !== null
       ? this.lastSubs : SubscriptionService.instance();
-    if (subs.nodes.length === 0 || this.tunnelConfigFingerprint.length === 0) {
+    if ((subs.nodes.length === 0 && !subs.hasUsableProfile()) || this.tunnelConfigFingerprint.length === 0) {
       return;
     }
-    if (this.tunnelConfigFingerprint === SubscriptionService.nodeSetFingerprint(subs.nodes)) {
+    if (this.tunnelConfigFingerprint === SubscriptionService.nodeSetFingerprint(subs.nodes)
+      && this.appliedProfileRevision === ProfileStore.revisionOf(ProfileStore.currentId())) {
       return;
     }
     AppLogger.info(TAG, 'tunnel config is stale (node set changed); hot reloading');
@@ -3125,6 +3239,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    */
   private testCoreIdleTimer: number = -1;
 
+  /**
+   * 「测速是否在跑」探针注册表（引擎侧注册，避免静态循环依赖：
+   * LatencyEngine/FlclashLatencyService 都依赖本类，本类不能反向 import 它们）。
+   * 回收定时器到点时若任一探针报忙，本轮回收顺延——否则 600 节点的批
+   * （引擎预算 ~138s）会在第 90s 被自己停核，剩余节点成片盖章超时。
+   */
+  static readonly testCoreBusyProbes: (() => boolean)[] = [];
+
   /** 挂起「延迟回收测速内核」；重复调用只保留最后一次。 */
   scheduleTestCoreRecycle(delayMs: number): void {
     // 安全闸（延迟测试重做新增）：测速内核与真实隧道**共用同一个 VpnExtensionAbility
@@ -3140,6 +3262,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.cancelTestCoreRecycle();
     this.testCoreIdleTimer = setTimeout((): void => {
       this.testCoreIdleTimer = -1;
+      // 批次进行中不回收：到点时引擎仍在跑 ⇒ 顺延一个完整窗口再查。
+      // （批次的单节点请求不再经过 ensureLatencyApi，取通道时挂的那次 90s
+      // 无法被批次自身续期 —— 引擎预算对 600 节点约 138s，远超 90s。）
+      for (const probe of ConnectionOrchestrator.testCoreBusyProbes) {
+        if (probe()) {
+          AppLogger.info(TAG, 'test core recycle deferred: latency batch still running');
+          this.scheduleTestCoreRecycle(delayMs);
+          return;
+        }
+      }
       // 定时器回调必须收敛异步异常，避免未处理的 Promise rejection 干扰后台进程。
       this.stopTestCore().catch((e: Object): void => {
         AppLogger.warn(TAG,
@@ -3200,10 +3332,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.buildRuntimeProfile(subs, settings, selectedNodeName, ports, secret,
       proxyHosts, smartModelReady, geoipReady, ruleProviderFileReady);
   }
-  private buildRuntimeProfile(subs: SubscriptionService, settings: AppSettings,
+  private async buildRuntimeProfile(subs: SubscriptionService, settings: AppSettings,
     selectedNodeName: string, ports: RuntimePorts, secret: string,
     proxyHosts: Record<string, string>, smartModelReady: boolean,
-    geoipReady: boolean, ruleProviderFileReady: boolean): RuntimeConfigProfile {
+    geoipReady: boolean, ruleProviderFileReady: boolean): Promise<RuntimeConfigProfile> {
     const profile = new RuntimeConfigProfile();
     profile.nodes = subs.nodes;
     profile.settings = settings;
@@ -3237,7 +3369,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
     }
     if (profileId.length > 0) {
-      profile.profileYaml = ProfileStore.read(profileId);
+      const sourceYaml = ProfileStore.read(profileId);
+      this.pendingProfileRevision = ProfileStore.fingerprint(sourceYaml);
+      profile.profileYaml = sourceYaml.length > 0 ? await ProfileStore.prepare(sourceYaml) : '';
       if (profile.profileYaml.length === 0) {
         // 文件读不出来（被删/写盘中断）：**不要**把它当配置基底，也不要把
         // applied 记成它 —— 否则界面会认为内核里是这份 profile，
@@ -3322,20 +3456,46 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   async connect(node: ProxyNode, subs: SubscriptionService): Promise<boolean> {
+    // 先登记意图再等待任何异步读取，用户停止可以使排队请求立即失效。
+    this.disconnectRequested = false;
+    const seq = ++this.connectSeq;
+    const task = this.lifecycleWrites.then((): Promise<boolean> => {
+      if (seq !== this.connectSeq || this.disconnectRequested) { return Promise.resolve(false); }
+      return this.connectExclusive(node, subs, seq);
+    });
+    this.lifecycleWrites = task.then((): void => {}, (): void => {});
+    const connected = await task;
+    if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
+    if (connected) { return true; }
+    if (this.failedConnectSeq !== seq) { return false; }
+    // 修复可能再次调用 disconnect/connect，必须在资源队列释放后执行。
+    const configRejected = this.lastError.indexOf('配置校验未通过') >= 0;
+    const nested = this.inRepairConnect || this.failoverRunning;
+    if (!configRejected && !nested && !this.healthRunning) {
+      const recovered = await this.runHealthSelfCheckAndRepair('connect-failed');
+      if (recovered) { return true; }
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
+      return await this.tryFailover('connect-failed');
+    }
+    return false;
+  }
+
+  private async connectExclusive(node: ProxyNode, subs: SubscriptionService, seq: number): Promise<boolean> {
+    this.failedConnectSeq = -1;
     // 策略拒绝不是网络故障：在任何状态变化/拆隧道/修复与故障切换前退出。
     let settings: AppSettings;
     let appRouting: AppRoutingRuntime;
     try {
       settings = await SettingsService.load();
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
       appRouting = AppRoutingPolicy.runtime(settings.appRoutingMode, settings.includedApps,
         settings.excludedApps, settings.appRoutingNeedsReview);
     } catch (e) {
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
       this.lastError = AppLogger.errText(e);
       this.notify();
       return false;
     }
-    this.disconnectRequested = false;
-    const seq = ++this.connectSeq;
 
     // 性能（2026-10-17 启动速度）：secret 读盘提前发起，与下面的节点检查/意图落盘/
     // 旧隧道拆除并行推进 —— 串行等于白等一次 preferences 往返；await 仍在原语义位置。
@@ -3365,6 +3525,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `subs hydration wait failed: ${AppLogger.errText(e)}`);
       }
     }
+    if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
 
     // ── 硬门禁：一个节点都没有时，绝不拉起 VPN 扩展 ─────────────────────────
     // 全新安装的典型路径：订阅已添加但尚未拉取成功 → subs.nodes 为空。
@@ -3375,9 +3536,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 用户被指向完全无关的方向，而且重试必然同样失败（订阅仍是空的）。
     // 正确做法：先自动补一次订阅拉取，仍为空就明确报错并立刻返回，
     // 不进入 CONNECTING、不写配置、不拉起扩展、不占用 20s。
-    if (subs.nodes.length === 0) {
+    if (subs.nodes.length === 0 && !subs.hasUsableProfile()) {
       await this.autoRefreshForZeroNodes(subs);
-      if (subs.nodes.length === 0) {
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
+      if (subs.nodes.length === 0 && !subs.hasUsableProfile()) {
         this.state = ConnState.DISCONNECTED;
         this.lastError = '没有可用节点：请先到「订阅」页添加订阅并点击刷新，等节点列表出现后再连接';
         this.notify();
@@ -3386,6 +3548,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return false;
       }
     }
+
+    const stateBeforeConnect: ConnState = this.state;
+    this.state = ConnState.CONNECTING;
+    this.lastError = '';
+    this.lastSubs = subs;
+    this.lastNodeName = node.name;
+    this.notify();
+    // 先作废并等待测速启动/清理结算，再把共享扩展交给真实隧道。
+    this.cancelTestCoreRecycle();
+    this.testCoreLaunchGeneration++;
+    if (this.testCoreFlight !== null) { await this.stopTestCore(); }
+    if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
 
     // 真实连接会重启扩展进程, headless 测速内核随之失效；同时必须取消
     // 挂起的「回收测速内核」定时器 —— 否则它会在真实隧道起来之后再执行
@@ -3397,12 +3571,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 记录**本次连接开始前**的状态：后面判断"是否真有旧隧道需要拆除并等待其退出"
     // 必须用它 —— 此刻 this.state 已/即将被 CONNECTING 覆盖，且编译器会把它
     // 窄化成常量，直接比较会被判为恒不成立。
-    const stateBeforeConnect: ConnState = this.state;
-    this.state = ConnState.CONNECTING;
-    this.lastError = '';
-    this.lastSubs = subs;
-    this.lastNodeName = node.name;
-    this.notify();
 
     // ── 用户意图必须**先于**拉起落盘 ───────────────────────────────
     // 后台保活自愈的基石：整个建连过程有 30s 就绪窗口 + 系统授权弹窗，
@@ -3411,6 +3579,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 冷启动/回前台时无从判断"用户本来是想连着的"，只能让用户手动再点一次。
     // 写入点前移后：任何时刻被杀，磁盘上的意图都是诚实的。
     const intentGeneration = await this.advanceSessionIntent(true, 'connecting', node.name, 0);
+    if (seq !== this.connectSeq || this.disconnectRequested) {
+      await this.clearSessionIntent(intentGeneration);
+      return false;
+    }
 
     try {
       if (this.context === null) {
@@ -3422,7 +3594,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 配置由订阅原文决定，App 侧不需要「能序列化成 YAML」——名字在内核里就是有效节点。
       // 旧判据会把影子节点判成无效并回落到 subs.nodes[0]（真机实测：点了香港Z09、连的是 hy2台湾）。
       const isValidNode = (n: ProxyNode): boolean =>
-        CoreNodeBridge.isShadow(n) || ClashConfigGenerator.proxyYamlLine(n).length > 0;
+        CoreNodeBridge.isShadow(n) || n.id.startsWith('profile:') || ClashConfigGenerator.proxyYamlLine(n).length > 0;
       let target: ProxyNode = node;
       if (!isValidNode(target)) {
         const firstValid = subs.nodes.find((n) => isValidNode(n)) ?? null;
@@ -3461,6 +3633,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // API secret 保持稳定(首次生成后复用): 每次重连都换 secret 会让其他页面
       // 持有的旧 secret 全部 401, 延迟测试/节点切换集体失败(表现全是"超时")。
       const savedSecret = await secretTask;
+      if (seq !== this.connectSeq || this.disconnectRequested) {
+        await this.clearSessionIntent(intentGeneration);
+        return false;
+      }
       if (savedSecret.length > 0) {
         this.apiSecret = savedSecret;
       } else {
@@ -3474,14 +3650,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         await SettingsService.setApiSecret(this.apiSecret);
       }
 
-      // 先拆掉可能残留的 headless 测速内核（上一批测速 / 页面预热留下的）：
-      // 它与真实隧道**共用同一个 VpnExtensionAbility 进程**，不先拆就会与下面的
-      // stopVpnExtensionAbility 互相 stop；而且测速通道状态会失真（扩展已死但
-      // 进程内仍记着 ACTIVE）→ 下一批测速会误判「通道不可用」而白拆一次再重启。
-      if (this.testCoreFlight !== null && this.testCoreFlight.isActive()) {
-        AppLogger.info(TAG, 'connect: tearing down test core before starting real tunnel');
-        await this.stopTestCore();
-      }
+      // 测速内核已在推进真实连接意图前结算，后续旧测速收尾不能再停止新隧道。
       // 关键：扩展进程存活时再次 startVpnExtensionAbility 只会累加 startId，
       // 系统不会重新回调 onCreate（TUN/内核启动逻辑不会重放）。
       // 因此每次连接前先停掉既有 VPN 扩展（触发 onDestroy → 内核停止），
@@ -3523,7 +3692,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
 
       // hyper-adrules(去广告) 是 type: http 的 rule-provider：本地文件缺失时内核会在
-      // SsrvpnStart() 内同步联网拉取并阻塞启动协程（不返回、不报错 → 扩展 30s 静默）。
+      // TunBoxStart() 内同步联网拉取并阻塞启动协程（不返回、不报错 → 扩展 30s 静默）。
       // 与 GEOIP 同策略：文件未就绪就不声明该 provider，后台补齐后下次连接生效。
       //
       // 2026-10-23 产品口径变更：
@@ -3610,6 +3779,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 与 DoH 预解析**并行**：两者互不依赖（端口探测只 bind/close 本地回环，
       // DoH 只发 HTTPS 查询），串行等于白等两段。
       await portsTask;
+      if (seq !== this.connectSeq || this.disconnectRequested) {
+        await this.disconnectInternal(intentGeneration);
+        return false;
+      }
       tPrelaunch = Date.now() - connectT0;
       // ── 内核 smart 组（自动选择）────────────────────────────────────────
       // 只有「用户选了自动模式」且「Model.bin 已就绪」才声明 type: smart。
@@ -3676,7 +3849,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const stagedConfigPath = `${configPath}.next`;
       // 闸门产物（可能已按受控降级修过）留在变量里：内核确认接受后要原样提升为正式配置，
       // 重新读盘既多一次 IO 也可能读到被并发改写的版本。
-      const preparedConfig = this.prepareConfigYaml(yaml, 'main');
+      const preparedConfig = await this.prepareConfigYaml(yaml, 'main');
+      if (seq !== this.connectSeq || this.disconnectRequested) {
+        await this.disconnectInternal(intentGeneration);
+        return false;
+      }
       privateFs.writePrivate(stagedConfigPath, preparedConfig);
       AppLogger.info(TAG, `config staged: ${stagedConfigPath} (${yaml.length} bytes)`);
       this.clearStartError();
@@ -3886,39 +4063,19 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       //   用户的要求是「任何场景都不能出现启动代理不可用」，所以宁可保留 0.3.3 的
       //   宽松语义：钉选失败 = 内核按配置里 PROXY 组首个成员（=本次目标节点）走，
       //   这正是我们生成 YAML 时 unshift 保证的顺序。读回日志用于事后定位。
-      const pinSmartGroup = built.options.useSmart && settings.autoSelectMode === AutoSelectModes.AUTO;
+      const pinSmartGroup = built.options.useSmart && settings.autoSelectMode === AutoSelectModes.AUTO
+        && yaml.includes(`name: ${ClashConfigGenerator.SMART_GROUP_NAME}`);
       const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name;
-      const pinned = await this.api.selectNode(pinTargetName);
+      // A provider-only profile can start with its own default group policy.
+      // Explicit user picks must be confirmed through the actual group graph.
+      const pinned = target.id.startsWith('profile:') ? true : await this.api.selectNode(pinTargetName);
       if (!pinned) {
-        AppLogger.warn(TAG, `selectNode(${pinTargetName}) failed; keep default PROXY first node`);
-      }
-      // 读回校验：只用于**观测**，不改变控制流。能区分三类现场：
-      //   · now === 目标（或 smart 组）→ 钉选确实生效；
-      //   · now === 别的节点 → 内核用了 store-selections 记忆/配置首项（有日志可查）；
-      //   · now 为空或 DIRECT/REJECT → 真正的异常，日志里能一眼看出来。
-      const pinnedNow = await this.api.groupSelection('PROXY');
-      if (pinnedNow === null) {
-        AppLogger.info(TAG, 'PROXY selection read-back unavailable (controller busy); skipping check');
-      } else if (pinnedNow !== pinTargetName) {
-        AppLogger.warn(TAG, `PROXY now=${pinnedNow.length > 0 ? pinnedNow : '<empty>'}`
-          + ` (expected ${pinTargetName}); dialing continues with kernel selection`);
-        // 定向自愈（2026-10-19）：只有一种读回值意味着「隧道完全没有出口」——
-        // PROXY 落到了内建策略 DIRECT / REJECT 上（或为空）。这正是"连上了但
-        // 代理不生效、公网 IP 拿不到"的最终形态，值得再钉一次。
-        // 只在这一种情况下重试，且失败也只记 error 不抛错 —— 不引入新的失败面。
-        if (pinnedNow === 'DIRECT' || pinnedNow === 'REJECT' || pinnedNow === 'REJECT-DROP'
-          || pinnedNow.length === 0) {
-          const retried = await this.api.selectNode(pinTargetName);
-          const after = retried ? await this.api.groupSelection('PROXY') : null;
-          if (after !== null && after === pinTargetName) {
-            AppLogger.info(TAG, `PROXY re-pinned to ${pinTargetName} after fallback to ${pinnedNow}`);
-          } else {
-            AppLogger.error(TAG, `PROXY still not pinned (now=${after === null ? '?' : after})`
-              + ` after retry; traffic may go DIRECT`);
-          }
-        }
-      } else {
-        AppLogger.info(TAG, `PROXY pinned to ${pinTargetName}`);
+        // ⚠ 2026-10-24 审计勘误：上方 4043-4049 的「只 warn、不抛错（0.3.3 口径）」注释
+        // 已过时 —— 后续真机取证（见 4035-4038：连上了但代理不生效/公网 IP 查不到）
+        // 把口径改为 fail-fast，并由 verify-connect-stability 的 b9.no-fake-success 契约
+        // 守护（选点未生效必须阻止 CONNECTED）。瞬态的首个 PUT 400/超时由
+        // ClashApiService.selectNode 内的一次重试吸收，走到这里的就是真钉不上。
+        throw new Error(`节点选择未生效：${pinTargetName}，未将本次连接标记为成功`);
       }
 
       if (seq !== this.connectSeq) {
@@ -3936,7 +4093,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 拒载路径从来不走到这里 ⇒ 正式配置保持上一份能用的字节。
       this.acceptStagedConfig(stagedConfigPath, configPath, preparedConfig);
       // 本次配置已被内核接受并真的连上 → 留作 last-good，供未来拒载时回滚。
-      this.snapshotLastGoodConfig();
+      this.snapshotLastGoodConfig(preparedConfig);
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
       this.reconnectAttempts = 0;
       this.cancelReconnect('connected');
@@ -3953,14 +4110,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(target.name);
+      if (seq !== this.connectSeq || this.disconnectRequested) {
+        await this.disconnectInternal(intentGeneration);
+        return false;
+      }
       // 通知权限从未授予时弹一次系统授权框（真机 1600004 disabled 实锤：
       // 不授权则常驻通知发不出，通知栏只剩系统 VPN 通知的运行时长）
-      SsrvpnNotifier.ensurePermission(this.context).catch((e: Object): void => {
+      TunBoxNotifier.ensurePermission(this.context).catch((e: Object): void => {
         AppLogger.warn(TAG, `ensure notification permission failed: ${AppLogger.errText(e)}`);
       });
       // 节点/速率/时长合并进系统长时任务通知（LIVE_VIEW），应用自有常驻通知已废除
       // —— 两条通知重复（用户实锤），这里只清掉可能残留的旧 id-1001
-      SsrvpnNotifier.cancel().catch((): void => {});
+      TunBoxNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${target.name}`);
       // 隧道就绪：把 **App 自身** 的 HTTP 请求导到本地 mixed 端口。
@@ -3984,6 +4145,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       } catch (cleanupError) {
         AppLogger.warn(TAG, `connect rollback failed: ${AppLogger.errText(cleanupError)}`);
       }
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
       this.state = ConnState.DISCONNECTED;
       this.startedAt = 0;
       this.ipv6Active = false;
@@ -4005,20 +4167,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         errorMessage.indexOf('内核启动超时') < 0) {
         await this.recordNodeFailure(this.lastNodeName);
       }
-      // 若本次失败是由修复/切换内部发起的连接，则不再向外级联，避免重连风暴
-      const nested = this.inRepairConnect || this.failoverRunning;
-      if (!configRejected && !nested && !this.healthRunning) {
-        // 集成点②：连接失败 → 一次链路自检 + 有限修复（受 healthCheckEnabled 门控）
-        const recovered = await this.runHealthSelfCheckAndRepair('connect-failed');
-        if (recovered) {
-          return true;
-        }
-        // 集成点③：仍失败且连续失败达阈值 → 自动切换节点（受配置/冷却约束）
-        const switched = await this.tryFailover('connect-failed');
-        if (switched) {
-          return true;
-        }
-      }
+      this.failedConnectSeq = seq;
       return false;
     }
   }
@@ -4060,27 +4209,25 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.disconnectTask !== null) {
       return this.disconnectTask;
     }
-    const task = this.disconnectExclusive();
+    const task = this.lifecycleWrites.then((): Promise<void> => this.disconnectExclusive());
+    this.lifecycleWrites = task.then((): void => {}, (): void => {});
     this.disconnectTask = task;
-    task.finally((): void => {
+    const clear = (): void => {
       if (this.disconnectTask === task) {
         this.disconnectTask = null;
       }
-    });
+    };
+    task.then(clear, clear);
     return task;
   }
 
   private async disconnectExclusive(): Promise<void> {
-    const seq = this.connectSeq;
     // 2026-10-20 自动断开整改：修复期重连（repairReconnect）里的"断开"只是
     // 重建隧道的一步，不该把 UI 落成"已断开"——那会让用户以为掉线，卡片也会在
     // 重连窗口里闪断。修复全程保持 RECOVERING。
     this.state = this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTING;
     this.notify();
     await this.disconnectInternal();
-    if (seq !== this.connectSeq) {
-      return;
-    }
     this.state = this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTED;
     this.startedAt = 0;
     this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
@@ -4153,6 +4300,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `${what} mirror ${idx}(${mirror.tag}) failed: ${e}`);
       } finally {
         client.destroy();
+        try { fs.unlinkSync(tempPath); } catch (e) { /* renamed or never created */ }
       }
       idx = idx + 1;
     }
@@ -4690,7 +4838,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } else {
       return '未知的数据项';
     }
-    // 去广告规则集更新成功 → 热加载新规则（失败由 applyRulesChanged 内部回退重连）。
+    // 去广告规则集更新成功 → 热加载新规则；失败保留当前会话，不自动重连。
     // 会话代次不符说明用户已重连/断开：迟到的下载结果不能改写新会话的配置。
     if (ok && id === 'ruleset' && this.isRuleSessionCurrent(seq, generation)) {
       await this.applyRulesChanged('ruleset-updated');
@@ -4887,7 +5035,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return;
       }
       this.trafficPollRunning = true;
+      const seq = this.connectSeq;
       this.api.traffic().then((t: TrafficSnapshot) => {
+        if (!this.isCurrentMonitor(generation, seq)) { return; }
         this.traffic = t;
         if (this.state === ConnState.CONNECTED) {
           TaskProgressUpdater.updateLive(
@@ -4898,8 +5048,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             this.connDurationText());
         }
         this.notify();
+      }).catch((e: Object): void => {
+        if (this.isCurrentMonitor(generation, seq)) {
+          AppLogger.warn(TAG, `traffic poll failed: ${AppLogger.errText(e)}`);
+        }
       }).finally(() => {
-        this.trafficPollRunning = false;
+        if (generation === this.monitorGeneration) { this.trafficPollRunning = false; }
       });
     }, TRAFFIC_POLL_INTERVAL_MS);
   }
@@ -4930,7 +5084,58 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
       }
       if (verdict === LivenessVerdict.ALIVE) {
+        // ── 终态黑洞检测（心跳新鲜 ≠ 内核活着）─────────────────────────
+        // 分层判定，正常态只多读一次状态文件（廉价预判）：
+        //   ① coreAlive=true / 文件不可信 → 真 ALIVE；
+        //   ② phase 在恢复中且 status 仍在更新（ts 前进 <90s）→ 扩展在自救，不抢跑；
+        //   ③ 本地 API 探针（127.0.0.1 回环，不受物理断网影响）再确认一次；
+        //   ④ 连续 3 票（时间间隔与心跳死亡同口径）才升级 handleCoreLoss。
+        const view = this.extensionStatus();
+        const stuckBlackhole = view.ok && !view.coreAlive
+          && (view.phase === 'running'
+            || (view.phase === 'recovering' && Date.now() - view.ts > CORE_RECOVERY_STUCK_MS));
+        if (!stuckBlackhole) {
+          this.coreDownStrikes = 0;
+          this.coreDownFirstAt = 0;
+          this.coreDownLastAt = 0;
+          this.resetCoreDeathConfirmation();
+          return;
+        }
+        const coreApiAlive = await this.api.healthProbe();
+        if (!this.isCurrentMonitor(generation, seq)) { return; }
+        if (coreApiAlive) {
+          // 状态文件落后于实际（内核已自行恢复/重启成功）：不投负票
+          this.coreDownStrikes = 0;
+          this.resetCoreDeathConfirmation();
+          return;
+        }
+        const downNow = Date.now();
+        if (this.coreDownStrikes > 0 && downNow - this.coreDownLastAt < CORE_LIVENESS_POLL_MS) {
+          return;
+        }
+        if (this.coreDownStrikes === 0) { this.coreDownFirstAt = downNow; }
+        this.coreDownLastAt = downNow;
+        this.coreDownStrikes++;
+        if (this.coreDownStrikes < CORE_DEATH_CONFIRMATIONS
+          || downNow - this.coreDownFirstAt < CORE_DEATH_CONFIRM_MS) {
+          AppLogger.warn(TAG, `extension alive but core down (${view.phase}); `
+            + `strikes=${this.coreDownStrikes}/${CORE_DEATH_CONFIRMATIONS}`);
+          return;
+        }
+        this.coreDownStrikes = 0;
+        this.coreDownFirstAt = 0;
+        this.coreDownLastAt = 0;
+        if (!await this.isCurrentSession(this.sessionGeneration)
+          || !this.isCurrentMonitor(generation, seq)) {
+          this.resetCoreDeathConfirmation();
+          return;
+        }
         this.resetCoreDeathConfirmation();
+        this.state = ConnState.RECOVERING;
+        this.notify();
+        AppLogger.warn(TAG, 'terminal black hole confirmed: lease fresh but core dead '
+          + 'and extension recovery exhausted; escalating to full reconnect');
+        this.handleCoreLoss();
         return;
       }
       const now = Date.now();

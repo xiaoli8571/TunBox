@@ -274,14 +274,12 @@ export class UriNodeParser {
     return out;
   }
 
-  /** 拆 authority：返回 [userInfo, host, 原始端口段]；格式不符返回 [] */
+  /** 拆 authority：返回 [userInfo, host, 原始端口段]；格式不符返回 []。userinfo 可省略
+   * （hysteria v1 的 auth 在 query 参数里、部分转换器生成的 trojan/anytls 也发无凭据形态） */
   static splitAuthority(authority: string): string[] {
     const at = authority.lastIndexOf('@');
-    if (at < 0) {
-      return [];
-    }
-    const userInfo = authority.substring(0, at);
-    const hostPart = authority.substring(at + 1);
+    const userInfo = at < 0 ? '' : authority.substring(0, at);
+    const hostPart = at < 0 ? authority : authority.substring(at + 1);
     if (hostPart.startsWith('[')) {
       // IPv6：[::1]:443
       const close = hostPart.indexOf(']');

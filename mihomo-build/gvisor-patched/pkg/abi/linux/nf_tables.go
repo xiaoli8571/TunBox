@@ -28,6 +28,7 @@ const (
 	NFT_OBJ_MAXNAMELEN   = NFT_NAME_MAXLEN
 	NFT_USERDATA_MAXLEN  = 256
 	NFT_OSF_MAXGENRELEN  = 16
+	NFT_SET_EXPR_MAX     = 2
 )
 
 // 16-byte Registers that can be used to maintain state for rules.
@@ -336,6 +337,22 @@ const (
 	NFTA_IMMEDIATE_MAX = __NFTA_IMMEDIATE_MAX - 1
 )
 
+// NfTablePayloadAttributes represents the netfilter payload attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_PAYLOAD_UNSPEC uint16 = iota
+	NFTA_PAYLOAD_DREG
+	NFTA_PAYLOAD_BASE
+	NFTA_PAYLOAD_OFFSET
+	NFTA_PAYLOAD_LEN
+	NFTA_PAYLOAD_SREG
+	NFTA_PAYLOAD_CSUM_TYPE
+	NFTA_PAYLOAD_CSUM_OFFSET
+	NFTA_PAYLOAD_CSUM_FLAGS
+	__NFTA_PAYLOAD_MAX
+	NFTA_PAYLOAD_MAX = __NFTA_PAYLOAD_MAX - 1
+)
+
 // Nf table relational operators.
 // Used by the nft comparison operation to compare values in registers.
 // These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
@@ -346,6 +363,17 @@ const (
 	NFT_CMP_LTE        // less than or equal to
 	NFT_CMP_GT         // greater than
 	NFT_CMP_GTE        // greater than or equal to
+)
+
+// Nf table cmp expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_CMP_UNSPEC uint16 = iota
+	NFTA_CMP_SREG
+	NFTA_CMP_OP
+	NFTA_CMP_DATA
+	__NFTA_CMP_MAX
+	NFTA_CMP_MAX = __NFTA_CMP_MAX - 1
 )
 
 // Nf table range operators.
@@ -390,6 +418,21 @@ const (
 	NFT_BITWISE_BOOL   = iota // mask-and-xor operation for NOT, AND, OR, & XOR
 	NFT_BITWISE_LSHIFT        // left-shift operation
 	NFT_BITWISE_RSHIFT        // right-shift operation
+)
+
+// Nf table bitwise expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_BITWISE_UNSPEC uint16 = iota
+	NFTA_BITWISE_SREG
+	NFTA_BITWISE_DREG
+	NFTA_BITWISE_LEN
+	NFTA_BITWISE_MASK
+	NFTA_BITWISE_XOR
+	NFTA_BITWISE_OP
+	NFTA_BITWISE_DATA
+	__NFTA_BITWISE_MAX
+	NFTA_BITWISE_MAX = __NFTA_BITWISE_MAX - 1
 )
 
 // Nf table route expression keys.
@@ -462,3 +505,323 @@ const (
 	NFT_META_SDIFNAME             // Slave device interface name
 	NFT_META_BRI_BROUTE           // Packet br_netfilter_broute bit
 )
+
+// Nf table meta expression netlink attributes
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_META_UNSPEC = iota
+	NFTA_META_DREG
+	NFTA_META_KEY
+	NFTA_META_SREG
+	__NFTA_META_MAX
+	NFTA_META_MAX = __NFTA_META_MAX - 1
+)
+
+// Nf table counter expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_COUNTER_UNSPEC = iota
+	NFTA_COUNTER_BYTES
+	NFTA_COUNTER_PACKETS
+	NFTA_COUNTER_PAD
+	__NFTA_COUNTER_MAX
+	NFTA_COUNTER_MAX = __NFTA_COUNTER_MAX - 1
+)
+
+// Nftables Generation Attributes
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_GEN_UNSPEC uint16 = iota
+	NFTA_GEN_ID
+	NFTA_GEN_PROC_PID
+	NFTA_GEN_PROC_NAME
+	__NFTA_GEN_MAX
+	NFTA_GEN_MAX = __NFTA_GEN_MAX - 1
+)
+
+// Nf table nat expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_NAT_UNSPEC uint16 = iota
+	NFTA_NAT_TYPE
+	NFTA_NAT_FAMILY
+	NFTA_NAT_REG_ADDR_MIN
+	NFTA_NAT_REG_ADDR_MAX
+	NFTA_NAT_REG_PROTO_MIN
+	NFTA_NAT_REG_PROTO_MAX
+	NFTA_NAT_FLAGS
+	__NFTA_NAT_MAX
+	NFTA_NAT_MAX = __NFTA_NAT_MAX - 1
+)
+
+// NfTableSetFlags represents the netfilter set flags.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_SET_ANONYMOUS = uint16(0x1)
+	NFT_SET_CONSTANT  = uint16(0x2)
+	NFT_SET_INTERVAL  = uint16(0x4)
+	NFT_SET_MAP       = uint16(0x8)
+	NFT_SET_TIMEOUT   = uint16(0x10)
+	NFT_SET_EVAL      = uint16(0x20)
+	NFT_SET_OBJECT    = uint16(0x40)
+	NFT_SET_CONCAT    = uint16(0x80)
+	NFT_SET_EXPR      = uint16(0x100)
+)
+
+// NfTableSetAttributes represents the netfilter set attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_SET_UNSPEC uint16 = iota
+	NFTA_SET_TABLE
+	NFTA_SET_NAME
+	NFTA_SET_FLAGS
+	NFTA_SET_KEY_TYPE
+	NFTA_SET_KEY_LEN
+	NFTA_SET_DATA_TYPE
+	NFTA_SET_DATA_LEN
+	NFTA_SET_POLICY
+	NFTA_SET_DESC
+	NFTA_SET_ID
+	NFTA_SET_TIMEOUT
+	NFTA_SET_GC_INTERVAL
+	NFTA_SET_USERDATA
+	NFTA_SET_PAD
+	NFTA_SET_OBJ_TYPE
+	NFTA_SET_HANDLE
+	NFTA_SET_EXPR
+	NFTA_SET_EXPRESSIONS
+	__NFTA_SET_MAX
+	NFTA_SET_MAX = __NFTA_SET_MAX - 1
+)
+
+// NfTableSetPolicies represents the netfilter set policies.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_SET_POL_PERFORMANCE uint32 = iota // prefer high performance over low memory use
+	NFT_SET_POL_MEMORY                    // prefer low memory use over high performance
+)
+
+// NfTableSetDescAttributes represents the netfilter set description attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_SET_DESC_UNSPEC uint16 = iota
+	NFTA_SET_DESC_SIZE
+	NFTA_SET_DESC_CONCAT
+	__NFTA_SET_DESC_MAX
+	NFTA_SET_DESC_MAX = __NFTA_SET_DESC_MAX - 1
+)
+
+// NfTableSetFieldAttributes represents the netfilter set field attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_SET_FIELD_UNSPEC uint16 = iota
+	NFTA_SET_FIELD_LEN
+	__NFTA_SET_FIELD_MAX
+	NFTA_SET_FIELD_MAX = __NFTA_SET_FIELD_MAX - 1
+)
+
+// NfTableObjectAttributes represents the netfilter object attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_OBJECT_UNSPEC uint32 = iota
+	NFT_OBJECT_COUNTER
+	NFT_OBJECT_QUOTA
+	NFT_OBJECT_CT_HELPER
+	NFT_OBJECT_LIMIT
+	NFT_OBJECT_CONNLIMIT
+	NFT_OBJECT_TUNNEL
+	NFT_OBJECT_CT_TIMEOUT
+	NFT_OBJECT_SECMARK
+	NFT_OBJECT_CT_EXPECT
+	NFT_OBJECT_SYNPROXY
+	__NFT_OBJECT_MAX
+	NFT_OBJECT_MAX = __NFT_OBJECT_MAX - 1
+)
+
+// NfTableSetElemListAttributes represents the netfilter set element list attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_SET_ELEM_LIST_UNSPEC uint16 = iota
+	NFTA_SET_ELEM_LIST_TABLE
+	NFTA_SET_ELEM_LIST_SET
+	NFTA_SET_ELEM_LIST_ELEMENTS
+	NFTA_SET_ELEM_LIST_SET_ID
+	__NFTA_SET_ELEM_LIST_MAX
+	NFTA_SET_ELEM_LIST_MAX = __NFTA_SET_ELEM_LIST_MAX - 1
+)
+
+// NfTableSetElemAttributes represents the netfilter set element attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_SET_ELEM_UNSPEC uint16 = iota
+	NFTA_SET_ELEM_KEY
+	NFTA_SET_ELEM_DATA
+	NFTA_SET_ELEM_FLAGS
+	NFTA_SET_ELEM_TIMEOUT
+	NFTA_SET_ELEM_EXPIRATION
+	NFTA_SET_ELEM_USERDATA
+	NFTA_SET_ELEM_EXPR
+	NFTA_SET_ELEM_PAD
+	NFTA_SET_ELEM_OBJREF
+	NFTA_SET_ELEM_KEY_END
+	NFTA_SET_ELEM_EXPRESSIONS
+	__NFTA_SET_ELEM_MAX
+	NFTA_SET_ELEM_MAX = __NFTA_SET_ELEM_MAX - 1
+)
+
+// NfTableSetElemFlags represents the netfilter set element flags.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_SET_ELEM_INTERVAL_END = uint16(0x1)
+	NFT_SET_ELEM_CATCHALL     = uint16(0x2)
+)
+
+// NfTableLookupAttributes represents the netfilter lookup attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_LOOKUP_UNSPEC uint16 = iota
+	NFTA_LOOKUP_SET
+	NFTA_LOOKUP_SREG
+	NFTA_LOOKUP_DREG
+	NFTA_LOOKUP_SET_ID
+	NFTA_LOOKUP_FLAGS
+	__NFTA_LOOKUP_MAX
+	NFTA_LOOKUP_MAX = __NFTA_LOOKUP_MAX - 1
+)
+const NFT_LOOKUP_F_INV = uint32(1 << 0)
+
+// NfTable fib expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_FIB_UNSPEC uint16 = iota
+	NFTA_FIB_DREG
+	NFTA_FIB_RESULT
+	NFTA_FIB_FLAGS
+	__NFTA_FIB_MAX
+)
+
+const NFTA_FIB_MAX = __NFTA_FIB_MAX - 1
+
+// NfTable fib result types.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_FIB_RESULT_UNSPEC = iota
+	NFT_FIB_RESULT_OIF
+	NFT_FIB_RESULT_OIFNAME
+	NFT_FIB_RESULT_ADDRTYPE
+	__NFT_FIB_RESULT_MAX
+)
+
+const NFT_FIB_RESULT_MAX = __NFT_FIB_RESULT_MAX - 1
+
+// NfTable fib flags.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_FIB_F_SADDR   = 1 << 0
+	NFTA_FIB_F_DADDR   = 1 << 1
+	NFTA_FIB_F_MARK    = 1 << 2
+	NFTA_FIB_F_IIF     = 1 << 3
+	NFTA_FIB_F_OIF     = 1 << 4
+	NFTA_FIB_F_PRESENT = 1 << 5
+)
+
+// Nf table ct expression keys.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFT_CT_STATE = iota
+	NFT_CT_DIRECTION
+	NFT_CT_STATUS
+	NFT_CT_MARK
+	NFT_CT_SECMARK
+	NFT_CT_EXPIRATION
+	NFT_CT_HELPER
+	NFT_CT_L3PROTOCOL
+	NFT_CT_SRC
+	NFT_CT_DST
+	NFT_CT_PROTOCOL
+	NFT_CT_PROTO_SRC
+	NFT_CT_PROTO_DST
+	NFT_CT_LABELS
+	NFT_CT_PKTS
+	NFT_CT_BYTES
+	NFT_CT_AVGPKT
+	NFT_CT_ZONE
+	NFT_CT_EVENTMASK
+	NFT_CT_SRC_IP
+	NFT_CT_DST_IP
+	NFT_CT_SRC_IP6
+	NFT_CT_DST_IP6
+	NFT_CT_ID
+	__NFT_CT_MAX
+	NFT_CT_MAX = __NFT_CT_MAX - 1
+)
+
+// Nf table ct expression netlink attributes.
+// These correspond to values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_CT_UNSPEC uint16 = iota
+	NFTA_CT_DREG
+	NFTA_CT_KEY
+	NFTA_CT_DIRECTION
+	NFTA_CT_SREG
+	__NFTA_CT_MAX
+	NFTA_CT_MAX = __NFTA_CT_MAX - 1
+)
+
+// IPCTInfo represents the state of a connection.
+// Used with NF_CT_STATE to represent the state of a connection.
+// Ref: enum include/uapi/linux/netfilter/nf_conntrack.h:ip_conntrack_info
+type IPCTInfo int
+
+const (
+	// IP_CT_ESTABLISHED represents an established connection (either direction).
+	IP_CT_ESTABLISHED IPCTInfo = iota
+	// IP_CT_RELATED represents a connection related to an existing connection,
+	// or an ICMP error (in either direction).
+	IP_CT_RELATED
+	// IP_CT_NEW represents a new connection to track.
+	IP_CT_NEW
+	// IP_CT_IS_REPLY indicates reply direction.
+	IP_CT_IS_REPLY
+	// IP_CT_ESTABLISHED_REPLY represents an established connection in the reply direction.
+	IP_CT_ESTABLISHED_REPLY = IP_CT_ESTABLISHED + IP_CT_IS_REPLY
+	// IP_CT_RELATED_REPLY represents a connection related to an existing connection,
+	// or an ICMP error in the reply direction.
+	IP_CT_RELATED_REPLY = IP_CT_RELATED + IP_CT_IS_REPLY
+	// IP_CT_NUMBER is the number of distinct IP_CT types.
+	IP_CT_NUMBER = 5
+	// IP_CT_NEW_REPLY is for userspace compatibility.
+	IP_CT_NEW_REPLY = IP_CT_NUMBER
+	// IP_CT_UNTRACKED represents an untracked connection.
+	IP_CT_UNTRACKED = 7
+)
+
+// Conntrack states.
+const (
+	// NF_CT_STATE_INVALID_BIT represents an invalid connection state.
+	NF_CT_STATE_INVALID_BIT = 1 << 0
+	// NF_CT_STATE_UNTRACKED_BIT represents an untracked connection state.
+	NF_CT_STATE_UNTRACKED_BIT = 1 << 6
+)
+
+// From include/uapi/linux/netfilter/nf_conntrack_common.h.
+const (
+	IP_CT_DIR_ORIGINAL uint8 = iota
+	IP_CT_DIR_REPLY
+	IP_CT_DIR_MAX
+)
+
+// Nf table masq expression netlink attributes.
+// These correspond to enum values in include/uapi/linux/netfilter/nf_tables.h.
+const (
+	NFTA_MASQ_UNSPEC uint16 = iota
+	NFTA_MASQ_FLAGS
+	NFTA_MASQ_REG_PROTO_MIN
+	NFTA_MASQ_REG_PROTO_MAX
+	__NFTA_MASQ_MAX
+	NFTA_MASQ_MAX = __NFTA_MASQ_MAX - 1
+)
+
+// SizeOfNfConntrackManProto is the size of the nf_conntrack_man_proto in bytes.
+// Ref: include/uapi/linux/netfilter/nf_conntrack_tuple_common.h:nf_conntrack_man_proto.
+const SizeOfNfConntrackManProto = 2

@@ -1,5 +1,5 @@
 /**
- * SSRVPN 桌面服务卡片 FormExtensionAbility。
+ * TunBox 桌面服务卡片 FormExtensionAbility。
  * 卡片点击在后台执行，生命周期回调只读取本地节点、进程状态、应用内存和公网 IP 缓存做轻量校准。
  */
 import FormExtensionAbility from '@ohos.app.form.FormExtensionAbility';

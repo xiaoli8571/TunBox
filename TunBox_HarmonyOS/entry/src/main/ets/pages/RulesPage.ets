@@ -20,7 +20,7 @@ export struct RulesView {
   private bootstrapTimer: number = -1;
   @State settingsReady: boolean = false;
   private bootstrapEpoch: number = 0;
-  @State rulesEnabled: boolean = true;
+  @State rulesEnabled: boolean = false;
   /** 去广告默认关闭：与 AppSettings.hyperAdRulesEnabled 的默认值保持一致 */
   @State hyperAdRulesEnabled: boolean = false;
   @State customRulesText: string = '';
@@ -46,6 +46,7 @@ export struct RulesView {
     if (outcome === 'reconnect') { return '正在自动重连'; }
     if (outcome === 'ad-unavailable') { return '广告规则尚未下载，请到设置的数据与规则手动更新'; }
     if (outcome === 'pending') { return '另一规则更新进行中，请稍后重试保存'; }
+    if (outcome === 'apply-failed') { return '立即应用未完成，未主动断开当前连接；请检查配置后重试'; }
     return '下次连接生效';
   }
 

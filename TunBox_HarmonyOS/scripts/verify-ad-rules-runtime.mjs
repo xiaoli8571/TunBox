@@ -5,10 +5,16 @@ function fixture() {
   const h = harness();
   h.settings = { rulesEnabled: true, hyperAdRulesEnabled: true, assetSource: 'github', proxyMode: 'rule' };
   h.promotes = []; h.removed = [];
-  h.platform.fs.renameSync = (from, to) => h.promotes.push([from, to]);
+  h.snapshots = [];
+  h.platform.fs.renameSync = (from, to) => {
+    if (to.endsWith('.lastgood.yaml')) { h.snapshots.push([from, to]); }
+    else { h.promotes.push([from, to]); }
+  };
   h.platform.fs.unlinkSync = path => { h.removed.push(path); if (path.endsWith('hyper_adrules_ads.mrs')) h.ruleReady = false; };
   h.downloads = 0; h.downloadOK = true; h.downloadGate = null; h.reloads = 0; h.restarts = 0; h.configs = [];
   h.platform.SettingsService.load = async () => ({ ...h.settings });
+  h.platform.ProfileStore = { currentId: () => 'fixture-profile' };
+  h.orch.appliedProfileId = 'fixture-profile';
   h.platform.ensurePrivateDir = () => {};
   h.platform.privateFs.writePrivate = (_path, text) => h.configs.push(JSON.parse(text));
   h.platform.SubscriptionService.nodeSetFingerprint = () => 'fixture';
@@ -18,6 +24,8 @@ function fixture() {
       && profile.settings.hyperAdRulesEnabled }) };
   } };
   h.orch.lastSubs = h.subs; h.orch.lastNode = h.subs.nodes[0];
+  h.subs.findNode = () => null;
+  h.subs.fallbackConnectionNode = () => h.subs.nodes[0];
   h.orch.lastNodeName = 'test-node';
   h.orch.hydrateAndBuildProfile = async (_subs, settings, _name, _ports, _secret, _hosts, _smart, _geo, ready) =>
     ({ settings, ready });
@@ -162,11 +170,61 @@ await test('another direct hot reload reports pending without restarting the tun
   assert.equal(await h.orch.applyRulesChanged('busy'), 'pending');
   assert.equal(h.reloads, 0); assert.equal(h.restarts, 0);
 });
-await test('controller reload failure still permits the existing reconnect fallback', async () => {
+await test('controller reload failure keeps the current tunnel without reconnecting', async () => {
   const h = fixture(); h.ruleReady = true;
   h.orch.api.reloadFromPath = async () => { h.reloads++; return false; };
-  assert.equal(await h.orch.applyRulesChanged('controller-failure'), 'reconnect');
-  assert.equal(h.reloads, 1); assert.equal(h.restarts, 1);
+  assert.equal(await h.orch.applyRulesChanged('controller-failure'), 'apply-failed');
+  assert.equal(h.reloads, 1); assert.equal(h.restarts, 0);
+  assert.equal(h.orch.state, h.ConnState.CONNECTED);
+});
+
+await test('preflight rejection never posts a reload or disconnects the working tunnel', async () => {
+  const h = fixture(); h.ruleReady = true;
+  h.orch.prepareConfigYaml = async () => { throw Error('invalid final configuration'); };
+  assert.equal(await h.orch.applyRulesChanged('invalid-config'), 'apply-failed');
+  assert.equal(h.reloads, 0); assert.equal(h.restarts, 0); assert.equal(h.configs.length, 0);
+});
+
+await test('late preflight response cannot write configuration after user stop', async () => {
+  const h = fixture(), gate = deferred(); h.ruleReady = true;
+  h.orch.prepareConfigYaml = async text => { await gate.promise; return text; };
+  const task = h.orch.applyRulesChanged('slow-validation'); await flush();
+  h.orch.requestDisconnect(); gate.resolve(); assert.equal(await task, 'none');
+  assert.equal(h.reloads, 0); assert.equal(h.configs.length, 0);
+});
+
+await test('failed node pin rolls back before accepting a new profile or snapshot', async () => {
+  const h = fixture(); h.ruleReady = true;
+  h.orch.pendingProfileId = 'new-profile'; h.orch.appliedProfileId = 'old-profile';
+  h.orch.api.selectNode = async () => false;
+  assert.equal(await h.orch.applyRulesChanged('failed-pin'), 'apply-failed');
+  assert.equal(h.reloads, 2); assert.equal(h.orch.appliedProfileId, 'old-profile');
+  assert.equal(h.promotes.length, 0); assert.equal(h.snapshots.length, 0); assert.equal(h.restarts, 0);
+});
+
+await test('accepted hot reload updates the last-good snapshot', async () => {
+  const h = fixture(); h.ruleReady = true;
+  assert.equal(await h.orch.applyRulesChanged('good-config'), 'hot');
+  assert.equal(h.snapshots.length, 1);
+});
+await test('rollback prefers accepted snapshot bytes over an unpromoted older main file', async () => {
+  const h = fixture(); h.ruleReady = true;
+  h.platform.privateFs.exists = path => path.endsWith('.lastgood.yaml');
+  const paths = []; h.orch.api.reloadFromPath = async path => { paths.push(path); return true; };
+  h.orch.api.selectNode = async () => false;
+  assert.equal(await h.orch.applyRulesChanged('rollback-source'), 'apply-failed');
+  assert.ok(paths[1].endsWith('.lastgood.yaml')); assert.equal(h.promotes.length, 0);
+});
+
+await test('switching profiles selects the new profile node rather than the old profile node', async () => {
+  const h = fixture(); h.ruleReady = true;
+  const next = { id: 'next', name: 'new-profile-node', subscriptionId: 'fixture-profile' };
+  h.orch.appliedProfileId = 'old-profile'; h.orch.pendingProfileId = 'fixture-profile';
+  h.subs.findNode = () => null; h.subs.fallbackConnectionNode = () => next;
+  const selected = []; h.orch.api.selectNode = async name => { selected.push(name); return name === next.name; };
+  assert.equal(await h.orch.applyRulesChanged('new-profile'), 'hot');
+  assert.deepEqual(selected, [next.name]); assert.equal(h.orch.lastNodeName, next.name);
+  assert.equal(h.orch.appliedProfileId, 'fixture-profile'); assert.equal(h.snapshot.nodeName, next.name);
 });
 
 await test('rejected staged config preserves the last accepted configuration', async () => {

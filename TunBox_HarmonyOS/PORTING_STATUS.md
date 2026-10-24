@@ -1,4 +1,4 @@
-# SSRVPN HarmonyOS — 移植进度与剩余工作清单
+# TunBox HarmonyOS — 移植进度与剩余工作清单
 
 > 本文件是移植工作的进度账本（2026-09-17 更新，见文末「架构与性能改造」一节）。
 > **当前状态：HAP 已可完整编译（BUILD SUCCESSFUL，含原生 NAPI）；网络监听、恢复编排与
@@ -10,12 +10,12 @@
 ## 构建方法（本机已验证）
 
 ```powershell
-cd C:\Users\Administrator\Downloads\zcode-worker\SSRVPN-HM\SSRVPN_HarmonyOS
+cd C:\Users\Administrator\Downloads\zcode-worker\TunBox-HM\TunBox_HarmonyOS
 $env:DEVECO_SDK_HOME = 'C:\Program Files\Huawei\DevEco Studio\sdk'
 $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 & 'C:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat' --mode module -p module=entry@default -p product=default assembleHap --no-daemon
 # 产物: entry\build\default\outputs\default\entry-default-unsigned.hap
-# 已复制: C:\Users\Administrator\Downloads\zcode-worker\SSRVPN_HarmonyOS.hap (未签名, ~1.6MB)
+# 已复制: C:\Users\Administrator\Downloads\zcode-worker\TunBox_HarmonyOS.hap (未签名, ~1.6MB)
 ```
 
 - SDK：本机 DevEco Studio SDK **API 26**（`compatibleSdkVersion: "26.0.0"`，注意新版本号格式不带 `(N)` 括号后缀）
@@ -26,14 +26,14 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 
 - 方案：**不用 gomobile**（upstream 用 gomobile bind 产出 bionic libc 的 android .so，无法在 OHOS musl 上加载）。
   自写 c-shared 包装层 `mihomo-build/mihomo-<commit>/cshared_main.go`（package main，导出
-  SsrvpnInit/SsrvpnStart/SsrvpnStop/SsrvpnIsRunning/SsrvpnVersion/SsrvpnLastError），
-  复制 upstream `SSRVPN_Android/native/bridge/bridge.go`（package bridge）到 mihomo 源码 `bridge/` 子目录，
+  TunBoxInit/TunBoxStart/TunBoxStop/TunBoxIsRunning/TunBoxVersion/TunBoxLastError），
+  复制 upstream `TunBox_Android/native/bridge/bridge.go`（package bridge）到 mihomo 源码 `bridge/` 子目录，
   `GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC=<OHOS NDK clang --target=aarch64-linux-ohos --sysroot=...>` 编译。
 - 本机构建脚本：`C:\Users\Administrator\Downloads\zcode-worker\build_core.ps1`（产物应放 `entry\libs\arm64-v8a\libgojni.so`）
 - protect 机制：cshared_main.go 内置 auto-approve 守护（读 pipe fd → 自动 SetProtectResult(true)）。
   **API21/26 核对点**：真机上若出现流量回环，需把该 fd 真正绑定到底层物理网络。
 - 注意：本机 8GB 内存，编译 mihomo 峰值内存大，需关闭 DevEco/浏览器等大户，`-p 1` 降低并行度。
-- ABI 对齐：`ssrvpn_core_napi.cpp` 的 dlsym 符号已与 cshared_main.go 一致（含 SsrvpnLastError）。
+- ABI 对齐：`tunbox_core_napi.cpp` 的 dlsym 符号已与 cshared_main.go 一致（含 TunBoxLastError）。
   NAPI startCore 直接收 configPath + tunFd，由 Go 侧读文件。
 
 ## 已完成（P0/P1 + UI 1:1 + P2/P3 全部收官，2026-09-06 最终版）
@@ -59,17 +59,17 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 >   HomePage 启动时若快照为已连接意图 → 自动重连上次节点（对应 NativeConnectionSnapshot 恢复语义）
 > - **内核自动恢复**：存活监控检测内核死亡 → 自动重连（最多 2 次退避），失败则转手动并提示
 > - **代理模式**：规则/全局（AppSettings.proxyMode → 配置生成 mode 字段 + 节点选择页 chips 运行时 PATCH /configs）
-> - **常驻通知速率**：SsrvpnNotifier（isOngoing，每秒随流量轮询刷新，节流 900ms，授权未开静默降级）
+> - **常驻通知速率**：TunBoxNotifier（isOngoing，每秒随流量轮询刷新，节流 900ms，授权未开静默降级）
 > - **订阅删除撤销条**：删除后 5 秒内可撤销（undoRemove 已有事务快照）
 > - **更新检查**：UpdateChecker 查 GitHub latest release，关于对话框"检查更新"按钮接线
 > - 注：errorManager 崩溃钩子在本 SDK（API26）的 ErrorObserver 类型不可公开导入，已移除（诊断面板日志仍可用）
 
-> **2026-09-06 UI 大版本更新**：读 upstream 共享 widgets 源码后发现安卓版真实 UI 使用 `SsrvpnUiTokens`
+> **2026-09-06 UI 大版本更新**：读 upstream 共享 widgets 源码后发现安卓版真实 UI 使用 `TunBoxUiTokens`
 > （深海军蓝渐变背景 + 紫色主色 #8A84FF，`app_theme.dart` 是旧版兼容色已被弃用）。已按 upstream 源码
 > **逐组件 1:1 重写**全部页面：
-> - `theme/UiTokens.ets`：SsrvpnUiTokens 全量色值/尺寸 + 延迟配色阈值（<180 绿/<350 黄/≥350 或超时红）+ 节点名规整
-> - `widgets/SurfaceCard.ets`：SsrvpnSurfaceCard 等价（surface 88% + 白20%描边 + 黑22%投影 blur28/offsetY14）
-> - `pages/HomePage.ets`：渐变背景+双辉光、头部（关于/SSRVPN/使用教程）、状态胶囊、166 圆形电源按钮
+> - `theme/UiTokens.ets`：TunBoxUiTokens 全量色值/尺寸 + 延迟配色阈值（<180 绿/<350 黄/≥350 或超时红）+ 节点名规整
+> - `widgets/SurfaceCard.ets`：TunBoxSurfaceCard 等价（surface 88% + 白20%描边 + 黑22%投影 blur28/offsetY14）
+> - `pages/HomePage.ets`：渐变背景+双辉光、头部（关于/TunBox/使用教程）、状态胶囊、166 圆形电源按钮
 >   （连接色逻辑+光晕+连接中 LoadingProgress）、当前节点卡（图标盒/旗帜/名称/延迟/chevron）、
 >   公网 IPv4 行、浮动底部导航（主页/订阅+版本页脚）、关于/教程自定义对话框
 > - `pages/NodeSelectionPage.ets`（新增）：订阅筛选 chips + 节点卡（旗帜/名称/延迟按钮/选中勾）+ 测全部/单测
@@ -92,8 +92,8 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 | `ets/commons/services/SettingsService.ets` / `SubscriptionService.ets`（含撤销 + ManualNodeStore） | 对应 services | ✅ |
 | `ets/commons/services/PublicIpService.ets`（含国家策略/旗帜） | public_ip_info_service + node_country_policy | ✅ |
 | `ets/commons/services/ConnectionOrchestrator.ets`（写配置→startVpnExtensionAbility→等 API→选节点→监控） | connection_orchestrator 等 | ✅ 真实 API 链路 |
-| `ets/core/CoreBridge.ets` + `cpp/ssrvpn_core_napi.cpp` + `cpp/types/` d.ts | native_bridge + Bridge.kt | ✅ 编译通过，import native from 'libssrvpn_core_napi.so' |
-| `ets/vpnability/VpnExtensionAbility.ets`（createVpnConnection→create→fd→内核；TASK_KEEPING 长时任务） | SsrvpnVpnService.kt | ✅ 真实 vpnExtension API |
+| `ets/core/CoreBridge.ets` + `cpp/tunbox_core_napi.cpp` + `cpp/types/` d.ts | native_bridge + Bridge.kt | ✅ 编译通过，import native from 'libtunbox_core_napi.so' |
+| `ets/vpnability/VpnExtensionAbility.ets`（createVpnConnection→create→fd→内核；TASK_KEEPING 长时任务） | TunBoxVpnService.kt | ✅ 真实 vpnExtension API |
 | `ets/pages/HomePage.ets` / `SubscriptionPage.ets` / `NodeEditPage.ets` | 三个页面 | ✅ 编译通过 |
 | `ets/widgets/`（GlassContainer@BuilderParam/NodeCard/SubscriptionCard/CountryFlagIcon/DiagnosticsSheet） | widgets | ✅ |
 | `ets/widget/ToggleCard.ets` 服务卡片 + form_config.json | VpnTileService | ✅ |
@@ -108,7 +108,7 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
    导出符号与旧内核逐一比对一致，`libgojni.h` 字节级不变）。后续改 Go 代码后用
    `scripts\build-ohos-core.ps1` 重编（源码在 `..\mihomo-build\mihomo-smart-8d4c8c7…\`，脚本会自动选中该目录；
    GOPROXY 必须走 goproxy.cn，链接期约需 4GB+ 提交内存）。
-   内核选型、补丁清单与验证记录见根目录 `MIHOMO_SMART_KERNEL_SWAP.md`。
+   内核选型、补丁清单与验证记录见 `docs/KERNEL_UPGRADE_2026-10-23.md`（含 2026-09 首轮换核前史）。
 2. **真机冒烟**：**不要在 module.json5 声明 ohos.permission.MANAGE_VPN**（受限 ACL 权限，声明后安装报
    "权限申请失败，请按ACL签名指导申请受限权限"；已于 2026-09-06 移除，参照 NekoBox4Harmony 已验证做法：
    HarmonyOS 6.x 上 type:"vpn" 的 VpnExtensionAbility 无需该权限，DevEco 自动签名即可安装，
@@ -141,7 +141,7 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 
 - `VpnExtensionAbility` 的 protect 由 Go 侧 auto-approve（见上），真机需验证回环
 - `SettingsService.apiSecret` 明文存储
-- HomePage 节点抽屉未按订阅分组（对应 ssrvpn_node_selection_subscription_filter）
+- HomePage 节点抽屉未按订阅分组（对应 tunbox_node_selection_subscription_filter）
 - HomePage 诊断抽屉传入 diag: null（固定显示未运行），需接入 orchestrator.diagnostics()
 - 服务卡片状态文本未联动 formProvider.updateForm
 
@@ -273,7 +273,7 @@ UI 的 15s 陈旧窗口判定仍然成立，I/O 从每 3s 降至每 10s 且相�
 
 ```powershell
 # 项目路径含中文会让 hvigor 报 Invalid project path，需镜像到纯 ASCII 目录再构建
-robocopy '<本目录>' 'C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\SSRVPN-HarmonyOS-build' `
+robocopy '<本目录>' 'C:\Users\xiaoli\Downloads\Agent-WorkerSpaces\TunBox-HarmonyOS-build' `
   /MIR /XD .git entry\build entry\.cxx .hvigor node_modules oh_modules
 # ohosTest 需要 hypium：首次在该目录执行 ohpm install --all
 & 'C:\Program Files\Huawei\DevEco Studio\tools\ohpm\bin\ohpm.bat' install --all
@@ -309,7 +309,7 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 - [x] HomePage / NodeSelectionPage 自定义 pageTransition 移除，与应用分流一致的系统默认 push/pop。
 - [x] clean 后 entry@default 与 entry@ohosTest 均 BUILD SUCCESSFUL（仅编译；页面运行与动画手感未做真机验证）。
 - [x] 回归：应用分流71项、网站分流56项（含6项既有AppSettings对损坏旧值的非阻断AUDIT，未扩scope）、架构127项、纯逻辑228项、延迟缓存3项全绿；verify-vpn-architecture 过时页面断言已按新导航同步迁移。
-- [x] 交付未签名 HAP：SSRVPN-Rules-HomeCards-unsigned.hap（20,231,983 字节，SHA256 1D5A0F3839702512EC44AA555A057F3F4C80C9765691A0F84CF6C982E436B38A）。
+- [x] 交付未签名 HAP：TunBox-Rules-HomeCards-unsigned.hap（20,231,983 字节，SHA256 1D5A0F3839702512EC44AA555A057F3F4C80C9765691A0F84CF6C982E436B38A）。
 - [ ] 真机验收：主页卡片布局、站点列表操作、全局模式下网站规则提示、进入节点页/网络规则页的过渡效果。
 - 已知限制：强制代理/直连是两份同时生效的名单（域名级，直连优先），与应用分流的互斥模式不同；绕过 VPN 的应用不受网站规则影响。AppSettings 历史上会静默丢弃损坏旧数据（非数组/非字符串），本轮不改该行为，仅 AUDIT 记录。
 
@@ -319,7 +319,7 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 - [x] 代理模式菜单更名「智能」；黑底系统菜单（showActionMenu 无背景色参数）改为主题化 CustomDialog。
 - [x] 公网 IP 胶囊移至启动按钮正下方，内容自适应宽度，长 IPv6 BREAK_ALL 换行。
 - [x] 双模块构建成功；回归：站点56/架构127/应用71/逻辑228/延迟3 全绿，断言迁移至弹窗结构。
-- [x] 交付 SSRVPN-HomeCards-v3-unsigned.hap（最新 SHA256 56AD19DD…C61038F；四卡随后按反馈从146固定高改为与旧版网络规则卡一致的内容自适应高度，提交 f73f3e4）。
+- [x] 交付 TunBox-HomeCards-v3-unsigned.hap（最新 SHA256 56AD19DD…C61038F；四卡随后按反馈从146固定高改为与旧版网络规则卡一致的内容自适应高度，提交 f73f3e4）。
 - [ ] 真机验收：弹窗主题色（深浅色）、2×2 布局、IPv6 胶囊换行、四入口路由。
 
 ## 第四轮：卡片启动 VPN 热恢复修复（2026-09-17，提交 914f35b）
@@ -346,7 +346,43 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 
 - [x] 第二~五轮全部改动（27 文件：应用分流 v2、站点分流、主页 2×2 + 网络规则弹窗、热恢复修复、会话守护 + 自动退桌面）已从试验副本逐文件哈希校验后合入主线；主线在合并前先以 `9596543` 提交原未提交工作作安全基线，可整体回退。
 - [x] 版本号统一 5.5.1（AppScope：50501/5.5.1）；主线 clean 后 default/ohosTest/assembleApp 三构建 BUILD SUCCESSFUL；七套件回归全绿（回归需在构建之后跑，卡片守护断言会校验构建 profile）。
-- [x] 新主线脚本 `sign-release-package.ps1`（版本号自动命名，产物在 `SSRVPN-HarmonyOS\dist\`）：SSRVPN_HarmonyOS-5.5.1-release-signed.app + SSRVPN-5.5.1-release-signed.hap，主线证书内外层 verify-app 通过。
-- [x] 试验目录 SSRVPN-AppRouting-20260917（快照/bundle/试验仓库/旧包）已按用户指示删除；全部历史可从本仓库两个提交（9596543 基线 + 本次功能合并）与标签 v5.5.1 复现。本文各轮中引用的 trial 路径自本条起失效。
+- [x] 新主线脚本 `sign-release-package.ps1`（版本号自动命名，产物在 `TunBox-HarmonyOS\dist\`）：TunBox_HarmonyOS-5.5.1-release-signed.app + TunBox-5.5.1-release-signed.hap，主线证书内外层 verify-app 通过。
+- [x] 试验目录 TunBox-AppRouting-20260917（快照/bundle/试验仓库/旧包）已按用户指示删除；全部历史可从本仓库两个提交（9596543 基线 + 本次功能合并）与标签 v5.5.1 复现。本文各轮中引用的 trial 路径自本条起失效。
 - [ ] 真机 5.5.1 验收（守护存活/退桌面/断开释放/通知降级），沿用第五轮清单。
 
+
+## 2026-10-23：0.6.0 审查修复与重新安装
+
+- 修复订阅校验/别名/Base64、配置新鲜度、内核目录启动、组选点、测速收尾与未开始却报完成；native stopCore 异步化。
+- 62 套 strict 回归通过，新专项最终 15 项、真实订阅保真 16 项、前台会话 24 项、热恢复 8 项通过；release APP/HAP 与设备签名 HAP 构建成功。
+- 最终 0.6.0 / 525 已重新安装到用户设备；此次干净安装首测由用户继续验收。细节见 docs/REVIEW_FIXES_2026-10-23_0.6.0.md。
+
+## 2026-10-23：0.6.0 / 527 规则默认值、测速提示与保活复查
+
+- 规则引擎默认关闭；修复自定义 GEOIP 缺库时漏过启动保护。移除两处页面的组级失败分类、超时/过载数量提示。
+- 核对 PR #5（d50845f）：音频保活和 30 秒后台任务自检仍在。修复恢复后漏接进度心跳、迟到旧任务事件误撤销新守护、普通取消后重复等待。
+- 保活生产源码回归 26/26、前台会话 24/24、卡片守护 8/8 通过；规则和测速定向回归通过。release APP/HAP 与设备兼容签名 HAP 均构建成功。
+- 527 安装包已生成，设备未连接，尚未推送安装；未测锁屏长时存活与耗电。详见 docs/KEEPALIVE_REVIEW_2026-10-23_0.6.0.md。
+
+## 2026-10-23：0.6.0 / 528 启动依赖复查
+
+- Geo 数据铺盘改为结构检查、失败可重试、缓存删除可重建、完整临时文件原子替换，避免进程标记和只看大小掩盖坏缓存。
+- 新增真实生产链路测试 43 项（含 64 份真实内核配置校验与 4 次内核实际启动），全部通过；旧安装器同组回归 6 项失败。规则默认关闭不变。
+- 528 已构建签名，设备未连接，尚未安装。范围与证据见 docs/STARTUP_RECHECK_2026-10-23_0.6.0.md。
+
+## 2026-10-23：0.6.0 / 529–531 第一批 P0 整改、图标事故与发布签名
+
+- 第一批 P0（启动/停止/热加载串行化、最终配置校验、代理模式 PATCH、最近可用快照回退、保活迟到事件隔离）见 docs/REMEDIATION_BATCH1_2026-10-23_0.6.0.md。
+- 530 暴露出增量编译资源编号错位（电源按钮与底栏三个图标串位）；531 用真正的清理构建修复，新增 scripts/verify-ui-resource-bindings.mjs 构建后门禁（debug+release 双模式），并在 AGENTS.md 固化“打包必须清理构建、构建后跑该门禁”。
+- 全量回归 65 个脚本：PASS 64 / FAIL 1（仅缺私有真实订阅夹具）/ SKIP 0，真失败 0；strict 退出码仍为 1，不能称为全门禁通过。
+- 已产出 0.6.0/531 三件套：未签名 HAP、签名 HAP、签名 APP；hap-sign-tool 验签成功，三者 modules.abc 一致（a26b8f54…）。
+- 531 debug 候选已覆盖安装并在真机确认图标恢复；设备随后被用户使用，531 上的启动/模式切换/断开逐步取证未完成。
+## 2026-10-24：0.6.0 / 531 真机逐步验收（release 编译模式）
+
+- 设备 MLR-AL00 / OpenHarmony-7.0.0.105 安装 release 编译 + 设备调试签名的同版本包；其 modules.abc 与 dist 三件套一致（a26b8f54…），即真机运行与发布包同一份编译产物。
+- 图标恢复在 release 编译包上再次目视确认（电源 ⏻、底栏九宫格/列表/齿轮）；4 个订阅数据在覆盖安装后保留。
+- 启动连接 1535ms（prep 39/launch 1162/ready 1453/pinned 1535），TUN 建立、startCore ok、VPN 图标出现。
+- 模式切换 规则→全局→直连→规则 全部生效：日志 hot-updated，直连时公网出口由代理 IP 变为本地 IP，切回规则恢复，连接未中断。
+- 主动断开约 2.0s 完成，VPN 扩展进程退出，UI/流量/时长/VPN 图标全部复位。
+- 未连接状态测速：headless test core 就绪，7/7 measured、timeout=0、failed=0，页面显示 58–265ms，无失败分类/超时数量横幅。
+- 仍未完成：8 小时锁屏存活、耗电对照、音频保活、网络切换矩阵。证据见本地审计目录 DEVICE-531R-VERIFICATION.md。

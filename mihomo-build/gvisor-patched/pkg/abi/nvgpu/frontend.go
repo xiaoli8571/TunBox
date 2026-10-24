@@ -15,6 +15,8 @@
 package nvgpu
 
 import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+
 	"github.com/metacubex/gvisor/pkg/marshal"
 )
 
@@ -26,15 +28,16 @@ const NV_IOCTL_MAGIC = uint32('F')
 // Note that these are only the IOC_NR part of the ioctl command.
 const (
 	// From kernel-open/common/inc/nv-ioctl-numbers.h:
-	NV_IOCTL_BASE             = 200
-	NV_ESC_CARD_INFO          = NV_IOCTL_BASE + 0
-	NV_ESC_REGISTER_FD        = NV_IOCTL_BASE + 1
-	NV_ESC_ALLOC_OS_EVENT     = NV_IOCTL_BASE + 6
-	NV_ESC_FREE_OS_EVENT      = NV_IOCTL_BASE + 7
-	NV_ESC_CHECK_VERSION_STR  = NV_IOCTL_BASE + 10
-	NV_ESC_ATTACH_GPUS_TO_FD  = NV_IOCTL_BASE + 12
-	NV_ESC_SYS_PARAMS         = NV_IOCTL_BASE + 14
-	NV_ESC_WAIT_OPEN_COMPLETE = NV_IOCTL_BASE + 18
+	NV_IOCTL_BASE              = 200
+	NV_ESC_CARD_INFO           = NV_IOCTL_BASE + 0
+	NV_ESC_REGISTER_FD         = NV_IOCTL_BASE + 1
+	NV_ESC_ALLOC_OS_EVENT      = NV_IOCTL_BASE + 6
+	NV_ESC_FREE_OS_EVENT       = NV_IOCTL_BASE + 7
+	NV_ESC_CHECK_VERSION_STR   = NV_IOCTL_BASE + 10
+	NV_ESC_ATTACH_GPUS_TO_FD   = NV_IOCTL_BASE + 12
+	NV_ESC_SYS_PARAMS          = NV_IOCTL_BASE + 14
+	NV_ESC_EXPORT_TO_DMABUF_FD = NV_IOCTL_BASE + 17
+	NV_ESC_WAIT_OPEN_COMPLETE  = NV_IOCTL_BASE + 18
 
 	// From kernel-open/common/inc/nv-ioctl-numa.h:
 	NV_ESC_NUMA_INFO = NV_IOCTL_BASE + 15
@@ -59,10 +62,46 @@ const (
 // Frontend ioctl parameter structs, from src/common/sdk/nvidia/inc/nvos.h or
 // kernel-open/common/inc/nv-ioctl.h.
 
+// IoctlCardInfo is nv_ioctl_card_info_t. NV_ESC_CARD_INFO takes an array of
+// IoctlCardInfo as parameter.
+//
+// +marshal
+type IoctlCardInfo struct {
+	_             structs.HostLayout
+	Valid         uint8
+	Pad0          [3]byte
+	PCIInfo       PCIInfo
+	GPUID         uint32
+	InterruptLine uint16
+	Pad1          [2]byte
+	RegAddress    uint64
+	RegSize       uint64
+	FBAddress     uint64
+	FBSize        uint64
+	MinorNumber   uint32
+	DevName       [10]byte
+	Pad2          [2]byte
+}
+
+// PCIInfo is nv_pci_info_t.
+//
+// +marshal
+type PCIInfo struct {
+	_        structs.HostLayout
+	Domain   uint32
+	Bus      uint8
+	Slot     uint8
+	Function uint8
+	Pad0     uint8
+	VendorID uint16
+	DeviceID uint16
+}
+
 // IoctlRegisterFD is the parameter type for NV_ESC_REGISTER_FD.
 //
 // +marshal
 type IoctlRegisterFD struct {
+	_     structs.HostLayout
 	CtlFD int32
 }
 
@@ -70,6 +109,7 @@ type IoctlRegisterFD struct {
 //
 // +marshal
 type IoctlAllocOSEvent struct {
+	_       structs.HostLayout
 	HClient Handle
 	HDevice Handle
 	FD      uint32
@@ -100,6 +140,7 @@ func (p *IoctlAllocOSEvent) SetStatus(status uint32) {
 //
 // +marshal
 type IoctlFreeOSEvent struct {
+	_       structs.HostLayout
 	HClient Handle
 	HDevice Handle
 	FD      uint32
@@ -130,6 +171,7 @@ func (p *IoctlFreeOSEvent) SetStatus(status uint32) {
 //
 // +marshal
 type RMAPIVersion struct {
+	_             structs.HostLayout
 	Cmd           uint32
 	Reply         uint32
 	VersionString [64]byte
@@ -139,6 +181,7 @@ type RMAPIVersion struct {
 //
 // +marshal
 type IoctlSysParams struct {
+	_            structs.HostLayout
 	MemblockSize uint64
 }
 
@@ -146,6 +189,7 @@ type IoctlSysParams struct {
 //
 // +marshal
 type IoctlWaitOpenComplete struct {
+	_             structs.HostLayout
 	Rc            int32
 	AdapterStatus uint32
 }
@@ -160,10 +204,119 @@ func (p *IoctlWaitOpenComplete) SetStatus(status uint32) {
 	p.AdapterStatus = status
 }
 
+// NV_DMABUF_EXPORT_MAX_HANDLES is the fixed size of the handle/offset/size
+// arrays in nv_ioctl_export_to_dma_buf_fd_t.
+// From kernel-open/common/inc/nv-ioctl.h.
+const NV_DMABUF_EXPORT_MAX_HANDLES = 128
+
+// IoctlExportToDMABufFD is nv_ioctl_export_to_dma_buf_fd_t, the parameter type
+// for NV_ESC_EXPORT_TO_DMABUF_FD (kernel-open/common/inc/nv-ioctl.h).
+//
+// +marshal
+type IoctlExportToDMABufFD struct {
+	_            structs.HostLayout
+	FD           int32
+	HClient      Handle
+	TotalObjects uint32
+	NumObjects   uint32
+	Index        uint32
+	Pad0         uint32
+	TotalSize    uint64
+	Handles      [NV_DMABUF_EXPORT_MAX_HANDLES]Handle
+	Offsets      [NV_DMABUF_EXPORT_MAX_HANDLES]uint64
+	Sizes        [NV_DMABUF_EXPORT_MAX_HANDLES]uint64
+	Status       uint32
+	Pad1         uint32
+}
+
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *IoctlExportToDMABufFD) GetFrontendFD() int32 { return p.FD }
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *IoctlExportToDMABufFD) SetFrontendFD(fd int32) { p.FD = fd }
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *IoctlExportToDMABufFD) GetStatus() uint32 { return p.Status }
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *IoctlExportToDMABufFD) SetStatus(status uint32) { p.Status = status }
+
+// IoctlExportToDMABufFD_V570 is the updated version of
+// nv_ioctl_export_to_dma_buf_fd_t since 570.86.15.
+//
+// +marshal
+type IoctlExportToDMABufFD_V570 struct {
+	_            structs.HostLayout
+	FD           int32
+	HClient      Handle
+	TotalObjects uint32
+	NumObjects   uint32
+	Index        uint32
+	Pad0         uint32
+	TotalSize    uint64
+	MappingType  uint8
+	Pad1         [3]byte
+	Handles      [NV_DMABUF_EXPORT_MAX_HANDLES]Handle
+	Pad2         uint32
+	Offsets      [NV_DMABUF_EXPORT_MAX_HANDLES]uint64
+	Sizes        [NV_DMABUF_EXPORT_MAX_HANDLES]uint64
+	Status       uint32
+	Pad3         uint32
+}
+
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *IoctlExportToDMABufFD_V570) GetFrontendFD() int32 { return p.FD }
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *IoctlExportToDMABufFD_V570) SetFrontendFD(fd int32) { p.FD = fd }
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *IoctlExportToDMABufFD_V570) GetStatus() uint32 { return p.Status }
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *IoctlExportToDMABufFD_V570) SetStatus(status uint32) { p.Status = status }
+
+// IoctlExportToDMABufFD_V580 is the updated version of
+// nv_ioctl_export_to_dma_buf_fd_t since 580.65.06.
+//
+// +marshal
+type IoctlExportToDMABufFD_V580 struct {
+	_            structs.HostLayout
+	FD           int32
+	HClient      Handle
+	TotalObjects uint32
+	NumObjects   uint32
+	Index        uint32
+	Pad0         uint32
+	TotalSize    uint64
+	MappingType  uint8
+	AllowMmap    uint8
+	Pad1         [2]byte
+	Handles      [NV_DMABUF_EXPORT_MAX_HANDLES]Handle
+	Pad2         uint32
+	Offsets      [NV_DMABUF_EXPORT_MAX_HANDLES]uint64
+	Sizes        [NV_DMABUF_EXPORT_MAX_HANDLES]uint64
+	Status       uint32
+	Pad3         uint32
+}
+
+// GetFrontendFD implements HasFrontendFD.GetFrontendFD.
+func (p *IoctlExportToDMABufFD_V580) GetFrontendFD() int32 { return p.FD }
+
+// SetFrontendFD implements HasFrontendFD.SetFrontendFD.
+func (p *IoctlExportToDMABufFD_V580) SetFrontendFD(fd int32) { p.FD = fd }
+
+// GetStatus implements HasStatus.GetStatus.
+func (p *IoctlExportToDMABufFD_V580) GetStatus() uint32 { return p.Status }
+
+// SetStatus implements HasStatus.SetStatus.
+func (p *IoctlExportToDMABufFD_V580) SetStatus(status uint32) { p.Status = status }
+
 // IoctlNVOS02ParametersWithFD is the parameter type for NV_ESC_RM_ALLOC_MEMORY.
 //
 // +marshal
 type IoctlNVOS02ParametersWithFD struct {
+	_      structs.HostLayout
 	Params NVOS02_PARAMETERS
 	FD     int32
 	Pad0   [4]byte
@@ -181,6 +334,7 @@ func (p *IoctlNVOS02ParametersWithFD) SetStatus(status uint32) {
 
 // +marshal
 type NVOS02_PARAMETERS struct {
+	_             structs.HostLayout
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectNew    Handle
@@ -208,6 +362,7 @@ const (
 //
 // +marshal
 type NVOS00_PARAMETERS struct {
+	_             structs.HostLayout
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectOld    Handle
@@ -252,6 +407,7 @@ func GetRmAllocParamObj(isNVOS64 bool) RmAllocParamType {
 //
 // +marshal
 type NVOS21_PARAMETERS struct {
+	_             structs.HostLayout
 	HRoot         Handle
 	HObjectParent Handle
 	HObjectNew    Handle
@@ -322,6 +478,7 @@ func (n *NVOS21_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS55_PARAMETERS struct {
+	_          structs.HostLayout
 	HClient    Handle
 	HParent    Handle
 	HObject    Handle
@@ -345,6 +502,7 @@ func (n *NVOS55_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS57_PARAMETERS struct {
+	_           structs.HostLayout
 	HClient     Handle
 	HObject     Handle
 	SharePolicy RS_SHARE_POLICY
@@ -365,6 +523,7 @@ func (n *NVOS57_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS30_PARAMETERS struct {
+	_           structs.HostLayout
 	Client      Handle
 	Device      Handle
 	Channel     Handle
@@ -394,6 +553,7 @@ func (n *NVOS30_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS32_PARAMETERS struct {
+	_             structs.HostLayout
 	HRoot         Handle
 	HObjectParent Handle
 	Function      uint32
@@ -424,6 +584,7 @@ const (
 // NVOS32AllocSize is the type of NVOS32Parameters.Data for
 // NVOS32_FUNCTION_ALLOC_SIZE.
 type NVOS32AllocSize struct {
+	_               structs.HostLayout
 	Owner           uint32
 	HMemory         Handle
 	Type            uint32
@@ -472,6 +633,7 @@ const (
 //
 // +marshal
 type IoctlNVOS33ParametersWithFD struct {
+	_      structs.HostLayout
 	Params NVOS33_PARAMETERS
 	FD     int32
 	Pad0   [4]byte
@@ -489,6 +651,7 @@ func (p *IoctlNVOS33ParametersWithFD) SetStatus(status uint32) {
 
 // +marshal
 type NVOS33_PARAMETERS struct {
+	_              structs.HostLayout
 	HClient        Handle
 	HDevice        Handle
 	HMemory        Handle
@@ -516,6 +679,7 @@ const (
 //
 // +marshal
 type NVOS34_PARAMETERS struct {
+	_              structs.HostLayout
 	HClient        Handle
 	HDevice        Handle
 	HMemory        Handle
@@ -539,6 +703,7 @@ func (n *NVOS34_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS39_PARAMETERS struct {
+	_             structs.HostLayout
 	HObjectParent Handle
 	HSubDevice    Handle
 	HObjectNew    Handle
@@ -567,6 +732,7 @@ func (n *NVOS39_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS46_PARAMETERS struct {
+	_         structs.HostLayout
 	Client    Handle
 	Device    Handle
 	Dma       Handle
@@ -595,6 +761,7 @@ func (n *NVOS46_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS46_PARAMETERS_V580 struct {
+	_            structs.HostLayout
 	Client       Handle
 	Device       Handle
 	Dma          Handle
@@ -624,6 +791,7 @@ func (n *NVOS46_PARAMETERS_V580) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS47_PARAMETERS struct {
+	_         structs.HostLayout
 	Client    Handle
 	Device    Handle
 	Dma       Handle
@@ -650,6 +818,7 @@ func (n *NVOS47_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS47_PARAMETERS_V550 struct {
+	_         structs.HostLayout
 	Client    Handle
 	Device    Handle
 	Dma       Handle
@@ -676,6 +845,7 @@ func (n *NVOS47_PARAMETERS_V550) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS54_PARAMETERS struct {
+	_          structs.HostLayout
 	HClient    Handle
 	HObject    Handle
 	Cmd        uint32
@@ -699,6 +869,7 @@ func (n *NVOS54_PARAMETERS) SetStatus(status uint32) {
 //
 // +marshal
 type NVOS56_PARAMETERS struct {
+	_              structs.HostLayout
 	HClient        Handle
 	HDevice        Handle
 	HMemory        Handle
@@ -724,6 +895,7 @@ func (n *NVOS56_PARAMETERS) SetStatus(status uint32) {
 // +marshal
 // +stateify savable
 type NVOS64_PARAMETERS struct {
+	_                structs.HostLayout
 	HRoot            Handle
 	HObjectParent    Handle
 	HObjectNew       Handle

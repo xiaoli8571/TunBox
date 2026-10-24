@@ -328,6 +328,8 @@ export struct SubscriptionPage {
    * 而不是 App 侧解析表。为空时回落旧解析表（离线/内核未起）。
    */
   @State coreNodes: ProxyNode[] = [];
+  /** 「N 个候选」的可渲染副本（见 syncCandidateCount 注释：方法内读取不算 ArkUI 依赖） */
+  @State candidateCount: number = 0;
   /** `coreNodes` 是哪份 profile 的目录（空 = 未知，不能用它算数量） */
   private coreNodesProfileId: string = '';
   /** 最近一次 activateProfile 的目标与时间（防抖用） */
@@ -501,6 +503,7 @@ export struct SubscriptionPage {
   private reload(): void {
     this.subs = this.service.subscriptions.filter((s: Subscription) =>
       s.id !== DIRECT_GROUP_ID || s.nodeCount > 0);
+    this.syncCandidateCount();
     // 展开状态只在首次进入时给默认值（活动订阅）；此后删/加订阅一律保持
     // 用户当前的展开/收起状态，不重置（此前 expandedIds 空了就自动展开第一个，
     // 表现为"每次删/加订阅都自动展开第一个分组"）。
@@ -638,38 +641,6 @@ export struct SubscriptionPage {
     this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
   }
 
-  private diagCache: Map<string, string> = new Map<string, string>();
-  private diagCacheTick: number = -1;
-
-  /**
-   * 组级诊断文案（带缓存）。
-   *
-   * build 里每张卡片会问两次（判空 + 取文本），而 groupDiagnosis 要遍历整份
-   * 测速结果表 —— 不缓存的话「展开一次」等于把全表扫两遍 × 卡片数。
-   * 缓存以 latencyTick 为版本：测速结果没变就直接吃缓存。
-   */
-  private subDiagnosisText(subId: string): string {
-    if (this.diagCacheTick !== this.latencyTick) {
-      this.diagCache.clear();
-      this.diagCacheTick = this.latencyTick;
-    }
-    const cached = this.diagCache.get(subId);
-    if (cached !== undefined) {
-      return cached;
-    }
-    // 【2026-10-22 · FlClash 同构】诊断用**内核**节点名（组级结论本来就来自内核
-    // LatencyStore，名字必须是内核名）；内核目录不可用时才退回 App 解析列表。
-    const nodes: ProxyNode[] = (subId === ProfileStore.currentId() && this.coreNodesUsable())
-      ? this.coreNodes : this.service.nodesOf(subId);
-    const names: string[] = [];
-    for (const node of nodes) {
-      names.push(node.name);
-    }
-    const text = LatencyStoreBridge.groupDiagnosis(names);
-    this.diagCache.set(subId, text);
-    return text;
-  }
-
   /**
    * 订阅头部点击（FlClash 语义）：**切换当前 Profile** + 展开。
    *
@@ -717,6 +688,7 @@ export struct SubscriptionPage {
       this.activeSubId = id;
       this.coreNodes = [];
       this.coreNodesProfileId = '';
+      this.syncCandidateCount();
       this.latencyTick = this.latencyTick + 1;
     }
     try {
@@ -737,6 +709,7 @@ export struct SubscriptionPage {
     // 只有内核确认已切到该 profile 时，这份目录才算它的
     const appliedNow = ConnectionOrchestrator.instance().appliedProfile();
     this.coreNodesProfileId = appliedNow === id ? id : '';
+    this.syncCandidateCount();
     this.latencyTick = this.latencyTick + 1;
     AppLogger.info(TAG, `profile activated: id=${id} coreNodes=${this.coreNodes.length} `
       + `previous=${previous}`);
@@ -813,6 +786,19 @@ export struct SubscriptionPage {
     return this.service.nodesOf(current).length;
   }
 
+  /**
+   * 「几个候选」的**可渲染副本**。
+   *
+   * totalNodes() 内部读的是 this.coreNodes / ProfileStore 这类非直接依赖，
+   * ArkUI 的定向刷新不会把「方法内部读取的状态」登记成依赖 —— 表现就是
+   * 概览卡的「24 节点」已刷新、智能优选卡的「0 个候选」还停在首帧
+   * （2026-10-23 真机：24 节点 vs 0 候选同屏并存）。
+   * 所以每次数据源变化后把结果抄进 @State，让 Text 直接依赖它。
+   */
+  private syncCandidateCount(): void {
+    this.candidateCount = this.totalNodes();
+  }
+
   /** 单个订阅卡片的节点数：当前 profile 用内核目录，其它用解析表。 */
   private nodeCountOf(sub: Subscription): number {
     if (sub.id === ProfileStore.currentId() && this.coreNodesUsable()) {
@@ -887,6 +873,7 @@ export struct SubscriptionPage {
       // 切换过程中 current 已经变了、内核还是旧的，用 current 标归属会把旧节点
       // 记到新订阅头上（界面上就是「当前订阅是 A、候选数却是 B 的」）。
       this.coreNodesProfileId = ConnectionOrchestrator.instance().appliedProfile();
+      this.syncCandidateCount();
       this.latencyTick = this.latencyTick + 1;
       AppLogger.info(TAG, `core catalog nodes=${this.coreNodes.length} `
         + `applied=${this.coreNodesProfileId} current=${ProfileStore.currentId()}`);
@@ -979,6 +966,14 @@ export struct SubscriptionPage {
       await this.activateProfile(subId);
       const progress = await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
         (): void => { this.showToast('正在测速…'); });
+      if (progress === null) {
+        this.showToast('本次未开始测速：通道未就绪或已有测速任务，请稍后重试');
+        return;
+      }
+      if (progress.measured + progress.timeout + progress.failed === 0) {
+        this.showToast('本次未取得测速结果，请重试');
+        return;
+      }
       // 【2026-10-22】测速结论立刻落盘。
       // 此前只写进程内视图（LatencyLiveView），force-stop / 被系统清理后重启，
       // 刚测出来的 24 个绿值全变回 `--`（真机复现：测完全绿 → 杀进程 → 全 `--`）。
@@ -998,16 +993,11 @@ export struct SubscriptionPage {
       } catch (e) {
         AppLogger.warn(TAG, `persist latency conclusions failed: ${AppLogger.errText(e)}`);
       }
-      // 控制器过载必须有界面出口：过载路径下引擎**故意不给节点写结论**（保持未测），
-      // 用户看到的会是「测速完成 + 一堆 --」。不单独说明就等于「跑完了没解释」——
-      // 正是 0.4.4 过载鉴别要消灭的现象。文案要与「通道不可用」区分：通道是好的。
       if (progress !== null && progress.total === 0) {
         // 0 个目标绝不能报「测速完成」——真机实证：测速内核被系统回收后
         // `/proxies` 拿不到任何节点，批次 0 个目标立即结束，用户看到
         // 「点一下就说测速完成、节点全是 --」，误以为功能坏了。
         this.showToast('没有可测速的节点：测速内核未就绪或该订阅没有节点，请稍后重试');
-      } else if (progress !== null && progress.coreOverloaded > 0) {
-        this.showToast(`✓ 测速完成（${progress.coreOverloaded} 个节点控制器过载未测，通道正常，可重测）`);
       } else {
         this.showToast('✓ 测速完成');
       }
@@ -1040,7 +1030,7 @@ export struct SubscriptionPage {
     }
     this.groupTesting = true;
     try {
-      const api = await ConnectionOrchestrator.instance().ensureLatencyApi();
+      const api = await ConnectionOrchestrator.instance().ensureLatencyApi(true);
       if (api === null) {
         this.showToast('内核不可用，已跳过（未写入超时）');
         return;
@@ -1578,7 +1568,7 @@ export struct SubscriptionPage {
                 .layoutWeight(1)
                 Blank()
                 Row({ space: 4 }) {
-                  Text(`${this.subs.length} 订阅 · ${this.totalNodes()} 节点`)
+                  Text(`${this.subs.length} 订阅 · ${this.candidateCount} 节点`)
                     .fontSize(11).fontColor(TunBoxColors.primary)
                 }
                 .padding({ left: 8, right: 8, top: 4, bottom: 4 })
@@ -1617,13 +1607,9 @@ export struct SubscriptionPage {
                             ? TunBoxColors.success : TunBoxColors.textMuted)
                           .margin({ left: 6 })
                       }
-                      Text(`当前订阅内自动优选 · 内核 smart 组 · ${this.totalNodes()} 个候选`)
+                      // 用户要求（2026-10-23）：精简成一行，去掉「启动代理后更新」提示
+                      Text(`smart 内核 · 订阅内自动优选 · ${this.candidateCount} 个候选`)
                         .fontSize(11).fontColor(TunBoxColors.textMuted)
-                        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                      // 用户要求（2026-10-22）：选点模型不自动下载，必须在解释里说清
-                      // 「什么时候才会有模型」—— 启动代理后由内核更新，无需另找入口。
-                      Text('选点模型：启动代理后更新')
-                        .fontSize(10).fontColor(TunBoxColors.textMuted)
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                     }
                     .alignItems(HorizontalAlign.Start)
@@ -1651,22 +1637,6 @@ export struct SubscriptionPage {
                   .alignItems(VerticalAlign.Center)
                   // 2026-10-17 用户要求：点整行即选中（不再展开子列表），语义等价原展开区里的 smart 行
                   .onClick(() => this.enableAutoSelect())
-
-                  // 右：内核组测速（纯图形按钮，与顶部刷新按钮同款 36 圆；在途时转圈）
-                  Stack({ alignContent: Alignment.Center }) {
-                    if (this.groupTesting) {
-                      LoadingProgress().width(18).height(18).color(TunBoxColors.success)
-                    } else {
-                      Image($r('app.media.ic_bolt')).width(18).height(18)
-                        .fillColor(TunBoxColors.success)
-                    }
-                  }
-                  .width(34).height(34)
-                  .borderRadius(TunBoxGeometry.pillRadius)
-                  .backgroundColor(this.groupTesting ? TunBoxColors.chipBg : TunBoxColors.surfaceCard)
-                  .margin({ left: 10 })
-                  .accessibilityText('内核组测速（一次测完所有节点）')
-                  .onClick(() => { this.runKernelGroupTest(); })
                 }
                 .width('100%')
                 .padding(14)
@@ -1769,27 +1739,6 @@ export struct SubscriptionPage {
                   // 展开节点区
                   if (this.isOpen(sub.id)) {
                     Column({ space: 6 }) {
-                      // 组级诊断条（订阅级）：整组同因全败时折叠成一条，
-                      // 别让用户逐个节点点开才发现是同一个原因
-                      // （文案与判定都归测速内核 LatencyStore.summarize）。
-                      if (this.subDiagnosisText(sub.id).length > 0) {
-                        Row({ space: 8 }) {
-                          Image($r('app.media.ic_warning'))
-                            .width(15).height(15)
-                            .fillColor(TunBoxColors.warning)
-                          Text(this.subDiagnosisText(sub.id))
-                            .fontSize(12)
-                            .fontColor(TunBoxColors.warning)
-                            .layoutWeight(1)
-                            .maxLines(3)
-                        }
-                        .width('100%')
-                        .padding({ left: 12, right: 12, top: 9, bottom: 9 })
-                        .borderRadius(10)
-                        .backgroundColor(TunBoxColors.surfaceSubtle)
-                        .borderWidth(1)
-                        .borderColor(TunBoxColors.warning)
-                      }
                       // 【2026-10-22 · FlClash 同构】「定义不完整」说明条已删除 ——
                       // App 不判节点可用性；节点能不用用只由内核决定（见卡片头注释）。
                       // 2026-10-19 用户要求：原「点击选用节点 · 长按可删除单个节点 ·

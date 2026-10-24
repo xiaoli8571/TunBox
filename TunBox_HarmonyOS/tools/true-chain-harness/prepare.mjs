@@ -158,6 +158,7 @@ const FILES = [
       '../subscription/UriNodeParser': './UriNodeParser.ts',
       // 2026-10-22（FlClash 同构）：订阅原文落成 profile 文件
       '../flclash/ProfileStore': './ProfileStore.ts',
+      '../../core/CoreBridge': './stubs.ts',
       '../flclash/SubConverter': './SubConverter.ts',
       '../flclash/CoreCatalogService': './stubs.ts',
       '../flclash/CoreNodeBridge': './stubs.ts',
@@ -225,6 +226,7 @@ const FILES = [
       '@kit.ArkTS': './stubs.ts',
       '../utils/AppLogger': './stubs.ts',
       './ProfileConfigMerger': './ProfileConfigMerger.ts',
+      '../subscription/BodyDispatch': './BodyDispatch.ts',
     },
   },
 ];

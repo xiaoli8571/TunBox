@@ -14,10 +14,15 @@
 
 package linux
 
+import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+)
+
 // PollFD is struct pollfd, used by poll(2)/ppoll(2), from uapi/asm-generic/poll.h.
 //
 // +marshal slice:PollFDSlice
 type PollFD struct {
+	_       structs.HostLayout
 	FD      int32
 	Events  int16
 	REvents int16
@@ -41,4 +46,10 @@ const (
 	POLLRDHUP      = 0x2000
 	POLLFREE       = 0x4000
 	POLL_BUSY_LOOP = 0x8000
+)
+
+const (
+	// ReventsOffsetInPollFD is the byte offset of the REvents field within
+	// linux.PollFD.
+	ReventsOffsetInPollFD = 6 // +checkoffset . PollFD.REvents
 )

@@ -34,9 +34,10 @@ const (
 
 // ID types for waitid(2), from include/uapi/linux/wait.h.
 const (
-	P_ALL  = 0x0
-	P_PID  = 0x1
-	P_PGID = 0x2
+	P_ALL   = 0x0
+	P_PID   = 0x1
+	P_PGID  = 0x2
+	P_PIDFD = 0x3
 )
 
 // WaitStatus represents a thread status, as returned by the wait* family of
@@ -84,7 +85,8 @@ func (ws WaitStatus) Exited() bool {
 // with WIFSIGNALED.
 func (ws WaitStatus) Signaled() bool {
 	// ws&0x7f != 0 (exited) and ws&0x7f != 0x7f (stopped or continued)
-	return ((ws&0x7f)+1)>>1 != 0
+	bits := ws & 0x7f
+	return bits != 0 && bits != 0x7f
 }
 
 // CoreDumped returns true if ws indicates that a core dump was produced,

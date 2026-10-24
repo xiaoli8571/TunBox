@@ -365,6 +365,21 @@ type TransportDispatcher interface {
 	DeliverRawPacket(tcpip.TransportProtocolNumber, *PacketBuffer)
 }
 
+// TransportDispatcherWithDefaultHandlerResult extends TransportDispatcher with
+// default-handler-specific delivery metadata.
+type TransportDispatcherWithDefaultHandlerResult interface {
+	TransportDispatcher
+
+	// DeliverTransportPacketWithDefaultHandlerResult delivers packets to the
+	// appropriate transport protocol endpoint and reports whether the packet was
+	// specifically handled by the per-stack default transport protocol handler.
+	//
+	// pkt.NetworkHeader must be set before calling this method.
+	//
+	// DeliverTransportPacketWithDefaultHandlerResult may modify the packet.
+	DeliverTransportPacketWithDefaultHandlerResult(tcpip.TransportProtocolNumber, *PacketBuffer) (TransportPacketDisposition, bool)
+}
+
 // PacketLooping specifies where an outbound packet should be sent.
 type PacketLooping byte
 
@@ -807,6 +822,12 @@ type NetworkInterface interface {
 	// assigned to it.
 	Spoofing() bool
 
+	// AllowPromiscuousSource returns whether incoming packets may use source
+	// addresses represented only by temporary endpoints created for a
+	// promiscuous interface. It has no effect unless promiscuous mode and local
+	// packet handling are both enabled.
+	AllowPromiscuousSource() bool
+
 	// PrimaryAddress returns the primary address associated with the interface.
 	//
 	// PrimaryAddress will return the first non-deprecated address if such an
@@ -837,8 +858,6 @@ type NetworkInterface interface {
 	// HandleNeighborConfirmation processes an incoming neighbor confirmation
 	// (e.g. ARP reply or NDP Neighbor Advertisement).
 	HandleNeighborConfirmation(tcpip.NetworkProtocolNumber, tcpip.Address, tcpip.LinkAddress, ReachabilityConfirmationFlags) tcpip.Error
-
-	DisableAutoICMPReplay() bool
 }
 
 // LinkResolvableNetworkEndpoint handles link resolution events.
@@ -873,6 +892,9 @@ type NetworkEndpoint interface {
 	// generally calculated as the MTU of the underlying data link endpoint
 	// minus the network endpoint max header length.
 	MTU() uint32
+
+	// EndpointHeaderSize returns the size of this endpoint header.
+	EndpointHeaderSize() uint32
 
 	// MaxHeaderLength returns the maximum size the network (and lower
 	// level layers combined) headers can have. Higher levels use this
@@ -1137,7 +1159,6 @@ const (
 	CapabilityRXChecksumOffload
 	CapabilityResolutionRequired
 	CapabilitySaveRestore
-	CapabilityDisconnectOk
 	CapabilityLoopback
 )
 

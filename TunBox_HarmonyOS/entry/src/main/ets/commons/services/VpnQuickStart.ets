@@ -11,7 +11,7 @@ import { FormStateSync, FormStateSnapshot } from './FormStateSync';
 import { ProxyNode } from '../models/ProxyNode';
 import { AppLogger } from '../utils/AppLogger';
 import { FormInfoMetrics } from './FormInfoMetrics';
-import { SsrvpnNotifier } from './SsrvpnNotifier';
+import { TunBoxNotifier } from './TunBoxNotifier';
 
 const TAG = 'VpnQuickStart';
 
@@ -78,7 +78,7 @@ export class VpnQuickStart {
       orchestrator.init(context);
 
       const node: ProxyNode | null = subscriptions.findNode(settings.preferredNodeId)
-        ?? (subscriptions.nodes.length > 0 ? subscriptions.nodes[0] : null);
+        ?? subscriptions.fallbackConnectionNode();
       const nodeName = node === null ? '' : node.name;
       // 权威判据：持久化意图 ∧ 内核存活证据。旧版只看进程内 state 与心跳，
       // 新进程(卡片/快捷方式)state 恒为 DISCONNECTED、心跳过期即 alive=false，
@@ -92,7 +92,7 @@ export class VpnQuickStart {
         await orchestrator.disconnect();
         finalSnapshot = node === null ? FormStateSync.noNode() : FormStateSync.disconnected(nodeName);
         await FormStateSync.publish(context, finalSnapshot);
-        await SsrvpnNotifier.cancel();
+        await TunBoxNotifier.cancel();
         FormInfoMetrics.refreshAfterVpnTransition(context);
         VpnQuickStart.lastReason = `toggled-off(${authority.reason})`;
         return 'off';
@@ -106,7 +106,7 @@ export class VpnQuickStart {
         await orchestrator.disconnect();
         finalSnapshot = node === null ? FormStateSync.noNode() : FormStateSync.disconnected(nodeName);
         await FormStateSync.publish(context, finalSnapshot);
-        await SsrvpnNotifier.cancel();
+        await TunBoxNotifier.cancel();
         VpnQuickStart.lastReason = `dead-tunnel-cleanup(${authority.reason})`;
         return 'off';
       }
@@ -146,7 +146,7 @@ export class VpnQuickStart {
         // 会随之消失。这里立即拉起常驻通知（配合 VpnExtensionAbility 的长时任务），
         // 保证用户能看到"已连接"前台凭证；内核死亡由 EntryFormAbility 的
         // reconcile/updateForm 周期对账负责把卡片改回已断开。
-        await SsrvpnNotifier.update('TunBox 已连接', node.name, '↓ 0 B/s  ↑ 0 B/s');
+        await TunBoxNotifier.update('TunBox 已连接', node.name, '↓ 0 B/s  ↑ 0 B/s');
         FormInfoMetrics.refreshAfterVpnTransition(context);
       }
       AppLogger.info(TAG, `quick ${mode} => ${ok ? 'on' : 'failed'} (node=${node.name})`);

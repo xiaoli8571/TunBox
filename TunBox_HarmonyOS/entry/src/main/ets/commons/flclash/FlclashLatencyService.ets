@@ -19,10 +19,11 @@
  *  5 分钟新鲜度跳过、后台静默自动测速。
  */
 import { ClashApiService } from '../services/ClashApiService';
+import { ConnectionOrchestrator } from '../services/ConnectionOrchestrator';
 import { AppLogger } from '../utils/AppLogger';
 import { LatencyRecord, LatencyState, LatencyChannel } from '../services/LatencyState';
 import { LatencyLiveView } from '../services/LatencyLiveView';
-import { LatencyProbeKind } from '../latency/LatencyKinds';
+import { LatencyProbeKind, LatencyStrategy } from '../latency/LatencyKinds';
 import {
   DelayResult, DelayTarget, FlclashDelayRun, FlclashDelaySummary,
   FLCLASH_DELAY_TIMED_OUT, FLCLASH_DELAY_FAILED, FLCLASH_DELAY_URL, delayTestKey
@@ -51,12 +52,29 @@ export class FlclashLatencySession {
   private readonly progress: FlclashLatencyProgress = new FlclashLatencyProgress();
   private readonly source: string;
   private finished: boolean = false;
+  private readonly targets: DelayTarget[];
+  private readonly runId: number;
+  private readonly previous: Map<string, LatencyRecord>;
+
+  private clearOwnTesting(): void {
+    for (const target of this.targets) {
+      if (LatencyLiveView.isTestingOwnedBy(target.proxyName, this.runId)) {
+        const old = this.previous.get(target.proxyName);
+        LatencyLiveView.setRecord(old !== undefined ? old : LatencyRecord.untested(target.proxyName));
+      }
+    }
+    LatencyLiveView.flushNow();
+  }
   /** 完成信号（供调用方 await；取消同样会兑现，避免永远挂住）。 */
   private resolveDone: (progress: FlclashLatencyProgress) => void = (): void => {};
   private readonly donePromise: Promise<FlclashLatencyProgress>;
 
-  constructor(api: ClashApiService, targets: DelayTarget[], source: string) {
+  constructor(api: ClashApiService, targets: DelayTarget[], source: string,
+    runId: number, previous: Map<string, LatencyRecord>) {
     this.api = api;
+    this.targets = targets;
+    this.runId = runId;
+    this.previous = previous;
     this.source = source;
     this.run = new FlclashDelayRun(api.endpointBase(), api.endpointSecret());
     this.donePromise = new Promise<FlclashLatencyProgress>((resolve) => {
@@ -76,7 +94,7 @@ export class FlclashLatencySession {
         this.progress.cancelled = summary.cancelled;
         this.progress.running = false;
         this.finished = true;
-        LatencyLiveView.flushNow();
+        this.clearOwnTesting();
         this.resolveDone(this.progress);
         AppLogger.info(TAG, `delay batch done: total=${summary.total} measured=${summary.measured} `
           + `timeout=${summary.timedOut} failed=${summary.failed} cancelled=${summary.cancelled}`);
@@ -96,7 +114,10 @@ export class FlclashLatencySession {
       failKind = result.httpCode === 404
         ? LatencyProbeKind.SWITCH_FAILED : LatencyProbeKind.NETWORK_UNREACHABLE;
     }
-    const rec: LatencyRecord = result.value > 0
+    // 延迟值合法性必须与旧引擎同口径（LatencyStrategy.isValidDelay，1..32766）：
+    // 内核偶发回 65535/-1 之类的哨兵值，不套校验会把它们当真实延迟落盘并参与排序。
+    const valid = LatencyStrategy.isValidDelay(result.value);
+    const rec: LatencyRecord = valid
       ? LatencyRecord.measured(result.proxyName, result.value, LatencyChannel.CORE, now)
       : LatencyRecord.failed(result.proxyName,
         result.value === FLCLASH_DELAY_TIMED_OUT ? LatencyState.TIMEOUT : LatencyState.FAILED,
@@ -104,7 +125,7 @@ export class FlclashLatencySession {
     rec.source = this.source;
     LatencyLiveView.setRecord(rec);
     this.progress.started = this.progress.started + 1;
-    if (result.value > 0) {
+    if (valid) {
       this.progress.measured = this.progress.measured + 1;
     } else if (result.value === FLCLASH_DELAY_TIMED_OUT) {
       this.progress.timeout = this.progress.timeout + 1;
@@ -132,6 +153,7 @@ export class FlclashLatencySession {
       return;
     }
     this.run.cancel();
+    this.clearOwnTesting();
     this.progress.running = false;
     this.finished = true;
     this.resolveDone(this.progress);
@@ -141,8 +163,6 @@ export class FlclashLatencySession {
 
 export class FlclashLatencyService {
   private static current: FlclashLatencySession | null = null;
-  /** 批次身份（写入 TESTING 记录，供旧批收尾时只收回自己打的标记）。 */
-  private static runIdSeq: number = 0;
 
   /**
    * 启动一批测速（新批会取消旧批，与 FlClash「一个 job 一个 cancel 标记」一致）。
@@ -160,8 +180,10 @@ export class FlclashLatencyService {
     const effectiveUrl = testUrl.length > 0 ? testUrl : FLCLASH_DELAY_URL;
     const seen: Set<string> = new Set<string>();
     const targets: DelayTarget[] = [];
-    FlclashLatencyService.runIdSeq = FlclashLatencyService.runIdSeq + 1;
-    const runId = FlclashLatencyService.runIdSeq;
+    const previous: Map<string, LatencyRecord> = new Map<string, LatencyRecord>();
+    // 批次身份：发号统一走 LatencyLiveView.nextRunId —— 与 LatencyEngine 共用
+    // 同一序列，跨引擎永不撞号（旧批收尾误清新批 TESTING 标记的结构性根因）。
+    const runId = LatencyLiveView.nextRunId();
     for (const name of nodeNames) {
       if (name.length === 0 || seen.has(name)) {
         continue;
@@ -170,9 +192,11 @@ export class FlclashLatencyService {
       const url = perNodeUrl !== null && perNodeUrl.has(name) ? perNodeUrl.get(name) as string : effectiveUrl;
       targets.push(new DelayTarget(name, url.length > 0 ? url : effectiveUrl,
         delayTestKey(url.length > 0 ? url : effectiveUrl, name)));
+      const old = LatencyLiveView.recordFor(name);
+      if (old !== null && old.state !== LatencyState.TESTING) { previous.set(name, old); }
       LatencyLiveView.markTesting(name, runId);
     }
-    const session = new FlclashLatencySession(api, targets, source);
+    const session = new FlclashLatencySession(api, targets, source, runId, previous);
     FlclashLatencyService.current = session;
     AppLogger.info(TAG, `delay batch start: nodes=${targets.length} url=${effectiveUrl} source=${source}`);
     return session;
@@ -201,4 +225,11 @@ export class FlclashLatencyService {
     source: string = 'manual'): FlclashLatencySession {
     return FlclashLatencyService.start(api, groupNodeNames, testUrl, source, null);
   }
+}
+
+// 回收探针注册：组测速/订阅测速批进行中阻止编排器回收无头内核（顺延而非杀核）。
+// 注册在类外静态初始化，import 本模块即生效；重复注册由 includes 去重。
+const recycleProbe = (): boolean => FlclashLatencyService.isRunning();
+if (!ConnectionOrchestrator.testCoreBusyProbes.includes(recycleProbe)) {
+  ConnectionOrchestrator.testCoreBusyProbes.push(recycleProbe);
 }

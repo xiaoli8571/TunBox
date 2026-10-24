@@ -1,8 +1,8 @@
 /**
  * 日志工具：有界文件日志 + 脱敏
- * 移植自 upstream: packages/ssrvpn_shared/lib/utils/app_logger.dart
- *                packages/ssrvpn_shared/lib/utils/bounded_file_logger.dart
- *                packages/ssrvpn_shared/lib/utils/log_redactor.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/utils/app_logger.dart
+ *                packages/tunbox_shared/lib/utils/bounded_file_logger.dart
+ *                packages/tunbox_shared/lib/utils/log_redactor.dart
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';

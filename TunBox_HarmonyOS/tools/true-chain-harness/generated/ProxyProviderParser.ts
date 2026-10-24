@@ -3,7 +3,7 @@
  * proxy-providers 提取器（漏洞 C）
  *
  * Clash / Mihomo 配置允许把节点放在   proxy-providers   段（远程 http(s) provider、内联
- * inline provider 或本地 file 文件），而   proxies   段只留少量甚至为空。此前 SSRVPN 只读
+ * inline provider 或本地 file 文件），而   proxies   段只留少量甚至为空。此前 TunBox 只读
  * proxies，于是「订阅少节点」且界面没有任何提示（用户看到 0 节点或只剩几个节点）。
  *
  * 本文件做两件事：

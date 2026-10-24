@@ -4,7 +4,7 @@
  *
  * 设计要点
  * 1) 元数据留在 preferences，凭据单独进 AssetStore，键空间与明文完全分离。
- * 2) alias 稳定：节点 "ssrvpn_node|<nodeId>|<field>"，订阅 "ssrvpn_sub|<subId>|headerValue"。
+ * 2) alias 稳定：节点 "tunbox_node|<nodeId>|<field>"，订阅 "tunbox_sub|<subId>|headerValue"。
  *    nodeId = SubscriptionService.nodeKey（subscriptionId|server|port|原名），跨刷新稳定。
  * 3) 读取回退：Asset 中不存在时由调用方传入 fallback（历史明文 / 一次性 rawUri），
  *    且不因读取失败而抛错（返回 fallback）。
@@ -16,7 +16,7 @@ import { asset } from '@kit.AssetStoreKit';
 import { util } from '@kit.ArkTS';
 import { ProxyNode } from '../models/ProxyNode';
 
-export const CRED_PREF_NAME = 'ssrvpn_credentials';
+export const CRED_PREF_NAME = 'tunbox_credentials';
 
 /**
  * 节点凭据字段（全部只允许存 AssetStore）。
@@ -38,11 +38,11 @@ export const SUB_CRED_FIELD = 'headerValue';
 
 export const MIGRATION_FLAG_KEY = 'migration_v1_done';
 
-const ASSET_SERVICE = 'ssrvpn_service';
-const NODE_ALIAS_PREFIX = 'ssrvpn_node';
-const SUB_ALIAS_PREFIX = 'ssrvpn_sub';
+const ASSET_SERVICE = 'tunbox_service';
+const NODE_ALIAS_PREFIX = 'tunbox_node';
+const SUB_ALIAS_PREFIX = 'tunbox_sub';
 /** 探测 alias 的一个不可能与真实凭据重名的哨兵键（用于判断 AssetStore 是否可用） */
-const PROBE_ALIAS = 'ssrvpn_probe';
+const PROBE_ALIAS = 'tunbox_probe';
 /** 迁移/落盘统计（不含任何凭据值，可安全记录日志） */
 export class CredentialMigrationReport {
   migratedNodes: number = 0;

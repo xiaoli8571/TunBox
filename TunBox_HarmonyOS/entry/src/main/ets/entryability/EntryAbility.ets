@@ -1,6 +1,6 @@
 /**
  * 应用入口 Ability
- * 移植自 upstream: SSRVPN_Android/lib/main.dart + app.dart + startup/*（启动编排的 ArkTS 等价）
+ * 移植自 upstream: TunBox_Android/lib/main.dart + app.dart + startup/*（启动编排的 ArkTS 等价）
  */
 import { UIAbility, AbilityConstant, Want } from '@kit.AbilityKit';
 import { window, display } from '@kit.ArkUI';

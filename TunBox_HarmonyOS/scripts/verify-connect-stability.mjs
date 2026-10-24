@@ -268,7 +268,7 @@ console.log('[B7] READINESS_MAX_DELAY_MS = 300（不得再是 150）');
 // ═══════════════════════════════════════════════════════════════════════
 console.log('[B8] connect() 里 selectNode 先于 CONNECTED 且被 await');
 {
-  const connect = methodBody(orch, 'async connect(');
+  const connect = methodBody(orch, 'async connectExclusive(');
   ok('b8.connect-found', connect !== null, '找不到 ConnectionOrchestrator.connect()');
   const ct = connect ? connect.text : '';
 
@@ -310,7 +310,7 @@ console.log('[B8] connect() 里 selectNode 先于 CONNECTED 且被 await');
 // ═══════════════════════════════════════════════════════════════════════
 console.log('[B9] 钉选失败不得静默（抛错或留痕 + 读回校验）');
 {
-  const connect = methodBody(orch, 'async connect(');
+  const connect = methodBody(orch, 'async connectExclusive(');
   const ctLit = litOf(orchLit, connect);
   ok('b9.pin-guard', connect !== null && /if\s*\(\s*!pinned\s*\)\s*\{/.test(connect.text),
     '缺少 `if (!pinned) { ... }` 的钉选结果判定');
@@ -330,47 +330,15 @@ console.log('[B9] 钉选失败不得静默（抛错或留痕 + 读回校验）')
   ok('b9.failure-not-silent', failBlk !== null && (throws || logsWithName),
     '钉选失败既没抛错也没留下带节点名的日志 —— 静默失败无法事后定案');
 
-  // 读回校验：PUT 204 不代表组内真的切过去了。
-  ok('b9.read-back-verification', /await\s+this\.api\.groupSelection\(/.test(connect ? connect.text : ''),
-    '缺少读回校验（await this.api.groupSelection(...)）—— 只信 PUT 的 204 不够');
-  ok('b9.read-back-null-handled', /if\s*\(\s*pinnedNow\s*===\s*null\s*\)/.test(connect ? connect.text : ''),
-    '读回结果为 null（内核不可达/组不存在）必须有显式分支，否则「读不到」会被当成「读到了」');
-
-  // ── 定向自愈（2026-10-19 新增）：PROXY 落到 DIRECT/REJECT 时再钉一次 ──
-  //
-  // 这是用户报障「连上了但代理不生效、公网 IP 拿不到」的**最终形态**：内核把 PROXY
-  // 选到了内建策略 DIRECT/REJECT（或留空），此时隧道虽然是 up 的，但所有流量直连。
-  // 只 warn 不重试等于放过这个形态，所以必须有「检测 → 再钉一次 → 再读回」的闭环。
-  // 同时**重试失败也只记 error 不抛错** —— 与 B9 的宽松语义一致，不引入新失败面。
-  {
-    const ct = connect ? connect.text : '';
-    const ctLit2 = ctLit;
-    // 字面量 'DIRECT'/'REJECT' 在 code 视图里被抹掉了 → 用 lit 视图定位。
-    ok('b9.direct-reject-detected', /pinnedNow\s*===\s*'DIRECT'\s*\|\|\s*pinnedNow\s*===\s*'REJECT'/.test(ctLit2),
-      "缺少「读回为 DIRECT/REJECT 即判定无出口」的检测（pinnedNow === 'DIRECT' || ... 'REJECT'）");
-
-    // 定位自愈分支（lit 视图找条件，code 视图配对花括号）。
-    const off = ctLit2.indexOf("pinnedNow === 'DIRECT'");
-    let healBlk = '';
-    if (off >= 0) {
-      const open = ctLit2.indexOf('{', off);
-      const close = open >= 0 ? matchBrace(ct, open) : -1;
-      if (close > 0) healBlk = ctLit2.slice(open + 1, close);
-    }
-    ok('b9.selfheal-repins', healBlk.length > 0 && /await\s+this\.api\.selectNode\(\s*pinTargetName\s*\)/.test(healBlk),
-      '自愈分支没有「再钉一次」：await this.api.selectNode(pinTargetName)');
-    ok('b9.selfheal-reverifies', healBlk.length > 0 && /await\s+this\.api\.groupSelection\(\s*'PROXY'\s*\)/.test(healBlk),
-      "自愈后没有再次读回校验：await this.api.groupSelection('PROXY')");
-    // 重试失败不得抛错（否则又会引入「target 不在 PROXY 组 → 完全连不上」的新失败面）。
-    ok('b9.selfheal-no-throw', healBlk.length > 0 && !/throw\s+new\s+Error\(/.test(healBlk),
-      healBlk.length === 0
-        ? '找不到自愈分支（依赖 b9.direct-reject-detected 先修复）'
-        : '自愈分支里抛错了 —— 重试失败只允许 AppLogger.error 留痕，不得新增失败面');
-    ok('b9.selfheal-logs-outcome', healBlk.length > 0 && /AppLogger\.(info|error)\(/.test(healBlk),
-      healBlk.length === 0
-        ? '找不到自愈分支（依赖 b9.direct-reject-detected 先修复）'
-        : '自愈结果（成功/仍失败）必须落日志，否则事后无法判断是否直连漏流量');
-  }
+  // Read-back now belongs to selectNode: profiles own their group names.
+  // Real nested group behavior is exercised by verify-review-runtime.mjs.
+  const apiText = apiRaw;
+  ok('b9.graph-read-back', /const afterJson = await this.proxiesJson\(\)/.test(apiText),
+    '选点后必须重新读取真实内核目录');
+  ok('b9.graph-verifies-members', /entry\['now'\] !== pair\[1\]/.test(apiText),
+    '必须验证所有实际操作组的 now');
+  ok('b9.no-fake-success', throws, '选点未生效必须阻止 CONNECTED');
+  ok('b9.nested-path', /selectionPath\(/.test(apiText), '嵌套组必须沿组链设置');
 
   // task-5 原文严格口径（默认不启用）：钉选失败必须抛错。
   if (process.argv.includes('--require-throw')) {

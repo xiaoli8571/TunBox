@@ -67,11 +67,11 @@ export class SettingsService {
 
 /** CredentialStore 的别名生成器替身（与真实实现同构，避免链路里出现不同的 key）。 */
 export function nodeAlias(nodeId: string, field: string): string {
-  return `ssrvpn_node|${nodeId}|${field}`;
+  return `tunbox_node|${nodeId}|${field}`;
 }
 
 export function subAlias(subscriptionId: string): string {
-  return `ssrvpn_sub|${subscriptionId}|headerValue`;
+  return `tunbox_sub|${subscriptionId}|headerValue`;
 }
 
 export const util = {
@@ -274,6 +274,7 @@ export class CredentialMigrationReport {
   addedNew: number = 0;
   failed: number = 0;
   fieldFailed(_id: string, _field: string): boolean { return false; }
+  fieldStored(_id: string, _field: string): boolean { return false; }
 }
 
 export class NodeCredentialValues {
@@ -288,7 +289,7 @@ export class SubscriptionCredentialSource {
   headerValue: string = '';
 }
 
-export const CRED_PREF_NAME = 'ssrvpn_credentials';
+export const CRED_PREF_NAME = 'tunbox_credentials';
 export const MIGRATION_FLAG_KEY = 'migration_v1_done';
 export const SUB_CRED_FIELD = 'headerValue';
 export const NODE_CRED_FIELDS: string[] = ['password', 'uuid', 'protocolParam', 'obfsParam'];
@@ -326,6 +327,15 @@ export class CredentialStore {
   }
   static async subscriptionCredential(_id: string, fallback: string): Promise<string> { return fallback; }
   static plaintextFieldKeys(): string[] { return []; }
+  static exportAliasCache(): string { return ''; }
+  static importAliasCache(_json: string): void {}
+  static setHydrateScope(_ids: string[]): void {}
+  static async loadAllCredentials(): Promise<AnyObj> { return {}; }
+  static async nodeCredentialsFromCache(_id: string, fallback: NodeCredentialValues): Promise<NodeCredentialValues> {
+    return fallback;
+  }
+  static async markMigrationFlagInAsset(): Promise<void> {}
+  static readonly NODE_CRED_FIELDS: string[] = [];
 }
 
 export class AppInfo {
@@ -369,20 +379,48 @@ export class SubscriptionFetchError extends Error {
 
 
 /**
- * fileIo 替身（ProfileStore 的落盘分支在 Node 里不执行；单测只走纯逻辑）。
- * `accessSync`/`statSync`/`openSync` 一律抛错 = 文件不存在，调用方按「无 profile」处理。
+ * fileIo 替身：内存 Map 沙箱（tmp→rename 原子写语义保留；harnessPrefs.clear 不清文件）。
+ * 路径按字符串原样作键；未写过的路径 access/stat/open 按不存在抛错。
  */
+interface StubFile { fd: number; path: string; content: string }
+const fsSandbox = new Map<string, string>();
+let fdSeq = 3;
+const openFiles = new Map<number, StubFile>();
 export const fileIo = {
   OpenMode: { READ_ONLY: 0, READ_WRITE: 1, CREATE: 2, TRUNC: 4 },
   mkdirSync(_path: string, _recursive?: boolean): void {},
-  accessSync(_path: string): void { throw new Error('stub: not found'); },
-  statSync(_path: string): { size: number } { throw new Error('stub: not found'); },
-  openSync(_path: string, _mode: number): { fd: number } { throw new Error('stub: not found'); },
-  readSync(_fd: number, _buf: ArrayBuffer): number { return 0; },
-  writeSync(_fd: number, _text: string): number { return 0; },
+  accessSync(path: string): void { if (!fsSandbox.has(path)) { throw new Error('stub: not found'); } },
+  statSync(path: string): { size: number } {
+    const c = fsSandbox.get(path);
+    if (c === undefined) { throw new Error('stub: not found'); }
+    return { size: c.length };
+  },
+  openSync(path: string, _mode: number): { fd: number } {
+    const content = fsSandbox.get(path) ?? '';
+    const fd = fdSeq++;
+    openFiles.set(fd, { fd, path, content });
+    return { fd };
+  },
+  readSync(fd: number, buf: ArrayBuffer): number {
+    const f = openFiles.get(fd);
+    if (f === undefined) { return 0; }
+    const bytes = new TextEncoder().encode(f.content);
+    new Uint8Array(buf).set(bytes.subarray(0, buf.byteLength));
+    return Math.min(bytes.length, buf.byteLength);
+  },
+  writeSync(fd: number, text: string): number {
+    const f = openFiles.get(fd);
+    if (f === undefined) { return 0; }
+    f.content = text;
+    fsSandbox.set(f.path, text);
+    return text.length;
+  },
   closeSync(_file: unknown): void {},
-  unlinkSync(_path: string): void {},
-  renameSync(_from: string, _to: string): void {},
+  unlinkSync(path: string): void { fsSandbox.delete(path); },
+  renameSync(from: string, to: string): void {
+    const c = fsSandbox.get(from);
+    if (c !== undefined) { fsSandbox.set(to, c); fsSandbox.delete(from); }
+  },
 };
 
 
@@ -399,3 +437,12 @@ export class CoreNodeBridge {
     return null;
   }
 }
+
+export const coreBridge = { async prepareProfile(_text: string): Promise<string> { throw new Error("Inject a real profile validator in tests"); } };
+
+// ArkUI AppStorage 沙箱（SubscriptionService.persist 里的 revision 计数）
+(globalThis as AnyObj).AppStorage = {
+  map: new Map<string, Object>(),
+  setOrCreate(key: string, value: Object): void { (this.map as Map<string, Object>).set(key, value); },
+  get<T>(key: string): T | undefined { return (this.map as Map<string, T>).get(key); },
+};

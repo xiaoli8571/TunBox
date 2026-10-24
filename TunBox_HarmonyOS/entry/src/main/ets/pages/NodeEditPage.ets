@@ -1,6 +1,6 @@
 /**
  * 节点编辑页（手工添加/编辑节点）— 视觉对齐 upstream 新令牌（UiTokens）
- * 移植自 upstream: SSRVPN_Android/lib/screens/node_edit_screen.dart
+ * 移植自 upstream: TunBox_Android/lib/screens/node_edit_screen.dart
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { TunBoxMotion } from '../theme/TunBoxTokens';

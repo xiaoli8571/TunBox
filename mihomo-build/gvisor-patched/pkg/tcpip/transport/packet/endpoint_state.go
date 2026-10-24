@@ -16,9 +16,9 @@ package packet
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	"github.com/metacubex/gvisor/pkg/log"
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
 )
@@ -43,11 +43,6 @@ func (ep *endpoint) beforeSave() {
 
 // afterLoad is invoked by stateify.
 func (ep *endpoint) afterLoad(ctx context.Context) {
-	if !ep.stack.IsSaveRestoreEnabled() {
-		ep.mu.Lock()
-		ep.stack = stack.RestoreStackFromContext(ctx)
-		ep.mu.Unlock()
-	}
 	ep.stack.RegisterRestoredEndpoint(ep)
 }
 
@@ -58,7 +53,8 @@ func (ep *endpoint) Restore(_ *stack.Stack) {
 
 	ep.ops.InitHandler(ep, ep.stack, tcpip.GetStackSendBufferLimits, tcpip.GetStackReceiveBufferLimits)
 	if err := ep.stack.RegisterPacketEndpoint(ep.boundNIC, ep.boundNetProto, ep); err != nil {
-		panic(fmt.Sprintf("RegisterPacketEndpoint(%d, %d, _): %s", ep.boundNIC, ep.boundNetProto, err))
+		log.Warningf("RegisterPacketEndpoint(%d, %d, _) failed during restore with error: %s", ep.boundNIC, ep.boundNetProto, err)
+		return
 	}
 
 	ep.rcvMu.Lock()

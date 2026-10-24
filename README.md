@@ -127,15 +127,15 @@ powershell -ExecutionPolicy Bypass -File TunBox_HarmonyOS\scripts\build-ohos-cor
 - **日志重定向**：内核 stdout/stderr 经 `dup3` 重定向到 `core.log`，供诊断弹窗「技术明细」读取。
 - **代理服务器解析**：`pinProxyServerHosts` 预解析代理域名写入 hosts，避免 fake-ip 把代理
   服务器域名解析成假地址导致拨号超时；`interface-name` 绑定物理网卡防回环。
-- **smart 内核组**：lux5am/mihomo-smart 独有 `smart` 代理组（LightGBM 按连接目标优选出口），
-  支持 `policy-priority` 按节点名加权。
+- **smart 内核组**：mihomo-smart 系 fork 独有的 `smart` 代理组（LightGBM 按连接目标优选出口），
+  支持 `policy-priority` 按节点名加权；当前基线为 `vernesong/mihomo@Alpha`（= 上游 v1.19.33 + Smart 层）。
 
 完整进度/规格见 `TunBox_HarmonyOS/PORTING_STATUS.md`、`SPEC.md`。
 
 ## 致谢 / 许可
 
 - 内核：[MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo)（GPL-3.0）及
-  lux5am/mihomo-smart fork（smart 组 + LightGBM 优选）
+  [vernesong/mihomo](https://github.com/vernesong/mihomo) smart fork（smart 组 + LightGBM 优选）
 - 参考实现：NekoBox4Harmony、Hey 等同平台移植项目
 - 集成 Mihomo 须遵守 GPL-3.0（提供内核源码构建方式，见 `mihomo-build/`）；
   其余代码遵循 MIT 许可

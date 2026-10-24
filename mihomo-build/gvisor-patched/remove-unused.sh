@@ -3,6 +3,7 @@
 function remove_unused() {
     git rm -rf --ignore-unmatch \
       runsc shim tools webhook \
+      sandboxexec \
       pkg/shim \
       pkg/eventchannel \
       pkg/coverage \

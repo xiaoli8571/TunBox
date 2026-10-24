@@ -33,11 +33,11 @@
  *  - **进度更新**：dataTransfer 要求周期更新进度（首次不得超过 10 分钟），
  *    由 TaskProgressUpdater 用申请返回的 notificationId 承担；taskKeeping
  *    **不得**修改长时任务通知内容（非数据传输任务），故不推实况窗进度，
- *    速率/运行时长继续由应用自有常驻通知（SsrvpnNotifier）承载。
+ *    速率/运行时长继续由应用自有常驻通知（TunBoxNotifier）承载。
  */
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
 // `WantAgent` 是模块的**具名类型导出**（不是 wantAgent 命名空间的成员），
-// 必须与命名空间一起具名导入 —— 与 SsrvpnNotifier.ets 的既有写法一致。
+// 必须与命名空间一起具名导入 —— 与 TunBoxNotifier.ets 的既有写法一致。
 import { wantAgent, WantAgent } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { AppLogger } from '../utils/AppLogger';
@@ -61,6 +61,8 @@ export class ContinuousTaskApplyResult {
   kind: ContinuousTaskKind = ContinuousTaskKind.NONE;
   /** 长时任务通知 id（只有 dataTransfer 会用它推实况窗进度） */
   notificationId: number = -1;
+  /** 系统任务 ID 与通知 ID 不同，用于过滤上一会话迟到的取消/暂停事件。 */
+  continuousTaskId: number = -1;
   /** 失败原因（成功时为空串） */
   detail: string = '';
 }
@@ -89,12 +91,15 @@ export class UiGuardian {
   private static currentKind: ContinuousTaskKind = ContinuousTaskKind.NONE;
   /** 最近一次申请返回的长时任务通知 id（暂停恢复时用于把进度心跳接回来） */
   private static lastNotificationId: number = -1;
+  private static lastContinuousTaskId: number = -1;
+  private static retiredTaskIds: number[] = [];
   private static generation: number = 0;
   private static taskWrites: Promise<void> = Promise.resolve();
   private static watchdogTimer: number = -1;
   private static watchdogContext: Context | null = null;
   private static sessionCheck: (() => Promise<boolean>) | null = null;
   private static watchdogBusy: boolean = false;
+  private static watchdogCheckId: number = 0;
   private static watchdogAttempts: number = 0;
   private static missingSince: number = 0;
   private static suspended: boolean = false;
@@ -191,6 +196,7 @@ export class UiGuardian {
           result.ok = true;
           result.kind = ContinuousTaskKind.AUDIO_PLAYBACK;
           result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
+          result.continuousTaskId = res?.continuousTaskId ?? -1;
           result.detail = 'audioPlayback';
           await UiGuardian.acceptApplication(context, generation, result);
           return result;
@@ -212,6 +218,7 @@ export class UiGuardian {
       result.ok = true;
       result.kind = ContinuousTaskKind.TASK_KEEPING;
       result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
+      result.continuousTaskId = res?.continuousTaskId ?? -1;
       result.detail = 'taskKeeping';
       await UiGuardian.acceptApplication(context, generation, result);
       AppLogger.info(TAG, 'continuous task registered (type=taskKeeping submode=normalNotification)');
@@ -231,6 +238,7 @@ export class UiGuardian {
       result.ok = true;
       result.kind = ContinuousTaskKind.DATA_TRANSFER;
       result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
+      result.continuousTaskId = res?.continuousTaskId ?? -1;
       result.detail = 'dataTransfer';
       await UiGuardian.acceptApplication(context, generation, result);
       AppLogger.info(TAG, 'continuous task registered (type=dataTransfer, fallback path)');
@@ -264,6 +272,9 @@ export class UiGuardian {
     UiGuardian.registered = true;
     UiGuardian.currentKind = result.kind;
     UiGuardian.lastNotificationId = result.notificationId;
+    UiGuardian.lastContinuousTaskId = result.continuousTaskId;
+    UiGuardian.retiredTaskIds = UiGuardian.retiredTaskIds.filter((id: number): boolean =>
+      id !== result.continuousTaskId);
     // 成功挂上即解除退避门禁（退避只针对"紧接着的重挂尝试"）
     UiGuardian.earliestRearmAt = 0;
     UiGuardian.missingSince = 0;
@@ -332,6 +343,8 @@ export class UiGuardian {
   }
 
   private static stopWatchdog(): void {
+    UiGuardian.watchdogCheckId++;
+    UiGuardian.watchdogBusy = false;
     if (UiGuardian.watchdogTimer >= 0) { clearInterval(UiGuardian.watchdogTimer); }
     UiGuardian.watchdogTimer = -1;
     UiGuardian.watchdogContext = null;
@@ -342,8 +355,9 @@ export class UiGuardian {
     const context = UiGuardian.watchdogContext;
     const check = UiGuardian.sessionCheck;
     if (context === null || check === null || UiGuardian.watchdogBusy || UiGuardian.engaging
-      || UiGuardian.autoEngageSuppressed || UiGuardian.suspended) { return; }
+      || UiGuardian.autoEngageSuppressed) { return; }
     const generation = UiGuardian.generation;
+    const checkId = ++UiGuardian.watchdogCheckId;
     UiGuardian.watchdogBusy = true;
     try {
       if (!await check()) { return; }
@@ -352,11 +366,15 @@ export class UiGuardian {
       const tasks = await backgroundTaskManager.getAllContinuousTasks(context);
       if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
       for (const task of tasks) {
-        const ownsTask = UiGuardian.lastNotificationId >= 0
-          ? task.notificationId === UiGuardian.lastNotificationId
-          : task.backgroundModes.includes(UiGuardian.currentKind);
+        const ownsTask = UiGuardian.lastContinuousTaskId >= 0
+          ? task.continuousTaskId === UiGuardian.lastContinuousTaskId
+          : (UiGuardian.lastNotificationId >= 0
+            ? task.notificationId === UiGuardian.lastNotificationId
+            : task.backgroundModes.includes(UiGuardian.currentKind));
         if (!ownsTask) { continue; }
+        UiGuardian.lastContinuousTaskId = task.continuousTaskId;
         if (task.suspendState) {
+          UiGuardian.suspended = true;
           UiGuardian.registered = false;
           TaskProgressUpdater.detach();
           await AudioKeepAlive.stop();
@@ -368,10 +386,19 @@ export class UiGuardian {
           return;
         }
         UiGuardian.registered = true;
+        UiGuardian.suspended = false;
+        // 暂停/恢复事件可能丢失，自检确认恢复时也要接回 dataTransfer 的进度心跳。
+        // 已接回时保持原定时器，避免每 30s 自检都推迟五分钟心跳。
+        if (UiGuardian.currentKind === ContinuousTaskKind.DATA_TRANSFER
+          && !TaskProgressUpdater.isActive() && UiGuardian.lastNotificationId >= 0) {
+          TaskProgressUpdater.attach(UiGuardian.lastNotificationId, UiGuardian.currentKind);
+        }
         UiGuardian.missingSince = 0;
         UiGuardian.watchdogAttempts = 0;
         return;
       }
+      // 暂停的任务不得当成普通缺失任务重新申请；等待系统确认恢复。
+      if (UiGuardian.suspended) { return; }
       UiGuardian.registered = false;
       TaskProgressUpdater.detach();
       await AudioKeepAlive.stop();
@@ -387,7 +414,7 @@ export class UiGuardian {
       if (!await check() || generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
       await UiGuardian.rearm(context, true);
     } finally {
-      UiGuardian.watchdogBusy = false;
+      if (checkId === UiGuardian.watchdogCheckId) { UiGuardian.watchdogBusy = false; }
     }
   }
 
@@ -480,6 +507,9 @@ export class UiGuardian {
     UiGuardian.registered = false;
     UiGuardian.currentKind = ContinuousTaskKind.NONE;
     UiGuardian.lastNotificationId = -1;
+    UiGuardian.retireCurrentTask();
+    UiGuardian.lastContinuousTaskId = -1;
+    UiGuardian.suspended = false;
     TaskProgressUpdater.detach();
 
     if (verdict.requireUserAction) {
@@ -494,6 +524,8 @@ export class UiGuardian {
       return;
     }
     if (verdict.allowAutoRearm) {
+      // 系统取消事件已经确认任务缺失，下一次自检只需等同一轮退避。
+      UiGuardian.missingSince = Date.now();
       UiGuardian.earliestRearmAt = Date.now() + verdict.backoffMs;
       AppLogger.info(TAG,
         `guardian auto re-arm allowed after backoff: category=${verdict.category} reason=${verdict.reasonCode} `
@@ -580,12 +612,32 @@ export class UiGuardian {
     UiGuardian.registered = false;
     UiGuardian.currentKind = ContinuousTaskKind.NONE;
     UiGuardian.lastNotificationId = -1;
+    UiGuardian.retireCurrentTask();
+    UiGuardian.lastContinuousTaskId = -1;
     UiGuardian.earliestRearmAt = 0;
     TaskProgressUpdater.detach();
   }
 
   static isRegistered(): boolean {
     return UiGuardian.registered;
+  }
+
+  /** Cancel/suspend IDs are continuous-task IDs, never notification IDs. */
+  static ownsTaskEvent(taskId: number): boolean {
+    if (UiGuardian.retiredTaskIds.includes(taskId)) { return false; }
+    if (UiGuardian.lastContinuousTaskId >= 0 && taskId >= 0) {
+      return taskId === UiGuardian.lastContinuousTaskId;
+    }
+    // Older SDKs may omit the ID in the registration reply; retain the legacy path
+    // only while this process actually owns or is applying a task.
+    return UiGuardian.registered || UiGuardian.engaging || UiGuardian.suspended;
+  }
+
+  private static retireCurrentTask(): void {
+    const id = UiGuardian.lastContinuousTaskId;
+    if (id < 0 || UiGuardian.retiredTaskIds.includes(id)) { return; }
+    UiGuardian.retiredTaskIds.push(id);
+    if (UiGuardian.retiredTaskIds.length > 16) { UiGuardian.retiredTaskIds.shift(); }
   }
 
   /**

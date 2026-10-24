@@ -1,6 +1,6 @@
 /**
- * SSRVPN Premium Theme — HarmonyOS 版本
- * 移植自 upstream: SSRVPN_Android/lib/theme/app_theme.dart
+ * TunBox Premium Theme — HarmonyOS 版本
+ * 移植自 upstream: TunBox_Android/lib/theme/app_theme.dart
  * 色值逐项照抄，不得改动。
  */
 export class AppTheme {

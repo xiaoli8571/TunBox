@@ -14,7 +14,11 @@
 
 package linux
 
-import "github.com/metacubex/gvisor/pkg/common"
+import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+
+	"github.com/metacubex/gvisor/pkg/common"
+)
 
 const (
 	// IFNAMSIZ is the size of the name field for IFReq.
@@ -25,6 +29,7 @@ const (
 //
 // +marshal
 type IFReq struct {
+	_ structs.HostLayout
 	// IFName is an encoded name, normally null-terminated. This should be
 	// accessed via the Name and SetName functions.
 	IFName [IFNAMSIZ]byte
@@ -68,6 +73,7 @@ var SizeOfIFReq = (*IFReq)(nil).SizeBytes()
 
 // IFMap contains interface hardware parameters.
 type IFMap struct {
+	_        structs.HostLayout
 	MemStart uint64
 	MemEnd   uint64
 	BaseAddr int16
@@ -82,6 +88,7 @@ type IFMap struct {
 //
 // +marshal
 type IFConf struct {
+	_   structs.HostLayout
 	Len int32
 	_   [4]byte // Pad to sizeof(struct ifconf).
 	Ptr uint64
@@ -108,6 +115,7 @@ const (
 //
 // +marshal
 type EthtoolGFeatures struct {
+	_    structs.HostLayout
 	Cmd  uint32
 	Size uint32
 }
@@ -118,6 +126,7 @@ type EthtoolGFeatures struct {
 //
 // +marshal
 type EthtoolGetFeaturesBlock struct {
+	_            structs.HostLayout
 	Available    uint32
 	Requested    uint32
 	Active       uint32

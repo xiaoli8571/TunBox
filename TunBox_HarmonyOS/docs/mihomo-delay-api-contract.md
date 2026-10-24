@@ -1,6 +1,6 @@
-# mihomo 延迟测试 API 契约（SSRVPN 实测存档）
+# mihomo 延迟测试 API 契约（TunBox 实测存档）
 
-**实测环境**：SSRVPN 5.5.6 真机（MLR-AL00 / API 24），内核 `{"meta":true,"version":"1.10.0"}`
+**实测环境**：TunBox 5.5.6 真机（MLR-AL00 / API 24），内核 `{"meta":true,"version":"1.10.0"}`
 通过 `hdc fport tcp:19090 tcp:9090` 把设备 controller 转发到 PC，用 Node/curl 直接打 API。
 配置含 47 个真实节点（46 可用 + 1 手填），11 个 select 组。
 
@@ -60,7 +60,7 @@ GET /group/{urlencoded-name}/delay?url={urlencoded}&timeout={ms}
 6 路并行单节点请求 → wall 842ms，全部 200，各自 77~156ms。
 内核自身并发能力充足，**瓶颈在客户端 lane 数与超时预算**。
 
-## 5. 对 SSRVPN 的结论
+## 5. 对 TunBox 的结论
 
 1. 现有「为测速拉起第二个无头内核进程（VpnExtensionAbility + mihomo_test_config.yaml）」是**完全不必要的**：组端点已经在内核内并发调度，且真实隧道运行时 controller 就在 9090。
 2. 现有 46 节点批测要经历：生成测速配置 → 停旧扩展 → 600ms 等待 → 启新扩展 → 健康轮询 → 10 lane × /delay → 回收 → 90s 宽限定时器；新方案只需**一个 HTTP 请求**。

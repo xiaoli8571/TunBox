@@ -1,6 +1,6 @@
 /**
  * 设置持久化服务
- * 移植自 upstream: SSRVPN_Android/lib/services/settings_service.dart
+ * 移植自 upstream: TunBox_Android/lib/services/settings_service.dart
  * - apiSecret：@ohos.security.asset（系统级加密存储，对应 Keystore AES-GCM / NativeApiSecretResolver）
  * - 连接快照：重启后恢复上次连接意图（对应 NativeConnectionSnapshotStore）
  */
@@ -13,7 +13,7 @@ import { RawSubscriptionStore } from './RawSubscriptionStore';
 import { NodeLatencyRecord, NodeSortModes, NodeSortSnapshot } from './NodeSortPersistence';
 
 const TAG = 'SettingsService';
-const PREF_NAME = 'ssrvpn_settings';
+const PREF_NAME = 'tunbox_settings';
 const KEY_SETTINGS = 'app_settings_json';
 /**
  * 测速结论分片（字段级落盘）：只装**测速路径拥有**的字段
@@ -26,7 +26,7 @@ const KEY_NODE_SORT_LATENCY = 'node_sort_latency_json';
  * 只由 `saveNodeSortStats()` 写。
  */
 const KEY_NODE_SORT_STATS = 'node_sort_stats_json';
-const ASSET_SERVICE = 'ssrvpn_service';
+const ASSET_SERVICE = 'tunbox_service';
 const ASSET_SECRET_KEY = 'api_secret';
 const KEY_SNAPSHOT = 'connection_snapshot_json';
 const KEY_DOH_PINS = 'doh_pins_json';

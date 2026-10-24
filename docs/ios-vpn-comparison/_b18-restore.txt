@@ -810,9 +810,9 @@ Line 97: {"todos":[{"content":"P0-1 订阅自动刷新接线（WorkScheduler+前
 <content>
 1: /**
 2:  * 订阅拉取策略：UA 协商
-3:  * 移植自 upstream: packages/ssrvpn_shared/lib/services/subscription_fetch_policy.dart
+3:  * 移植自 upstream: packages/tunbox_shared/lib/services/subscription_fetch_policy.dart
 4:  *
-5:  * UA 顺序（必须一致）：SSRVPN → Clash Verge → v2rayN → Shadowrocket。
+5:  * UA 顺序（必须一致）：TunBox → Clash Verge → v2rayN → Shadowrocket。
 6:  * 每次降级重试都在 HTTP 403/406 或空结果时触发。
 7:  */
 8: import { http, connection } from '@kit.NetworkKit';
@@ -859,7 +859,7 @@ Line 97: {"todos":[{"content":"P0-1 订阅自动刷新接线（WorkScheduler+前
 38: /**
 39:  * UA 顺序：优先 Clash 系 UA 让面板直接返回 Clash YAML（vmess/vless/trojan 字段最完整），
 40:  * 其余 UA 依次兜底；解析层同时支持 vless/vmess/trojan 链接格式。
-41:  * SSRVPN 自家 UA 携带实时版本（AppInfo 单一来源, 不再硬编码）。
+41:  * TunBox 自家 UA 携带实时版本（AppInfo 单一来源, 不再硬编码）。
 42:  */
 43: export const UA_CHAIN: string[] = [
 44:   'clash-verge/v1.7.7',

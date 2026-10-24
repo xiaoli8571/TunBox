@@ -120,20 +120,19 @@ export class ProfileConfigMerger {
     }
     // 2) 原文显式写了 enhanced-mode 就完全尊重
     const joined: string = lines.join(LF);
-    if (ProfileConfigMerger.hasKey(joined, 'enhanced-mode')) {
+    // sectionText 已把 DNS 直接子键归一到两空格，hasKey 只识别顶层键，不能用在这里。
+    const hasChild = (key: string): boolean =>
+      lines.some((line: string): boolean => line.startsWith(`  ${key}:`));
+    if (hasChild('enhanced-mode')) {
       return joined;
     }
     // 3) 否则补 fake-ip：境外域名交给节点侧解析，不吃国内 DNS 的污染结果
-    const extra: string[] = [
-      '  enhanced-mode: fake-ip',
-      '  fake-ip-range: 198.18.0.1/16',
-      '  fake-ip-filter:',
-      '    - "*.lan"',
-      '    - "*.local"',
-      '    - localhost.ptlogin2.qq.com',
-      '    - "+.msftconnecttest.com"',
-      '    - "+.msftncsi.com"'
-    ];
+    const extra: string[] = ['  enhanced-mode: fake-ip'];
+    if (!hasChild('fake-ip-range')) { extra.push('  fake-ip-range: 198.18.0.1/16'); }
+    if (!hasChild('fake-ip-filter')) {
+      extra.push('  fake-ip-filter:', '    - "*.lan"', '    - "*.local"',
+        '    - localhost.ptlogin2.qq.com', '    - "+.msftconnecttest.com"', '    - "+.msftncsi.com"');
+    }
     const head: string[] = lines.slice(0, 1);
     const tail: string[] = lines.slice(1);
     return head.concat(extra).concat(tail).join(LF);
@@ -161,19 +160,7 @@ export class ProfileConfigMerger {
       return profileYaml;
     }
     const LF: string = String.fromCharCode(10);
-    const names: string[] = [];
-    const body = ProfileConfigMerger.sectionBody(profileYaml, 'proxies');
-    for (const line of body) {
-      const m = /^\s*-\s*name:\s*(.+)$/.exec(line);
-      if (m !== null) {
-        const raw = m[1].trim();
-        const unquoted = (raw.startsWith('"') && raw.endsWith('"'))
-          ? raw.substring(1, raw.length - 1) : raw;
-        if (unquoted.length > 0) {
-          names.push(unquoted);
-        }
-      }
-    }
+    const names = YamlMerger.sequenceItemNames(profileYaml, 'proxies');
     if (names.length === 0) {
       return profileYaml;
     }
@@ -190,7 +177,7 @@ export class ProfileConfigMerger {
     for (const n of names) {
       lines.push(`      - ${ProfileConfigMerger.yamlQuote(n)}`);
     }
-    lines.push('rules:', '  - GEOIP,CN,DIRECT', '  - MATCH,手动选择');
+    lines.push('rules:', '  - MATCH,手动选择');
     return lines.join(LF);
   }
 
@@ -235,20 +222,33 @@ export class ProfileConfigMerger {
     if (!ProfileConfigMerger.hasKey(yaml, key)) {
       return '';
     }
-    let body = '';
-    try {
-      body = YamlMerger.extractSection(yaml, key);
-    } catch (e) {
-      body = '';
+    const lines = yaml.replace(/\r/g, '').split('\n');
+    const body: string[] = [];
+    let head = '';
+    let collecting = false;
+    for (const raw of lines) {
+      const line = raw.replace(/^\uFEFF/, '');
+      if (!collecting) {
+        if (line.startsWith(`${key}:`)) { head = line; collecting = true; }
+        continue;
+      }
+      if (line.trim().length > 0 && !line.startsWith(' ') && !line.startsWith('\t')
+        && !line.trimStart().startsWith('#') && !line.startsWith('-')) { break; }
+      body.push(line);
     }
-    const trimmed = body.trim();
-    if (trimmed.length === 0) {
-      return `${key}:`;
+    if (head.substring(key.length + 1).trim().length > 0) { return head; }
+    let indent = 999999;
+    for (const line of body) {
+      if (line.trim().length > 0 && !line.trimStart().startsWith('#')) {
+        indent = Math.min(indent, line.length - line.trimStart().length);
+      }
     }
-    if (trimmed === '[]') {
-      return `${key}: []`;
+    if (indent === 999999) { return head; }
+    const normalized: string[] = [head];
+    for (const line of body) {
+      if (line.trim().length > 0) { normalized.push('  ' + line.substring(Math.min(indent, line.length - line.trimStart().length))); }
     }
-    return `${key}:\n${body}`;
+    return normalized.join('\n');
   }
 
   /**
@@ -517,8 +517,7 @@ export class ProfileConfigMerger {
       out.add(name);
     }
     for (const key of ['proxies', 'proxy-groups']) {
-      for (const line of ProfileConfigMerger.sectionBody(profileYaml, key)) {
-        const name = ProfileConfigMerger.itemName(line);
+      for (const name of YamlMerger.sequenceItemNames(profileYaml, key)) {
         if (name.length > 0) {
           out.add(name);
         }
@@ -568,14 +567,7 @@ export class ProfileConfigMerger {
   }
 
   private static countProxyItems(yaml: string): number {
-    const body = ProfileConfigMerger.sectionBody(yaml, 'proxies');
-    let count = 0;
-    for (const raw of body) {
-      if (raw.trimStart().startsWith('- ') || raw.trim() === '-') {
-        count = count + 1;
-      }
-    }
-    return count;
+    return YamlMerger.proxyItemGroups(yaml).length;
   }
 
   private static removeKey(yaml: string, key: string): string {

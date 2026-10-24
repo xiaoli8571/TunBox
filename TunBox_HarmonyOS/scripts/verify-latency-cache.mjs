@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os';
 
 const appRoot = resolve(import.meta.dirname, '..');
 const services = join(appRoot, 'entry', 'src', 'main', 'ets', 'commons', 'services');
-const sandbox = join(tmpdir(), 'ssrvpn-latency-cache-' + process.pid);
+const sandbox = join(tmpdir(), 'tunbox-latency-cache-' + process.pid);
 rmSync(sandbox, { recursive: true, force: true });
 mkdirSync(sandbox, { recursive: true });
 writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');

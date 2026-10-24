@@ -17,7 +17,7 @@ $entry = [IO.File]::ReadAllText($entryPath)
 $module = [IO.File]::ReadAllText($modulePath)
 $app = [IO.File]::ReadAllText($appPath)
 
-Assert-Text $shortcut '"bundleName"\s*:\s*"com\.ssrvpn\.client"' 'Shortcut bundleName mismatch'
+Assert-Text $shortcut '"bundleName"\s*:\s*"com\.tunbox\.client"' 'Shortcut bundleName mismatch'
 Assert-Text $shortcut '"abilityName"\s*:\s*"QuickToggleAbility"' 'Shortcut target mismatch'
 Assert-Text $shortcut '"vpn_shortcut"\s*:\s*"start"' 'Shortcut parameter missing'
 Assert-Text $module '"name"\s*:\s*"QuickToggleAbility"' 'QuickToggleAbility module declaration missing'
@@ -31,7 +31,7 @@ Assert-Text $ability 'if\s*\(this\.running\s*\|\|' 'Single-flight running guard 
 Assert-Text $ability 'if\s*\(this\.pendingMode\.length\s*>\s*0\)' 'Deferred click drain missing'
 Assert-Text $entry 'onCreate\s*\(' 'EntryAbility onCreate missing'
 Assert-Text $entry 'onNewWant\s*\(' 'EntryAbility onNewWant missing'
-Assert-Text $app '"bundleName"\s*:\s*"com\.ssrvpn\.client"' 'App bundleName mismatch'
+Assert-Text $app '"bundleName"\s*:\s*"com\.tunbox\.client"' 'App bundleName mismatch'
 Assert-Text $app '"versionName"\s*:\s*"5\.2"' 'versionName is not 5.2'
 Assert-Text $app '"versionCode"\s*:\s*50200' 'versionCode is not 50200'
 

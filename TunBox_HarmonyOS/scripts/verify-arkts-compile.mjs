@@ -98,7 +98,7 @@ const args = [
  * 返回 { out, arktsErrors, buildOk }。
  *
  * ⚠ 2026-10-20（settings-ui 实测反馈）：**ArkTS 错误数为 0 但打包/签名阶段失败**是工具链偶发
- *   （实测一次 `Sign lib error msg : null AT entry : libs/arm64-v8a/libssrvpn_core_napi.so`，
+ *   （实测一次 `Sign lib error msg : null AT entry : libs/arm64-v8a/libtunbox_core_napi.so`，
  *   紧接着重跑一次就 BUILD SUCCESSFUL）⇒ 这种「不是代码问题」的失败要**自动重试一次**再判红，
  *   否则会把工具链抖动误报成代码回归（用户看到「编译红了」会去查代码，实际代码是干净的）。
  */

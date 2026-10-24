@@ -305,14 +305,14 @@ if (!kernel || !fs.existsSync(kernel)) {
   // 删掉并重新联网下载（实测 90s 阻塞）。所以这里用真实模型文件，找不到就跳过，
   // 绝不能用假文件 —— 那只会测出「下载耗时」而不是「是否复用现成模型」。
   const modelCandidates = [
-    process.env.SSRVPN_MODEL_BIN,
-    path.join(os.homedir(), '.ssrvpn-test', 'Model.bin'),
+    process.env.TUNBOX_MODEL_BIN,
+    path.join(os.homedir(), '.tunbox-test', 'Model.bin'),
     path.join(root, '..', 'mihomo-build', 'Model.bin'),
   ].filter(Boolean);
   const realModel = modelCandidates.find(p => fs.existsSync(p) && fs.statSync(p).size > 1024 * 1024);
   if (!realModel) {
     skip('未找到真实 Model.bin（9.3MB）—— 跳过内核解析段');
-    skip(`  可设 SSRVPN_MODEL_BIN=<path> 或用 curl 经代理下载到 ${modelCandidates[1]}`);
+    skip(`  可设 TUNBOX_MODEL_BIN=<path> 或用 curl 经代理下载到 ${modelCandidates[1]}`);
   } else {
   fs.copyFileSync(realModel, path.join(kd, 'Model.bin'));
   console.log(`  使用模型: ${realModel} (${fs.statSync(realModel).size} bytes)`);

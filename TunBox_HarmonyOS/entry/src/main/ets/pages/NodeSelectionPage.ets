@@ -1,5 +1,5 @@
 /**
- * 节点选择页 — 对齐 upstream SsrvpnNodeSelectionPage + _NodeSelectionCard
+ * 节点选择页 — 对齐 upstream TunBoxNodeSelectionPage + _NodeSelectionCard
  * 顶栏(返回/标题/测全部) + 订阅筛选 chips + 节点卡列表（旗帜/名称/延迟按钮/选中勾）。
  *
  * 测速唯一入口是 `LatencyEngine`：已连接时复用隧道 controller，未连接时由编排器的
@@ -180,31 +180,6 @@ struct NodeSelectionPage {
    * （真机取证 2026-10-20：通道准备 = DoH 预解析 + 启扩展 + 就绪轮询 + 预热）。
    */
   @State latencyPreparing: boolean = false;
-  /**
-   * 本轮组测返回 **504（all proxies timeout）** = **所有节点都不通**，但**通道正常**。
-   *
-   * 必须与 `latencyCoreUnavailable` 区分开：
-   *  - 「内核不可用，本轮未测」= 本轮**根本没测出任何结论**（secret 错配 / 组不存在 / 传输异常）；
-   *  - 「全部节点超时」= 测了，**结论就是节点全不通**（可落库、可排序）。
-   * 早期实现把两者混为一谈（组测 504 → `resultMap === null` → coreUnavailable），
-   * 于是用户报「测速全部失败」时根本分不清是节点坏了还是内核挂了。
-   */
-  @State latencyAllTimedOut: boolean = false;
-  /**
-   * **组级诊断条**文案（空串 = 不显示）。
-   *
-   * 整组**同因**全败时折叠成一条，而不是铺 N 条同色红条。
-   * 真机取证（2026-10-20，lead 追加）：那批全败节点的服务器域名在
-   * 阿里/Cloudflare/Google/腾讯**全部 NXDOMAIN** —— 失败在**域名解析**，
-   * 不是网络不通。用户原话：「你就把失败改成网络不可达，你糊弄谁呢」。
-   * 于是「34/34 个节点域名无法解析，疑似机场域名下线，请联系机场换线路
-   * 或更换订阅」必须**说在前面**，而不是让用户对着 34 条一样的红条自己猜。
-   *
-   * 口径：同一失败分类占本批失败总数的比例 ≥ 80%（且 ≥ 2 个）才折叠；
-   * 只统计**判定类**失败（通道没就绪/没排上队这类「我们自己的问题」不算
-   * 节点结论，它们由顶栏的「内核不可用」提示）。
-   */
-  @State latencyGroupDiagnosis: string = '';
   /**
    * 本轮是否被取消（用户点取消 / 页面退出）。
    * 引擎的 LatencyProgress 只统计「取消时正好在探测的节点」，无法回答"这一批是否
@@ -999,7 +974,6 @@ struct NodeSelectionPage {
     }
     this.batchCancelled = false;
     // 逐节点路径不涉及组测的 504 语义：每轮重置，避免上一轮的「全部超时」残留。
-    this.latencyAllTimedOut = false;
     if (driveHeader) {
       // 立刻进入「进度 + 取消」态：取通道本身可能要等（未连接时要拉起进程内无头内核），
       // 这段等待必须有可见反馈，否则用户会以为点了没反应。
@@ -1053,7 +1027,6 @@ struct NodeSelectionPage {
       LatencyStoreBridge.flushNow();
       // 组级诊断（同因全败 → 折叠成一条）：本批结束后重算，
       // 新批次没有同因失败时自动收起。
-      this.latencyGroupDiagnosis = this.computeGroupDiagnosis(list);
       if (driveHeader) {
         this.batchTesting = false;
       }
@@ -1150,18 +1123,6 @@ struct NodeSelectionPage {
       names.push(node.name);
     }
     await LatencyStoreBridge.persistConclusions(names);
-  }
-
-  /**
-   * 组级诊断（**唯一实现**在 LatencyStoreBridge.groupDiagnosis —— 节点页与
-   * 订阅页共用同一份聚合口径与同一句文案，避免同一句话两处实现）。
-   */
-  private computeGroupDiagnosis(tested: ProxyNode[]): string {
-    const names: string[] = [];
-    for (const node of tested) {
-      names.push(node.name);
-    }
-    return LatencyStoreBridge.groupDiagnosis(names);
   }
 
   /** 无记录 = 本次没得出节点结论：保持「未测」，交给 buildAuto 沿用旧结论 */
@@ -1381,7 +1342,6 @@ struct NodeSelectionPage {
     await this.commitLatencySnapshot(list);
     await this.persistSortState();
     // 组级诊断：整组同因全败 → 折叠成一条诊断条（不铺 N 条同色红条）
-    this.latencyGroupDiagnosis = this.computeGroupDiagnosis(list);
     AppLogger.info(TAG, `latency batch done: total=${progress.total} measured=${progress.measured} `
       + `timeout=${progress.timeout} failed=${progress.failed} channel=${progress.channel}`);
     if (this.pageActive) {
@@ -1625,11 +1585,6 @@ struct NodeSelectionPage {
                 Text('内核不可用，本轮未测')
                   .fontSize(11)
                   .fontColor(Ui.warning)
-              } else if (this.latencyAllTimedOut) {
-                // 504：通道正常，只是所有节点都不通 —— 与「内核不可用」是两件事
-                Text('全部节点超时（通道正常）')
-                  .fontSize(11)
-                  .fontColor(Ui.warning)
               }
               // 测试中「测全部」变成转圈反馈（用户要求）：不然以为没点上
               if (this.batchTesting) {
@@ -1661,30 +1616,6 @@ struct NodeSelectionPage {
         .padding({ left: 16, right: 16 })
         // 选择态下整条常规顶栏让位给上面的「已选 N · 全选 · 删除」条
         .visibility(this.selectMode ? Visibility.None : Visibility.Visible)
-
-        // ── 组级诊断条 ──
-        // 整组同因全败时，折叠成**一条**能说清原因的诊断条
-        // （例：「34/34 个节点域名无法解析，疑似机场域名下线，请联系机场换线路
-        // 或更换订阅」），而不是让用户对着 34 条一模一样的红条自己猜。
-        if (this.latencyGroupDiagnosis.length > 0) {
-          Row({ space: 8 }) {
-            Image($r('app.media.ic_warning'))
-              .width(16).height(16)
-              .fillColor(Ui.warning)
-            Text(this.latencyGroupDiagnosis)
-              .fontSize(12)
-              .fontColor(Ui.warning)
-              .layoutWeight(1)
-              .maxLines(3)
-          }
-          .width('100%')
-          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-          .margin({ left: 16, right: 16, top: 10 })
-          .borderRadius(10)
-          .backgroundColor(Ui.surfaceMuted)
-          .borderWidth(1)
-          .borderColor(Ui.warning)
-        }
 
         // ── 订阅筛选 chips ──
         if (this.subChips.length > 0) {

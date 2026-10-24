@@ -92,5 +92,5 @@ func packetEPsinitLockNames() {}
 
 func init() {
 	packetEPsinitLockNames()
-	packetEPsprefixIndex = locking.NewMutexClass(reflect.TypeOf(packetEPsRWMutex{}), packetEPslockNames)
+	packetEPsprefixIndex = locking.NewMutexClass(reflect.TypeOf((*packetEPsRWMutex)(nil)).Elem(), packetEPslockNames)
 }

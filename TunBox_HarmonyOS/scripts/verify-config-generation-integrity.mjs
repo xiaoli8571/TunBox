@@ -455,7 +455,10 @@ console.log(`临时转译环境：${tmpRoot}`);
 // 本机路径：C:\Worker\TunBox\mihomo-build\<build>\mihomo.exe（与 App 内置同一份构建）。
 // 找不到就整段降级为「跳过」（不判失败），保证脚本在别的机器上也能跑。
 const MIHOMO_CANDIDATES = [
-  'C:/Worker/TunBox/mihomo-build/mihomo-smart-8d4c8c70faedc27fda176ee18742ab86b5835a83/mihomo.exe',
+  // 与 App 内置内核同源的 Windows 构建（prepare.mjs 钉死的那一份）
+  'C:/Worker/TunBox/TunBox-Window/extra/sidecar/mihomo-smart.exe',
+  // 或者直接放在新内核源码树里的构建产物
+  'C:/Worker/TunBox/mihomo-build/mihomo-smart-462455136157a760937c666bba71afe33b1a809e/mihomo.exe',
 ];
 function findMihomo() {
   for (const p of MIHOMO_CANDIDATES) {
@@ -1332,6 +1335,24 @@ section('[16] 原文透传：有/无原文、有无订阅归属的节点都不�
   ok((pBlock.match(/^\s*-\s/gm) || []).length === 3,
     `⑯ proxies: 段条目数 = 3（实际 ${(pBlock.match(/^\s*-\s/gm) || []).length}）`);
   kernelOk(cfg, '⑯ 原文透传 + 手工节点混合的配置');
+}
+
+// 自定义 GEOIP 规则也必须受数据库就绪闸门约束，首次安装不能同步联网下载卡住启动。
+{
+  const settings = baseSettings();
+  settings.customRules = ['GEOIP,US,DIRECT', 'DOMAIN-SUFFIX,example.com,REJECT'];
+  const before = settings.customRules.slice();
+  const missing = generateConfig({ settings, useGeoip: false });
+  ok(!missing.includes('GEOIP,US,DIRECT'), '⑰ 缺库时跳过自定义 GEOIP 规则');
+  ok(missing.includes('DOMAIN-SUFFIX,example.com,REJECT'), '⑰ 缺库不影响普通域名规则');
+  ok(JSON.stringify(settings.customRules) === JSON.stringify(before), '⑰ 不修改用户保存的规则');
+  kernelOk(missing, '⑰ 没有 GeoIP 数据库的首次连接配置');
+  const ready = generateConfig({ settings, useGeoip: true });
+  ok(ready.includes('GEOIP,US,DIRECT'), '⑰ 数据库就绪后自定义 GEOIP 规则恢复');
+  settings.rulesEnabled = false;
+  const disabled = generateConfig({ settings, useGeoip: false });
+  ok(!disabled.includes('GEOIP,US,DIRECT') && !disabled.includes('DOMAIN-SUFFIX,example.com,REJECT'),
+    '⑰ 关闭规则引擎后不发射自定义规则');
 }
 
 console.log(`\n${passed} passed, ${failed} failed, ${deferred} deferred`);

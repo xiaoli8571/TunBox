@@ -1,7 +1,7 @@
 /**
  * 诊断面板（底部弹出）
- * 移植自 upstream: SSRVPN_Android/lib/widgets/android_diagnostics_sheet.dart
- *                packages/ssrvpn_shared/lib/widgets/app_diagnostics_view.dart
+ * 移植自 upstream: TunBox_Android/lib/widgets/android_diagnostics_sheet.dart
+ *                packages/tunbox_shared/lib/widgets/app_diagnostics_view.dart
  *
  * 第二阶段·第三轮增强：新增「链路健康自检」区域
  *   - 展示 lastHealthReport() 的分项（label/status/detail/耗时）

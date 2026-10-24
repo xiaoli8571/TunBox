@@ -258,7 +258,7 @@ func (l *listenContext) startHandshake(s *segment, opts header.TCPSynOptions, qu
 
 		// Propagate any inheritable options from the listening endpoint
 		// to the newly created endpoint.
-		l.listenEP.propagateInheritableOptionsLocked(ep) // +checklocksforce
+		l.listenEP.propagateInheritableOptionsLocked(ep) // +checklocksforce:ep.mu
 
 		if !ep.reserveTupleLocked() {
 			ep.mu.Unlock()
@@ -362,6 +362,7 @@ func (e *Endpoint) propagateInheritableOptionsLocked(n *Endpoint) {
 	n.boundBindToDevice = e.boundBindToDevice
 	n.boundPortFlags = e.boundPortFlags
 	n.userMSS = e.userMSS
+	n.ops.SetMark(e.ops.GetMark())
 }
 
 // reserveTupleLocked reserves an accepted endpoint's tuple.
@@ -532,6 +533,7 @@ func (e *Endpoint) handleListenSegment(ctx *listenContext, s *segment) tcpip.Err
 			seq:       cookie,
 			ack:       s.sequenceNumber + 1,
 			rcvWnd:    ctx.rcvWnd,
+			df:        e.pmtud == tcpip.PMTUDiscoveryWant || e.pmtud == tcpip.PMTUDiscoveryDo || e.pmtud == tcpip.PMTUDiscoveryProbe,
 			expOptVal: e.getExperimentOptionValue(route),
 		}
 		if err := e.sendSynTCP(route, fields, synOpts); err != nil {

@@ -144,19 +144,26 @@ export class SubscriptionUpdateScheduler {
    * 刷新走既有 refreshSubscriptionsConcurrently（并发拉取 + 串行落盘，语义零改动）。
    */
   async maybeRunExpiredRefresh(context: Context, force: boolean): Promise<StaleScanResult> {
+    // 闸门必须**同步 check-and-set**：下面 load/init 两个 await 之间若只检查不置位，
+    // WorkScheduler 批次与冷启动 onAppStart(force=true) 会双双通过检查 → 两个批次并发
+    // → prefetchCache 被后者清空、apply 跨批次交错（正是 ConcurrentRefresh 明文禁止的
+    // 非重入写路径）。先占坑；整个方法体包 try/finally，任何提前返回或异常都释放闸门，
+    // 避免一次 load() reject 让 running 卡死、后续批次永远 'batch already running'。
     if (SubscriptionUpdateScheduler.running) {
       return StaleScanResult.none('batch already running');
     }
-    if (!force && Date.now() - this.lastForegroundRunAt < FOREGROUND_THROTTLE_MS) {
-      return StaleScanResult.none('throttled');
-    }
-    this.lastForegroundRunAt = Date.now();
-    const settings = await SettingsService.load();
-    if (!settings.autoUpdateSubscription) {
-      return StaleScanResult.none('autoUpdateSubscription disabled');
-    }
-    const subs = SubscriptionService.instance();
-    await subs.init(context);
+    SubscriptionUpdateScheduler.running = true;
+    try {
+      if (!force && Date.now() - this.lastForegroundRunAt < FOREGROUND_THROTTLE_MS) {
+        return StaleScanResult.none('throttled');
+      }
+      this.lastForegroundRunAt = Date.now();
+      const settings = await SettingsService.load();
+      if (!settings.autoUpdateSubscription) {
+        return StaleScanResult.none('autoUpdateSubscription disabled');
+      }
+      const subs = SubscriptionService.instance();
+      await subs.init(context);
     const now = Date.now();
     const staleIds: string[] = [];
     let total = 0;
@@ -198,25 +205,23 @@ export class SubscriptionUpdateScheduler {
     if (staleIds.length === 0) {
       return StaleScanResult.none('no stale subscription');
     }
-    SubscriptionUpdateScheduler.running = true;
-    try {
-      AppLogger.info(TAG, `auto refresh start: ${staleIds.length}/${total} stale`);
-      const summary: RefreshBatchSummary = await subs.refreshSubscriptionsConcurrently(
-        staleIds, 2,
-        (progress: RefreshBatchProgress, item: RefreshItemOutcome): void => {
-          // 后台批次不带 UI：每条完成只写日志（订阅状态/lastFetchedAt 由既有路径落盘）
-          AppLogger.info(TAG, `auto refresh item ${item.id}: ok=${item.ok} `
-            + `nodes=${item.nodeCount} ${item.advice.length > 0 ? item.advice : item.message}`);
-        },
-        (): boolean => false // 无用户中止来源；批次自跑到底
-      );
-      AppLogger.info(TAG, `auto refresh done: ok=${summary.okCount} fail=${summary.failCount} `
-        + `nodes=${summary.nodeCount}`);
-      const r = new StaleScanResult();
-      r.total = total;
-      r.stale = staleIds.length;
-      r.launched = staleIds.length;
-      return r;
+    AppLogger.info(TAG, `auto refresh start: ${staleIds.length}/${total} stale`);
+    const summary: RefreshBatchSummary = await subs.refreshSubscriptionsConcurrently(
+      staleIds, 2,
+      (progress: RefreshBatchProgress, item: RefreshItemOutcome): void => {
+        // 后台批次不带 UI：每条完成只写日志（订阅状态/lastFetchedAt 由既有路径落盘）
+        AppLogger.info(TAG, `auto refresh item ${item.id}: ok=${item.ok} `
+          + `nodes=${item.nodeCount} ${item.advice.length > 0 ? item.advice : item.message}`);
+      },
+      (): boolean => false // 无用户中止来源；批次自跑到底
+    );
+    AppLogger.info(TAG, `auto refresh done: ok=${summary.okCount} fail=${summary.failCount} `
+      + `nodes=${summary.nodeCount}`);
+    const r = new StaleScanResult();
+    r.total = total;
+    r.stale = staleIds.length;
+    r.launched = staleIds.length;
+    return r;
     } finally {
       SubscriptionUpdateScheduler.running = false;
     }

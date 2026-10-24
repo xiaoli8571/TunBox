@@ -192,7 +192,24 @@ func (fs FeatureSet) VirtualAddressBits() uint32 {
 //go:nosplit
 func (fs FeatureSet) PhysicalAddressBits() uint32 {
 	ax, _, _, _ := fs.query(addressSizes)
-	return ax & 0xff
+	physBits := ax & 0xff
+	if !fs.AMD() {
+		return physBits
+	}
+
+	maxExtended, _, _, _ := fs.query(extendedFunctionInfo)
+	if maxExtended < uint32(amdMemoryEncryptionInfo) {
+		return physBits
+	}
+
+	memEncAX, memEncBX, _, _ := fs.query(amdMemoryEncryptionInfo)
+	if memEncAX&amdMemoryEncryptionFeatureMask == 0 {
+		return physBits
+	}
+	// AMD memory encryption reduces usable physical address width by the
+	// CPUID-reported amount. Match Linux's
+	// arch/x86/kernel/cpu/amd.c:early_detect_mem_encrypt().
+	return physBits - ((memEncBX >> amdPhysAddrReductionShift) & amdPhysAddrReductionMask)
 }
 
 // CacheType describes the type of a cache, as returned in eax[4:0] for eax=4.
@@ -382,15 +399,16 @@ var (
 )
 
 const (
-	// XCR0AMXMask are the bits that enable xsave to operate on AMX TILECFG
-	// and TILEDATA.
-	//
-	// Note: TILECFG and TILEDATA are always either both enabled or both
-	//       disabled.
+	// XCR0AmxCfgMask is the bits that enable xsave to operate on
+	// AMX TILECFG.
 	//
 	// See Intel® 64 and IA-32 Architectures Software Developer’s Manual Vol.1
 	// section 13.3 for details.
-	XCR0AMXMask = uint64((1 << 17) | (1 << 18))
+	XCR0AmxCfgMask = uint64(1 << 17)
+
+	// XCR0AmxDataMask is the bits that enable xsave to operate on
+	// AMX TILEDATA.
+	XCR0AmxDataMask = uint64(1 << 18)
 )
 
 // ExtendedStateSize returns the number of bytes needed to save the "extended
@@ -415,13 +433,15 @@ func (fs FeatureSet) ExtendedStateSize() (size, align uint) {
 // AMXExtendedStateSize returns the number of bytes within the "extended state"
 // area that is used for AMX.
 func (fs FeatureSet) AMXExtendedStateSize() uint {
+	total := uint(0)
 	if fs.UseXsave() {
 		xcr0 := xgetbv(0)
-		if (xcr0 & XCR0AMXMask) != 0 {
-			return uint(amxTileCfgSize + amxTileDataSize)
+		// TILECFG is not part of AMX extended state, only TILEDATA.
+		if (xcr0 & XCR0AmxDataMask) != 0 {
+			total += uint(amxTileDataSize)
 		}
 	}
-	return 0
+	return total
 }
 
 // ValidXCR0Mask returns the valid bits in control register XCR0.
@@ -435,7 +455,7 @@ func (fs FeatureSet) ValidXCR0Mask() uint64 {
 		return 0
 	}
 	ax, _, _, dx := fs.query(xSaveInfo)
-	return (uint64(dx)<<32 | uint64(ax)) &^ XCR0AMXMask
+	return (uint64(dx)<<32 | uint64(ax)) &^ (XCR0AmxCfgMask | XCR0AmxDataMask)
 }
 
 // UseXsave returns the choice of fp state saving instruction.

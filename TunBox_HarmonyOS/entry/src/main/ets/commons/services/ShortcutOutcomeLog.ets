@@ -6,7 +6,7 @@
  * 把「最后一次执行结果 + 失败原因 + 耗时」落到应用私有 cacheDir 的有界状态文件，
  * 便于事后取证（真机可直接读，无需 root）：
  *
- *   hdc shell cat /data/app/el2/100/base/com.ssrvpn.client/haps/entry/cache/vpn_shortcut_outcome.txt
+ *   hdc shell cat /data/app/el2/100/base/com.tunbox.client/haps/entry/cache/vpn_shortcut_outcome.txt
  *
  * 约束：
  *  - 绝不外抛异常：可观测通道不得反过来破坏 VPN 主流程；

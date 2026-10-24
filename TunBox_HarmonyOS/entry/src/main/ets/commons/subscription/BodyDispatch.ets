@@ -60,7 +60,7 @@ export class BodyDispatch {
     const out = new BodyDispatchResult();
     out.body = body;
     // 1) 明文就是 Clash YAML
-    if (YamlMerger.proxyItemGroups(body).length > 0) {
+    if (/^(?:\uFEFF)?(?:proxies|proxy-groups|proxy-providers)\s*:/m.test(body)) {
       out.kind = BodyKind.YAML;
       return out;
     }
@@ -74,7 +74,7 @@ export class BodyDispatch {
     if (decoded.length === 0) {
       return out;
     }
-    if (YamlMerger.proxyItemGroups(decoded).length > 0) {
+    if (/^(?:\uFEFF)?(?:proxies|proxy-groups|proxy-providers)\s*:/m.test(decoded)) {
       out.kind = BodyKind.YAML;
       out.decoded = true;
       out.body = decoded;

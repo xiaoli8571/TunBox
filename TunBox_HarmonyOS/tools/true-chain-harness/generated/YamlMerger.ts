@@ -1,8 +1,8 @@
 // [harness] generated from entry/src/main/ets/commons/services/YamlMerger.ets — 仅 import 目标被重写
 /**
  * 订阅 YAML 合并引擎
- * 移植自 upstream: packages/ssrvpn_shared/lib/services/subscription_yaml_merger.dart
- *                packages/ssrvpn_shared/lib/utils/bounded_yaml.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/services/subscription_yaml_merger.dart
+ *                packages/tunbox_shared/lib/utils/bounded_yaml.dart
  *
  * 语义对齐：proxies 分节提取与缩进规整、条目切分、按内容指纹跨订阅去重（保留归属）、
  *           与 previousYaml 的同名节点保留（刷新不重排名称）、唯一名 "(n)" 后缀、全部限额。
@@ -108,6 +108,39 @@ export class YamlNodeError extends Error {
 }
 
 export class YamlMerger {
+  /** Read names without interpreting a proxy protocol or rebuilding its fields. */
+  static sequenceItemNames(yaml: string, section: string): string[] {
+    const out: string[] = [];
+    const lines = YamlMerger.normalizedSectionLines(yaml, section);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.startsWith('  -')) { continue; }
+      const first = line.substring(3).trim();
+      if (first.startsWith('{')) {
+        const end = first.lastIndexOf('}');
+        for (const field of YamlMerger.splitFlowMap(first.substring(1, end))) {
+          const colon = YamlMerger.findUnquotedColon(field);
+          if (colon >= 0 && YamlMerger.decodeScalar(field.substring(0, colon)) === 'name') {
+            out.push(YamlMerger.decodeScalar(field.substring(colon + 1)));
+          }
+        }
+      } else {
+        const fields: string[] = [first];
+        for (let j = i + 1; j < lines.length && !lines[j].startsWith('  -'); j++) {
+          if (lines[j].startsWith('    ') && !lines[j].startsWith('     ')) {
+            fields.push(lines[j].trim());
+          }
+        }
+        for (const field of fields) {
+          const colon = YamlMerger.findUnquotedColon(field);
+          if (colon >= 0 && YamlMerger.decodeScalar(field.substring(0, colon)) === 'name') {
+            out.push(YamlMerger.decodeScalar(field.substring(colon + 1)));
+          }
+        }
+      }
+    }
+    return out;
+  }
   /** 提取指定顶层分节并归一化缩进为 2 空格（对齐 _normalizedSectionLines） */
   static extractSection(yaml: string, sectionName: string): string {
     const lines = YamlMerger.normalizedSectionLines(yaml, sectionName);

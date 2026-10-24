@@ -15,6 +15,8 @@
 package linux
 
 import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+
 	"github.com/metacubex/gvisor/pkg/marshal"
 	"github.com/metacubex/gvisor/pkg/marshal/primitive"
 )
@@ -109,6 +111,7 @@ const (
 //
 // +marshal
 type IPTEntry struct {
+	_ structs.HostLayout
 	// IP is used to filter packets based on the IP header.
 	IP IPTIP
 
@@ -148,13 +151,14 @@ const SizeOfIPTEntry = 112
 //
 // +marshal dynamic
 type KernelIPTEntry struct {
+	_     structs.HostLayout
 	Entry IPTEntry
 
 	// Elems holds the data for all this rule's matches followed by the
 	// target. It is variable length -- users have to iterate over any
 	// matches and use TargetOffset and NextOffset to make sense of the
 	// data.
-	Elems primitive.ByteSlice
+	Elems primitive.ByteSlice `hostlayout:"ignore"`
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -182,6 +186,7 @@ var _ marshal.Marshallable = (*KernelIPTEntry)(nil)
 //
 // +marshal
 type IPTIP struct {
+	_ structs.HostLayout
 	// Src is the source IP address.
 	Src InetAddr
 
@@ -246,6 +251,7 @@ const SizeOfIPTIP = 84
 //
 // +marshal
 type XTCounters struct {
+	_ structs.HostLayout
 	// Pcnt is the packet count.
 	Pcnt uint64
 
@@ -267,6 +273,7 @@ const SizeOfXTCounters = 16
 //
 // +marshal
 type XTEntryMatch struct {
+	_         structs.HostLayout
 	MatchSize uint16
 	Name      ExtensionName
 	Revision  uint8
@@ -281,8 +288,9 @@ const SizeOfXTEntryMatch = 32
 // KernelXTEntryMatch is identical to XTEntryMatch, but contains
 // variable-length Data field.
 type KernelXTEntryMatch struct {
+	_ structs.HostLayout
 	XTEntryMatch
-	Data []byte
+	Data []byte `hostlayout:"ignore"`
 }
 
 // XTGetRevision corresponds to xt_get_revision in
@@ -290,6 +298,7 @@ type KernelXTEntryMatch struct {
 //
 // +marshal
 type XTGetRevision struct {
+	_        structs.HostLayout
 	Name     ExtensionName
 	Revision uint8
 }
@@ -308,6 +317,7 @@ const SizeOfXTGetRevision = 30
 //
 // +marshal
 type XTEntryTarget struct {
+	_          structs.HostLayout
 	TargetSize uint16
 	Name       ExtensionName
 	Revision   uint8
@@ -322,8 +332,9 @@ const SizeOfXTEntryTarget = 32
 // KernelXTEntryTarget is identical to XTEntryTarget, but contains a
 // variable-length Data field.
 type KernelXTEntryTarget struct {
+	_ structs.HostLayout
 	XTEntryTarget
-	Data []byte
+	Data []byte `hostlayout:"ignore"`
 }
 
 // XTStandardTarget is a built-in target, one of ACCEPT, DROP, JUMP, QUEUE,
@@ -332,6 +343,7 @@ type KernelXTEntryTarget struct {
 //
 // +marshal
 type XTStandardTarget struct {
+	_      structs.HostLayout
 	Target XTEntryTarget
 	// A positive verdict indicates a jump, and is the offset from the
 	// start of the table to jump to. A negative value means one of the
@@ -350,6 +362,7 @@ const SizeOfXTStandardTarget = 40
 //
 // +marshal
 type XTErrorTarget struct {
+	_      structs.HostLayout
 	Target XTEntryTarget
 	Name   ErrorName
 	_      [2]byte
@@ -379,6 +392,7 @@ const (
 //
 // +marshal
 type NfNATIPV4Range struct {
+	_       structs.HostLayout
 	Flags   uint32
 	MinIP   [4]byte
 	MaxIP   [4]byte
@@ -391,6 +405,7 @@ type NfNATIPV4Range struct {
 //
 // +marshal
 type NfNATIPV4MultiRangeCompat struct {
+	_         structs.HostLayout
 	RangeSize uint32
 	RangeIPV4 NfNATIPV4Range
 }
@@ -400,6 +415,7 @@ type NfNATIPV4MultiRangeCompat struct {
 //
 // +marshal
 type XTRedirectTarget struct {
+	_       structs.HostLayout
 	Target  XTEntryTarget
 	NfRange NfNATIPV4MultiRangeCompat
 	_       [4]byte
@@ -413,6 +429,7 @@ const SizeOfXTRedirectTarget = 56
 //
 // +marshal
 type XTNATTargetV0 struct {
+	_       structs.HostLayout
 	Target  XTEntryTarget
 	NfRange NfNATIPV4MultiRangeCompat
 	_       [4]byte
@@ -425,6 +442,7 @@ const SizeOfXTNATTargetV0 = 56
 //
 // +marshal
 type XTNATTargetV1 struct {
+	_      structs.HostLayout
 	Target XTEntryTarget
 	Range  NFNATRange
 }
@@ -436,6 +454,7 @@ const SizeOfXTNATTargetV1 = SizeOfXTEntryTarget + SizeOfNFNATRange
 //
 // +marshal
 type XTNATTargetV2 struct {
+	_      structs.HostLayout
 	Target XTEntryTarget
 	Range  NFNATRange2
 }
@@ -443,11 +462,33 @@ type XTNATTargetV2 struct {
 // SizeOfXTNATTargetV2 is the size of an XTNATTargetV2.
 const SizeOfXTNATTargetV2 = SizeOfXTEntryTarget + SizeOfNFNATRange2
 
+// XTCTTargetInfoV0 corresponds to struct xt_ct_target_info (revision 0) in
+// include/uapi/linux/netfilter/xt_CT.h. The CT target is used in the raw
+// table for conntrack zone assignment. The trailing padding accounts for the
+// kernel-internal nf_conn pointer that is 8-byte aligned.
+//
+// +marshal
+type XTCTTargetInfoV0 struct {
+	_         structs.HostLayout
+	Target    XTEntryTarget
+	Flags     uint16
+	Zone      uint16
+	CTEvents  uint32
+	ExpEvents uint32
+	Helper    [16]byte
+	_         [4]byte // padding for 8-byte alignment of ct pointer
+	_         [8]byte // space for kernel nf_conn pointer (unused in userspace)
+}
+
+// SizeOfXTCTTargetInfoV0 is the size of an XTCTTargetInfoV0.
+const SizeOfXTCTTargetInfoV0 = 72
+
 // IPTGetinfo is the argument for the IPT_SO_GET_INFO sockopt. It corresponds
 // to struct ipt_getinfo in include/uapi/linux/netfilter_ipv4/ip_tables.h.
 //
 // +marshal
 type IPTGetinfo struct {
+	_          structs.HostLayout
 	Name       TableName
 	ValidHooks uint32
 	HookEntry  [NF_INET_NUMHOOKS]uint32
@@ -465,6 +506,7 @@ const SizeOfIPTGetinfo = 84
 //
 // +marshal
 type IPTGetEntries struct {
+	_    structs.HostLayout
 	Name TableName
 	Size uint32
 	_    [4]byte
@@ -482,8 +524,9 @@ const SizeOfIPTGetEntries = 40
 //
 // +marshal dynamic
 type KernelIPTGetEntries struct {
+	_ structs.HostLayout
 	IPTGetEntries
-	Entrytable []KernelIPTEntry
+	Entrytable []KernelIPTEntry `hostlayout:"ignore"`
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -521,6 +564,7 @@ var _ marshal.Marshallable = (*KernelIPTGetEntries)(nil)
 //
 // +marshal
 type IPTReplace struct {
+	_           structs.HostLayout
 	Name        TableName
 	ValidHooks  uint32
 	NumEntries  uint32
@@ -582,6 +626,7 @@ func goString(cstring []byte) string {
 //
 // +marshal
 type XTTCP struct {
+	_ structs.HostLayout
 	// SourcePortStart specifies the inclusive start of the range of source
 	// ports to which the matcher applies.
 	SourcePortStart uint16
@@ -637,6 +682,7 @@ const (
 //
 // +marshal
 type XTUDP struct {
+	_ structs.HostLayout
 	// SourcePortStart is the inclusive start of the range of source ports
 	// to which the matcher applies.
 	SourcePortStart uint16
@@ -679,6 +725,7 @@ const (
 //
 // +marshal
 type IPTOwnerInfo struct {
+	_ structs.HostLayout
 	// UID is user id which created the packet.
 	UID uint32
 
@@ -711,6 +758,7 @@ const SizeOfIPTOwnerInfo = 34
 //
 // +marshal
 type XTOwnerMatchInfo struct {
+	_      structs.HostLayout
 	UIDMin uint32
 	UIDMax uint32
 	GIDMin uint32
@@ -753,6 +801,7 @@ const (
 //
 // +marshal
 type XTMultiport struct {
+	_ structs.HostLayout
 	// Flags indicates whether the match applies to
 	// source ports, destination ports, or either, as
 	// defined by "enum xt_multiport_flags".
@@ -774,6 +823,7 @@ type XTMultiport struct {
 //
 // +marshal
 type XTMultiportV1 struct {
+	_ structs.HostLayout
 	// Fields same as "XTMultiport".
 	Flags uint8
 	Count uint8
@@ -794,3 +844,68 @@ const SizeOfXTMultiport = 2 + (XT_MULTI_PORTS * 2)
 
 // SizeOfXTMultiportV1 is the size of XTMultiportV1 (in bytes).
 const SizeOfXTMultiportV1 = SizeOfXTMultiport + XT_MULTI_PORTS + 1
+
+// XTMarkMtinfo1 holds data for matching packets against a mark.
+// It corresponds to struct xt_mark_mtinfo1 in include/uapi/linux/netfilter/xt_mark.h.
+//
+// +marshal
+type XTMarkMtinfo1 struct {
+	_      structs.HostLayout
+	Mark   uint32
+	Mask   uint32
+	Invert uint8
+	_      [3]byte
+}
+
+// SizeOfXTMarkMtinfo1 is the size of XTMarkMtinfo1.
+const SizeOfXTMarkMtinfo1 = 12
+
+// Ref: include/uapi/linux/netfilter_ipv4/ipt_REJECT.h:enum ipt_reject_with
+const (
+	IPT_ICMP_NET_UNREACHABLE = iota
+	IPT_ICMP_HOST_UNREACHABLE
+	IPT_ICMP_PROT_UNREACHABLE
+	IPT_ICMP_PORT_UNREACHABLE
+	IPT_ICMP_ECHOREPLY
+	IPT_ICMP_NET_PROHIBITED
+	IPT_ICMP_HOST_PROHIBITED
+	IPT_TCP_RESET
+	IPT_ICMP_ADMIN_PROHIBITED
+)
+
+// Ref: include/uapi/linux/netfilter_ipv6/ip6t_REJECT.h:enum ip6t_reject_with
+const (
+	IP6T_ICMP6_NO_ROUTE = iota
+	IP6T_ICMP6_ADM_PROHIBITED
+	IP6T_ICMP6_NOT_NEIGHBOUR
+	IP6T_ICMP6_ADDR_UNREACH
+	IP6T_ICMP6_PORT_UNREACH
+	IP6T_ICMP6_ECHOREPLY
+	IP6T_TCP_RESET
+	IP6T_ICMP6_POLICY_FAIL
+	IP6T_ICMP6_REJECT_ROUTE
+)
+
+// IPTRejectInfo is the argument for the IPT_REJECT target. It corresponds to
+// struct ipt_reject_info in include/uapi/linux/netfilter_ipv4/ipt_REJECT.h.
+//
+// +marshal
+type IPTRejectInfo struct {
+	_    structs.HostLayout
+	With uint32
+}
+
+// SizeOfIPTRejectInfo is the size of an IPTRejectInfo.
+const SizeOfIPTRejectInfo = 4
+
+// IP6TRejectInfo is the argument for the IP6T_REJECT target. It corresponds to
+// struct ip6t_reject_info in include/uapi/linux/netfilter_ipv6/ip6t_REJECT.h.
+//
+// +marshal
+type IP6TRejectInfo struct {
+	_    structs.HostLayout
+	With uint32
+}
+
+// SizeOfIP6TRejectInfo is the size of an IP6TRejectInfo.
+const SizeOfIP6TRejectInfo = 4

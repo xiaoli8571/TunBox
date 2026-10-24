@@ -1,6 +1,6 @@
 {
   "string": [
-    { "name": "TestAbility_desc", "value": "SSRVPN 单元测试" },
-    { "name": "TestAbility_label", "value": "SSRVPN Tests" }
+    { "name": "TestAbility_desc", "value": "TunBox 单元测试" },
+    { "name": "TestAbility_label", "value": "TunBox Tests" }
   ]
 }

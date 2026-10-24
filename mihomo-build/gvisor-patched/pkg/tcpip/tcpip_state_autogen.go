@@ -1097,9 +1097,10 @@ func (so *SocketOptions) StateFields() []string {
 		"bindToDevice",
 		"sendBufferSize",
 		"receiveBufferSize",
-		"linger",
 		"rcvlowat",
 		"experimentOptionValue",
+		"mark",
+		"linger",
 	}
 }
 
@@ -1134,9 +1135,10 @@ func (so *SocketOptions) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(23, &so.bindToDevice)
 	stateSinkObject.Save(24, &so.sendBufferSize)
 	stateSinkObject.Save(25, &so.receiveBufferSize)
-	stateSinkObject.Save(26, &so.linger)
-	stateSinkObject.Save(27, &so.rcvlowat)
-	stateSinkObject.Save(28, &so.experimentOptionValue)
+	stateSinkObject.Save(26, &so.rcvlowat)
+	stateSinkObject.Save(27, &so.experimentOptionValue)
+	stateSinkObject.Save(28, &so.mark)
+	stateSinkObject.Save(29, &so.linger)
 }
 
 func (so *SocketOptions) afterLoad(context.Context) {}
@@ -1169,9 +1171,10 @@ func (so *SocketOptions) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(23, &so.bindToDevice)
 	stateSourceObject.Load(24, &so.sendBufferSize)
 	stateSourceObject.Load(25, &so.receiveBufferSize)
-	stateSourceObject.Load(26, &so.linger)
-	stateSourceObject.Load(27, &so.rcvlowat)
-	stateSourceObject.Load(28, &so.experimentOptionValue)
+	stateSourceObject.Load(26, &so.rcvlowat)
+	stateSourceObject.Load(27, &so.experimentOptionValue)
+	stateSourceObject.Load(28, &so.mark)
+	stateSourceObject.Load(29, &so.linger)
 }
 
 func (l *LocalSockError) StateTypeName() string {
@@ -1262,31 +1265,6 @@ func (s *stdClock) StateSave(stateSinkObject state.Sink) {
 func (s *stdClock) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.monotonicOffset)
 	stateSourceObject.AfterLoad(func() { s.afterLoad(ctx) })
-}
-
-func (st *stdTimer) StateTypeName() string {
-	return "pkg/tcpip.stdTimer"
-}
-
-func (st *stdTimer) StateFields() []string {
-	return []string{
-		"t",
-	}
-}
-
-func (st *stdTimer) beforeSave() {}
-
-// +checklocksignore
-func (st *stdTimer) StateSave(stateSinkObject state.Sink) {
-	st.beforeSave()
-	stateSinkObject.Save(0, &st.t)
-}
-
-func (st *stdTimer) afterLoad(context.Context) {}
-
-// +checklocksignore
-func (st *stdTimer) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &st.t)
 }
 
 func (mt *MonotonicTime) StateTypeName() string {
@@ -1505,8 +1483,8 @@ func (c *ReceivableControlMessages) beforeSave() {}
 // +checklocksignore
 func (c *ReceivableControlMessages) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
-	var TimestampValue int64
-	TimestampValue = c.saveTimestamp()
+	TimestampValue := c.saveTimestamp()
+	_ = (int64)(TimestampValue)
 	stateSinkObject.SaveValue(0, TimestampValue)
 	stateSinkObject.Save(1, &c.HasInq)
 	stateSinkObject.Save(2, &c.Inq)
@@ -3224,7 +3202,6 @@ func (j *jobInstance) StateTypeName() string {
 
 func (j *jobInstance) StateFields() []string {
 	return []string{
-		"timer",
 		"earlyReturn",
 	}
 }
@@ -3234,16 +3211,14 @@ func (j *jobInstance) beforeSave() {}
 // +checklocksignore
 func (j *jobInstance) StateSave(stateSinkObject state.Sink) {
 	j.beforeSave()
-	stateSinkObject.Save(0, &j.timer)
-	stateSinkObject.Save(1, &j.earlyReturn)
+	stateSinkObject.Save(0, &j.earlyReturn)
 }
 
 func (j *jobInstance) afterLoad(context.Context) {}
 
 // +checklocksignore
 func (j *jobInstance) StateLoad(ctx context.Context, stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &j.timer)
-	stateSourceObject.Load(1, &j.earlyReturn)
+	stateSourceObject.Load(0, &j.earlyReturn)
 }
 
 func (j *Job) StateTypeName() string {
@@ -3328,7 +3303,6 @@ func init() {
 	state.Register((*LocalSockError)(nil))
 	state.Register((*SockError)(nil))
 	state.Register((*stdClock)(nil))
-	state.Register((*stdTimer)(nil))
 	state.Register((*MonotonicTime)(nil))
 	state.Register((*Address)(nil))
 	state.Register((*AddressMask)(nil))

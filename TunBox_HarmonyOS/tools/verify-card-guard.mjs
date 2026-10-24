@@ -47,6 +47,7 @@ await check('EXEC normalizeMisses clamps garbage safely', () => {
 const toggleCard = read('entry/src/main/ets/widget/ToggleCard.ets');
 const infoCard = read('entry/src/main/ets/widget/InfoCard.ets');
 const guard = read('entry/src/main/ets/quicktoggleability/QuickToggleAbility.ets');
+const uiGuardian = read('entry/src/main/ets/commons/services/UiGuardian.ets');
 const ext = read('entry/src/main/ets/vpnability/VpnExtensionAbility.ets');
 const manifest = JSON.parse(read('entry/build/default/intermediates/process_profile/default/module.json')
   .replace(/^\uFEFF/, ''));
@@ -58,9 +59,10 @@ await check('SOURCE both cards route toggle to QuickToggleAbility (no in-form co
     assert.ok(!card.includes("'command': 'toggle'"), card.includes("'command': 'toggle'") ? 'legacy message must go' : '');
   }
 });
-await check('SOURCE guardian registers dataTransfer task and releases it', () => {
-  assert.ok(guard.includes("['dataTransfer']"), 'DATA_TRANSFER mode (string[] overload, official sample form)');
-  assert.ok(guard.includes('startBackgroundRunning(this.context'), 'UIAbility context');
+await check('SOURCE guardian delegates task negotiation and releases its UIAbility task', () => {
+  assert.ok(guard.includes('UiGuardian.applyContinuousTask(this.context)'), 'UIAbility context reaches the shared registration path');
+  assert.ok(uiGuardian.includes("['dataTransfer']"), 'DATA_TRANSFER fallback stays in the shared path');
+  assert.ok(uiGuardian.includes('backgroundTaskManager.startBackgroundRunning(context'), 'shared UIAbility registration');
   assert.ok(guard.includes('stopBackgroundRunning(this.context'), 'release path');
   assert.ok(guard.includes('VpnGuardianPolicy.shouldGuard'), 'policy-driven guard decision');
   assert.ok(guard.includes('authorityState'), 'lease polling via cross-process authority');

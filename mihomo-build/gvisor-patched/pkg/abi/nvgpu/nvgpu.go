@@ -18,13 +18,21 @@ package nvgpu
 
 import (
 	"fmt"
+	"github.com/metacubex/gvisor/pkg/common/structs"
 )
 
 // Device numbers.
 const (
-	NV_MAJOR_DEVICE_NUMBER          = 195 // from kernel-open/common/inc/nv.h
-	NV_CONTROL_DEVICE_MINOR         = 255 // from kernel-open/common/inc/nv-linux.h
-	NVIDIA_UVM_PRIMARY_MINOR_NUMBER = 0   // from kernel-open/nvidia-uvm/uvm_common.h
+	// From kernel-open/common/inc/nv-chardev-numbers.h:
+	NV_MAJOR_DEVICE_NUMBER                = 195
+	NV_MINOR_DEVICE_NUMBER_REGULAR_MAX    = 247
+	NV_MINOR_DEVICE_NUMBER_CONTROL_DEVICE = 255
+
+	// From kernel-open/nvidia-uvm/uvm_common.h:
+	NVIDIA_UVM_PRIMARY_MINOR_NUMBER = 0
+
+	// From kernel-open/nvidia/nv-caps.c:
+	NV_CAP_DRV_MINOR_COUNT = 8192
 )
 
 // Handle is NvHandle, from src/common/sdk/nvidia/inc/nvtypes.h.
@@ -32,6 +40,7 @@ const (
 // +marshal
 // +stateify savable
 type Handle struct {
+	_   structs.HostLayout
 	Val uint32
 }
 
@@ -63,6 +72,7 @@ const (
 // +marshal
 // +stateify savable
 type RS_ACCESS_MASK struct {
+	_     structs.HostLayout
 	Limbs [SDK_RS_ACCESS_MAX_LIMBS]uint32 // RsAccessLimb
 }
 
@@ -73,6 +83,7 @@ const SDK_RS_ACCESS_MAX_LIMBS = 1
 //
 // +marshal
 type RS_SHARE_POLICY struct {
+	_          structs.HostLayout
 	Target     uint32
 	AccessMask RS_ACCESS_MASK
 	Type       uint16

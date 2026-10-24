@@ -141,6 +141,16 @@ export class BackgroundLatencyService {
 
   private static async runWithCatalog(api: ClashApiService, names: string[], url: string,
     progress: LatencyProgress): Promise<void> {
+    // 跨引擎互斥（2026-10-24 P1 修复）：手动组测直调本方法（不走 execute 的双检），
+    // 与 LatencyEngine 批次重叠时两引擎合计 64 在途打同一个内核 API（栈内并发 ~8），
+    // 互相制造假超时 + runId 清标交叉。Flclash 自身的旧批允许被新批抢占（start 内
+    // cancel），但**另一引擎**在跑时必须让行。
+    if (LatencyEngine.isRunning()) {
+      progress.cancelled = names.length;
+      progress.running = false;
+      AppLogger.info(TAG, 'kernel group test skipped: LatencyEngine batch in flight');
+      return;
+    }
     const session = FlclashLatencyService.start(api, names, url, 'manual', null);
     const summary: FlclashLatencyProgress = await session.wait();
     progress.finished = summary.started;
@@ -175,10 +185,10 @@ export class BackgroundLatencyService {
       if (subs.subscriptions.length === 0) {
         return null;
       }
-      const api = await orchestrator.ensureLatencyApi();
+      const api = await orchestrator.ensureLatencyApi(true);
       if (api === null) {
         AppLogger.warn(TAG, 'delay batch skipped: kernel channel unavailable');
-        return null;
+        throw new Error('测速通道尚未就绪，请稍后重试；若旧连接未结束，请先断开代理');
       }
       // 节点名来自内核目录（FlClash 同构：App 不持有节点清单）
       const model = await CoreCatalogService.refresh(api, true);

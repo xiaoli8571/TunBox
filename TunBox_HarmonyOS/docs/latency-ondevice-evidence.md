@@ -5,7 +5,7 @@
 
 ## 0. 怎么装上去的（这条本身就是个坑）
 
-发布产物是 **store profile（`SSRVPNRelease.p7b`）** 签名，`hdc install` 直接失败
+发布产物是 **store profile（`TunBoxRelease.p7b`）** 签名，`hdc install` 直接失败
 `9568322`；用户只能用 DevEco Run 装。但 `build-profile.json5` 的 `default` product
 用的是 **debug 签名配置**（`keyAlias = "debugKey"` + `~/.ohos/config/default_*.p7b`），
 而 debug profile 是**可以 hdc 安装的**：
@@ -80,7 +80,7 @@ LatencyEngine: latency cleanup: 6 node(s) left TESTING -> untested (cancelled=tr
 
 ## 5. 可持久化：重启后仍在，落盘内容可在设备上直接验证
 
-`preferences/ssrvpn_settings` → `app_settings_json.nodeSortSnapshot`（真机原文解析）：
+`preferences/tunbox_settings` → `app_settings_json.nodeSortSnapshot`（真机原文解析）：
 
 ```
 testedAt: 2026/9/19 16:31:56 | mode: auto

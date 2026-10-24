@@ -92,5 +92,5 @@ func deviceinitLockNames() {}
 
 func init() {
 	deviceinitLockNames()
-	deviceprefixIndex = locking.NewMutexClass(reflect.TypeOf(deviceRWMutex{}), devicelockNames)
+	deviceprefixIndex = locking.NewMutexClass(reflect.TypeOf((*deviceRWMutex)(nil)).Elem(), devicelockNames)
 }

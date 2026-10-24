@@ -15,6 +15,7 @@
 package linux
 
 import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
 	"math"
 	"time"
 )
@@ -86,7 +87,10 @@ const (
 	TFD_NONBLOCK = O_NONBLOCK
 
 	// TFD_TIMER_ABSTIME is a timerfd_settime flag.
-	TFD_TIMER_ABSTIME = 1
+	TFD_TIMER_ABSTIME = 1 << 0
+
+	// TFD_TIMER_CANCEL_ON_SET is a timerfd_settime flag.
+	TFD_TIMER_CANCEL_ON_SET = 1 << 1
 )
 
 // The safe number of seconds you can represent by int64.
@@ -106,6 +110,7 @@ func NsecToTimeT(nsec int64) TimeT {
 //
 // +marshal slice:TimespecSlice
 type Timespec struct {
+	_    structs.HostLayout
 	Sec  int64
 	Nsec int64
 }
@@ -162,6 +167,7 @@ const SizeOfTimeval = 16
 //
 // +marshal slice:TimevalSlice
 type Timeval struct {
+	_    structs.HostLayout
 	Sec  int64
 	Usec int64
 }
@@ -201,8 +207,14 @@ func DurationToTimeval(dur time.Duration) Timeval {
 //
 // +marshal
 type Itimerspec struct {
+	_        structs.HostLayout
 	Interval Timespec
 	Value    Timespec
+}
+
+// Valid returns whether the itimerspec contains valid values.
+func (its Itimerspec) Valid() bool {
+	return its.Interval.Valid() && its.Value.Valid()
 }
 
 // ItimerVal mimics the following struct in <sys/time.h>
@@ -214,6 +226,7 @@ type Itimerspec struct {
 //
 // +marshal
 type ItimerVal struct {
+	_        structs.HostLayout
 	Interval Timeval
 	Value    Timeval
 }
@@ -232,6 +245,7 @@ func ClockTFromDuration(d time.Duration) ClockT {
 //
 // +marshal
 type Tms struct {
+	_      structs.HostLayout
 	UTime  ClockT
 	STime  ClockT
 	CUTime ClockT
@@ -248,6 +262,7 @@ type TimerID int32
 //
 // +marshal
 type StatxTimestamp struct {
+	_    structs.HostLayout
 	Sec  int64
 	Nsec uint32
 	_    int32
@@ -283,6 +298,7 @@ func (sxts StatxTimestamp) ToTime() time.Time {
 //
 // +marshal
 type Utime struct {
+	_       structs.HostLayout
 	Actime  int64
 	Modtime int64
 }

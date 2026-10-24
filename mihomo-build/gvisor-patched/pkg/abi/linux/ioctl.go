@@ -19,9 +19,13 @@ package linux
 // These are ordered by request number (low byte).
 const (
 	TCGETS      = 0x00005401
+	TCGETS2     = 0x802c542a
 	TCSETS      = 0x00005402
+	TCSETS2     = 0x402c542b
 	TCSETSW     = 0x00005403
+	TCSETSW2    = 0x402c542c
 	TCSETSF     = 0x00005404
+	TCSETSF2    = 0x402c542d
 	TCSBRK      = 0x00005409
 	TIOCEXCL    = 0x0000540c
 	TIOCNXCL    = 0x0000540d
@@ -56,7 +60,7 @@ const (
 	TIOCCONS    = 0x0000541d
 	TIOCSSERIAL = 0x0000541f
 	TIOCGEXCL   = 0x80045440
-	TIOCGPTPEER = 0x80045441
+	TIOCGPTPEER = 0x00005441
 	TIOCGICOUNT = 0x0000545d
 	FIONCLEX    = 0x00005450
 	FIOCLEX     = 0x00005451
@@ -152,6 +156,13 @@ func IOC_SIZE(nr uint32) uint32 {
 	return (nr >> IOC_SIZESHIFT) & ((1 << IOC_SIZEBITS) - 1)
 }
 
+// TCFLSH queue selector arguments.
+const (
+	TCIFLUSH  = 0
+	TCOFLUSH  = 1
+	TCIOFLUSH = 2
+)
+
 /* Used for packet mode */
 const (
 	TIOCPKT_DATA       = 0
@@ -183,4 +194,16 @@ const (
 	KCOV_MODE_INIT      = 1
 	KCOV_MODE_TRACE_PC  = 2
 	KCOV_MODE_TRACE_CMP = 3
+)
+
+// File clone/dedup ioctls from include/uapi/linux/fs.h.
+var (
+	FICLONE       = IOW(0x94, 9, 4)
+	FICLONERANGE  = IOW(0x94, 13, 32)
+	FIDEDUPERANGE = IOWR(0x94, 54, 24)
+)
+
+// FUSE_DEV_IOC_CLONE from include/uapi/linux/fuse.h.
+var (
+	FUSE_DEV_IOC_CLONE = IOR(229, 0, 4)
 )

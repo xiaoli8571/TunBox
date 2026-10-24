@@ -1,8 +1,8 @@
 /**
  * 订阅拉取策略：UA 协商
- * 移植自 upstream: packages/ssrvpn_shared/lib/services/subscription_fetch_policy.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/services/subscription_fetch_policy.dart
  *
- * UA 顺序（必须一致）：SSRVPN → Clash Verge → v2rayN → Shadowrocket。
+ * UA 顺序（必须一致）：TunBox → Clash Verge → v2rayN → Shadowrocket。
  * 每次降级重试都在 HTTP 403/406 或空结果时触发。
  */
 import { http, connection } from '@kit.NetworkKit';
@@ -41,7 +41,7 @@ const TRANSPORT_RETRY_BACKOFF_MS = 700;
 /**
  * UA 顺序：优先 Clash 系 UA 让面板直接返回 Clash YAML（vmess/vless/trojan 字段最完整），
  * 其余 UA 依次兜底；解析层同时支持 vless/vmess/trojan 链接格式。
- * SSRVPN 自家 UA 携带实时版本（AppInfo 单一来源, 不再硬编码）。
+ * TunBox 自家 UA 携带实时版本（AppInfo 单一来源, 不再硬编码）。
  *
  * 【2026-10-20 版本上调：1.7.7 → 2.4.2】面板普遍按 UA **版本号**做内容协商，
  * 且 fetch() 命中第一个 200+非空 body 就返回（见本文件 fetch），后面的兜底 UA

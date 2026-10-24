@@ -694,6 +694,7 @@ func (ds *decodeState) Load(obj reflect.Value) {
 	// iterations required to finish all objects.
 	if err := safely(func() {
 		for elem := ds.leaves.Front(); elem != nil; elem = elem.Next() {
+			ods = elem.ods
 			ds.checkComplete(elem.ods)
 		}
 	}); err != nil {
@@ -714,7 +715,7 @@ func (ds *decodeState) Load(obj reflect.Value) {
 			fmt.Fprintf(&buf, "%q", cycleOS.obj.Type())
 		}
 		buf.WriteString("}")
-		Failf("incomplete graph: %s", string(buf.Bytes()))
+		Failf("incomplete graph: %s", buf.String())
 	}
 }
 

@@ -1,6 +1,6 @@
 /**
  * VPN 扩展能力：TUN 建立、fd 注入内核、长时任务
- * 移植自 upstream: android/.../SsrvpnVpnService.kt
+ * 移植自 upstream: android/.../TunBoxVpnService.kt
  *                VpnRouteInstaller.kt / VpnIpv6Config.kt / CoreLivenessMonitor.kt
  *
  * 真实 API（SDK @ohos.net.vpnExtension，API 11+ / 本机 SDK 26）：
@@ -135,7 +135,7 @@ const CORE_DEATH_CONFIRMATIONS = 2;
 /** Extension 主导的权威运行态文件（事件驱动写入，UI 打开时直接读取真实状态）。 */
 const STATUS_FILE = 'vpn_status.json';
 /**
- * 内核启动硬超时。mihomo 的 SsrvpnStart() 若在启动路径里联网（典型：rule-provider /
+ * 内核启动硬超时。mihomo 的 TunBoxStart() 若在启动路径里联网（典型：rule-provider /
  * MMDB 本地文件缺失时同步拉取远端），会一直阻塞不返回也不报错——UI 侧只能等到
  * 30s deadline 拿到"未上报启动结果"这种无用文案。这里在内核调用外加一层超时，
  * 把「静默挂起」转成明确错误并回传（真机实证 2026-09-19 全新安装首连）。
@@ -209,7 +209,7 @@ class TunFlags {
   public ipv6: boolean = false;
 }
 
-export default class SsrvpnVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
+export default class TunBoxVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
   /** 当前 VpnConnection（重入时先 destroy 旧的，避免 2200002 VPN already exist） */
   private connection: vpnExtension.VpnConnection | null = null;
   /** Borrowed platform fd; never pass native's private template back to attachTun. */
@@ -673,7 +673,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       // 流式 `ipv6: "true"` / `ipv6: yes`，旧正则对它们全部返回 false ⇒ TUN 静默
       // 退回「IPv4-only」，而内核仍按 YAML 开着双栈 —— 正是本文件头部警告的
       // 「TUN 与内核不一致」。
-      flags.ipv6 = SsrvpnVpnExtension.readTopLevelBool(text, 'ipv6');
+      flags.ipv6 = TunBoxVpnExtension.readTopLevelBool(text, 'ipv6');
     } catch (e) {
       // 读不到 → 退回保守形态（IPv4-only）：宁可少开，也不要装一条
       // 内核并不认的 ::/0 把设备的 v6 打进黑洞。
@@ -690,7 +690,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
   private static readTopLevelBool(text: string, key: string): boolean {
     const re = new RegExp('^' + key + ':[ \\t]*("?)([A-Za-z0-9]+)\\1[ \\t]*(?:#.*)?$', 'm');
     const m: RegExpMatchArray | null = text.match(re);
-    return m !== null && SsrvpnVpnExtension.isTrueScalar(m[2]);
+    return m !== null && TunBoxVpnExtension.isTrueScalar(m[2]);
   }
 
   /** YAML 1.1/1.2 里所有被视为「真」的标量写法（内核用 yaml.v3，两种拼写都认）。 */
@@ -913,7 +913,9 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       this.protectCandidate = candidate;
       this.startProtectMonitor();
       this.ensureConfigMtu();
-      const ok = await coreBridge.startCore(this.configPathForCleanup);
+      // 恢复/重建路径与 onCreate 同样可能因 provider/MMDB 联网下载而永不 settle，
+      // 必须套 20s 硬超时（onCreate 路径的 startCoreWithTimeout 就是为此而设）。
+      const ok = await this.startCoreWithTimeout(this.configPathForCleanup);
       if (!current()) { return; }
       if (!ok) {
         const error = await coreBridge.lastError();
@@ -1048,7 +1050,14 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
     this.stopLeaseTimer();
     this.touchLivenessLease(Date.now());
     this.leaseTimer = setInterval((): void => {
-      if (this.connection === null || this.cleanupPromise !== null) {
+      if (this.cleanupPromise !== null) {
+        return;
+      }
+      // 重建 TUN（rebuildTunnel）期间 connection 暂为 null（先拆后建），但扩展进程
+      // 仍然活着、隧道语义仍在 —— 此刻心跳必须继续（上方注释的承诺）。若因
+      // connection===null 停刷，UI 会在重建窗口内误判扩展死亡而拆隧道，与扩展内
+      // 的重建互相打架。真正的清理/断开由 cleanupPromise 兜住（那时确实该停）。
+      if (this.connection === null && !this.rebuilding && !this.recoveryRunning) {
         return;
       }
       this.touchLivenessLease(Date.now());
@@ -1120,7 +1129,9 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       if (!protectReady) { throw new Error('core recovery initProtect failed'); }
       this.startProtectMonitor();
       this.ensureConfigMtu();
-      const ok = await coreBridge.startCore(this.configPathForCleanup);
+      // 热恢复路径同样要 20s 硬超时（与 onCreate/rebuild 同口径）：
+      // provider/规则集联网下载阻塞时 startCore 可能永不 settle。
+      const ok = await this.startCoreWithTimeout(this.configPathForCleanup);
       if (!current()) { return; }
       if (!ok) {
         throw new Error(await coreBridge.lastError());
@@ -1262,7 +1273,7 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       }
     }
     this.configPathForCleanup = configPath;
-    this.configIsTransient = SsrvpnVpnExtension.isTransientConfig(configPath);
+    this.configIsTransient = TunBoxVpnExtension.isTransientConfig(configPath);
     this.clearStartError(configPath);
 
     // 重入防护：Core 仍可能使用旧 TUN fd，必须先同步停止 Core，再销毁平台连接。
@@ -1439,8 +1450,9 @@ export default class SsrvpnVpnExtension extends VpnExtensionAbility implements N
       const msg = AppLogger.errText(e);
       this.reportStartError(configPath, `测速内核启动失败: ${msg}`);
       AppLogger.error(TAG, `headless start failed: ${msg}`);
-      // 失败路径不留残余：删除测速配置与启动标记文件
-      this.clearStartError(configPath);
+      // 失败路径清理测速配置，但**保留** START_ERROR_FILE：reportStartError 刚把真实
+      // 原因写进去给 UI 轮询读（UI 步长 ≥40ms），同 tick 删掉等于错误通道失效，
+      // UI 只能白等 20s 报通用超时。错误文件由 UI 侧消费或下次启动覆盖，不含凭据。
       this.removePrivateConfig(true);
       await this.cleanupResources();
     }

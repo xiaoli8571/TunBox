@@ -224,7 +224,7 @@ check('EXEC session recovery rejects missing/corrupted snapshot', () => {
   r.mode = 'all'; r.packages = ['com.demo.a']; assert.notEqual(P.runtimeError(r), '');
   r.mode = 'future'; assert.notEqual(P.runtimeError(r), '');
 });
-const connect = orchestrator.slice(orchestrator.indexOf('  async connect('));
+const connect = orchestrator.slice(orchestrator.indexOf('  private async connectExclusive('));
 const onCreate = extension.slice(extension.indexOf('  async onCreate('));
 const rebuild = extension.slice(extension.indexOf('  private async rebuildTunnel('), extension.indexOf('  private startNetworkAuthority('));
 const recover = extension.slice(extension.indexOf('  private async recoverCore('), extension.indexOf('  private cleanupResources('));
@@ -291,7 +291,7 @@ check('SOURCE restart prevalidates before disconnect and failure cannot be repor
   assert.match(restart, /if \(!ok\) \{\s*throw new Error/);
 });
 check('SOURCE direct connect routing failure preserves old tunnel and avoids repair/failover', () => {
-  const preflight = connect.slice(0, connect.indexOf('this.disconnectRequested = false;'));
+  const preflight = connect.slice(0, connect.indexOf('const secretTask:'));
   assert.ok(preflight.includes('AppRoutingPolicy.runtime('));
   assert.ok(preflight.includes('return false;'));
   assert.ok(!preflight.includes('disconnectInternal('));

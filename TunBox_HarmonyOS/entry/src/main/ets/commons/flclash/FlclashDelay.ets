@@ -185,6 +185,10 @@ export class ArkDelayHttpTransport implements DelayHttpTransport {
       const raw = resp.result;
       const body: string = typeof raw === 'string' ? raw as string : '';
       return new DelayHttpReply(resp.responseCode, body);
+    }).finally((): void => {
+      // settle（成功或失败）后必须释放原生 http 句柄：不 destroy 的话每个请求泄一个，
+      // 600 节点一批就漏 600 个，反复测速直接耗尽网络栈资源。abort 自带 destroyed 防重入。
+      abort();
     });
     return new DelayRequestHandle(promise, abort);
   }

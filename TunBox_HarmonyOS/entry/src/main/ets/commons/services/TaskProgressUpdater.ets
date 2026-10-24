@@ -20,7 +20,7 @@
  *  - dataTransfer（回退类型）：保持现状 —— 实况窗 LIVE_VIEW + typeCode 8 +
  *    5 分钟进度心跳；接管长时任务通知 id，并撤掉应用自有常驻通知（避免两条通知）。
  *  - taskKeeping（目标类型）：**不推**实况窗进度、**不接管**通知 id、
- *    **不撤**应用自有常驻通知 —— 节点名/速率/运行时长继续由 SsrvpnNotifier 承载
+ *    **不撤**应用自有常驻通知 —— 节点名/速率/运行时长继续由 TunBoxNotifier 承载
  *    （updateLive 在没有长时任务通知 id 时自动回落到应用自有通知）。
  *
  * ── 通知栏为什么是「两张卡」（2026-10-20 用户反馈，先说清楚再改）─────────
@@ -41,7 +41,7 @@
  */
 import { notificationManager } from '@kit.NotificationKit';
 import { AppLogger } from '../utils/AppLogger';
-import { SsrvpnNotifier } from './SsrvpnNotifier';
+import { TunBoxNotifier } from './TunBoxNotifier';
 
 const TAG = 'TaskProgressUpdater';
 
@@ -94,7 +94,7 @@ export class TaskProgressUpdater {
    * 这里。任务通知 id 未拿到（长时任务未挂上）时退回应用自有通知兜底。
    *
    * taskKeeping 模式下长时任务通知 id 恒为 -1（不允许改通知内容），
-   * 因此本函数**始终**走应用自有常驻通知（SsrvpnNotifier）—— 这正是
+   * 因此本函数**始终**走应用自有常驻通知（TunBoxNotifier）—— 这正是
    * taskKeeping 的预期分工：系统通知只表示"有长时任务在跑"，
    * 速率/运行时长由应用自己的通知承载。
    */
@@ -114,7 +114,7 @@ export class TaskProgressUpdater {
       //   节点名进 title，additionalText 仍留节点名（展开态多一行，不丢信息）。
       const speed = TaskProgressUpdater.compactSpeed(speedLine);
       const liveLine = durationText.length > 0 ? `${speed} · ${durationText}` : speed;
-      SsrvpnNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`,
+      TunBoxNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`,
         TaskProgressUpdater.lastNodeText,
         liveLine).catch((): void => {});
       return;
@@ -133,7 +133,7 @@ export class TaskProgressUpdater {
     if (kind !== ContinuousTaskKind.DATA_TRANSFER) {
       // taskKeeping：接入规范「不得修改长时任务通知内容（数据传输任务除外）」——
       // 因此既不推实况窗进度、也不接管通知 id、更**不撤**应用自有常驻通知
-      // （速率/运行时长继续由 SsrvpnNotifier 承载：updateLive 在没有长时任务
+      // （速率/运行时长继续由 TunBoxNotifier 承载：updateLive 在没有长时任务
       // 通知 id 时会自动回落到应用自有通知）。
       AppLogger.info(TAG,
         `${kind} mode: live-view progress disabled (non-dataTransfer long-running task notification must not be modified)`);
@@ -145,7 +145,7 @@ export class TaskProgressUpdater {
     }
     TaskProgressUpdater.taskNotificationId = notificationId;
     // 应用自有常驻通知与长时任务通知重复（用户实锤「两个通知消息」），接管即撤
-    SsrvpnNotifier.cancel().catch((): void => {});
+    TunBoxNotifier.cancel().catch((): void => {});
     TaskProgressUpdater.push();
     TaskProgressUpdater.timer = setInterval((): void => {
       TaskProgressUpdater.push();

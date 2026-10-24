@@ -44,6 +44,8 @@ function findMihomo() {
     return process.env.MIHOMO_BIN;
   }
   const candidates = [];
+  // 与 App 内置内核同源的 Windows 构建（prepare.mjs 钉死的那一份）
+  candidates.push('C:\\Worker\\TunBox\\TunBox-Window\\extra\\sidecar\\mihomo-smart.exe');
   const buildRoot = 'C:\\Worker\\TunBox\\mihomo-build';
   if (fs.existsSync(buildRoot)) {
     for (const dir of fs.readdirSync(buildRoot)) {

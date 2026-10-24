@@ -1,6 +1,6 @@
 // tools/true-chain-harness/fetch_raw.mjs
 // 用与 App 相同的 UA 链抓取真实订阅原文，落盘到 _audit/input/raw/ ，只打印数量口径。
-// 目的：补齐「原始订阅内容 → 解析」这一层，用于对比「其他客户端正常 / SSRVPN 少节点」。
+// 目的：补齐「原始订阅内容 → 解析」这一层，用于对比「其他客户端正常 / TunBox 少节点」。
 // 不打印也不落盘订阅地址、UUID、密码（文件本身含节点凭据，仅本地审计用）。
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';

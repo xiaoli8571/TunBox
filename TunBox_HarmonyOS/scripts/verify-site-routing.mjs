@@ -275,13 +275,13 @@ await check('SOURCE discard and hardware back are guarded and never persist', ()
   assert.ok(!back.includes('SettingsService.save')); assert.ok(!back.includes('applyRulesChanged'));
   assert.match(page, /onBackPress\(\): boolean \{ this\.back\(\); return true; \}/);
 });
-await check('SOURCE hot reload attempted before reconnect fallback', () => {
+await check('SOURCE failed hot reload preserves the current session without reconnect fallback', () => {
   assert.match(method(orchestrator, 'applyRulesChanged'), /this\.applyRulesChangedNow\(reason, seq, generation\)/);
   const apply = method(orchestrator, 'applyRulesChangedNow');
-  assert.ok(apply.indexOf('reloadRulesHot(reason)') < apply.indexOf('restartIfConnected(reason)'));
+  assert.ok(apply.includes('reloadRulesHot(reason)'));
   assert.match(apply, /if \(hot\) \{\s*return adUnavailable \? 'ad-unavailable' : 'hot';/);
-  assert.ok(apply.indexOf('await this.reloadRulesHot(reason)') < apply.indexOf('await this.restartIfConnected(reason)'));
-  assert.ok(apply.includes("'reconnect' : 'none'"));
+  assert.ok(!apply.includes('restartIfConnected(reason)'));
+  assert.ok(apply.includes("return 'apply-failed'"));
 });
 await check('SOURCE generator emits all three lists, direct before proxy, and suffix semantics', () => {
   assert.ok(generator.includes('normalizeDomains(settings.forceDirectSites)'));

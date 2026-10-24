@@ -206,7 +206,7 @@ await check('SOURCE snapshot file name agrees across processes and clears with t
 
 // ── 5.5.7：内核启动期"联网下载"阻塞（全新安装 ruleset 缺失） ────────────────
 // 真机实证 2026-09-19：rule-providers 是 type: http，本地 path 文件缺失时 mihomo 会在
-// SsrvpnStart() 内同步拉取远端并阻塞（不返回、不报错）→ 扩展静默、UI 30s 超时。
+// TunBoxStart() 内同步拉取远端并阻塞（不返回、不报错）→ 扩展静默、UI 30s 超时。
 await check('SOURCE generator gates http rule-provider on local file readiness', () => {
   assert.match(gen, /ruleProviderReady: boolean = true/, 'opt-in param with safe default');
   // provider 声明与 RULE-SET 引用必须同受该开关约束，否则仍会引用未声明的 provider

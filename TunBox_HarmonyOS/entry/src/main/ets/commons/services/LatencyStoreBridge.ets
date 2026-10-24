@@ -18,8 +18,7 @@
  * 现在依赖方向是单向的：`页面 → 本桥 → {LatencyController, LatencyStore}`，
  * `LatencyController` 不认识落盘仓 ✓。
  */
-import { LatencyGroupSummary, LatencyStore, PreferencesLatencyPersistence } from '../latency/LatencyStore';
-import { LatencyProbeKind } from '../latency/LatencyKinds';
+import { LatencyStore, PreferencesLatencyPersistence } from '../latency/LatencyStore';
 import { LatencyRecord, LatencyState } from './LatencyState';
 import { LatencyLiveView } from './LatencyLiveView';
 import { AppLogger } from '../utils/AppLogger';
@@ -143,40 +142,6 @@ export class LatencyStoreBridge {
       AppLogger.warn(TAG, `latency store restore failed: ${AppLogger.errText(e)}`);
     }
     return restored;
-  }
-
-  // -- 组级诊断（整组同因全败 -> 折叠成一条，别铺 N 条同色红条）------------
-  //
-  // 真机取证（2026-10-20，lead 追加）：那批全败节点的服务器域名在
-  // 阿里/Cloudflare/Google/腾讯**全部 NXDOMAIN** —— 失败在**域名解析**，
-  // 不是网络不通。用户原话：「你就把失败改成网络不可达，你糊弄谁呢」。
-  // 于是「34/34 个节点域名无法解析，疑似机场域名下线，请联系机场换线路
-  // 或更换订阅」必须**说在前面**。
-  //
-  // ⚠ **聚合口径与结论文案都归测速内核所有**（`LatencyStore.summarize`：
-  //   分类计数 + 主导分类 + 一条组级结论）。这里只做**折叠规则**（什么时候
-  //   显示这一条）与**唯一入口**（节点页 / 订阅页共用，避免同一句话两处实现）。
-
-  /**
-   * 组级诊断文案（空串 = 不显示这一条）。
-   *
-   * 折叠规则：判定类失败 >= 2 个才显示 —— 「1 个节点失败」不需要一条组级
-   * 诊断条（节点行已经写清楚了）；整组同因全败时，内核给的结论就是
-   * 「N/M 个节点域名无法解析，疑似机场域名下线……」这样一句能直接行动的提示。
-   *
-   * 2026-10-23 用户口径（第三次强调）：**「N/M 节点超时」这类纯计数提示是噪音**，
-   * 节点行已经写明「超时」，再顶一条同样的汇总等于多此一举。所以超时档的
-   * 结论一律不展示；只保留能直接行动的结论（域名解析失败 / 不可达 / 未在内核生效）。
-   */
-  static groupDiagnosis(nodeNames: string[]): string {
-    const summary: LatencyGroupSummary = LatencyStore.summarize(nodeNames);
-    if (summary.failedCount < 2) {
-      return '';
-    }
-    if (summary.dominantKind === LatencyProbeKind.TIMEOUT) {
-      return '';
-    }
-    return summary.conclusion;
   }
 
   /**

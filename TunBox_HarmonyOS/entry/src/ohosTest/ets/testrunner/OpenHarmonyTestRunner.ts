@@ -15,7 +15,7 @@ import AbilityDelegatorRegistry from '@ohos.app.ability.abilityDelegatorRegistry
 import type Want from '@ohos.app.ability.Want';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
-const TAG: string = 'SSRVPNTestRunner';
+const TAG: string = 'TunBoxTestRunner';
 const TEST_ABILITY_NAME: string = 'TestAbility';
 
 export default class OpenHarmonyTestRunner implements TestRunner {

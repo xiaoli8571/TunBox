@@ -1,5 +1,5 @@
 /**
- * SSRVPN UI Tokens — 1:1 对齐 upstream packages/ssrvpn_shared/lib/widgets/ssrvpn_app_surface.dart
+ * TunBox UI Tokens — 1:1 对齐 upstream packages/tunbox_shared/lib/widgets/tunbox_app_surface.dart
  * 这是真实安卓版使用的现代色板（app_theme.dart 为旧版兼容色，勿再使用）。
  */
 import { LatencyRecord, LatencyState, LatencyPolicy } from '../commons/services/LatencyState';
@@ -81,7 +81,7 @@ export class Ui {
   ];
 }
 
-/** 延迟配色与文案（对齐 ssrvpn_node_selection_node_card / current_node_card 阈值） */
+/** 延迟配色与文案（对齐 tunbox_node_selection_node_card / current_node_card 阈值） */
 export class LatencyStyle {
   static readonly TIMEOUT_MS: number = 65535;
 

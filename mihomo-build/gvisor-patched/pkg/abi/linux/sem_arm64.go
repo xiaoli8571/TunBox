@@ -17,12 +17,17 @@
 
 package linux
 
+import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+)
+
 // SemidDS is equivalent to struct semid64_ds.
 //
 // Source: include/uapi/asm-generic/sembuf.h
 //
 // +marshal
 type SemidDS struct {
+	_        structs.HostLayout
 	SemPerm  IPCPerm
 	SemOTime TimeT
 	SemCTime TimeT

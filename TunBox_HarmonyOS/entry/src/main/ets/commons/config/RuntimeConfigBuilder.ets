@@ -338,10 +338,20 @@ export class RuntimeConfigBuilder {
     const options = RuntimeConfigBuilder.decideRuntimeOptions(profile);
     // 局部变量刻意不叫 selectedNode：闸门要靠「const selectedNode =」数**决策点**，
     // 这里只是把决策结果取出来用（不是第二次决策）。
-    const node = options.selectedNode;
-    if (node === null) {
+    let node = options.selectedNode;
+    const profileBacked = profile.profileYaml.trim().length > 0;
+    if (node === null && !profileBacked) {
       throw new Error('runtime config: 节点集为空，无法生成配置');
     }
+
+    // The overlay is infrastructure only when a profile supplies all outbounds.
+    // This internal placeholder is always removed by the mandatory profile merge.
+    const overlayNode = new ProxyNode();
+    overlayNode.name = '__tunbox_overlay__';
+    overlayNode.proxyType = 'socks5';
+    overlayNode.server = '127.0.0.1';
+    overlayNode.port = 9;
+    if (node === null) { node = overlayNode; }
 
     // 过期 pin 的刷新全仓只在这一处（审计 F10）：**无论 profile 是否已带快照都刷新一次** ——
     // 否则「带快照的隧道路径」会永远不刷新过期 pin（快照是上一轮的结果）。
@@ -372,7 +382,7 @@ export class RuntimeConfigBuilder {
     const ipv6Enabled: boolean = profile.settings.ipv6Enabled !== false;
 
     const yaml = ClashConfigGenerator.generate(
-      node, profile.nodes, profile.settings,
+      profileBacked ? overlayNode : node, profileBacked ? [overlayNode] : profile.nodes, profile.settings,
       profile.mixedPort, profile.apiPort, profile.dnsPort, profile.apiSecret,
       options.useGeoip, ipv6Enabled, hosts, tunEnabled, profile.proxyGroups,
       options.ruleProviderReady, options.useSmart,
@@ -387,7 +397,7 @@ export class RuntimeConfigBuilder {
     // ── FlClash 同构：订阅原文接管 proxies / proxy-groups / rules / dns ──────
     // overlay（上面生成的 yaml）只保留运行期参数（端口 / secret / tun / mode 等），
     // 原文段整体替换进来；原文 dns.enable=true 时整段 dns 用原文。
-    // 合并失败（原文为空或没有代理定义）→ 保持 overlay，不阻断连接。
+    // 有原文时合并失败必须拒绝，不能把内部占位节点当作用户的有效配置。
     let finalYaml = yaml;
     if (profile.profileYaml.trim().length > 0) {
       const merged = ProfileConfigMerger.merge(yaml, profile.profileYaml);
@@ -396,7 +406,7 @@ export class RuntimeConfigBuilder {
         AppLogger.info(TAG, `profile merged: mode=${mode} applied=${merged.applied} `
           + `items=${merged.profileProxyItems} bytes=${finalYaml.length}`);
       } else {
-        AppLogger.warn(TAG, `profile merge skipped: ${merged.error}`);
+        throw new Error(`订阅配置合并失败：${merged.error}`);
       }
     }
 

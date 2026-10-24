@@ -267,11 +267,12 @@ func (ep *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tc
 	}
 	payloadSz := payload.Size()
 
+	mark := ep.ops.GetMark()
 	if err := func() tcpip.Error {
 		if ep.cooked {
-			return ep.stack.WritePacketToRemote(nicID, remote, proto, payload)
+			return ep.stack.WritePacketToRemoteWithMark(nicID, remote, proto, payload, mark)
 		}
-		return ep.stack.WriteRawPacket(nicID, proto, payload)
+		return ep.stack.WriteRawPacketWithMark(nicID, proto, payload, mark)
 	}(); err != nil {
 		return 0, err
 	}
@@ -456,14 +457,14 @@ func (ep *endpoint) UpdateLastError(err tcpip.Error) {
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
 func (ep *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) tcpip.Error {
-	switch opt.(type) {
+	switch opt := opt.(type) {
 	case *tcpip.TpacketStats:
 		ep.packetMmapMu.RLock()
 		defer ep.packetMmapMu.RUnlock()
 		if ep.packetMMapEp == nil {
 			return nil
 		}
-		*(opt.(*tcpip.TpacketStats)) = ep.packetMMapEp.Stats()
+		*opt = ep.packetMMapEp.Stats()
 		return nil
 	default:
 		return &tcpip.ErrUnknownProtocolOption{}

@@ -5,8 +5,8 @@
   "main": "",
   "author": "",
   "license": "MIT",
-  "types": "./src/main/cpp/types/libssrvpn_core_napi/index.d.ts",
+  "types": "./src/main/cpp/types/libtunbox_core_napi/index.d.ts",
   "dependencies": {
-    "libssrvpn_core_napi.so": "file:./src/main/cpp/types/libssrvpn_core_napi"
+    "libtunbox_core_napi.so": "file:./src/main/cpp/types/libtunbox_core_napi"
   }
 }

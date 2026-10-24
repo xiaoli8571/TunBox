@@ -88,10 +88,6 @@ type Options struct {
 	// include CapabilitySaveRestore
 	SaveRestore bool
 
-	// DisconnectOk if true, indicates that this NIC capability set should
-	// include CapabilityDisconnectOk.
-	DisconnectOk bool
-
 	// TXChecksumOffload if true, indicates that this endpoints capability
 	// set should include CapabilityTXChecksumOffload.
 	TXChecksumOffload bool
@@ -109,6 +105,9 @@ type Options struct {
 
 	// GRO enables generic receive offload.
 	GRO bool
+
+	// QueueID is the ID of the RX queue to which the AF_XDP socket is attached.
+	QueueID uint32
 }
 
 // New creates a new endpoint from an AF_XDP socket.
@@ -124,10 +123,6 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 
 	if opts.SaveRestore {
 		caps |= stack.CapabilitySaveRestore
-	}
-
-	if opts.DisconnectOk {
-		caps |= stack.CapabilityDisconnectOk
 	}
 
 	if err := unix.SetNonblock(opts.FD, true); err != nil {
@@ -164,7 +159,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 		NDescriptors: nFrames / 2,
 		Bind:         opts.Bind,
 	}
-	ep.control, err = xdp.NewFromSocket(opts.FD, uint32(opts.InterfaceIndex), 0 /* queueID */, xdpOpts)
+	ep.control, err = xdp.NewFromSocket(opts.FD, uint32(opts.InterfaceIndex), opts.QueueID, xdpOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AF_XDP dispatcher: %v", err)
 	}

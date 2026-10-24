@@ -123,7 +123,16 @@ async function main() {
   console.log('A. 默认值');
   const defaults = new mods.AppSettings();
   ok(defaults.hyperAdRulesEnabled === false, 'A1 去广告开关默认关闭（AppSettings 运行时默认值）');
-  ok(defaults.rulesEnabled === true, 'A2 规则引擎默认开启（与去广告互不影响）');
+  ok(defaults.rulesEnabled === false, 'A2 规则引擎默认关闭（与去广告互不影响）');
+  const { AppSettingsJson } = await import(generated('AppSettings.ts'));
+  ok(new AppSettingsJson().rulesEnabled === false, 'A3 持久化模型默认关闭');
+  ok(mods.AppSettings.fromJson({}).rulesEnabled === false, 'A4 旧配置缺少开关时保持关闭');
+  for (const rulesEnabled of [false, true]) {
+    const restored = mods.AppSettings.fromJson({ rulesEnabled });
+    ok(restored.rulesEnabled === rulesEnabled, `A5 显式保存 ${rulesEnabled} 可恢复`);
+    ok(mods.AppSettings.fromJson(restored.toJson()).rulesEnabled === rulesEnabled,
+      `A6 显式保存 ${rulesEnabled} 往返不变`);
+  }
 
   // ── B. 行为断言：四种组合 ────────────────────────────────────────────────
   console.log('\nB. 生成配置（行为断言）');

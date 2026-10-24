@@ -17,7 +17,6 @@ package tun
 import (
 	"fmt"
 
-	"github.com/metacubex/gvisor/pkg/atomicbitops"
 	"github.com/metacubex/gvisor/pkg/buffer"
 	"github.com/metacubex/gvisor/pkg/context"
 	"github.com/metacubex/gvisor/pkg/errors/linuxerr"
@@ -258,10 +257,15 @@ func (d *Device) Write(data *buffer.View) (int64, error) {
 	case d.flags.TUN:
 		// TUN interface with IFF_NO_PI enabled, thus
 		// we need to determine protocol from version field
+		if data.Size() == 0 {
+			// Ignore bad packet.
+			return dataLen, nil
+		}
 		version := data.AsSlice()[0] >> 4
-		if version == 4 {
+		switch version {
+		case 4:
 			protocol = header.IPv4ProtocolNumber
-		} else if version == 6 {
+		case 6:
 			protocol = header.IPv6ProtocolNumber
 		}
 	}
@@ -362,22 +366,26 @@ type tunEndpoint struct {
 	tunEndpointRefs
 	*channel.Endpoint
 
-	stack      *stack.Stack
-	nicID      tcpip.NICID
-	name       string
-	isTap      bool
-	persistent atomicbitops.Bool
-	closed     atomicbitops.Bool
+	stack *stack.Stack
+	nicID tcpip.NICID
+	name  string
+	isTap bool
 
 	mu            endpointMutex `state:"nosave"`
 	onCloseAction func()        `state:"nosave"`
+	persistent    bool
+	closed        bool
 }
 
 func (e *tunEndpoint) setPersistent(v bool) {
-	old := e.persistent.Swap(v)
-	if old == v {
+	e.mu.Lock()
+	if e.persistent == v || e.closed {
+		e.mu.Unlock()
 		return
 	}
+	e.persistent = v
+	e.mu.Unlock()
+	// Update refs without holding the lock.
 	if v {
 		e.IncRef()
 	} else {
@@ -386,17 +394,19 @@ func (e *tunEndpoint) setPersistent(v bool) {
 }
 
 func (e *tunEndpoint) Close() {
-	if e.closed.Swap(true) {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
 		return
 	}
-
-	if e.persistent.Load() {
-		e.DecRef(context.Background())
-	}
-	e.mu.Lock()
+	e.closed = true
+	decref := e.persistent
 	action := e.onCloseAction
 	e.onCloseAction = nil
 	e.mu.Unlock()
+	if decref {
+		e.DecRef(context.Background())
+	}
 	if action != nil {
 		action()
 	}

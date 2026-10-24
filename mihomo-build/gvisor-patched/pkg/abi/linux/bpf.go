@@ -14,11 +14,16 @@
 
 package linux
 
+import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
+)
+
 // BPFInstruction is a raw BPF virtual machine instruction.
 //
 // +marshal slice:BPFInstructionSlice
 // +stateify savable
 type BPFInstruction struct {
+	_ structs.HostLayout
 	// OpCode is the operation to execute.
 	OpCode uint16
 

@@ -248,6 +248,8 @@ try {
   const custom = new CustomRuleSet();
   Object.assign(custom, { name: 'custom', policy: 'DIRECT', url: 'https://example.invalid/custom.yaml' });
   input.settings.customRuleSets = [custom];
+  // 规则默认关闭；本组专门验证用户显式启用后的自定义规则集。
+  input.settings.rulesEnabled = true;
   for (const mode of [RuntimeConfigMode.TUNNEL, RuntimeConfigMode.TEST]) {
     for (const rawProfile of ['', profile]) {
       input.profileYaml = rawProfile;

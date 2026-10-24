@@ -1,7 +1,7 @@
 // [harness] generated from entry/src/main/ets/commons/models/ProxyNode.ets — 仅 import 目标被重写
 /**
  * 数据模型：代理节点
- * 移植自 upstream: packages/ssrvpn_shared/lib/models/proxy_node.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/models/proxy_node.dart
  */
 import { util } from './stubs.ts';
 import { parse as parseUriNode, ParseError, ParsedNode } from './UriNodeParser.ts';
@@ -173,10 +173,13 @@ export class ProxyNode {
         continue;
       }
       if (ProxyNodeAdapter.isBooleanField(field)) {
+        // 分享链接里布尔常写 allow_insecure=1 / insecure=0（数字形态）；只认 'true' 会把
+        // 「跳过证书校验」静默丢掉，自签证书机场的节点全部 TLS 握手失败。
+        const boolValue = value === 'true' || value === '1';
         if (field === 'tls') {
-          node.tls = value === 'true';
+          node.tls = boolValue;
         } else {
-          node.skipCertVerify = value === 'true';
+          node.skipCertVerify = boolValue;
         }
         continue;
       }

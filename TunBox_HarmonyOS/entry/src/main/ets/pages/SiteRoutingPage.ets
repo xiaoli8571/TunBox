@@ -158,7 +158,7 @@ struct SiteRoutingPage {
     this.busy = true;
     try {
       const result = await promptAction.showDialog({ title: '保存网站规则',
-        message: '三份名单同时保存。立即应用优先热更新规则；热更新失败时可能回退重连。仅保存则下次连接或规则重新加载时生效。',
+        message: '三份名单同时保存。立即应用通过热更新规则生效；失败时保留当前连接，不自动重连。仅保存则下次连接或规则重新加载时生效。',
         buttons: [{ text: '取消', color: $r('app.color.ui_text_secondary') }, { text: '仅保存', color: $r('app.color.ui_text_blue') }, { text: '保存并应用', color: $r('app.color.ui_text_blue') }] });
       if (result.index === 0) { return; }
       const settings = await SettingsService.load();
@@ -183,8 +183,9 @@ struct SiteRoutingPage {
           this.notice = outcome === 'hot' ? '已保存并热更新规则，未重建 VPN。'
             : outcome === 'reconnect' ? '已保存并请求重连，请在主页确认连接状态。'
             : outcome === 'ad-unavailable' ? '已保存，广告规则尚未下载，请到设置的数据与规则手动更新。'
+            : outcome === 'apply-failed' ? '已保存，但立即应用未完成；未主动断开当前连接，请检查配置后重试。'
             : outcome === 'pending' ? '已保存，另一规则更新进行中，请稍后重试立即应用。' : '已保存，下次连接生效。';
-        } catch (e) { this.notice = '配置已保存，但立即应用失败，请到主页重新连接。'; }
+        } catch (e) { this.notice = '配置已保存，但立即应用失败；请检查配置后重试。'; }
       }
       if (settings.proxyMode === 'global') { this.notice += ' 当前全局模式，请切回智能规则模式使用网站规则。'; }
       this.toast(this.notice);

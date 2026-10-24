@@ -16,7 +16,7 @@ import { util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'FormInfoMetrics';
-const PREF_NAME = 'ssrvpn_form_info';
+const PREF_NAME = 'tunbox_form_info';
 const KEY_PUBLIC_IP = 'public_ip';
 const KEY_PUBLIC_IP_TIME = 'public_ip_time';
 const PUBLIC_IP_TTL_MS = 30 * 60 * 1000;

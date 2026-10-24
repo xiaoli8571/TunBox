@@ -1,7 +1,7 @@
 // [harness] generated from entry/src/main/ets/commons/models/Subscription.ets — 仅 import 目标被重写
 /**
  * 数据模型：订阅
- * 移植自 upstream: packages/ssrvpn_shared/lib/models/subscription.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/models/subscription.dart
  */
 import { SubscriptionJson } from './stubs.ts';
 

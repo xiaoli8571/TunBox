@@ -19,12 +19,15 @@ function deferred() {
 async function flush() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
 
 function harness({ audioEnabled = false, deny = [], rendererError = false } = {}) {
-  let now = 100000, id = 0;
+  let now = 100000, id = 0, progressActive = false;
   const timers = new Map(), calls = [], sessions = [], renderers = [], logs = [];
   const h = { audioEnabled, deny, rendererError, tasks: [], alive: true,
     queryError: false, queryGate: null, startGate: null, sessionGate: null };
   class Clock extends Date { static now() { return now; } }
   const bg = {
+    ContinuousTaskCancelReason: { USER_CANCEL: 1, SYSTEM_CANCEL: 2, USER_CANCEL_REMOVE_NOTIFICATION: 3 },
+    ContinuousTaskDetailedCancelReason: { USER_CANCEL_REMOVE_NOTIFICATION: 3 },
+    ContinuousTaskSuspendReason: {},
     ContinuousTaskRequest: class {}, BackgroundTaskMode: { MODE_TASK_KEEPING: 9 },
     BackgroundTaskSubmode: { SUBMODE_NORMAL_NOTIFICATION: 0 },
     async startBackgroundRunning(_ctx, request) {
@@ -33,8 +36,9 @@ function harness({ audioEnabled = false, deny = [], rendererError = false } = {}
       if (h.deny.some(x => modes.includes(x))) throw new Error('denied');
       if (h.startGate) { const gate = h.startGate; h.startGate = null; await gate.promise; }
       const notificationId = ++id;
-      h.tasks = [{ notificationId, backgroundModes: [...modes], suspendState: false }];
-      return { notificationId };
+      const continuousTaskId = notificationId + 1000;
+      h.tasks = [{ notificationId, continuousTaskId, backgroundModes: [...modes], suspendState: false }];
+      return { notificationId, continuousTaskId };
     },
     async stopBackgroundRunning() { calls.push(['stop']); h.tasks = []; },
     async getAllContinuousTasks() {
@@ -55,8 +59,8 @@ function harness({ audioEnabled = false, deny = [], rendererError = false } = {}
     SettingsService: { async load() { return { audioKeepAliveEnabled: h.audioEnabled }; } },
     ContinuousTaskKind: { NONE: 'none', TASK_KEEPING: 'taskKeeping',
       DATA_TRANSFER: 'dataTransfer', AUDIO_PLAYBACK: 'audioPlayback' },
-    TaskProgressUpdater: { attach: (...a) => calls.push(['progress', ...a]),
-      detach: () => calls.push(['detach']) },
+    TaskProgressUpdater: { attach: (...a) => { progressActive = a[1] === 'dataTransfer'; calls.push(['progress', ...a]); },
+      detach: () => { progressActive = false; calls.push(['detach']); }, isActive: () => progressActive },
     avSession: {
       PlaybackState: { PLAYBACK_STATE_PLAY: 2 },
       async createAVSession() {
@@ -87,7 +91,9 @@ function harness({ audioEnabled = false, deny = [], rendererError = false } = {}
   });
   ctx.AudioKeepAlive = load('commons/services/AudioKeepAlive.ets', 'AudioKeepAlive', ctx);
   const guardian = load('commons/services/UiGuardian.ets', 'UiGuardian', ctx);
-  return Object.assign(h, { guardian, audio: ctx.AudioKeepAlive, calls, timers, renderers, sessions, logs,
+  ctx.UiGuardian = guardian;
+  const watch = load('commons/services/BackgroundTaskWatch.ets', 'BackgroundTaskWatch', ctx);
+  return Object.assign(h, { guardian, watch, audio: ctx.AudioKeepAlive, calls, timers, renderers, sessions, logs,
     context: {}, check: async () => h.alive,
     starts: () => calls.filter(x => x[0] === 'start'),
     advance(ms) { now += ms; },
@@ -214,7 +220,7 @@ await test('audio tasks never publish dataTransfer progress', async () => {
   const ctx = vm.createContext({ console, Date, setInterval: (...a) => { timers.push(a); return 1; },
     clearInterval() {}, AppLogger: { info() {}, warn() {}, errText: String },
     notificationManager: { publish: (...a) => { publications.push(a); return Promise.resolve(); } },
-    SsrvpnNotifier: { cancel: async () => {}, update: async () => {} } });
+    TunBoxNotifier: { cancel: async () => {}, update: async () => {} } });
   const progress = load('commons/services/TaskProgressUpdater.ets', 'TaskProgressUpdater', ctx);
   progress.attach(7, 'audioPlayback'); assert.equal(timers.length, 0); assert.equal(publications.length, 0);
 });
@@ -236,5 +242,80 @@ await test('old and malformed settings keep audio off; explicit true round-trips
   assert.equal(settings.fromJson({ audioKeepAliveEnabled: 'true' }).audioKeepAliveEnabled, false);
   const value = settings.fromJson({ audioKeepAliveEnabled: true });
   assert.equal(settings.fromJson(value.toJson()).audioKeepAliveEnabled, true);
+});
+await test('watchdog restores dataTransfer progress after an unreported system resume', async () => {
+  const h = harness({ deny: ['taskKeeping'] }); await h.guardian.engage(h.context, h.check);
+  h.tasks[0].suspendState = true; await h.tick();
+  h.tasks[0].suspendState = false; await h.tick();
+  assert.equal(h.guardian.isRegistered(), true);
+  assert.equal(h.calls.filter(x => x[0] === 'progress' && x[2] === 'dataTransfer').length, 2,
+    'resumed dataTransfer must regain its progress timer');
+  await h.tick();
+  assert.equal(h.calls.filter(x => x[0] === 'progress' && x[2] === 'dataTransfer').length, 2,
+    'healthy checks must not repeatedly reset the five-minute timer');
+  await h.close();
+});
+await test('watchdog observes resume even when the suspend event arrived but resume event was lost', async () => {
+  const h = harness({ deny: ['taskKeeping'] }); await h.guardian.engage(h.context, h.check);
+  h.tasks[0].suspendState = true;
+  h.guardian.noteExternalSuspend({ requireUserAction: false, category: 'general', reasonCode: 2 }, true);
+  h.tasks[0].suspendState = false; await h.tick();
+  assert.equal(h.guardian.isRegistered(), true); await h.close();
+});
+await test('confirmed generic cancellation re-arms after one backoff window', async () => {
+  const h = harness(); await h.guardian.engage(h.context, h.check);
+  const id = h.tasks[0].continuousTaskId; h.tasks = [];
+  h.watch.dispatchCancel({ id, reason: 2 }); await h.tick();
+  assert.equal(h.starts().length, 2, 'OS cancellation already confirms missing; no second 30s delay');
+  await h.close();
+});
+await test('late cancellation and suspension from an old task cannot revoke the new task', async () => {
+  const h = harness(); await h.guardian.engage(h.context, h.check);
+  const oldId = h.tasks[0].continuousTaskId;
+  await h.guardian.release(h.context); await h.guardian.engage(h.context, h.check);
+  h.watch.dispatchCancel({ id: oldId, reason: 1 });
+  h.watch.dispatchSuspend({ continuousTaskId: oldId, suspendState: true, suspendReason: 2 });
+  assert.equal(h.guardian.isRegistered(), true);
+  assert.equal(h.guardian.isAutoEngageSuppressed(), false);
+  assert.equal(h.guardian.isWatching(), true); await h.close();
+});
+await test('late old-task cancellation cannot abort a pending replacement registration', async () => {
+  const h = harness(); await h.guardian.engage(h.context, h.check);
+  const oldId = h.tasks[0].continuousTaskId;
+  await h.guardian.release(h.context);
+  const gate = deferred(); h.startGate = gate;
+  const pending = h.guardian.engage(h.context, h.check); await flush();
+  h.watch.dispatchCancel({ id: oldId, reason: 1 });
+  gate.resolve(); assert.equal(await pending, true);
+  assert.equal(h.guardian.isAutoEngageSuppressed(), false); await h.close();
+});
+await test('generic cancellation after a suspension can still repair the missing task', async () => {
+  const h = harness(); await h.guardian.engage(h.context, h.check);
+  const id = h.tasks[0].continuousTaskId;
+  h.guardian.noteExternalSuspend({ requireUserAction: false, category: 'general', reasonCode: 2 }, true);
+  h.tasks = []; h.watch.dispatchCancel({ id, reason: 2 }); await h.tick();
+  assert.equal(h.guardian.isRegistered(), true); await h.close();
+});
+await test('the current task user-stop event still suppresses all automatic registration', async () => {
+  const h = harness({ audioEnabled: true }); await h.guardian.engage(h.context, h.check);
+  h.watch.dispatchCancel({ id: h.tasks[0].continuousTaskId, reason: 1 }); await flush();
+  assert.equal(h.guardian.isAutoEngageSuppressed(), true);
+  assert.equal(h.guardian.isWatching(), false); assert.equal(h.audio.isActive(), false);
+  assert.equal(await h.guardian.engage(h.context, h.check), false); await h.close();
+});
+await test('old watchdog query neither blocks nor unlocks a new session check', async () => {
+  const h = harness(); await h.guardian.engage(h.context, h.check);
+  const old = deferred(); h.queryGate = old;
+  const first = h.guardian.checkBackgroundTask(); await flush();
+  await h.guardian.release(h.context);
+  await h.guardian.engage(h.context, h.check);
+  const current = deferred(); h.queryGate = current;
+  const second = h.guardian.checkBackgroundTask(); await flush();
+  assert.equal(h.calls.filter(x => x[0] === 'query').length, 2,
+    'an old query must not block the replacement watchdog');
+  old.resolve(); await first;
+  assert.equal(h.guardian.watchdogBusy, true, 'the old finally must not unlock the new query');
+  current.resolve(); await second;
+  assert.equal(h.guardian.watchdogBusy, false); await h.close();
 });
 console.log(`RESULT: ${passed} passed, 0 failed (platform boundaries mocked; not a device test)`);

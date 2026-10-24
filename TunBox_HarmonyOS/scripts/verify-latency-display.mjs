@@ -130,16 +130,11 @@ ok('测速完成提示不带计数（只有「✓ 测速完成」）',
   && !/可用 \$\{progress\.measured\}/.test(fs.readFileSync(
     path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8')));
 
-// ── 「控制器过载」必须有界面出口（2026-10-22 迁到真实入口：订阅页闪电测速）────
-// 契约：过载路径下引擎**故意不给节点写结论**（保持未测）⇒ 用户看到「测速完成 + 一堆 --」。
-// 必须单独说明，且文案与「通道不可用」区分（通道是好的、可以重测）。
-// 本条曾锁在 NodeSelectionPage（死页），随该页的组测实现一起迁到 SubscriptionPage。
+// 2026-10-23 用户要求：所有组级失败统计提示一律移除，诊断数据仍留在日志。
 const subPageSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8');
-ok('过载数进入测速结论文案（不静默丢弃）',
-  /coreOverloaded\s*>\s*0/.test(subPageSrc) && /控制器过载/.test(subPageSrc));
-ok('过载文案与「通道不可用」区分（说明通道正常、可重测）',
-  /控制器过载[^`]{0,40}通道正常/.test(subPageSrc));
+ok('测速完成提示不带控制器过载计数',
+  !/coreOverloaded\s*>\s*0|个节点控制器过载未测/.test(subPageSrc));
 ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress）',
   /Promise<LatencyProgress\s*\|\s*null>/.test(fs.readFileSync(
     path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8'))
@@ -156,9 +151,9 @@ const flcSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/flclash/FlclashDelay.ets'), 'utf8');
 ok('组测唯一入口 = FlclashLatencyService（逐节点，不再调内核组接口）',
   /FlclashLatencyService\.start\(/.test(bgSrc) && !/testGroupDetailedResult/.test(bgSrc));
-ok('组测入口是智能优选行内的纯图形按钮（不是独立卡片/文字标题）',
-  /accessibilityText\('内核组测速（一次测完所有节点）'\)/.test(subPageSrc)
-  && !/Text\('内核组测速'\)/.test(subPageSrc));
+ok('订阅展开区保留可访问的闪电测速入口',
+  /accessibilityText\('闪电测速'\)/.test(subPageSrc)
+  && /onClick\(\(\) => this.speedTestSub\(sub.id\)\)/.test(subPageSrc));
 ok('组测在途有防重入 + 转圈',
   /if \(this\.groupTesting\) \{\s*return;/.test(subPageSrc)
   && /@State groupTesting: boolean = false;/.test(subPageSrc));
@@ -174,7 +169,7 @@ ok('失败结果写 LatencyProbeKind 真分类（timeout / switch_failed / netwo
   /LatencyProbeKind\.TIMEOUT/.test(flcServiceSrc)
   && /LatencyProbeKind\.SWITCH_FAILED/.test(flcServiceSrc)
   && /LatencyProbeKind\.NETWORK_UNREACHABLE/.test(flcServiceSrc)
-  && /import \{ LatencyProbeKind \}/.test(flcServiceSrc));
+  && /import \{[^}]*LatencyProbeKind[^}]*\} from/.test(flcServiceSrc));
 ok('不再写表外失败分类字面量（: \'failed\' 会让 describe() 落到 --）',
   !/result\.value === FLCLASH_DELAY_TIMED_OUT \? 'timeout' : 'failed'/.test(flcServiceSrc));
 ok('并发/超时/测速地址对齐 FlClash（32 / 5000ms / gstatic https）',
@@ -236,6 +231,14 @@ ok('批次硬截止可注入（0 = 自动，测试注入小值仍生效）',
   /batchDeadlineMs: number = 0;/.test(engineSrc)
   && /batchDeadlineMs > 0/.test(engineSrc)
   && /static deadlineForBatch\(nodeCount: number\): number/.test(engineSrc));
+
+for (const name of ['SubscriptionPage', 'NodeSelectionPage']) {
+  const page = fs.readFileSync(path.join(root, 'entry/src/main/ets/pages', `${name}.ets`), 'utf8');
+  ok(`${name} 不再展示组级失败诊断`,
+    !/subDiagnosisText|latencyGroupDiagnosis|groupDiagnosis\(/.test(page));
+  ok(`${name} 不再展示超时或过载数量提示`,
+    !/全部节点超时|个节点控制器过载未测/.test(page));
+}
 
 console.log(`\n延迟显示契约自检：${pass} 条通过，${fails.length} 条失败`);
 if (fails.length > 0) {

@@ -51,7 +51,7 @@ for (const [label, p] of [['typescript(tsc.js)', TSC], ['ets/kits', KITS], ['ets
   }
 }
 
-const sandbox = join(tmpdir(), 'ssrvpn-typecheck-' + process.pid);
+const sandbox = join(tmpdir(), 'tunbox-typecheck-' + process.pid);
 rmSync(sandbox, { recursive: true, force: true });
 mkdirSync(sandbox, { recursive: true });
 writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
@@ -97,7 +97,7 @@ try {
 }
 
 let failures = 0;
-console.log('===== SSRVPN 第二阶段类型校验 =====');
+console.log('===== TunBox 第二阶段类型校验 =====');
 console.log('[INFO] tsc: ' + TSC);
 console.log('[INFO] SDK: @kit.* -> ' + KITS);
 console.log('[INFO] SDK: @ohos.* -> ' + API);

@@ -274,7 +274,7 @@ if (launch !== null) {
 }
 
 // F8 ── 真实隧道配置生成路径同样先回填
-const connect = methodBody(orch.code, /async\s+connect\s*\(\s*node:/);
+const connect = methodBody(orch.code, /async\s+connectExclusive\s*\(\s*node:/);
 ok('F8a 存在 connect()', connect !== null);
 if (connect !== null) {
   const b = connect.body;
@@ -348,7 +348,7 @@ if (fresh !== null) {
   ok('F16c 隧道配置指纹与当前节点集比对',
     fresh.body.includes('tunnelConfigFingerprint') && fresh.body.includes('nodeSetFingerprint'));
 }
-const hot = methodBody(orch.code, /async\s+reloadRulesHot\s*\(/);
+const hot = methodBody(orch.code, /async\s+reloadRulesHotExclusive\s*\(/);
 ok('F17a 存在 reloadRulesHot()', hot !== null);
 if (hot !== null) {
   const b = hot.body;

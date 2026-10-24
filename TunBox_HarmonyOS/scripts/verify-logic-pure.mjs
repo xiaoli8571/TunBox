@@ -63,7 +63,7 @@ function near(label, actual, expected, eps = 1e-9) {
 }
 
 // ── 生成加载沙箱：真实源码 + SDK 垫片 ─────────────────────────────────
-const sandbox = join(tmpdir(), 'ssrvpn-logic-verify-' + process.pid);
+const sandbox = join(tmpdir(), 'tunbox-logic-verify-' + process.pid);
 rmSync(sandbox, { recursive: true, force: true });
 mkdirSync(sandbox, { recursive: true });
 writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
@@ -608,7 +608,7 @@ eq('selector.sentinel.failed', Select.LATENCY_FAILED, -1);
 // ── 收尾 ──────────────────────────────────────────────────────────────
 rmSync(sandbox, { recursive: true, force: true });
 
-console.log('===== SSRVPN 第二阶段纯逻辑离线校验 =====');
+console.log('===== TunBox 第二阶段纯逻辑离线校验 =====');
 for (const n of notes) {
   console.log('[INFO] ' + n);
 }

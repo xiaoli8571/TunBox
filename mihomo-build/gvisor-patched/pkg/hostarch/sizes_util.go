@@ -11,10 +11,11 @@ const (
 	PageMask      = PageSize - 1
 	HugePageMask  = HugePageSize - 1
 	CacheLineMask = CacheLineSize - 1
+	JumboPageMask = ^uintptr(JumboPageSize - 1)
 )
 
 type bytecount interface {
-	~uint | ~uint16 | ~uint32 | ~uint64 | ~uintptr
+	~uint | ~uint32 | ~uint64 | ~uintptr
 }
 
 type hugebytecount interface {
@@ -111,4 +112,14 @@ func CacheLineRoundUp[T bytecount](x T) (val T, ok bool) {
 	val = CacheLineRoundDown(x + CacheLineMask)
 	ok = val >= x
 	return
+}
+
+// MustCacheLineRoundUp is equivalent to CacheLineRoundUp, but panics if
+// rounding up overflows.
+func MustCacheLineRoundUp[T bytecount](x T) T {
+	val, ok := CacheLineRoundUp(x)
+	if !ok {
+		panic("CacheLineRoundUp overflows")
+	}
+	return val
 }

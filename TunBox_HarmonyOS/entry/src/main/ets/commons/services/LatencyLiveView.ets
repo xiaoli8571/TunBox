@@ -37,6 +37,22 @@ export class LatencyLiveView {
   /** 待触发的合并通知定时器；-1 表示当前没有挂起的通知 */
   private static notifyTimer: number = -1;
 
+  /**
+   * 批次 runId 的**唯一发号器**（2026-10-24 P1 修复）。
+   *
+   * 两个引擎（LatencyEngine / FlclashLatencyService）曾经各自维护从 1 起的独立
+   * 计数器，而 isTestingOwnedBy 按裸数值判定标记所有权 —— 两计数器撞号时，旧批
+   * 收尾会把新批同节点上的 TESTING 标记误清成 UNTESTED（正在测的行转圈消失、
+   * 旧延迟值永久丢成 --）。发号器收敛到 runId 的唯一消费者（本类）后，
+   * 进程内任何两次取号必然不同值，撞号在结构上不再可能。
+   */
+  private static runIdSeq: number = 0;
+
+  static nextRunId(): number {
+    LatencyLiveView.runIdSeq = LatencyLiveView.runIdSeq + 1;
+    return LatencyLiveView.runIdSeq;
+  }
+
   /** 完整记录（新代码入口） */
   static recordFor(nodeName: string): LatencyRecord | null {
     const v = LatencyLiveView.map.get(nodeName);

@@ -30,23 +30,40 @@ struct ConnectionsPage {
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   private subs: SubscriptionService = SubscriptionService.instance();
   private pollTimer: number = -1;
+  private bootstrapTimer: number = -1;
+  private pageVisible: boolean = false;
+  private pageGeneration: number = 0;
 
   onPageShow(): void {
+    this.stopPoll();
+    this.pageVisible = true;
+    const generation = this.pageGeneration;
     // 入场转场期间不抢 UI 线程：首帧建表延到转场之后（2026-10-17 用户反馈进入页面卡顿）
-    setTimeout((): void => { this.bootstrap(); }, 240);
+    this.bootstrapTimer = setTimeout((): void => {
+      this.bootstrapTimer = -1;
+      this.bootstrap(generation).catch((e: Object): void => {
+        AppLogger.warn(TAG, `bootstrap failed: ${AppLogger.errText(e)}`);
+      });
+    }, 240);
+  }
+
+  onPageHide(): void {
+    this.stopPoll();
   }
 
   aboutToDisappear(): void {
     this.stopPoll();
   }
 
-  private async bootstrap(): Promise<void> {
+  private async bootstrap(generation: number): Promise<void> {
+    if (!this.isCurrentPage(generation)) { return; }
     const ctx = getContext(this) as Context;
     this.orchestrator.init(ctx);
     await this.subs.init(ctx);
+    if (!this.isCurrentPage(generation)) { return; }
     this.knownNames = this.subs.nodes.map((n) => n.name);
-    await this.refreshOnce();
-    this.startPoll();
+    await this.refreshOnce(generation);
+    if (this.isCurrentPage(generation)) { this.startPoll(); }
   }
 
   private startPoll(): void {
@@ -59,19 +76,31 @@ struct ConnectionsPage {
   }
 
   private stopPoll(): void {
+    this.pageVisible = false;
+    this.pageGeneration++;
+    this.refreshing = false;
+    if (this.bootstrapTimer >= 0) {
+      clearTimeout(this.bootstrapTimer);
+      this.bootstrapTimer = -1;
+    }
     if (this.pollTimer >= 0) {
       clearInterval(this.pollTimer);
       this.pollTimer = -1;
     }
   }
 
-  private async refreshOnce(): Promise<void> {
-    if (this.refreshing) {
+  private isCurrentPage(generation: number): boolean {
+    return this.pageVisible && generation === this.pageGeneration;
+  }
+
+  private async refreshOnce(generation: number = this.pageGeneration): Promise<void> {
+    if (!this.isCurrentPage(generation) || this.refreshing) {
       return;
     }
     this.refreshing = true;
     try {
       const list = await this.orchestrator.api.listConnections(this.knownNames);
+      if (!this.isCurrentPage(generation)) { return; }
       if (list === null) {
         this.reachable = false;
       } else {
@@ -84,7 +113,7 @@ struct ConnectionsPage {
     } catch (e) {
       AppLogger.warn(TAG, `refresh failed: ${AppLogger.errText(e)}`);
     } finally {
-      this.refreshing = false;
+      if (this.isCurrentPage(generation)) { this.refreshing = false; }
     }
   }
 

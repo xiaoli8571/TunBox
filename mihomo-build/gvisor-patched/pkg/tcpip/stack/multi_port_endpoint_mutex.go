@@ -92,5 +92,5 @@ func multiPortEndpointinitLockNames() {}
 
 func init() {
 	multiPortEndpointinitLockNames()
-	multiPortEndpointprefixIndex = locking.NewMutexClass(reflect.TypeOf(multiPortEndpointRWMutex{}), multiPortEndpointlockNames)
+	multiPortEndpointprefixIndex = locking.NewMutexClass(reflect.TypeOf((*multiPortEndpointRWMutex)(nil)).Elem(), multiPortEndpointlockNames)
 }

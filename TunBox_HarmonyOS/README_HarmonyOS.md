@@ -1,6 +1,6 @@
-# SSRVPN for HarmonyOS
+# TunBox for HarmonyOS
 
-SSRVPN 的 HarmonyOS NEXT 移植版（1:1 复刻 upstream Android 版的 UI 与功能）。upstream：`Elegying/SSRVPN`（MIT），内核 Mihomo（Clash Meta，GPL-3.0）。
+TunBox 的 HarmonyOS NEXT 移植版（1:1 复刻 upstream Android 版的 UI 与功能）。upstream：`Elegying/TunBox`（MIT），内核 Mihomo（Clash Meta，GPL-3.0）。
 
 ## 构建
 
@@ -8,7 +8,7 @@ SSRVPN 的 HarmonyOS NEXT 移植版（1:1 复刻 upstream Android 版的 UI 与�
 2. 编译内核（先做一次）：
    ```bash
    # 先用 upstream 原文件覆盖占位桥接层
-   cp ../SSRVPN-upstream/SSRVPN_Android/native/bridge/bridge.go entry/src/main/cpp/bridge/bridge.go
+   cp ../TunBox-upstream/TunBox_Android/native/bridge/bridge.go entry/src/main/cpp/bridge/bridge.go
    OHOS_NDK=/path/to/ohos-sdk/native ./scripts/build-ohos-core.sh /path/to/mihomo-src
    ```
    产物 `entry/libs/arm64-v8a/libgojni.so`。详见 `PORTING_STATUS.md` P1-2。
@@ -21,7 +21,7 @@ SSRVPN 的 HarmonyOS NEXT 移植版（1:1 复刻 upstream Android 版的 UI 与�
 ## 目录
 
 - `entry/src/main/ets/pages/` — 三个主页面（主页/订阅/节点编辑）
-- `entry/src/main/ets/commons/` — 与 upstream `packages/ssrvpn_shared` 一一对应的逻辑层
+- `entry/src/main/ets/commons/` — 与 upstream `packages/tunbox_shared` 一一对应的逻辑层
 - `entry/src/main/ets/vpnability/` — VPN 扩展能力（TUN、长时任务）
 - `entry/src/main/cpp/` — NAPI 内核桥（dlopen libgojni.so）
 - `scripts/build-ohos-core.sh` — Mihomo 内核交叉编译脚本

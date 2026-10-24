@@ -15,7 +15,7 @@
  *
  * provider `path` 语义（真机无法验证，按最保守可用方式实现，并可一键切换）：
  * - 内核初始化时 HomeDir 被硬编码为 /data/storage/el2/base/haps/entry/cache，
- *   即应用 cacheDir（见 entry/src/main/cpp/ssrvpn_core_napi.cpp loadCore()）。
+ *   即应用 cacheDir（见 entry/src/main/cpp/tunbox_core_napi.cpp loadCore()）。
  *   Mihomo 对 provider path 的既有约定是「相对路径按 HomeDir 解析、绝对路径原样使用」，
  *   本项目现有配置里的 rule-provider 也已经在用 `path: ./ruleset/xxx.mrs`。
  * - 因此默认选 'relative'（./raw_subscriptions/raw_<id>.yaml）：不依赖 UI 进程与

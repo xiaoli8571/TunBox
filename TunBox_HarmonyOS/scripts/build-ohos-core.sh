@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# SSRVPN HarmonyOS - Mihomo 内核交叉编译脚本
+# TunBox HarmonyOS - Mihomo 内核交叉编译脚本
 # 对应 upstream: scripts/build-android-core.sh（recipe 见 assets/libgojni-source.txt）
 #
 # 产物: libgojni.so (ohos arm64, c-shared, tags: with_gvisor,cmfa)
 # 放入: entry/libs/arm64-v8a/ (HVigor 会打包进 HAP 的 /data/storage/el1/bundle/libs/arm64/)
 #
-# 内核来源: mihomo-build/mihomo-smart-<sha>/（lux5am/mihomo-smart, 分支 Alpha）。
-# 该目录内已含 SSRVPN 集成层，构建期不注入任何文件:
+# 内核来源: mihomo-build/mihomo-smart-<sha>/（vernesong/mihomo, 分支 Alpha；
+# 462455136157a760937c666bba71afe33b1a809e = 上游 mihomo v1.19.33 稳定版代码 + Smart 组层）。
+# 该目录内已含 TunBox 集成层，构建期不注入任何文件:
 #   bridge/bridge.go, bridge/bridge_test.go, cshared_main.go,
 #   REALITY legacy 协商补丁(component/tls/reality*.go),
 #   sniffer/tuic SetDeadline 补丁,

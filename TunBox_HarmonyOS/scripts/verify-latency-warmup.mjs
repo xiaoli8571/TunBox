@@ -578,7 +578,7 @@ console.log('[A5] 该条件等待由「扩展之前是否在跑」的布尔量�
 // ═══════════════════════════════════════════════════════════════════════
 console.log('[A6] connect() 里 stopTestCore() 早于 stopVpnExtensionAbility()');
 {
-  const m = methodBody(orch.code, /\basync[ \t]+connect[ \t]*\(/);
+  const m = methodBody(orch.code, /\basync[ \t]+connectExclusive[ \t]*\(/);
   ok('a6.connect-found', m !== null, '找不到 ConnectionOrchestrator.connect()');
   const body = m ? m.text : '';
   const stopCore = /(?:\bthis[ \t]*\.[ \t]*)?(?:stopTestCore|teardownTestCore)[ \t]*\(/.exec(body);

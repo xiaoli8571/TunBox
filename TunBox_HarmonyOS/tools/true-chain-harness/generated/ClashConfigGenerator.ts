@@ -1,7 +1,7 @@
 // [harness] generated from entry/src/main/ets/commons/services/ClashConfigGenerator.ets — 仅 import 目标被重写
 /**
  * Clash / Mihomo 配置生成器
- * 移植自 upstream: packages/ssrvpn_shared/lib/services/clash_config_generator.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/services/clash_config_generator.dart
  *
  * 关键约束（与 upstream 行为一致）：
  * - DNS 恒接管（设置页无开关）：`dns.enable: true` + `tun.dns-hijack: any:53` +
@@ -875,6 +875,11 @@ export class ClashConfigGenerator {
         lines.push(`  - RULE-SET,rs-${ruleSet.name},${ruleSet.policy}`);
       }
       for (const customRule of ClashConfigGenerator.normalizeCustomRules(settings.customRules)) {
+        // 自定义 GEOIP 与订阅 GEOIP 共用资产闸门，缺库时避免启动期同步下载。
+        // 只跳过本次发射，用户保存的规则保留，数据库就绪后自动恢复。
+        if (!useGeoip && customRule.toUpperCase().startsWith('GEOIP,')) {
+          continue;
+        }
         lines.push(`  - ${customRule}`);
       }
       // ── 订阅自带 rules（导入订阅时落账）──────────────────────────────
@@ -2807,11 +2812,18 @@ export class ClashConfigGenerator {
       if (n.obfsParam.length > 0) {
         fields.push(`obfs-password: ${q(n.obfsParam)}`);
       }
+    }
+    // hysteria v1/v2 带宽：内核 HysteriaOption/Hysteria2Option 的 up/down 同键名（string）。
+    // v1 漏发时内核用默认带宽，机场限速形同虚设；v1 的混淆键只有 obfs（无 obfs-password）。
+    if (proxyType === 'hysteria2' || proxyType === 'hysteria') {
       if (n.hyUp.length > 0) {
         fields.push(`up: ${q(n.hyUp)}`);
       }
       if (n.hyDown.length > 0) {
         fields.push(`down: ${q(n.hyDown)}`);
+      }
+      if (proxyType === 'hysteria' && n.obfs.length > 0) {
+        fields.push(`obfs: ${q(n.obfs)}`);
       }
     }
     if (n.alpnList.length > 0 && YamlMerger.supportsAlpn(proxyType)) {

@@ -19,7 +19,7 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 /* Start of preamble from import "C" comments.  */
 
 
-#line 19 "cshared_main.go"
+#line 22 "cshared_main.go"
 
 #include <stdlib.h>
 
@@ -79,15 +79,17 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
-extern void SsrvpnInit(char* homeDir, char* configFile);
-extern int SsrvpnStart(char* configPath, long long tunFd);
-extern long long SsrvpnInitProtect();
-extern void SsrvpnSetProtectResult(int ok);
-extern void SsrvpnSetProtectResultForFd(long long fd, long long seq, int ok);
-extern void SsrvpnStop();
-extern int SsrvpnIsRunning();
-extern char* SsrvpnVersion();
-extern char* SsrvpnLastError();
+extern char* TunBoxPrepareProfile(char* text);
+extern void TunBoxFreeString(char* text);
+extern void TunBoxInit(char* homeDir, char* configFile);
+extern int TunBoxStart(char* configPath, long long tunFd);
+extern long long TunBoxInitProtect();
+extern void TunBoxSetProtectResult(int ok);
+extern void TunBoxSetProtectResultForFd(long long fd, long long seq, int ok);
+extern void TunBoxStop();
+extern int TunBoxIsRunning();
+extern char* TunBoxVersion();
+extern char* TunBoxLastError();
 
 #ifdef __cplusplus
 }

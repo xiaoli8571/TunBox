@@ -1,7 +1,7 @@
 {
   "forms": [
     {
-      "name": "SsrvpnToggleCard",
+      "name": "TunBoxToggleCard",
       "displayName": "$string:form_desc",
       "description": "Nexus quick toggle card",
       "isDefault": true,
@@ -17,7 +17,7 @@
       "supportDimensions": ["2*2"]
     },
     {
-      "name": "SsrvpnInfoCard",
+      "name": "TunBoxInfoCard",
       "displayName": "$string:form_info_desc",
       "description": "Nexus status, node, application memory and cached public IP card",
       "isDefault": false,

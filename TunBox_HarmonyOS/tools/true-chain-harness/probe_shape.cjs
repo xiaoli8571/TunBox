@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 const dir = process.argv[2] || __dirname;
-for (const fname of ['ssrvpn_subscriptions_r4', 'ssrvpn_subscriptions']) {
+for (const fname of ['tunbox_subscriptions_r4', 'tunbox_subscriptions']) {
   const p = path.join(dir, fname);
   if (!fs.existsSync(p)) { console.log(fname + ': MISSING'); continue; }
   const xml = fs.readFileSync(p, 'utf8');

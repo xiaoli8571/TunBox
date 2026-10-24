@@ -38,7 +38,8 @@ export function harness() {
       phase: 'connected', sessionGeneration: 7, savedAt: now - 360000 },
     config: 'mixed-port: 17890\nexternal-controller: 127.0.0.1:19090\nsecret: "not-read"\ndns:\n  listen: 127.0.0.1:11053\n',
     storedSecret: 'fixture-secret', acceptedSecret: 'fixture-secret', controllerPort: 19090,
-    writes: 0, losses: 0, readGate: null, apiCalls: 0, testCoreStarts: 0, ruleReady: false };
+    writes: 0, losses: 0, readGate: null, apiCalls: 0, testCoreStarts: 0, ruleReady: false,
+    trafficGate: null, trafficFailure: false, trafficReply: null, liveUpdates: 0 };
   class Clock extends Date { static now() { return now; } }
   class Api {
     port = 9090; secret = '';
@@ -49,14 +50,18 @@ export function harness() {
       if (h.controllerGate) { const gate = h.controllerGate; h.controllerGate = null; await gate.promise; }
       return h.controller && this.port === h.controllerPort && this.secret === h.acceptedSecret;
     }
-    async traffic() { return { uploadSpeed: 0, downloadSpeed: 0, uploadBytes: 0, downloadBytes: 0 }; }
+    async traffic() {
+      if (h.trafficGate) { const gate = h.trafficGate; h.trafficGate = null; await gate.promise; }
+      if (h.trafficFailure) { throw new Error('injected traffic error'); }
+      return h.trafficReply ?? { uploadSpeed: 0, downloadSpeed: 0, uploadBytes: 0, downloadBytes: 0 };
+    }
   }
   function read(path) {
     const text = path.endsWith('vpn_heartbeat.txt') ? (h.heartbeat === null ? '' : String(h.heartbeat))
       : path.endsWith('mihomo_config.yaml') ? h.config : '';
     return { ok: text.length > 0, text, truncated: false };
   }
-  const subs = { nodes: [{ name: 'test-node' }], async init() {} };
+  const subs = { nodes: [{ id: 'fixture-node', name: 'test-node' }], async init() {} };
   const context = vm.createContext({
     Date: Clock, Math, Promise, Map, Set, Number,
     setInterval(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
@@ -85,12 +90,13 @@ export function harness() {
         a[0] = 0x28; a[1] = 0xB5; a[2] = 0x2F; a[3] = 0xFD; return 4; },
       closeSync() {},
     },
-    privateFs: { readCapped: read, async readCappedAsync(path) {
+    privateFs: { exists: path => read(path).ok, readCapped: read, async readCappedAsync(path) {
       if (h.readGate) { const gate = h.readGate; h.readGate = null; await gate.promise; } return read(path);
     } },
     MAX_STATE_FILE_BYTES: 65536,
     AppLogger: { info: (...a) => logs.push(a), warn: (...a) => logs.push(a), errText: String },
-    TaskProgressUpdater: { updateLive() {} }
+    chmodPrivate() {},
+    TaskProgressUpdater: { updateLive() { h.liveUpdates++; } }
   });
   Object.assign(context, load('commons/services/TunnelAuthority.ets',
     '({ resolveAuthority, parseExtensionStatus, deriveUiPhase })', context));

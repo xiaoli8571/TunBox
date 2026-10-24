@@ -1,6 +1,6 @@
 /**
  * 数据模型：公网 IP 信息
- * 移植自 upstream: packages/ssrvpn_shared/lib/models/public_ip_info.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/models/public_ip_info.dart
  */
 export class PublicIpInfo {
   ip: string = '';

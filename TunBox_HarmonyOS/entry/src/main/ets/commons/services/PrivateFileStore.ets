@@ -37,9 +37,12 @@ export function ensurePrivateDir(dir: string): void {
 /** 共享的 fileIo 实现实例（无状态，可全局复用） */
 export class FileIoPrivateFs implements PrivateFs {
   writePrivate(path: string, content: string): void {
+    const bytes = util.TextEncoder.create('utf-8').encode(content);
     const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
     try {
-      fs.writeSync(file.fd, content);
+      // writeSync 返回 UTF-8 字节数，不能用 JS 字符数判断；短写不得进入后续原子提升。
+      const written = bytes.byteLength > 0 ? fs.writeSync(file.fd, bytes.slice().buffer as ArrayBuffer) : 0;
+      if (written !== bytes.byteLength) { throw new Error('private file write incomplete'); }
     } finally {
       // fd 必须关闭：writeSync 抛错（磁盘满/权限）时同样释放
       fs.closeSync(file);

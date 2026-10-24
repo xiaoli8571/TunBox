@@ -1,6 +1,6 @@
 /**
  * 数据模型：应用设置
- * 移植自 upstream: packages/ssrvpn_shared/lib/models/app_settings.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/models/app_settings.dart
  * 字段与 upstream 保持一致；鸿蒙端持久化由 SettingsService（@ohos.data.preferences）承担。
  */
 import { NodeSortModes } from '../services/NodeSortPersistence';
@@ -116,7 +116,7 @@ export class AppSettingsJson {
    * 确有 http 需求的用户可在设置页显式打开。
    */
   allowInsecureSubscriptionHttp: boolean = false;
-  rulesEnabled: boolean = true;
+  rulesEnabled: boolean = false;
   /**
    * HyperADRules 去广告规则集开关。**默认关闭**，由用户在「规则」页自行打开。
    *
@@ -150,7 +150,7 @@ export class AppSettingsJson {
    * 节点定义由内核解析，App 不再逐字段搬运。前两次失败的原因已逐条解决：
    *  ① 2026-10-21 绝对路径 → 内核 `path is not subpath of home directory` 拒载；
    *     现用相对路径 `raw_subscriptions/raw_<id>.yaml`；
-   *  ② 「双核 home 不同」的旧结论**是错的**：NAPI `SsrvpnInit` 的 homeDir 恒为
+   *  ② 「双核 home 不同」的旧结论**是错的**：NAPI `TunBoxInit` 的 homeDir 恒为
    *     entry cache（隧道核与无头测速核同目录），本机真实内核与真机双双验证过；
    *  ③ 跨订阅重名 → 该订阅整体退回内联发射（`planRawProviders` 的 nameConflicts），
    *     名字不再二义，`/proxies/{name}/delay` 与延迟表按名索引才成立。
@@ -278,8 +278,8 @@ export class AppSettings {
   healthRepairMaxSteps: number = 2;
   /** 是否允许明文 HTTP 订阅（默认 false；三家主流客户端都只接受 https） */
   allowInsecureSubscriptionHttp: boolean = false;
-  /** 是否启用规则功能；关闭后不生成广告规则和自定义规则。 */
-  rulesEnabled: boolean = true;
+  /** 自定义规则路由默认关闭，用户可手动开启；去广告由独立开关控制。 */
+  rulesEnabled: boolean = false;
   /**
    * HyperADRules 去广告规则集开关，默认 **false**（由用户在「规则」页自行打开）。
    *
@@ -310,7 +310,8 @@ export class AppSettings {
   /**
    * 内核 smart 组的 `policy-priority`：按**节点名**给权重因子，格式 `模式:因子;模式:因子`。
    *
-   * 这是 lux5am/mihomo-smart 独有的 fork 能力（mainline mihomo 没有 smart 组，更没有这个键）。
+   * 这是 mihomo-smart 系 fork（当前基线 vernesong/mihomo@Alpha）独有的能力（mainline mihomo
+   * 没有 smart 组，更没有这个键）。
    * 语义见 `adapter/outboundgroup/smart.go`：因子**大于** LightGBM 评分的排序优先级 ——
    * 只要两个节点的因子不同，就按因子降序排，分数再高也翻不过来（`smart.go:580`）。
    * 模式支持子串匹配（默认）或正则；**首个命中的规则生效**；因子必须为正数，非法规则内核
@@ -500,7 +501,7 @@ export class AppSettings {
     s.healthRepairMaxSteps = clampInt(j.healthRepairMaxSteps, 2, 0, 3);
     // 明文订阅默认拒绝：字段缺失（用户从未设置过）→ false，只认显式 true。
     s.allowInsecureSubscriptionHttp = j.allowInsecureSubscriptionHttp === true;
-    s.rulesEnabled = typeof j.rulesEnabled === 'boolean' ? j.rulesEnabled : true;
+    s.rulesEnabled = typeof j.rulesEnabled === 'boolean' ? j.rulesEnabled : false;
     // 去广告规则默认关闭：字段缺失（用户从未设置过）→ false。
     // 老用户显式存过的 true/false 原样恢复，不会被这次改默认值覆盖。
     s.hyperAdRulesEnabled = typeof j.hyperAdRulesEnabled === 'boolean' ? j.hyperAdRulesEnabled : false;

@@ -148,5 +148,33 @@ await test('a residual live core remains visible to disconnect logic after inten
   assert.equal(state.connected, false); assert.equal(state.coreAlive, true); h.stop();
 });
 
+function trafficTick(h) {
+  for (const timer of [...h.timers.values()]) if (timer.delay === 2000) timer.fn();
+}
+await test('late traffic cannot overwrite a disconnected session or notify observers', async () => {
+  const h = harness(), gate = deferred(); h.trafficGate = gate;
+  h.trafficReply = { uploadSpeed: 99, downloadSpeed: 98, uploadBytes: 97, downloadBytes: 96 };
+  let updates = 0; h.orch.addListener(() => updates++);
+  h.orch.startMonitors(); trafficTick(h); await flush();
+  h.orch.stopMonitors(); h.orch.state = h.ConnState.DISCONNECTED;
+  gate.resolve(); await flush();
+  assert.equal(h.orch.traffic.downloadSpeed, 0); assert.equal(updates, 0);
+  assert.equal(h.liveUpdates, 0); h.stop();
+});
+await test('old traffic completion cannot release the new monitor single flight', async () => {
+  const h = harness(), old = deferred(), current = deferred();
+  h.trafficGate = old; h.orch.startMonitors(); trafficTick(h); await flush();
+  h.orch.stopMonitors(); h.orch.startMonitors(); h.trafficGate = current;
+  trafficTick(h); await flush(); assert.equal(h.orch.trafficPollRunning, true);
+  old.resolve(); await flush(); assert.equal(h.orch.trafficPollRunning, true);
+  current.resolve(); await flush(); assert.equal(h.orch.trafficPollRunning, false); h.stop();
+});
+await test('traffic errors settle the single flight and allow a later sample', async () => {
+  const h = harness(); h.trafficFailure = true; h.orch.startMonitors(); trafficTick(h); await flush();
+  assert.equal(h.orch.trafficPollRunning, false); assert.equal(h.liveUpdates, 0);
+  h.trafficFailure = false; trafficTick(h); await flush();
+  assert.equal(h.liveUpdates, 1); h.stop();
+});
+
 console.log(JSON.stringify({ baseline, passed, failed }));
 if (failed) process.exitCode = 1;

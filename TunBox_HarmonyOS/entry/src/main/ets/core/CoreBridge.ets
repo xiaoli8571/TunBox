@@ -1,14 +1,14 @@
 /**
  * 内核桥（NAPI 封装的 ArkTS 侧接口）
- * 移植自 upstream: SSRVPN_Android/lib/services/clash_service_native_bridge.dart
+ * 移植自 upstream: TunBox_Android/lib/services/clash_service_native_bridge.dart
  *                android/.../kotlin/bridge/Bridge.kt
  *
  * 底层由 entry/src/main/cpp (NAPI) 加载 libgojni.so（Mihomo c-shared 内核）实现。
  * ABI（cshared_main.go 导出）：
- *   SsrvpnInit(homeDir, configFile) / SsrvpnStart(configPath, tunFd) /
- *   SsrvpnStop() / SsrvpnIsRunning() / SsrvpnVersion() / SsrvpnLastError()
+ *   TunBoxInit(homeDir, configFile) / TunBoxStart(configPath, tunFd) /
+ *   TunBoxStop() / TunBoxIsRunning() / TunBoxVersion() / TunBoxLastError()
  */
-import native from 'libssrvpn_core_napi.so';
+import native from 'libtunbox_core_napi.so';
 import { AppLogger } from '../commons/utils/AppLogger';
 
 const TAG = 'CoreBridge';
@@ -21,7 +21,8 @@ interface NativeCoreModule {
   setProtectResult(ok: boolean): void;
   setProtectResultForFd(fd: number, seq: number, ok: boolean): void;
   startCore(configPath: string, tunFd: number): Promise<boolean>;
-  stopCore(): void;
+  stopCore(): Promise<void>;
+  prepareProfile(text: string): Promise<string>;
   isCoreAlive(): boolean;
   coreVersion(): string;
   lastError(): string;
@@ -34,6 +35,23 @@ export class CoreBridgeImpl {
   private loaded: boolean = false;
   private tunFd: number = -1;
   private pendingStart: Promise<boolean> | null = null;
+
+  async prepareProfile(text: string): Promise<string> {
+    const result = await nativeModule.prepareProfile(text);
+    if (result.length === 0) {
+      throw new Error('内核订阅校验器不可用');
+    }
+    const reply = JSON.parse(result) as Record<string, Object>;
+    const error = reply['error'];
+    if (typeof error === 'string' && error.length > 0) {
+      throw new Error(error);
+    }
+    const yaml = reply['yaml'];
+    if (typeof yaml !== 'string' || yaml.length === 0) {
+      throw new Error('内核未返回有效订阅');
+    }
+    return yaml;
+  }
 
   private ensureLoaded(): boolean {
     if (this.loaded) {
@@ -121,7 +139,7 @@ export class CoreBridgeImpl {
         }
       }
     }
-    nativeModule.stopCore();
+    await nativeModule.stopCore();
   }
 
   async isCoreAlive(): Promise<boolean> {

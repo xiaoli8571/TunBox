@@ -66,7 +66,7 @@ function deepEq(label, actual, expected) {
 
 // ── 加载真实源码（type-stripping，只改扩展名）────────────────────────
 const CR_SOURCE = readFileSync(join(svcDir, 'ConcurrentRefresh.ets'), 'utf8');
-const sandbox = join(tmpdir(), 'ssrvpn-concurrent-refresh-' + process.pid);
+const sandbox = join(tmpdir(), 'tunbox-concurrent-refresh-' + process.pid);
 rmSync(sandbox, { recursive: true, force: true });
 mkdirSync(sandbox, { recursive: true });
 writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');

@@ -1,6 +1,6 @@
 /**
  * 订阅解析器（统一入口）
- * 移植自 upstream: packages/ssrvpn_shared/lib/services/subscription_parser.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/services/subscription_parser.dart
  *                subscription_parser_base64_part.dart
  *                subscription_parser_naming_part.dart
  *                subscription_parser_yaml_part.dart
@@ -179,16 +179,20 @@ export class SubscriptionParser {
     // 3) Clash YAML proxies 提取（对应 subscription_parser_yaml_part；完整 YAML 语义由 ClashConfigGenerator 的解析支持）
     if (nodes.length === 0) {
       const groups = YamlMerger.proxyItemGroups(normalized);
-      diagnostics.inputCount = groups.length;
+      // 明文/base64 分支可能已计过数（链接全部解析失败时 nodes 仍为 0，会落到本分支）。
+      // 覆盖式重算会吞掉那些失败计数，诊断显示"输入 0 条"，用户无从知道节点为何变少 —— 改为增量聚合。
+      const priorInput = diagnostics.inputCount;
+      const priorInvalid = diagnostics.invalidCount;
+      diagnostics.inputCount = priorInput + groups.length;
       YamlMerger.resetSkipStats();
       const yamlNodes = SubscriptionParser.parseClashYaml(normalized, subscriptionId, counter);
       for (const n of yamlNodes) {
         add(n);
       }
-      diagnostics.unsupportedCount = YamlMerger.lastSkippedCount;
+      diagnostics.unsupportedCount = diagnostics.unsupportedCount + YamlMerger.lastSkippedCount;
       diagnostics.unsupportedTypes = YamlMerger.lastSkippedTypes;
       const accounted = nodes.length + diagnostics.duplicateCount + diagnostics.unsupportedCount;
-      diagnostics.invalidCount = Math.max(0, diagnostics.inputCount - accounted);
+      diagnostics.invalidCount = priorInvalid + Math.max(0, diagnostics.inputCount - accounted);
     }
 
     AppLogger.info(TAG, `parsed ${nodes.length} nodes for subscription ${subscriptionId}`);

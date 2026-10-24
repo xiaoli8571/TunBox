@@ -15,6 +15,7 @@
 package linux
 
 import (
+	"github.com/metacubex/gvisor/pkg/common/structs"
 	"strings"
 )
 
@@ -254,6 +255,7 @@ const (
 //
 // +marshal
 type VfsCapData struct {
+	_             structs.HostLayout
 	MagicEtc      uint32
 	PermittedLo   uint32
 	InheritableLo uint32
@@ -287,6 +289,7 @@ func (c *VfsCapData) ToString() string {
 //
 // +marshal
 type VfsNsCapData struct {
+	_ structs.HostLayout
 	VfsCapData
 	RootID uint32
 }
@@ -323,6 +326,7 @@ func (c *VfsNsCapData) ToString() string {
 //
 // +marshal
 type CapUserHeader struct {
+	_       structs.HostLayout
 	Version uint32
 	Pid     int32
 }
@@ -331,6 +335,7 @@ type CapUserHeader struct {
 //
 // +marshal slice:CapUserDataSlice
 type CapUserData struct {
+	_           structs.HostLayout
 	Effective   uint32
 	Permitted   uint32
 	Inheritable uint32

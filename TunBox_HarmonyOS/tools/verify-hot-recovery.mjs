@@ -39,7 +39,7 @@ function fixture({ attach = true, protect = true, start = true, gate = null } = 
   });
   vm.runInContext(`{ ${source('core/CoreBridge.ets')} globalThis.bridge = coreBridge; }`, context);
   context.coreBridge = context.bridge;
-  vm.runInContext(`${source('vpnability/VpnExtensionAbility.ets')} globalThis.Extension = SsrvpnVpnExtension;`, context);
+  vm.runInContext(`${source('vpnability/VpnExtensionAbility.ets')} globalThis.Extension = TunBoxVpnExtension;`, context);
   const ext = new context.Extension();
   ext.connection = { async destroy() { events.push(['destroy']); } };
   ext.platformTunFd = 42;

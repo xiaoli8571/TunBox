@@ -1,7 +1,7 @@
 /**
  * 节点国家识别策略 + 公网 IP 服务
- * 移植自 upstream: packages/ssrvpn_shared/lib/utils/node_country_policy.dart
- *                packages/ssrvpn_shared/lib/services/public_ip_info_service.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/utils/node_country_policy.dart
+ *                packages/tunbox_shared/lib/services/public_ip_info_service.dart
  *
  * ## 2026-10-19 稳定性加固（0.4.0「取不到公网 IP」复盘的直接产物）
  *

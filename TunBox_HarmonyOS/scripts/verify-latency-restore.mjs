@@ -285,8 +285,8 @@ check('选点评分不再直接读被污染的 rec.latency',
   check('NodeSelectionPage 不再整单写回旧快照（测速结论走字段级写入口）',
     /SettingsService\.nodeSortSnapshotWrite\(/.test(nodeSrc) &&
     !/SettingsService\.save\(this\.settings\)/.test(nodeSrc));
-  check('NodeSelectionPage 的组级诊断走内核聚合（不自己拼文案）',
-    /LatencyStoreBridge\.groupDiagnosis\(/.test(nodeSrc));
+  check('NodeSelectionPage 不再显示组级失败统计和超时横幅',
+    !/groupDiagnosis|latencyGroupDiagnosis|latencyAllTimedOut/.test(nodeSrc));
 }
 
 const persistSrc = stripComments(

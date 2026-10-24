@@ -1,11 +1,12 @@
-# SSRVPN HarmonyOS - Mihomo core cross-compile script (PowerShell, ASCII-only)
+# TunBox HarmonyOS - Mihomo core cross-compile script (PowerShell, ASCII-only)
 # NOTE: keep this file ASCII-only. PS5.1 reads UTF-8-no-BOM as ANSI/GBK and a
 #       Chinese comment with odd UTF-8 byte count eats the trailing CR and
 #       merges the next line into the comment.
 # Output: entry\libs\arm64-v8a\libgojni.so (ohos arm64, musl, c-shared, tags: with_gvisor,cmfa)
 #
-# Kernel source of record: mihomo-build\mihomo-smart-<sha>\ (lux5am/mihomo-smart,
-# branch Alpha). It already contains the SSRVPN integration layer in-tree:
+# Kernel source of record: mihomo-build\mihomo-smart-<sha>\ (vernesong/mihomo,
+# branch Alpha; 462455136157a760937c666bba71afe33b1a809e = upstream mihomo v1.19.33
+# stable code + Smart group layer). It already contains the TunBox layer in-tree:
 #   bridge\bridge.go, bridge\bridge_test.go, cshared_main.go,
 #   the REALITY legacy-negotiation patch (component\tls\reality*.go),
 #   the sniffer/tuic SetDeadline patches, and
@@ -87,8 +88,8 @@ $env:CGO_CXXFLAGS = $env:CGO_CFLAGS
 
 Set-Location $SrcDir
 Write-Host "==> building mihomo c-shared for ohos arm64 from $SrcDir ..."
-$outLog = Join-Path $LogDir 'ssrvpn_go_build_out.log'
-$errLog = Join-Path $LogDir 'ssrvpn_go_build_err.log'
+$outLog = Join-Path $LogDir 'tunbox_go_build_out.log'
+$errLog = Join-Path $LogDir 'tunbox_go_build_err.log'
 $argLine = 'build -p 1 -buildmode=c-shared -tags with_gvisor,cmfa -ldflags "-s -w -buildid=" -o "' + "$OutDir\libgojni.so" + '" .'
 $p = Start-Process -FilePath $GoExe `
   -ArgumentList $argLine `

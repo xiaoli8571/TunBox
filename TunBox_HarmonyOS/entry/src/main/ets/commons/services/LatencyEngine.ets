@@ -437,14 +437,10 @@ export class LatencyRun {
   /**
    * 批次身份（写入每条 TESTING 记录）。与 generation 分开：
    * generation 会被 cancel/invalidate 递增（用于丢弃结果），runId 必须**稳定**
-   * 表示"这批标记是谁打的"，否则收尾时会认不出自己的标记。进程内单调唯一即可。
+   * 表示"这批标记是谁打的"，否则收尾时会认不出自己的标记。
+   * 发号统一走 LatencyLiveView.nextRunId（进程内跨引擎唯一，防与 Flclash 路径撞号）。
    */
-  private readonly runId: number = LatencyRun.nextRunId();
-  private static runCounter: number = 0;
-  private static nextRunId(): number {
-    LatencyRun.runCounter = LatencyRun.runCounter + 1;
-    return LatencyRun.runCounter;
-  }
+  private readonly runId: number = LatencyLiveView.nextRunId();
   private cancelled: boolean = false;
   private finished: boolean = false;
   private coreNotReadyStreak: number = 0;
@@ -1218,4 +1214,11 @@ export class LatencyEngine {
       LatencyEngine.current = null;
     }
   }
+}
+
+// 回收探针注册：测速批进行中阻止编排器回收无头内核（顺延而非杀核）。
+// 注册在类外静态初始化，import 本模块即生效；重复注册由 includes 去重。
+const recycleProbe = (): boolean => LatencyEngine.isRunning();
+if (!ConnectionOrchestrator.testCoreBusyProbes.includes(recycleProbe)) {
+  ConnectionOrchestrator.testCoreBusyProbes.push(recycleProbe);
 }

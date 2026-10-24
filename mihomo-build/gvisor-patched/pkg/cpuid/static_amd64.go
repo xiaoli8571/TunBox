@@ -17,7 +17,11 @@
 
 package cpuid
 
-import "context"
+import (
+	"context"
+
+	"github.com/metacubex/gvisor/pkg/common"
+)
 
 // Static is a static CPUID function.
 //
@@ -105,8 +109,8 @@ func (s Static) normalize() {
 	if fs.HasFeature(X86FeatureXSAVE) {
 		in := In{Eax: uint32(xSaveInfo)}
 		out := s[in]
-		out.Ecx = max(out.Ecx, maxXsaveSize)
-		out.Ebx = max(out.Ebx, xsaveSize)
+		out.Ecx = common.Max(out.Ecx, maxXsaveSize)
+		out.Ebx = common.Max(out.Ebx, xsaveSize)
 		s[in] = out
 	}
 }

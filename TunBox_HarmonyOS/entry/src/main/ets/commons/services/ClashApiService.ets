@@ -1,6 +1,6 @@
 /**
  * Clash RESTful API 客户端
- * 移植自 upstream: packages/ssrvpn_shared/lib/services/clash_service_base.dart
+ * 移植自 upstream: packages/tunbox_shared/lib/services/clash_service_base.dart
  *                clash_service_latency_support.dart
  *                clash_service_data_plane_support.dart
  * 对应 Android 端 MihomoApiWaiter / MihomoApiHealthProbe / MihomoProxySelection 的职责。
@@ -294,40 +294,71 @@ export class ClashApiService {
    *  GLOBAL 是**尽力而为**（部分配置不声明 GLOBAL 组，PUT 会 404，属正常）。
    *  失败时重试一次：内核刚起时首个 PUT 偶发 400/超时，重试即可收敛。
    */
+  /** Find a member chain, including intermediate groups, with cycle protection. */
+  private selectionPath(table: Record<string, Object>, group: string, target: string,
+    visited: string[]): string[] {
+    if (visited.includes(group) || visited.length > 32) { return []; }
+    const entry = table[group] as Record<string, Object>;
+    if (entry === undefined || entry === null || !Array.isArray(entry['all'])) { return []; }
+    if (!['Selector', 'URLTest', 'Fallback', 'Smart'].includes(entry['type'] as string)) { return []; }
+    const members = entry['all'] as string[];
+    if (members.includes(target)) { return [group, target]; }
+    const next = visited.concat([group]);
+    for (const member of members) {
+      const path = this.selectionPath(table, member, target, next);
+      if (path.length > 0) { return [group].concat(path); }
+    }
+    return [];
+  }
+
   async selectNode(nodeName: string): Promise<boolean> {
-    // ── FlClash 同构（2026-10-22）：组名不再假设是 `PROXY` ─────────────────
-    // 订阅原文接管 proxy-groups 后，组名由机场决定（「🔰 选择节点」「🚀 节点选择」…），
-    // 硬编码 PROXY 的 PUT 会 404 → 用户点节点「没反应」。改为：
-    //   ① 先试 PROXY（旧的 App 生成组，兼容）；
-    //   ② 再试 GLOBAL；
-    //   ③ 最后从 /proxies 里找**确实包含这个节点**的组逐个试。
-    const groups: string[] = await this.groupsContaining(nodeName);
-    for (const group of groups) {
-      if (await this.selectInGroup(group, nodeName)) {
-        if (group !== 'GLOBAL') {
-          if (!(await this.selectInGroup('GLOBAL', nodeName))) {
-            AppLogger.info(TAG, `selectInGroup(GLOBAL) not applied for ${nodeName} (group may be absent)`);
-          }
-        }
-        AppLogger.info(TAG, `selectNode(${nodeName}) applied in group ${group}`);
-        return true;
+    // 「失败时重试一次」（本函数头注释承诺但旧实现缺失）：内核刚起时首个 PUT 偶发
+    // 400/超时是已知瞬态，connect 恰恰在内核刚起时调用本函数 —— 不重试会把瞬态
+    // 当永久失败。第二次失败才如实返回 false（调用方按宽松语义降级）。
+    if (await this.selectNodeOnce(nodeName)) {
+      return true;
+    }
+    return this.selectNodeOnce(nodeName);
+  }
+
+  private async selectNodeOnce(nodeName: string): Promise<boolean> {
+    const json = await this.proxiesJson();
+    if (json === null) { return false; }
+    let table: Record<string, Object>;
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>;
+      table = parsed['proxies'] as Record<string, Object>;
+      if (table === undefined || table === null || table[nodeName] === undefined) { return false; }
+    } catch (e) { return false; }
+    const expected: Map<string, string> = new Map<string, string>();
+    for (const group of Object.keys(table)) {
+      const path = this.selectionPath(table, group, nodeName, []);
+      // Pin leaves before their parents. A successful unrelated group or GLOBAL
+      // must never hide a failure in a rule-facing selector.
+      for (let i = path.length - 2; i >= 0; i--) {
+        expected.set(path[i], path[i + 1]);
       }
     }
-    // 退回到「只试 PROXY」的老路径（部分内核/组不在快照里时仍能生效）
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (await this.selectInGroup('PROXY', nodeName)) {
-        // GLOBAL 尽力而为，不参与返回值；失败只记 info，避免误判为整体失败
-        if (!(await this.selectInGroup('GLOBAL', nodeName))) {
-          AppLogger.info(TAG, `selectInGroup(GLOBAL) not applied for ${nodeName} (group may be absent)`);
-        }
-        return true;
-      }
-      if (attempt === 0) {
-        await ClashApiService.sleep(120);
-      }
+    let nonGlobal = false;
+    for (const pair of expected) {
+      const group = pair[0];
+      const member = pair[1];
+      const ok = await this.selectInGroup(group, member);
+      if (!ok && group !== 'GLOBAL') { return false; }
+      if (ok && group !== 'GLOBAL') { nonGlobal = true; }
     }
-    AppLogger.error(TAG, `selectNode(${nodeName}) failed after retry`);
-    return false;
+    const afterJson = await this.proxiesJson();
+    if (afterJson === null) { return false; }
+    try {
+      const parsed = JSON.parse(afterJson) as Record<string, Object>;
+      const after = parsed['proxies'] as Record<string, Object>;
+      for (const pair of expected) {
+        if (pair[0] === 'GLOBAL' && nonGlobal) { continue; }
+        const entry = after[pair[0]] as Record<string, Object>;
+        if (entry === undefined || entry['now'] !== pair[1]) { return false; }
+      }
+    } catch (e) { return false; }
+    return expected.size > 0;
   }
 
   /**
@@ -677,14 +708,15 @@ export class ClashApiService {
     }
   }
 
-  /** 通用 PUT /configs（updateConfigs）：传入任意 JSON 字段映射，返回是否 2xx/204。 */
-  private async putConfigs(payload: Record<string, string>, op: string): Promise<boolean> {
+  /** PUT 加载配置文件；PATCH 修改运行参数。两者在 Mihomo 中不是同一条路由。 */
+  private async putConfigs(payload: Record<string, string>, op: string,
+    patch: boolean = false): Promise<boolean> {
     const req = http.createHttp();
     try {
       const headers: Record<string, string> = this.authHeader();
       headers['Content-Type'] = 'application/json';
-      const resp = await req.request(`${this.baseUrl()}/configs?force=true`, {
-        method: http.RequestMethod.PUT,
+      const resp = await req.request(`${this.baseUrl()}/configs${patch ? '' : '?force=true'}`, {
+        method: patch ? http.RequestMethod.PATCH : http.RequestMethod.PUT,
         header: headers,
         extraData: JSON.stringify(payload),
         connectTimeout: 3000,
@@ -700,18 +732,18 @@ export class ClashApiService {
     }
   }
 
-  /** 切换运行时代理模式（全局/规则）：PUT /configs（mihomo 中 PUT 与 PATCH 同为 updateConfigs） */
+  /** 只修改模式，不能用 PUT 重新加载文件并重置策略组。 */
   async setMode(mode: string): Promise<boolean> {
     const payload: Record<string, string> = {};
     // mihomo 原生支持 mode: rule / global / direct（2026-10-17 用户要求主页提供直连按钮）
     payload['mode'] = (mode === 'global' || mode === 'direct') ? mode : 'rule';
-    return this.putConfigs(payload, 'setMode');
+    return this.putConfigs(payload, 'setMode', true);
   }
 
   /**
    * 热重载整份配置文件（规则/DNS/代理组等）：PUT /configs {"path": ...} ?force=true。
    * 内核在同一进程内重建 DNS/Router/Rules 并保持 TUN 与连接，无需 UI 侧重建 VPN。
-   * 用于规则/强制站点等变更的最小化生效路径（失败时调用方回退完整重连）。
+   * 失败不代表应重建 VPN；调用方保留当前会话并报告未应用或未确认。
    */
   async reloadFromPath(configPath: string): Promise<boolean> {
     const payload: Record<string, string> = {};

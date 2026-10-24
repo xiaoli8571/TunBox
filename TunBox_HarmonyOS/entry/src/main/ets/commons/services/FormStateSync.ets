@@ -13,14 +13,14 @@ import { SubscriptionService } from './SubscriptionService';
 import { ProxyNode } from '../models/ProxyNode';
 import { AppLogger } from '../utils/AppLogger';
 import { FormInfoMetrics } from './FormInfoMetrics';
-import { SsrvpnNotifier } from './SsrvpnNotifier';
+import { TunBoxNotifier } from './TunBoxNotifier';
 
 const TAG = 'FormStateSync';
-const FORM_PREF = 'ssrvpn_forms';
+const FORM_PREF = 'tunbox_forms';
 const FORM_IDS_KEY = 'form_ids';
 const FORM_RECORDS_KEY = 'form_records';
-export const TOGGLE_FORM_NAME = 'SsrvpnToggleCard';
-export const INFO_FORM_NAME = 'SsrvpnInfoCard';
+export const TOGGLE_FORM_NAME = 'TunBoxToggleCard';
+export const INFO_FORM_NAME = 'TunBoxInfoCard';
 const INFO_REFRESH_INTERVAL_MS = 3000;
 /** 权威对账间隔：内核崩溃/心跳超时后最长 3s 内卡片即变为已断开 */
 const RECONCILE_INTERVAL_MS = 3000;
@@ -187,7 +187,7 @@ export class FormStateSync {
     await FormStateSync.publish(context, snapshot);
     if (snapshot.stateCode !== FormStateCode.CONNECTED) {
       // 隧道已不可用：撤销常驻通知，避免"卡片已断开但通知还挂着"。
-      SsrvpnNotifier.cancel().catch((): void => {
+      TunBoxNotifier.cancel().catch((): void => {
       });
     }
     return snapshot;

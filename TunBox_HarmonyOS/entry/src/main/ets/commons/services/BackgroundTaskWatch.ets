@@ -276,6 +276,10 @@ export class BackgroundTaskWatch {
    */
   private static dispatchCancel(info: backgroundTaskManager.ContinuousTaskCancelInfo): void {
     const id: number = (info !== undefined && info !== null) ? info.id : -1;
+    if (!UiGuardian.ownsTaskEvent(id)) {
+      AppLogger.info(TAG, `ignore cancellation of an unowned task: id=${id}`);
+      return;
+    }
     // SDK 的 reason 是**数值枚举**（ContinuousTaskCancelReason），不是字符串 ——
     // 改造前按 string 读取，判断永远不成立（分类恒为空）。
     const reasonCode: number = (info !== undefined && info !== null && typeof info.reason === 'number')
@@ -317,6 +321,10 @@ export class BackgroundTaskWatch {
    */
   private static dispatchSuspend(info: backgroundTaskManager.ContinuousTaskSuspendInfo): void {
     const id: number = (info !== undefined && info !== null) ? info.continuousTaskId : -1;
+    if (!UiGuardian.ownsTaskEvent(id)) {
+      AppLogger.info(TAG, `ignore suspension of an unowned task: id=${id}`);
+      return;
+    }
     const suspended: boolean = (info !== undefined && info !== null) ? info.suspendState === true : false;
     const reasonCode: number = (info !== undefined && info !== null && typeof info.suspendReason === 'number')
       ? info.suspendReason : 0;

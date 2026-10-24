@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 架构与性能改造自动化验证（对应《SSRVPN HarmonyOS + mihomo VPN 架构与性能优化建议》
+ * 架构与性能改造自动化验证（对应《TunBox HarmonyOS + mihomo VPN 架构与性能优化建议》
  * 全部尚未达标项）。分两层给出证据：
  *
  *   A) 可执行验证（真逻辑）：用 Node 24 原生 TS type-stripping 直接加载
@@ -46,7 +46,7 @@ function has(label, text, needle) { record(label, text.includes(needle), 'missin
 function notHas(label, text, needle) { record(label, !text.includes(needle), 'must NOT contain: ' + needle); }
 
 // ── A) 加载真实纯逻辑源码（零 SDK 依赖，直接 type-strip 导入）───────────
-const sandbox = join(tmpdir(), 'ssrvpn-arch-verify-' + process.pid);
+const sandbox = join(tmpdir(), 'tunbox-arch-verify-' + process.pid);
 rmSync(sandbox, { recursive: true, force: true });
 mkdirSync(sandbox, { recursive: true });
 writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
@@ -566,8 +566,9 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
 const apiSrc = readFileSync(join(svcDir, 'ClashApiService.ets'), 'utf8');
 {
   has('api.reloadFromPath', apiSrc, 'async reloadFromPath');
-  has('api.putConfigs-force', apiSrc, '/configs?force=true');
-  has('api.setMode-via-put', apiSrc, "payload['mode']");
+  has('api.reload-force', apiSrc, "patch ? '' : '?force=true'");
+  has('api.setMode-via-patch', apiSrc, "this.putConfigs(payload, 'setMode', true)");
+  has('api.patch-method', apiSrc, 'http.RequestMethod.PATCH');
 }
 
 const homeSrc = readFileSync(join(etsRoot, 'pages', 'HomePage.ets'), 'utf8');
@@ -795,9 +796,11 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   ok('config.coldstart-promote-order',
     orchSrc.indexOf('this.state = ConnState.CONNECTED;') >= 0
       && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') > orchSrc.indexOf('this.state = ConnState.CONNECTED;')
-      && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') < orchSrc.indexOf('this.snapshotLastGoodConfig();'));
+      && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') < orchSrc.indexOf('this.snapshotLastGoodConfig(preparedConfig);'));
   // 等价兜底仍保留（内核拒载时回滚到最后一份能连上的配置）
-  has('config.lastgood-snapshot', orchSrc, 'this.snapshotLastGoodConfig();');
+  has('config.lastgood-snapshot', orchSrc, 'this.snapshotLastGoodConfig(preparedConfig);');
+  has('config.final-native-validation', orchSrc, 'await coreBridge.prepareProfile(candidate)');
+  has('config.resource-serialization', orchSrc, 'this.lifecycleWrites.then(');
   has('config.lastgood-restore', orchSrc, 'this.restoreLastGoodConfig()');
 
   // ── 明文 HTTP 订阅默认拒绝（对齐 FlClash / Clash Verge Rev / CMFA）──
@@ -810,7 +813,7 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────────
-console.log('===== SSRVPN 架构与性能改造自动化验证 =====');
+console.log('===== TunBox 架构与性能改造自动化验证 =====');
 console.log('[A] 可执行纯逻辑：TunnelAuthority.ets / VpnRecoveryPolicy.ets（Node 24 type-stripping）');
 console.log('[B] 源码级不变量：ClashConfigGenerator / VpnExtensionAbility / ConnectionOrchestrator / ClashApiService / 页面');
 console.log('-----------------------------------------');

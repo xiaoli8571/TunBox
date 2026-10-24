@@ -51,7 +51,7 @@ function countBy(list, fn) {
 // 原因：本套件以前缺样本即 `exit 0`，把它放进 CI 会永远绿灯却什么都没验证 ——
 // "没有执行任何用例"被当成了"通过"。需要有意跳过时显式传 --allow-skip。
 const fixtureArg = process.argv[2] !== undefined && !process.argv[2].startsWith('--')
-  ? process.argv[2] : '';
+  ? process.argv[2] : (process.env.TUNBOX_SUBSCRIPTION_FIXTURE || '');
 const allowSkip = process.argv.includes('--allow-skip');
 const defaultFixture = path.join(appRoot, 'test/fixtures/real-subscription.yaml');
 const fixturePath = fixtureArg.length > 0 ? fixtureArg
@@ -136,7 +136,8 @@ function expectedNodes(yaml) {
       server: fieldOf(text, 'server'),
       port: fieldOf(text, 'port'),
       hasSni: hasRealValue(text, 'sni'),
-      hasSkipCertVerify: hasRealValue(text, 'skip-cert-verify')
+      hasSkipCertVerify: hasRealValue(text, 'skip-cert-verify'),
+      skipCertVerify: fieldOf(text, 'skip-cert-verify').toLowerCase() === 'true'
     });
   }
   return out;
@@ -163,6 +164,12 @@ for (const f of ['SubscriptionParser', 'YamlMerger', 'ProxyProviderParser']) {
 }
 w('ProxyNode.ts', stage1(path.join(models, 'ProxyNode.ets')));
 w('ProxyGroup.ts', stage1(path.join(models, 'ProxyGroup.ets')));
+w('SubDnsUpstream.ts', stage1(path.join(models, 'SubDnsUpstream.ets')));
+const subscriptionDir = path.join(appRoot, 'entry/src/main/ets/commons/subscription');
+for (const file of fs.readdirSync(subscriptionDir)) {
+  if (file.endsWith('.ets')) w(file.replace(/\.ets$/, '.ts'), stage1(path.join(subscriptionDir, file)));
+}
+
 w('AppLogger.ts', `
 export class AppLogger {
   static info() {}
@@ -304,7 +311,7 @@ check('credentials are reachable per contract (structured slot, or extraOpts rel
 
 check('anytls credentials reachable (real subs are anytls-heavy)', () => {
   const anytls = got.filter(n => (n.proxyType || '').toLowerCase() === 'anytls');
-  ok(anytls.length > 0, 'no anytls parsed at all');
+  if (expected.some(n => n.type.toLowerCase() === 'anytls')) ok(anytls.length > 0, 'source anytls nodes were not parsed');
   const bad = anytls.filter(n => n.password.length === 0 && !extraOptMap(n).has('password'));
   ok(bad.length === 0, `${bad.length}/${anytls.length} anytls lost password`);
 });
@@ -333,7 +340,9 @@ check('declared skip-cert-verify is reachable', () => {
     if (!e.hasSkipCertVerify) continue;
     const n = byKey.get(`${e.name}|${e.server}|${e.port}`);
     if (n === undefined) continue;
-    if (n.skipCertVerify !== true && !extraOptMap(n).has('skip-cert-verify')) bad.push(`${e.name}(${e.type})`);
+    const extra = extraOptMap(n);
+    const actual = extra.has('skip-cert-verify') ? String(extra.get('skip-cert-verify')).toLowerCase() === 'true' : n.skipCertVerify;
+    if (actual !== e.skipCertVerify) bad.push(`${e.name}(${e.type})`);
   }
   ok(bad.length === 0, `${bad.length} nodes dropped a declared skip-cert-verify: ${bad.slice(0, 3).join(' / ')}`);
 });

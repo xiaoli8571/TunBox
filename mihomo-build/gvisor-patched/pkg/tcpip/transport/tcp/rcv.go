@@ -96,7 +96,6 @@ func (r *receiver) currentWindow() (curWnd seqnum.Size) {
 // getSendParams returns the parameters needed by the sender when building
 // segments to send.
 // +checklocks:r.ep.mu
-// +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) getSendParams() (RcvNxt seqnum.Value, rcvWnd seqnum.Size) {
 	newWnd := r.ep.selectWindow()
 	curWnd := r.currentWindow()
@@ -187,7 +186,6 @@ func (r *receiver) getSendParams() (RcvNxt seqnum.Value, rcvWnd seqnum.Size) {
 // in such cases we may need to send an ack to indicate to our peer that it can
 // resume sending data.
 // +checklocks:r.ep.mu
-// +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) nonZeroWindow() {
 	// Immediately send an ack.
 	r.ep.snd.sendAck()
@@ -200,7 +198,6 @@ func (r *receiver) nonZeroWindow() {
 // Returns true if the segment was consumed, false if it cannot be consumed
 // yet because of a missing segment.
 // +checklocks:r.ep.mu
-// +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum.Size) bool {
 	if segLen > 0 {
 		// If the segment doesn't include the seqnum we're expecting to
@@ -265,7 +262,7 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 		case StateEstablished:
 			r.ep.setEndpointState(StateCloseWait)
 		case StateFinWait1:
-			if s.flags.Contains(header.TCPFlagAck) && s.ackNumber == r.ep.snd.SndNxt {
+			if s.flags.Contains(header.TCPFlagAck) && r.ep.snd.finSent && s.ackNumber == r.ep.snd.SndNxt {
 				// FIN-ACK, transition to TIME-WAIT.
 				r.ep.setEndpointState(StateTimeWait)
 			} else {
@@ -299,8 +296,9 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 	}
 
 	// Handle ACK (not FIN-ACK, which we handled above) during one of the
-	// shutdown states.
-	if s.flags.Contains(header.TCPFlagAck) && s.ackNumber == r.ep.snd.SndNxt {
+	// shutdown states. These completions require that our FIN was sent;
+	// without finSent a data ACK would be mistaken for a FIN ACK.
+	if s.flags.Contains(header.TCPFlagAck) && r.ep.snd.finSent && s.ackNumber == r.ep.snd.SndNxt {
 		switch r.ep.EndpointState() {
 		case StateFinWait1:
 			r.ep.setEndpointState(StateFinWait2)
@@ -320,9 +318,12 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 	return true
 }
 
-// updateRTT updates the receiver RTT measurement based on the sequence number
-// of the received segment.
-func (r *receiver) updateRTT() {
+// updateRTT estimates a receiver-side RTT for receive-buffer autotuning, based
+// on the sequence number of the received segment. rcvdTime is the ingress
+// timestamp of the segment that triggered this measurement; it is used instead
+// of the current clock so that an internal processing delay does not inflate the
+// estimate (which would size the receive buffer too large).
+func (r *receiver) updateRTT(rcvdTime tcpip.MonotonicTime) {
 	// From: https://public.lanl.gov/radiant/pubs/drs/sc2001-poster.pdf
 	//
 	// A system that is only transmitting acknowledgements can still
@@ -332,7 +333,7 @@ func (r *receiver) updateRTT() {
 	r.ep.rcvQueueMu.Lock()
 	if r.ep.RcvAutoParams.RTTMeasureTime == (tcpip.MonotonicTime{}) {
 		// New measurement.
-		r.ep.RcvAutoParams.RTTMeasureTime = r.ep.stack.Clock().NowMonotonic()
+		r.ep.RcvAutoParams.RTTMeasureTime = rcvdTime
 		r.ep.RcvAutoParams.RTTMeasureSeqNumber = r.RcvNxt.Add(r.rcvWnd)
 		r.ep.rcvQueueMu.Unlock()
 		return
@@ -341,20 +342,19 @@ func (r *receiver) updateRTT() {
 		r.ep.rcvQueueMu.Unlock()
 		return
 	}
-	rtt := r.ep.stack.Clock().NowMonotonic().Sub(r.ep.RcvAutoParams.RTTMeasureTime)
+	rtt := rcvdTime.Sub(r.ep.RcvAutoParams.RTTMeasureTime)
 	// We only store the minimum observed RTT here as this is only used in
 	// absence of a SRTT available from either timestamps or a sender
 	// measurement of RTT.
 	if r.ep.RcvAutoParams.RTT == 0 || rtt < r.ep.RcvAutoParams.RTT {
 		r.ep.RcvAutoParams.RTT = rtt
 	}
-	r.ep.RcvAutoParams.RTTMeasureTime = r.ep.stack.Clock().NowMonotonic()
+	r.ep.RcvAutoParams.RTTMeasureTime = rcvdTime
 	r.ep.RcvAutoParams.RTTMeasureSeqNumber = r.RcvNxt.Add(r.rcvWnd)
 	r.ep.rcvQueueMu.Unlock()
 }
 
 // +checklocks:r.ep.mu
-// +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, closed bool) (drop bool, err tcpip.Error) {
 	r.ep.rcvQueueMu.Lock()
 	rcvClosed := r.ep.RcvClosed || r.closed
@@ -452,7 +452,6 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 // handleRcvdSegment handles TCP segments directed at the connection managed by
 // r as they arrive. It is called by the protocol main loop.
 // +checklocks:r.ep.mu
-// +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 	state := r.ep.EndpointState()
 	closed := r.ep.closed
@@ -475,8 +474,10 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 		}
 	}
 
-	// Store the time of the last ack.
-	r.lastRcvdAckTime = r.ep.stack.Clock().NowMonotonic()
+	// Store the time of the last ack. Use the segment's ingress time rather than
+	// the current clock so a segment delayed inside the stack before processing
+	// records when it actually arrived (consumed by the user-timeout check).
+	r.lastRcvdAckTime = s.rcvdTime
 
 	// Defer segment processing if it can't be consumed now.
 	if !r.consumeSegment(s, segSeq, segLen) {
@@ -519,7 +520,7 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 	// Since we consumed a segment update the receiver's RTT estimate
 	// if required.
 	if segLen > 0 {
-		r.updateRTT()
+		r.updateRTT(s.rcvdTime)
 	}
 
 	// By consuming the current segment, we may have filled a gap in the
@@ -548,7 +549,6 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 // handleTimeWaitSegment handles inbound segments received when the endpoint
 // has entered the TIME_WAIT state.
 // +checklocks:r.ep.mu
-// +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) handleTimeWaitSegment(s *segment) (resetTimeWait bool, newSyn bool) {
 	segSeq := s.sequenceNumber
 	segLen := seqnum.Size(s.payloadSize())

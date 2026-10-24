@@ -252,7 +252,9 @@ export class LatencyTimeout {
    * 1000ms 已被真机证伪：飞鸟云 35 个 hysteria2（QUIC/UDP）节点首握需 1~2 RTT，
    * 同一批 **3s** 能测出 143/558/560ms，1s 时 measured=0/timeout=31（全部误杀）
    * —— 3000 是「已验证能测出这批节点」的取值，不是拍脑袋。
-   * 与 `LatencyProbeLimits.NODE_TIMEOUT_MS` 必须同值（闸门断言）。
+   * ⚠ 本值（内核 URLTest 预算，5s）与 `LatencyProbeLimits.NODE_TIMEOUT_MS`（离线
+   * TCP/TLS 探测预算，3s）是**两个不同场景的尺子**，不要求同值；旧注释「必须同值
+   * （闸门断言）」不成立——不存在该闸门，引擎批实传本值、离线探测用 3000。
    */
   static readonly DEFAULT_TIMEOUT_MS: number = 5000;
   /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */

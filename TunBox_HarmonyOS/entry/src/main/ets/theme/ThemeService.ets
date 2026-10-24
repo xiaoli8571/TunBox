@@ -2,7 +2,7 @@ import { common, ConfigurationConstant } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 import { window } from '@kit.ArkUI';
 
-const PREF_NAME = 'ssrvpn_theme';
+const PREF_NAME = 'tunbox_theme';
 const KEY_THEME_MODE = 'theme_mode';
 
 export enum AppThemeMode {

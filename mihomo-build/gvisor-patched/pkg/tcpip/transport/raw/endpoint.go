@@ -363,7 +363,10 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	}
 	payloadSz := payload.Size()
 
-	if packetInfo := ctx.PacketInfo(); packetInfo.NetProto == header.IPv6ProtocolNumber && ipv6ChecksumOffset >= 0 {
+	if packetInfo := ctx.PacketInfo(); packetInfo.NetProto == header.IPv6ProtocolNumber && ipv6ChecksumOffset >= 0 &&
+		// The default ICMPv6 checksum offset is relative to the transport header,
+		// so it must not be applied to a packet that starts with an IPv6 header.
+		!(e.ops.GetHeaderIncluded() && e.transProto == header.ICMPv6ProtocolNumber) {
 		// Make sure we can fit the checksum.
 		if payload.Size() < int64(ipv6ChecksumOffset+checksum.Size) {
 			return 0, &tcpip.ErrInvalidOptionValue{}

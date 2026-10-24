@@ -3,7 +3,7 @@
 struct Index {
   build() {
     Column() {
-      Text('SSRVPN Local Unit Tests')
+      Text('TunBox Local Unit Tests')
         .fontSize(18)
         .fontColor('#F5F7FF')
     }

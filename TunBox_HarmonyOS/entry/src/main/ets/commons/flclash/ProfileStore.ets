@@ -7,19 +7,19 @@
  * ## 与旧实现的结构差别（这次是刻意改的）
  *
  * 旧：订阅 → App 侧解析成 ProxyNode 表 → 生成配置时逐字段重建节点。
- * 新（FlClash 同构）：订阅 → **原文落盘** `<filesDir>/profiles/<id>.yaml` → 内核解析。
+ * 新（FlClash 同构）：订阅 → **完整文档校验并规范化落盘** `<filesDir>/profiles/<id>.yaml` → 内核解析。
  *     App 侧不再持有节点清单，节点/分组一律从内核 `/proxies` 读（见 CoreCatalog）。
  *
  * ## 文件布局
  *
  * ```
- * <filesDir>/profiles/<subId>.yaml     订阅原文（或转换后的 proxies 列表）
- * preferences 'ssrvpn_profiles'        { current: '<id>', autoUpdate: {id:bool} }
+ * <filesDir>/profiles/<subId>.yaml     校验后的完整 YAML（原始响应由 RawSubscriptionStore 保留）
+ * preferences 'tunbox_profiles'        { current: '<id>', autoUpdate: {id:bool} }
  * ```
  *
  * ## 校验（等价 FlClash validateProfile，转换分支见 attachConverter）
  *
- * 1. 原文是内核可解析的 Clash 配置 → 原样落盘；
+ * 1. 原文是 Clash 配置 → 内核解析完整文档、展开别名、校验后落盘；
  * 2. 否则尝试 `SubConverter`（mihomo `convert.ConvertsV2Ray` 的移植）→ 转成
  *    `proxies:` 列表再落盘；
  * 3. 两者都失败 → 拒绝，**不覆盖已有文件**（旧 profile 保持可用）。
@@ -29,9 +29,10 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 import { ProfileConfigMerger } from './ProfileConfigMerger';
+import { BodyDispatch } from '../subscription/BodyDispatch';
 
 const TAG = 'ProfileStore';
-const PREF_NAME = 'ssrvpn_profiles';
+const PREF_NAME = 'tunbox_profiles';
 const KEY_STATE = 'profile_state';
 const DIR_NAME = 'profiles';
 /** 单份 profile 上限（与订阅拉取上限一致：8MB） */
@@ -56,6 +57,41 @@ export class ProfileStore {
   private static currentProfileId: string = '';
   private static converter: ProfileTextConverter | null = null;
   private static loaded: boolean = false;
+  private static preparedCache: Map<string, string> = new Map<string, string>();
+  private static preparer: ((text: string) => Promise<string>) | null = null;
+
+  static attachPreparer(preparer: (text: string) => Promise<string>): void {
+    ProfileStore.preparer = preparer;
+  }
+
+  static async prepare(text: string): Promise<string> {
+    if (ProfileStore.preparer === null) {
+      throw new Error('订阅校验器尚未初始化');
+    }
+    const key = ProfileStore.fingerprint(text);
+    const cached = ProfileStore.preparedCache.get(key);
+    if (cached !== undefined) { return cached; }
+    const prepared = await ProfileStore.preparer(text);
+    if (ProfileStore.preparedCache.size >= 8) { ProfileStore.preparedCache.clear(); }
+    ProfileStore.preparedCache.set(key, prepared);
+    ProfileStore.preparedCache.set(ProfileStore.fingerprint(prepared), prepared);
+    return prepared;
+  }
+
+  /** Content identity only; never include profile text or credentials in logs. */
+  static fingerprint(text: string): string {
+    let first = 2166136261;
+    let second = 5381;
+    for (let i = 0; i < text.length; i++) {
+      first = Math.imul(first ^ text.charCodeAt(i), 16777619);
+      second = Math.imul(second, 33) ^ text.charCodeAt(i);
+    }
+    return `${text.length}:${first >>> 0}:${second >>> 0}`;
+  }
+
+  static revisionOf(id: string): string {
+    return id.length === 0 ? '' : ProfileStore.fingerprint(ProfileStore.read(id));
+  }
 
   /** 注入 convertProxies 实现（由 SubConverter 接入；未注入时只走 YAML 校验）。 */
   static attachConverter(converter: ProfileTextConverter | null): void {
@@ -189,11 +225,7 @@ export class ProfileStore {
       fs.writeSync(file.fd, content);
       fs.closeSync(file);
       file = null;
-      try {
-        fs.unlinkSync(target);
-      } catch (e) {
-        // 目标不存在属正常
-      }
+      // Same-directory rename replaces the previous file atomically.
       fs.renameSync(tmp, target);
       return true;
     } catch (e) {
@@ -250,44 +282,36 @@ export class ProfileStore {
    *
    * 已存在的 profile 不被坏内容覆盖：只有 converted 或 YAML 合法时才写。
    */
-  static validateAndStore(id: string, text: string): ProfileValidationResult {
+  static async validateAndStore(id: string, text: string): Promise<ProfileValidationResult> {
     const out = new ProfileValidationResult();
-    if (id.length === 0) {
-      out.message = 'profile id is empty';
+    if (id.length === 0 || text.trim().length === 0) {
+      out.message = '订阅内容或标识为空';
       return out;
     }
-    if (text.trim().length === 0) {
-      out.message = '订阅内容为空';
-      return out;
-    }
-    if (ProfileConfigMerger.isKernelLoadableConfig(text)) {
-      if (!ProfileStore.write(id, text)) {
-        out.message = '订阅保存失败';
+    try {
+      // Decode a wrapped YAML document before trying the URI converter.
+      let candidate = BodyDispatch.classify(text).body;
+      if (!ProfileConfigMerger.isKernelLoadableConfig(candidate)) {
+        if (ProfileStore.converter === null) {
+          out.message = '请提供 Clash 配置或有效节点链接';
+          return out;
+        }
+        candidate = ProfileStore.converter(candidate);
+        out.converted = true;
+      }
+      // Native YAML resolves aliases in the complete document and validates
+      // outbound/group references without starting a core or fetching providers.
+      const prepared = await ProfileStore.prepare(candidate);
+      if (prepared.length === 0 || !ProfileStore.write(id, prepared)) {
+        out.message = '订阅保存失败，已保留旧配置';
         return out;
       }
       out.ok = true;
-      out.nodeCount = ProfileConfigMerger.merge('a: 1', text).profileProxyItems;
-      AppLogger.info(TAG, `profile saved as-is: id=${id} bytes=${text.length} items=${out.nodeCount}`);
+      out.nodeCount = ProfileConfigMerger.merge('a: 1', prepared).profileProxyItems;
+      return out;
+    } catch (e) {
+      out.message = `订阅校验失败，已保留旧配置：${AppLogger.errText(e)}`;
       return out;
     }
-    // YAML 不像 Clash 配置 → 走 convertProxies（base64 / URI 列表）
-    const converter = ProfileStore.converter;
-    if (converter !== null) {
-      const converted = converter(text);
-      if (converted.length > 0 && ProfileConfigMerger.isKernelLoadableConfig(converted)) {
-        if (!ProfileStore.write(id, converted)) {
-          out.message = '订阅保存失败';
-          return out;
-        }
-        out.ok = true;
-        out.converted = true;
-        out.nodeCount = ProfileConfigMerger.merge('a: 1', converted).profileProxyItems;
-        AppLogger.info(TAG, `profile converted and saved: id=${id} nodes=${out.nodeCount}`);
-        return out;
-      }
-    }
-    out.message = '请提供 Clash 订阅（该内容既不是 Clash 配置，也无法转换为节点列表）';
-    AppLogger.warn(TAG, `profile rejected: id=${id} bytes=${text.length}`);
-    return out;
   }
 }

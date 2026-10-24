@@ -87,8 +87,8 @@ var ErrMetadataInvalid = fmt.Errorf("metadata invalid, can't start with _")
 var ErrInvalidFlags = fmt.Errorf("flags set is invalid")
 
 const (
-	// CompressionKey is the key for the compression level in the metadata.
-	CompressionKey = "compression"
+	// compressionKey is the key for the compression level in the metadata.
+	compressionKey = "compression"
 )
 
 // CompressionLevel is the image compression level.
@@ -100,7 +100,7 @@ const (
 	// CompressionLevelNone represents the absence of any compression on an image.
 	CompressionLevelNone = CompressionLevel("none")
 	// CompressionLevelDefault represents the default compression level.
-	CompressionLevelDefault = CompressionLevelFlateBestSpeed
+	CompressionLevelDefault = CompressionLevelNone
 )
 
 func (c CompressionLevel) String() string {
@@ -109,7 +109,7 @@ func (c CompressionLevel) String() string {
 
 // ToMetadata returns the compression level as a metadata map.
 func (c CompressionLevel) ToMetadata() map[string]string {
-	return map[string]string{CompressionKey: string(c)}
+	return map[string]string{compressionKey: string(c)}
 }
 
 // CompressionLevelFromString parses a string into the CompressionLevel.
@@ -127,21 +127,14 @@ func CompressionLevelFromString(val string) (CompressionLevel, error) {
 }
 
 // CompressionLevelFromMetadata returns image compression type stored in the metadata.
-// If the metadata doesn't contain compression information the default behavior
-// is the "flate-best-speed" state because the default behavior used to be to always
-// compress. If the parameter is missing it will be set to default.
+// If the metadata doesn't contain compression information, the default behavior
+// is "none" (no compression) and it is added to the metadata.
 func CompressionLevelFromMetadata(metadata map[string]string) (CompressionLevel, error) {
-	compression := CompressionLevelDefault
-
-	if val, ok := metadata[CompressionKey]; ok {
-		var err error
-		if compression, err = CompressionLevelFromString(val); err != nil {
-			return CompressionLevelNone, err
-		}
-	} else {
-		metadata[CompressionKey] = string(compression)
+	if val, ok := metadata[compressionKey]; ok {
+		return CompressionLevelFromString(val)
 	}
-
+	compression := CompressionLevelDefault
+	metadata[compressionKey] = string(compression)
 	return compression, nil
 }
 
@@ -166,8 +159,12 @@ func NewWriter(w io.Writer, key []byte, metadata map[string]string) (io.WriteClo
 	}
 
 	// Create our HMAC function.
-	h := hmac.New(sha256.New, key)
-	mw := io.MultiWriter(w, h)
+	mw := w
+	var h hash.Hash
+	if len(key) > 0 {
+		h = hmac.New(sha256.New, key)
+		mw = io.MultiWriter(w, h)
+	}
 
 	// First, write the header.
 	if _, err := mw.Write(magicHeader); err != nil {
@@ -204,12 +201,14 @@ func NewWriter(w io.Writer, key []byte, metadata map[string]string) (io.WriteClo
 		return nil, err
 	}
 	// Write the current hash.
-	cur := h.Sum(nil)
-	for done := 0; done < len(cur); {
-		n, err := mw.Write(cur[done:])
-		done += n
-		if err != nil {
-			return nil, err
+	if h != nil {
+		cur := h.Sum(nil)
+		for done := 0; done < len(cur); {
+			n, err := mw.Write(cur[done:])
+			done += n
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -240,8 +239,10 @@ func readMetadataLen(r io.Reader) (uint64, error) {
 
 // metadata validates the magic header and reads out the metadata from a state
 // data stream.
-func metadata(r io.Reader, h hash.Hash) (map[string]string, error) {
-	if h != nil {
+func metadata(r io.Reader, key []byte) (map[string]string, error) {
+	var h hash.Hash
+	if len(key) > 0 {
+		h = hmac.New(sha256.New, key)
 		r = io.TeeReader(r, h)
 	}
 
@@ -285,6 +286,9 @@ func metadata(r io.Reader, h hash.Hash) (map[string]string, error) {
 		cur := h.Sum(nil)
 		buf := make([]byte, len(cur))
 		if _, err := io.ReadFull(r, buf); err != nil {
+			if err == io.EOF {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 		if !hmac.Equal(cur, buf) {
@@ -304,8 +308,7 @@ func metadata(r io.Reader, h hash.Hash) (map[string]string, error) {
 // NewReader returns a reader for a statefile.
 func NewReader(r io.ReadCloser, key []byte) (io.ReadCloser, map[string]string, error) {
 	// Read the metadata with the hash.
-	h := hmac.New(sha256.New, key)
-	metadata, err := metadata(r, h)
+	metadata, err := metadata(r, key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -321,11 +324,12 @@ func NewReader(r io.ReadCloser, key []byte) (io.ReadCloser, map[string]string, e
 	// Pick correct reader
 	var cr io.ReadCloser
 
-	if compression == CompressionLevelFlateBestSpeed {
+	switch compression {
+	case CompressionLevelFlateBestSpeed:
 		cr, err = compressio.NewReader(r, key)
-	} else if compression == CompressionLevelNone {
+	case CompressionLevelNone:
 		cr = compressio.NewSimpleReader(r, key)
-	} else {
+	default:
 		// Should never occur, as it has the default path.
 		return nil, nil, fmt.Errorf("metadata contains invalid compression flag value: %v", compression)
 	}

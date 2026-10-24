@@ -1,8 +1,8 @@
 // [harness] generated from entry/src/main/ets/commons/services/SubscriptionService.ets — 仅 import 目标被重写
 /**
  * 订阅服务：增删改查 + 刷新 + 撤销；手工节点独立存储（ManualNodeStore）
- * 移植自 upstream: SSRVPN_Android/lib/services/subscription_service.dart
- *                packages/ssrvpn_shared/lib/services/subscription_service_*.dart
+ * 移植自 upstream: TunBox_Android/lib/services/subscription_service.dart
+ *                packages/tunbox_shared/lib/services/subscription_service_*.dart
  *                subscription_processing.dart / subscription_undo_record.dart
  *
  * 敏感凭据存储策略（对齐 SettingsService.apiSecret 的 AssetStore 先例）：
@@ -12,7 +12,7 @@
  *   链接，两者与 password 同级敏感，不能按字段名猜测是否安全。
  * - 其余节点元数据（server/port/method/network/TLS 参数/rawTemplate 等）仍存 preferences。
  *   rawTemplate 由 YamlMerger.buildRawTemplate 在构造期剔除全部凭据键，故可持久化。
- *   alias 采用稳定键 "ssrvpn_node|<nodeId>|<field>" / "ssrvpn_sub|<subId>|headerValue"。
+ *   alias 采用稳定键 "tunbox_node|<nodeId>|<field>" / "tunbox_sub|<subId>|headerValue"。
  * - 写 preferences 前**逐字段**确认加密层已回读一致，才允许清空该字段的明文；
  *   加密层不可用或回读不一致时保留明文（fail-closed：宁可多留一份也不丢凭据），
  *   并由 credentialMissingCount 与诊断面板如实告知用户。
@@ -22,6 +22,7 @@
 import { RawBodyCache } from './RawProxyYaml.ts';
 // FlClash 同构：订阅原文 = profile 文件（App 侧不再把节点当作权威来源）
 import { ProfileStore } from './ProfileStore.ts';
+import { coreBridge } from './stubs.ts';
 // convertProxies（mihomo convert.ConvertsV2Ray 的 ArkTS 移植）：base64 / URI 列表订阅
 import { SubConverter } from './SubConverter.ts';
 import { CoreCatalogService } from './stubs.ts';
@@ -64,7 +65,7 @@ import { parse as parseUriNode, ParseError, ParsedNode } from './UriNodeParser.t
 import { UnusableLedger } from './UnusableLedger.ts';
 
 const TAG = 'SubscriptionService';
-const PREF_NAME = 'ssrvpn_subscriptions';
+const PREF_NAME = 'tunbox_subscriptions';
 
 /** rules/rule-providers 段提取结果（模块级显式类，满足 arkts-no-untyped-obj-literals） */
 class SubscriptionRulesSections {
@@ -183,7 +184,9 @@ export class SubscriptionService {
         credFilled += 1;
       }
     }
-    return `${acc}|cred=${credFilled}`;
+    const current = ProfileStore.currentId();
+    const details = ProfileStore.fingerprint(JSON.stringify(nodes));
+    return `${acc}|cred=${credFilled}|details=${details}|profile=${current}:${ProfileStore.revisionOf(current)}`;
   }
 
   /**
@@ -335,6 +338,7 @@ export class SubscriptionService {
     RawSubscriptionStore.init(context.cacheDir);
     // FlClash 同构：订阅原文落盘目录（filesDir/profiles/<id>.yaml）+ 当前 profile
     await ProfileStore.init(context);
+    ProfileStore.attachPreparer((text: string): Promise<string> => coreBridge.prepareProfile(text));
     // convertProxies：非 YAML 订阅（整体 base64 / 逐行分享链接）转成 proxies 列表
     ProfileStore.attachConverter((text: string): string => SubConverter.convert(text).proxiesYaml);
     // 本地转换订阅（设置页「订阅转换」产出的伪链接由它渲染）：必须在任何 fetch 之前就绪，
@@ -2084,7 +2088,7 @@ export class SubscriptionService {
     this.undoSnapshot = null;
     // FlClash 同构：撤销删除时把 profile 文件一起写回（否则「恢复」后没有可运行配置）
     if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0) {
-      ProfileStore.validateAndStore(snapshot.rawSubscriptionId, snapshot.rawBody);
+      await ProfileStore.validateAndStore(snapshot.rawSubscriptionId, snapshot.rawBody);
       if (ProfileStore.currentId().length === 0) {
         await ProfileStore.setCurrent(snapshot.rawSubscriptionId);
       }
@@ -2211,6 +2215,27 @@ export class SubscriptionService {
       result.status === SubscriptionRefreshStatus.RATE_LIMITED, result.advice);
   }
 
+  /**
+   * 进程级刷新写链（2026-10-24 P1 修复）。
+   *
+   * ConcurrentRefresh 只保证**批内** apply 串行；`refreshSubscription` 公开可直调
+   * （页面单条刷新、启动 2.5s 补拉 backfillRawBodies），与并发批次/其它单条刷新
+   * 的落地交错会造成：nodes 读-改-写互相覆盖、整表 persist 后写盖先写、
+   * lastImportDiagnostics 张冠李戴。这里把「落地写路径」统一挂到同一条链上，
+   * 与批次 apply（内部同样走 refreshSubscription 的落地段）天然互斥。
+   * 锁只包写路径；网络 fetch/provider 拉取仍在锁外，并发拉取能力不变。
+   */
+  private refreshWriteChain: Promise<void> = Promise.resolve();
+
+  private runRefreshExclusive<T>(task: () => Promise<T>): Promise<T> {
+    const mine: Promise<T> = this.refreshWriteChain.then(task);
+    // 链上异常必须吞掉：否则一次失败断链，后续所有刷新永远排队等一个 rejected promise
+    this.refreshWriteChain = mine.then((): void => {
+    }, (): void => {
+    });
+    return mine;
+  }
+
   async refreshSubscription(id: string): Promise<SubscriptionRefreshResult> {
     const sub = this.subscriptions.find((s) => s.id === id);
     if (sub === undefined) {
@@ -2265,17 +2290,12 @@ export class SubscriptionService {
       // 原文落盘 + 进进程内缓存：生成运行配置时原样透传。
       // 与 FlClash/Verge/CMFA 同形——订阅原文作为 profile 文件存在私有目录，
       // 内核/生成器直接吃原文，App 不重写节点定义。
-      const rawWrite = RawSubscriptionStore.writeRaw(sub.id, body);
-      if (!rawWrite.ok) {
-        AppLogger.warn(TAG, `raw profile write failed: ${rawWrite.reason}`);
-      }
-      RawBodyCache.put(sub.id, body);
       // ── FlClash 同构（2026-10-22）：原文落成 profile 文件 ───────────────
       // FlClash `CoreController.validateProfile`：Clash YAML 原样通过；不是 YAML
       // 时用 convertProxies（base64 / URI 列表）转成 proxies 列表再通过；两者都失败才拒。
       // 这里必须**先**判定，不能再用旧的 isClashBody 一刀切 —— 否则 base64 订阅会被
       // 误判成「非 Clash」而 FlClash 是能导入的。
-      const profileValidation = ProfileStore.validateAndStore(sub.id, body);
+      const profileValidation = await ProfileStore.validateAndStore(sub.id, body);
       // 首个成功落盘的订阅立刻成为当前 Profile（FlClash putProfile 语义），
       // 必须在**生成配置之前**定下来，否则本次刷新生成的仍是旧的全量配置。
       if (profileValidation.ok) {
@@ -2304,6 +2324,11 @@ export class SubscriptionService {
         rejected.advice = SubscriptionService.NON_CLASH_ADVICE;
         return rejected;
       }
+      const rawWrite = RawSubscriptionStore.writeRaw(sub.id, body);
+      if (!rawWrite.ok) {
+        AppLogger.warn(TAG, `raw profile write failed: ${rawWrite.reason}`);
+      }
+      RawBodyCache.put(sub.id, body);
       sub.legacyFormat = false;
       // 记住 ETag 供下次条件请求（服务端没给就保持空串 = 下次完整拉取）
       if (fetched.etag.length > 0) {
@@ -2452,6 +2477,23 @@ export class SubscriptionService {
         diagnostics.inputCount = diagnostics.inputCount + providerImported;
       }
 
+      // ── 进程级刷新写锁：以下写路径（状态落盘/节点 concat/整表 persist/current
+      // 指针）与并发批次 apply、其它单条刷新互斥。内段保持原缩进（闭包仅作互斥包裹）。
+      return await this.runRefreshExclusive(async (): Promise<SubscriptionRefreshResult> => {
+      // 【P0 修复】刷新期间订阅可能已被用户删除（网络拉取+解析横跨多个 await）。
+      // removeSubscription 已清理该订阅的节点/组/profile/raw 文件；这里若继续落地，
+      // nodes concat 会把已删节点复活、writeRawProvider 重建 raw 文件、
+      // ProfileStore.setCurrent 把 current 指回已删 id —— 存储与内存永久分叉。
+      if (!this.subscriptions.some((s) => s.id === id)) {
+        AppLogger.info(TAG, `subscription ${id} removed during refresh; results dropped`);
+        // 刷新中途 validateAndStore/writeRawProvider 可能已重建 removeSubscription
+        // 删掉的文件：按同一套清理幂等收尾（RawBodyCache/ProfileStore 均可安全重复调用）。
+        RawSubscriptionStore.remove(id);
+        RawBodyCache.drop(id);
+        ProfileStore.remove(id);
+        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
+          '订阅已在刷新期间删除，本次结果已丢弃', diagnostics);
+      }
       // FlClash 同构：profile 已落盘 ⇒ 节点由内核解析，App 侧解析出 0 条不是失败。
       // （典型：订阅只有 proxy-providers 段，或含 App 解析器不认识的协议。）
       const profileReady = ProfileStore.exists(sub.id);
@@ -2539,6 +2581,7 @@ export class SubscriptionService {
         AppLogger.info(TAG, `current profile set to ${id}`);
       }
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
+      }); // ── 刷新写锁结束 ──
     } catch (e) {
       const msg = AppLogger.errText(e);
       let status = SubscriptionRefreshStatus.PARSE_ERROR;
@@ -2702,7 +2745,10 @@ export class SubscriptionService {
         AppLogger.info(TAG, `local refresh imported ${providerImported} provider node(s) `
           + `for subscription ${id}`);
       }
-      if (parsed.length === 0) {
+      // ── 进程级刷新写锁（与 refreshSubscription 主路径同一把链）：本地伪订阅的
+      // 落地同样写 this.nodes / 整表 persist，不得与并发批次/其它单条刷新交错。
+      return await this.runRefreshExclusive(async (): Promise<SubscriptionRefreshResult> => {
+      if (parsed.length === 0 && !ProfileStore.exists(id)) {
         sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.EMPTY_ENTRIES,
           '重解析未得到节点（原文件内容可能已变化）', diagnostics);
@@ -2742,6 +2788,7 @@ export class SubscriptionService {
       AppLogger.info(TAG, `local subscription refreshed: ${sub.name} (${parsed.length} nodes, `
         + `${this.groupsOf(id).length} groups)`);
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
+      }); // ── 刷新写锁结束（local 路径）──
     } catch (e) {
       sub.lastRefreshResult = SubscriptionRefreshStatus.PARSE_ERROR;
       return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
@@ -2769,7 +2816,7 @@ export class SubscriptionService {
       `本地:${base.length > 0 ? base : '订阅'}`, `local://${base}`);
     sub.sortOrder = this.subscriptions.length;
     // FlClash 同构：本地文件同样落成 profile 文件（内核直接吃原文）
-    const localProfile = ProfileStore.validateAndStore(sub.id, content);
+    const localProfile = await ProfileStore.validateAndStore(sub.id, content);
     if (!localProfile.ok) {
       throw new Error(localProfile.message);
     }
@@ -2833,9 +2880,10 @@ export class SubscriptionService {
         SubscriptionService.noteInvalid(diagnostics, `解析异常：${SubscriptionService.describeError(e)}`);
       }
       AppLogger.warn(TAG, `local yaml parse failed: ${SubscriptionService.describeError(e)}`);
-      return 0;
+      parsed = [];
+      parsedGroups = [];
     }
-    if (parsed.length === 0) {
+    if (parsed.length === 0 && !localProfile.ok) {
       SubscriptionService.noteInvalid(diagnostics, '内容未解析出节点');
       return 0;
     }
@@ -2854,6 +2902,9 @@ export class SubscriptionService {
     SubscriptionParser.materializeDynamicGroups(parsedGroups, parsed);
     this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== sub.id).concat(parsedGroups);
     this.subscriptions.push(sub);
+    if (ProfileStore.currentId().length === 0) {
+      await ProfileStore.setCurrent(sub.id);
+    }
     this.nodes = this.nodes.concat(parsed);
     this.ensureUniqueNames();
     // 【2026-10-22 · FlClash 同构】本地导入与远程刷新同口径：节点数取原文条目数
@@ -2878,7 +2929,7 @@ export class SubscriptionService {
     }
     this.noteConfigDrops(diagnostics);
     AppLogger.info(TAG, `local yaml imported: ${sub.name} (${parsed.length} nodes)`);
-    return parsed.length;
+    return Math.max(parsed.length, localProfile.nodeCount, 1);
   }
 
   nodesOf(subscriptionId: string): ProxyNode[] {
@@ -3234,6 +3285,26 @@ export class SubscriptionService {
       return true;
     }
     return false;
+  }
+
+  hasUsableProfile(): boolean {
+    const id = ProfileStore.currentId();
+    return (id.length > 0 && ProfileStore.exists(id))
+      || this.subscriptions.some((sub: Subscription): boolean => sub.enabled && ProfileStore.exists(sub.id));
+  }
+
+  fallbackConnectionNode(): ProxyNode | null {
+    const current = ProfileStore.currentId();
+    const local = this.nodes.find((node: ProxyNode): boolean => node.subscriptionId === current);
+    if (local !== undefined) { return local; }
+    if (this.hasUsableProfile()) {
+      const node = new ProxyNode();
+      node.id = `profile:${current}`;
+      node.name = '订阅默认出口';
+      node.subscriptionId = current;
+      return node;
+    }
+    return this.nodes.length > 0 ? this.nodes[0] : null;
   }
 
   findNode(id: string): ProxyNode | null {

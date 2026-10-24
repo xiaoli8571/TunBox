@@ -666,14 +666,8 @@ export struct HomePage {
   }
 
   private selectedNode(): ProxyNode | null {
-    const preferred: ProxyNode | null = this.subs.findNode(this.settings.preferredNodeId);
-    if (preferred !== null) {
-      return preferred;
-    }
-    if (this.subs.nodes.length > 0) {
-      return this.subs.nodes[0];
-    }
-    return null;
+    const preferred = this.subs.findNode(this.settings.preferredNodeId);
+    return preferred !== null ? preferred : this.subs.fallbackConnectionNode();
   }
 
   private refreshDisplayNode(): void {
