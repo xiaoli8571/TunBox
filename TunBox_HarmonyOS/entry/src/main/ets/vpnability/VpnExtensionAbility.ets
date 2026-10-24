@@ -631,25 +631,56 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       const text = this.readConfigText(path);
       const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
       if (patched !== text) {
-        const wf = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        // 原子替换（tmp → rename）：startCore 与本改写可能紧邻，半写文件会让内核
+        // 撞上截断 YAML（unexpected end of stream）。同目录 rename 在 POSIX 语义下
+        // 对读者要么旧文件、要么新文件，永不半份。
+        const tmp = `${path}.mtu.tmp`;
+        const wf = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
         try {
           fs.writeSync(wf.fd, patched);
         } finally {
           fs.closeSync(wf);
         }
+        fs.renameSync(tmp, path);
       }
     } catch (e) {
       AppLogger.warn(TAG, `config mtu sync skipped: ${AppLogger.errText(e)}`);
     }
   }
 
-  /** 读配置全文（只读一遍，256KB 上限）。ensureConfigMtu 与 readTunFlagsFromConfig 共用。 */
+  /** 读配置全文（循环读到 EOF，无截断）。ensureConfigMtu 与 readTunFlagsFromConfig 共用。
+   *
+   * 【2026-10-24 蜂窝必现事故修复】旧实现单次 readSync 进固定 256KB buffer——
+   * 大订阅配置（真机 4846+ 行，超 256KB）被静默截断，ensureConfigMtu 在蜂窝
+   * （MTU=1360 ≠ 默认，必走改写分支）把半份 YAML TRUNC 重写回盘，内核报
+   * `parse config: yaml: line N: found unexpected end of stream` 整份拒载。
+   * WiFi（MTU 与默认一致）跳过改写所以从不复现——与 2026-09-18 那次
+   * 「蜂窝必现、WiFi 不复现」同款模式。现循环读到 EOF，8MB 硬上限仅防失控
+   * （2000 节点 + 规则集的极端配置也在 1MB 量级）。
+   */
   private readConfigText(path: string): string {
     const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
     try {
-      const buf = new ArrayBuffer(262144);
-      const len = fs.readSync(file.fd, buf);
-      return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
+      const chunkSize = 262144;
+      const hardCap = 8 * 1024 * 1024;
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      while (total < hardCap) {
+        const buf = new ArrayBuffer(chunkSize);
+        const len = fs.readSync(file.fd, buf);
+        if (len <= 0) {
+          break;
+        }
+        chunks.push(new Uint8Array(buf).subarray(0, len));
+        total += len;
+      }
+      const all = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        all.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return util.TextDecoder.create('utf-8').decodeToString(all);
     } finally {
       fs.closeSync(file);
     }
