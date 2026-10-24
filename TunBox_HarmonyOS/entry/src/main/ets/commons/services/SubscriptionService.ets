@@ -61,8 +61,8 @@ import { BodyDispatch, BodyDispatchResult, BodyKind } from '../subscription/Body
 import { YamlNodeAdapter } from '../subscription/YamlNodeAdapter';
 // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退走**规范解析层**，不再走 ProxyNode.fromUri
 import { parse as parseUriNode, ParseError, ParsedNode } from '../subscription/UriNodeParser';
-import { UnusableLedger } from '../subscription/UnusableLedger';
-import { NodeUsability } from '../subscription/NodeUsability';
+import { NodeUsability, UnusableCategory } from '../subscription/NodeUsability';
+import { UnusableLedger, UnusableRecord } from '../subscription/UnusableLedger';
 
 const TAG = 'SubscriptionService';
 const PREF_NAME = 'tunbox_subscriptions';
@@ -2475,6 +2475,39 @@ export class SubscriptionService {
         }
         diagnostics.providerCount = providerImported;
         diagnostics.inputCount = diagnostics.inputCount + providerImported;
+      }
+
+      // ── 订阅信息条目统一过滤（2026-10-24）────────────────────────────
+      // YAML 原文/provider 里的「剩余流量：xxx GB」类条目字段完整、会进内核代理表但
+      // 永远拨不通，还可能被选为连接目标（真机取证：connected to node 剩余流量：
+      // 596.2 GB）。URI 路径已在 UriNodeParser 拦截；此处统一覆盖 YAML 与 provider
+      // 引入的全部节点（parseClashYaml 源头过滤覆盖导入路径，此处覆盖刷新路径）。
+      if (parsed.length > 0) {
+        let infoDropped = 0;
+        const kept: ProxyNode[] = [];
+        for (const n of parsed) {
+          if (NodeUsability.isInfoEntry(n.name)) {
+            infoDropped = infoDropped + 1;
+            const infoRecord = new UnusableRecord();
+            infoRecord.subscriptionId = n.subscriptionId;
+            infoRecord.source = 'yaml';
+            infoRecord.protocol = n.proxyType;
+            infoRecord.name = n.name;
+            infoRecord.server = n.server;
+            infoRecord.port = n.port;
+            infoRecord.category = UnusableCategory.INFO;
+            infoRecord.excluded = true;
+            infoRecord.reason = NodeUsability.infoReason(n.name);
+            infoRecord.detail = '订阅信息条目，非节点（刷新统一过滤）：不进代理表、不参与测速。';
+            UnusableLedger.record(infoRecord);
+            continue;
+          }
+          kept.push(n);
+        }
+        if (infoDropped > 0) {
+          AppLogger.info(TAG, `subscription ${id}: dropped ${infoDropped} info-entry node(s)`);
+          parsed = kept;
+        }
       }
 
       // ── 进程级刷新写锁：以下写路径（状态落盘/节点 concat/整表 persist/current

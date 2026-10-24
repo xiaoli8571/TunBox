@@ -83,6 +83,9 @@ const FILES = [
       '../utils/AppLogger': './stubs.ts',
       // 2026-10-20（B6 旧解析器退场）：链接列表改走规范解析层
       '../subscription/UriNodeParser': './UriNodeParser.ts',
+      // 2026-10-24：YAML 路径信息条目过滤
+      '../subscription/NodeUsability': './NodeUsability.ts',
+      '../subscription/UnusableLedger': './UnusableLedger.ts',
     },
   },
   {

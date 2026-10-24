@@ -14,6 +14,8 @@ import { MergedProxy, YamlMergeError, YamlMerger, YamlNodeError } from './YamlMe
 import { AppLogger } from '../utils/AppLogger';
 // 2026-10-20（B6 旧解析器退场）：链接列表走**规范解析层**，不再走 ProxyNode.fromUri
 import { parse as parseUriNode, ParseError, ParsedNode } from '../subscription/UriNodeParser';
+import { NodeUsability, UnusableCategory } from '../subscription/NodeUsability';
+import { UnusableLedger, UnusableRecord } from '../subscription/UnusableLedger';
 
 const TAG = 'SubscriptionParser';
 
@@ -640,6 +642,25 @@ export class SubscriptionParser {
       node.alpnList = merged.alpnList;
       node.extraOpts = merged.extraOpts;
       node.rawYaml = '';
+      // 【2026-10-24】订阅信息条目过滤（与 URI 路径 UriNodeParser 同口径）：YAML 原文里
+      // 「剩余流量：xxx GB / 套餐到期」这类条目字段完整、能进内核代理表但永远拨不通，
+      // 还会被选为连接目标（真机取证：connected to node 剩余流量：596.2 GB）。
+      // 剔除 + 台账留痕（用户可见「本订阅有 N 条信息条目被跳过」）。
+      if (NodeUsability.isInfoEntry(node.name)) {
+        const infoRecord = new UnusableRecord();
+        infoRecord.subscriptionId = subscriptionId;
+        infoRecord.source = 'yaml';
+        infoRecord.protocol = merged.type;
+        infoRecord.name = node.name;
+        infoRecord.server = node.server;
+        infoRecord.port = node.port;
+        infoRecord.category = UnusableCategory.INFO;
+        infoRecord.excluded = true;
+        infoRecord.reason = NodeUsability.infoReason(node.name);
+        infoRecord.detail = '订阅信息条目，非节点（YAML 路径）：不进代理表、不参与测速。';
+        UnusableLedger.record(infoRecord);
+        continue;
+      }
       out.push(node);
     }
     return out;

@@ -24,7 +24,7 @@ import { ConfigValidator } from './ConfigValidator';
 import { DoHResolver } from './DoHResolver';
 
 import { SubscriptionService } from './SubscriptionService';
-import { SubscriptionRefreshStatus } from '../models/Subscription';
+import { SubscriptionRefreshStatus, SubscriptionRefreshResult } from '../models/Subscription';
 import { SettingsService, ConnectionSnapshot, AppRoutingSnapshot } from './SettingsService';
 import { TunBoxNotifier } from './TunBoxNotifier';
 import { TaskProgressUpdater } from './TaskProgressUpdater';
@@ -3608,9 +3608,25 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           AppLogger.warn(TAG, `preferred node invalid; fall back to ${target.name}`);
         } else {
           AppLogger.warn(TAG, 'no valid node config; auto-refreshing subscriptions');
+          // 【2026-10-24 限时】连接路径内的自动刷新必须有总预算：蜂窝下面板超时/530
+          // 每条要吃满传输层重试（真机取证：4 个订阅串行 60s，用户全程卡在「连接中」）。
+          // 15s 预算内刷多少算多少，到点用现有节点继续；刷不出来的留给连接成功后的
+          // self-heal 补拉（markNetworkFetchFailure 机制不变）。
+          const refreshDeadline = Date.now() + 15000;
           for (const s of subs.subscriptions) {
+            if (Date.now() >= refreshDeadline) {
+              AppLogger.warn(TAG, 'connect-time auto-refresh budget exhausted; continuing with current nodes');
+              break;
+            }
             try {
-              const refreshResult = await subs.refreshSubscription(s.id);
+              // 单条硬帽 12s：refreshSubscription 的传输层重试链最坏 45s，
+              // race 放弃后该条刷新仍在后台自行落地（写锁保证安全），连接不再等它
+              const refreshResult = await Promise.race([
+                subs.refreshSubscription(s.id),
+                new Promise<SubscriptionRefreshResult>((_, reject) => {
+                  setTimeout(() => reject(new Error('connect-time refresh budget (12s) exceeded')), 12000);
+                })
+              ]);
               if (refreshResult.status !== SubscriptionRefreshStatus.OK
                 && refreshResult.status !== SubscriptionRefreshStatus.NOT_MODIFIED) {
                 AppLogger.warn(TAG,
