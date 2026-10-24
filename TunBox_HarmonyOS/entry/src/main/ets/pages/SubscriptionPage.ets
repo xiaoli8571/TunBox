@@ -967,7 +967,7 @@ export struct SubscriptionPage {
       const progress = await BackgroundLatencyService.testSubscription(getContext(this) as Context, subId,
         (): void => { this.showToast('正在测速…'); });
       if (progress === null) {
-        this.showToast('本次未开始测速：通道未就绪或已有测速任务，请稍后重试');
+        this.showToast('测速通道未就绪或已有测速任务在跑，请稍后重试');
         return;
       }
       if (progress.measured + progress.timeout + progress.failed === 0) {

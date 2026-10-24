@@ -185,10 +185,29 @@ export class BackgroundLatencyService {
       if (subs.subscriptions.length === 0) {
         return null;
       }
-      const api = await orchestrator.ensureLatencyApi(true);
+      // 【2026-10-24 体验修复】冷启动自动重连/prewarm 正在准备通道的头几秒，
+      // 用户点测速会撞上「通道未就绪」被立即拒绝（真机取证：17:53:46 被拒、
+      // 17:53:52 隧道就绪、17:54:34 手动批正常——中间只差几秒）。改为短暂
+      // 等待重试：通道就绪后正常开测，而不是让用户自己掐时间再点一次。
+      // 9s 窗口足够覆盖隧道建立（connect timing ~2-5s）；负缓存/内核真起不来
+      // 的场景重试也无害，到点如实报错。
+      let api: ClashApiService | null = null;
+      const channelDeadline = Date.now() + 9000;
+      while (Date.now() < channelDeadline) {
+        api = await orchestrator.ensureLatencyApi(true);
+        if (api !== null) {
+          break;
+        }
+        if (LatencyEngine.isRunning() || FlclashLatencyService.isRunning()) {
+          // 等待期间真有批次开始了（另一个入口先到）：直接让行退出
+          AppLogger.info(TAG, 'delay batch skipped: another run started while waiting for channel');
+          return null;
+        }
+        await new Promise<void>((resolve) => setTimeout(() => resolve(), 1500));
+      }
       if (api === null) {
         AppLogger.warn(TAG, 'delay batch skipped: kernel channel unavailable');
-        throw new Error('测速通道尚未就绪，请稍后重试；若旧连接未结束，请先断开代理');
+        throw new Error('测速通道未就绪（代理连接建立中或测速内核未启动），请稍后重试');
       }
       // 节点名来自内核目录（FlClash 同构：App 不持有节点清单）
       const model = await CoreCatalogService.refresh(api, true);
