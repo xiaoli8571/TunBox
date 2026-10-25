@@ -3353,8 +3353,10 @@ export class SubscriptionService {
       node.subscriptionId = current;
       return node;
     }
-    const anyReal = this.nodes.find((node: ProxyNode): boolean => !NodeUsability.isInfoEntry(node.name));
-    return anyReal !== undefined ? anyReal : (this.nodes.length > 0 ? this.nodes[0] : null);
+    // 【2026-10-25 产品口径：单订阅作用域】最后回落不再跨订阅抓节点（旧实现 anyReal
+    // 会把别家订阅的节点当连接目标 → 配置里没有这个名字 → 钉选必失败「选择未生效」）。
+    // 当前订阅确实没有任何可用节点时如实返回 null，由调用方给出可行动提示。
+    return null;
   }
 
   /**

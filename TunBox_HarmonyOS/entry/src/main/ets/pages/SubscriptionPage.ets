@@ -16,6 +16,7 @@ import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { SubscriptionService, DIRECT_GROUP_ID } from '../commons/services/SubscriptionService';
 import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
 import { ProxyNode } from '../commons/models/ProxyNode';
+import { NodeUsability } from '../commons/subscription/NodeUsability';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
@@ -521,13 +522,18 @@ export struct SubscriptionPage {
       }
     }
     // 同步活动节点展示。
-    // ⚠ 影子节点（core:<name>）在解析表里找不到是**正常**的（节点来自内核），
-    // 以前这里会回落到 nodes[0] 并把 activeSubId 覆盖成它的订阅 —— 于是「使用中」
-    // 徽标与展开的卡片跑到了别的订阅上（用户实锤：吹雪云卡片显示 oc2 的节点）。
+    // ⚠ 影子节点（core:<name>）在解析表里找不到是**正常**的（节点来自内核）。
+    // 【2026-10-25 二次修】兜底**只在当前订阅内**找展示替身，且**永不改 activeSubId**
+    // —— 旧实现回落 nodes[0]（全表第一个，别家订阅）并把 activeSubId 一起带跑，
+    // 顶部「当前使用订阅组」就跳到别的机场（真机两次实锤：oc2 节点/飞鸟云顶栏）。
     const node = this.service.findNode(this.activeNodeId);
-    if (node === null && !this.activeNodeId.startsWith('core:') && this.service.nodes.length > 0) {
-      this.activeNodeId = this.service.nodes[0].id;
-      this.activeSubId = this.service.nodes[0].subscriptionId;
+    if (node === null && !this.activeNodeId.startsWith('core:')) {
+      const current = ProfileStore.currentId();
+      const scoped = this.service.nodesOf(current)
+        .find((n: ProxyNode): boolean => !NodeUsability.isInfoEntry(n.name));
+      if (scoped !== undefined) {
+        this.activeNodeId = scoped.id;
+      }
     }
   }
 

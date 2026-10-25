@@ -26,6 +26,17 @@ const TAG = 'ClashApiService';
 const SELECT_CONVERGE_TIMEOUT_MS: number = 3000;
 const SELECT_CONVERGE_INTERVAL_MS: number = 400;
 
+/** 钉选链上的一跳：组名 + 组类型（只有 type=Selector 允许 PUT）。 */
+export class SelectionHop {
+  name: string;
+  type: string;
+
+  constructor(name: string, type: string) {
+    this.name = name;
+    this.type = type;
+  }
+}
+
 export interface LatencyResult {
   nodeName: string;
   delayMs: number; // -1 = 超时/失败
@@ -298,19 +309,23 @@ export class ClashApiService {
    *  GLOBAL 是**尽力而为**（部分配置不声明 GLOBAL 组，PUT 会 404，属正常）。
    *  失败时重试一次：内核刚起时首个 PUT 偶发 400/超时，重试即可收敛。
    */
-  /** Find a member chain, including intermediate groups, with cycle protection. */
+  /** Find a member chain, including intermediate groups, with cycle protection.
+   *  返回外层组→内层组的 hop 链（末个 hop 的下一跳就是目标节点）。
+   *  每个 hop 带 type：只有 Selector 可 PUT（2026-10-25 定案：URLTest/Fallback/Smart
+   *  是策略组，mihomo 对它们的 PUT 一律 400 —— 机场组结构下按整链 PUT 必挂）。 */
   private selectionPath(table: Record<string, Object>, group: string, target: string,
-    visited: string[]): string[] {
+    visited: string[]): SelectionHop[] {
     if (visited.includes(group) || visited.length > 32) { return []; }
     const entry = table[group] as Record<string, Object>;
     if (entry === undefined || entry === null || !Array.isArray(entry['all'])) { return []; }
-    if (!['Selector', 'URLTest', 'Fallback', 'Smart'].includes(entry['type'] as string)) { return []; }
+    const type = entry['type'] as string;
+    if (!['Selector', 'URLTest', 'Fallback', 'Smart'].includes(type)) { return []; }
     const members = entry['all'] as string[];
-    if (members.includes(target)) { return [group, target]; }
+    if (members.includes(target)) { return [new SelectionHop(group, type)]; }
     const next = visited.concat([group]);
     for (const member of members) {
       const path = this.selectionPath(table, member, target, next);
-      if (path.length > 0) { return [group].concat(path); }
+      if (path.length > 0) { return [new SelectionHop(group, type)].concat(path); }
     }
     return [];
   }
@@ -339,15 +354,25 @@ export class ClashApiService {
     }
   }
 
-  /** 内核真相兜底：规则面 PROXY 组或 GLOBAL 组的 `now` 已等于目标即视为已生效。 */
+  /**
+   * 内核真相兜底（2026-10-25 扩展）：任何 **Selector** 组的 `now` 已等于目标即视为
+   * 已生效。旧实现只查 PROXY/GLOBAL —— 订阅原文接管模式下组名是机场自己起的
+   * （手动选择/🚀 节点选择...），这两个名字根本不存在，兜底恒失效。
+   */
   private async kernelAlreadySelected(nodeName: string): Promise<boolean> {
-    const groups: string[] = ['PROXY', 'GLOBAL'];
-    for (const group of groups) {
-      const now = await this.groupSelection(group);
-      if (now !== null && now === nodeName) {
-        return true;
+    const json = await this.proxiesJson();
+    if (json === null) { return false; }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>;
+      const table = parsed['proxies'] as Record<string, Object>;
+      if (table === undefined || table === null) { return false; }
+      for (const group of Object.keys(table)) {
+        const entry = table[group] as Record<string, Object>;
+        if (entry === undefined || entry === null) { continue; }
+        if ((entry['type'] as string) !== 'Selector') { continue; }
+        if ((entry['now'] as string) === nodeName) { return true; }
       }
-    }
+    } catch (e) { return false; }
     return false;
   }
 
@@ -360,22 +385,45 @@ export class ClashApiService {
       table = parsed['proxies'] as Record<string, Object>;
       if (table === undefined || table === null || table[nodeName] === undefined) { return false; }
     } catch (e) { return false; }
+    // 只把 **Selector** hop 记入待钉清单；URLTest/Fallback/Smart 是策略组（内核按
+    // 延迟/评分自动切换，PUT 必 400），视为直通 —— 0.6.4 真机定案：机场组结构下
+    // 节点常只挂在自动组下，旧实现整链 PUT 永久失败 → 「节点选择未生效」。
     const expected: Map<string, string> = new Map<string, string>();
+    let reachedViaAutoOnly = false;
     for (const group of Object.keys(table)) {
       const path = this.selectionPath(table, group, nodeName, []);
+      if (path.length === 0) { continue; }
+      let hasSelector = false;
       // Pin leaves before their parents. A successful unrelated group or GLOBAL
       // must never hide a failure in a rule-facing selector.
-      for (let i = path.length - 2; i >= 0; i--) {
-        expected.set(path[i], path[i + 1]);
+      for (let i = path.length - 1; i >= 0; i--) {
+        const hop = path[i];
+        if (hop.type !== 'Selector') { continue; }
+        hasSelector = true;
+        const member = i + 1 < path.length ? path[i + 1].name : nodeName;
+        expected.set(hop.name, member);
       }
+      if (path.length > 0 && !hasSelector) { reachedViaAutoOnly = true; }
     }
-    let nonGlobal = false;
+    if (expected.size === 0) {
+      if (reachedViaAutoOnly) {
+        // 节点只存在于策略组内：没有可钉的 Selector，内核按组策略自动调度 ——
+        // 这不是失败，诚实返回成功（连接可用性由组自身健康度保证）。
+        AppLogger.info(TAG, `selectNode: ${nodeName} only in policy groups; kernel auto-manages`);
+        return true;
+      }
+      return false;
+    }
+    // GLOBAL 是尽力而为：存在其他 Selector 时GLOBAL 的偶发失败/404 不拖垮整链
+    // （规则模式下流量不走 GLOBAL；mode=global 且只有 GLOBAL 可钉时才强制）。
+    if (expected.size > 1 && expected.has('GLOBAL')) {
+      expected.delete('GLOBAL');
+    }
     for (const pair of expected) {
       const group = pair[0];
       const member = pair[1];
       const ok = await this.selectInGroup(group, member);
       if (!ok && group !== 'GLOBAL') { return false; }
-      if (ok && group !== 'GLOBAL') { nonGlobal = true; }
     }
     const afterJson = await this.proxiesJson();
     if (afterJson === null) { return false; }
@@ -383,12 +431,11 @@ export class ClashApiService {
       const parsed = JSON.parse(afterJson) as Record<string, Object>;
       const after = parsed['proxies'] as Record<string, Object>;
       for (const pair of expected) {
-        if (pair[0] === 'GLOBAL' && nonGlobal) { continue; }
         const entry = after[pair[0]] as Record<string, Object>;
         if (entry === undefined || entry['now'] !== pair[1]) { return false; }
       }
     } catch (e) { return false; }
-    return expected.size > 0;
+    return true;
   }
 
   /**

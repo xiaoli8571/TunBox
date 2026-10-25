@@ -70,6 +70,7 @@ import { ProxyGroup } from '../models/ProxyGroup';
 import { AppSettings, AutoSelectModes } from '../models/AppSettings';
 import { SubDnsUpstream } from '../models/SubDnsUpstream';
 import { ClashConfigGenerator } from '../services/ClashConfigGenerator';
+import { LatencyTestUrl } from '../latency/LatencyTestUrl';
 import { DoHResolver } from '../services/DoHResolver';
 // 订阅原文 → overlay 合并（FlClash mergeProfileBase 的等价实现）
 import { ProfileConfigMerger } from '../flclash/ProfileConfigMerger';
@@ -405,6 +406,37 @@ export class RuntimeConfigBuilder {
         finalYaml = merged.yaml;
         AppLogger.info(TAG, `profile merged: mode=${mode} applied=${merged.applied} `
           + `items=${merged.profileProxyItems} bytes=${finalYaml.length}`);
+        // ── smart 组注入（2026-10-25 定案）────────────────────────────
+        // 原文接管模式下生成器的 ♻️ smart 组会被原文 proxy-groups 整段顶掉，
+        // 自动模式在真实订阅上从未生效。这里把 smart 组接回分流结构：
+        // 追加组定义（成员=原文自己的节点名，天然单订阅）+ 主选择组首位插入。
+        // 注入失败（无 MATCH/主组非 select/纯 provider 订阅）只降级不报错——
+        // 自动模式回落为钉选具体节点，与历史行为一致。
+        if (mode === RuntimeConfigMode.TUNNEL && options.useSmart
+          && profile.settings.autoSelectMode === AutoSelectModes.AUTO) {
+          const smartUrl: string = LatencyTestUrl.effective(profile.settings.testLatencyUrl);
+          const smartHead: string[] = [
+            `  - name: "${ClashConfigGenerator.SMART_GROUP_NAME}"`,
+            '    type: smart',
+            '    uselightgbm: true',
+            '    collectdata: false',
+            '    prefer-asn: false',
+            `    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`,
+            `    exclude-filter: "${ClashConfigGenerator.escapeYaml(ClashConfigGenerator.SMART_INFO_NODE_FILTER)}"`
+          ];
+          const priority: string = (profile.settings.smartPolicyPriority ?? '').trim();
+          if (priority.length > 0) {
+            smartHead.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
+          }
+          const injected = ProfileConfigMerger.injectSmartPrimary(
+            finalYaml, ClashConfigGenerator.SMART_GROUP_NAME, smartHead);
+          if (injected.ok) {
+            finalYaml = injected.yaml;
+            AppLogger.info(TAG, `smart group injected: ${injected.reason}`);
+          } else {
+            AppLogger.warn(TAG, `smart group injection skipped: ${injected.reason}`);
+          }
+        }
       } else {
         throw new Error(`订阅配置合并失败：${merged.error}`);
       }

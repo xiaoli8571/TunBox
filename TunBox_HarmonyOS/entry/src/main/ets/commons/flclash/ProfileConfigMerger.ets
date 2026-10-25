@@ -67,6 +67,13 @@ export class ProfileMergeResult {
   profileProxyItems: number = 0;
 }
 
+/** smart 组注入结果（ok=false 时 reason 说明跳过原因，注入降级为节点钉选） */
+export class SmartInjectResult {
+  ok: boolean = false;
+  yaml: string = '';
+  reason: string = '';
+}
+
 export class ProfileConfigMerger {
   /**
    * 订阅原文是否是内核可解析的 Clash 配置。
@@ -179,6 +186,127 @@ export class ProfileConfigMerger {
     }
     lines.push('rules:', '  - MATCH,手动选择');
     return lines.join(LF);
+  }
+
+  /**
+   * 把 smart 组注入订阅原文的分流结构（2026-10-25，「自动选择」在原文接管模式下
+   * 从未生效的定案修复）：原文的 proxy-groups 整段顶掉生成器的同名段 → 生成器的
+   * ♻️ smart 组永远进不了最终配置，自动模式只能退化成钉选具体节点。
+   *
+   * 注入语义（用户拍板：插入主选择组首位）：
+   *   ① 主选择组 = 原文 rules 里最后一条 `MATCH,<target>` 的 target；
+   *   ② target 必须是 proxy-groups 里真实存在且 type: select 的组（url-test 等
+   *      自动组不可钉选，注入进去也没有语义）；
+   *   ③ 把 smart 组**首位**插进该组的 proxies 成员（内核默认即走 smart；用户仍可
+   *      在该组手动固定任何节点/子组——与生成器给 PROXY 组的做法同构）；
+   *   ④ smart 组定义整体追加到 proxy-groups 段尾，成员 = 原文自己的节点名
+   *      （天然单订阅，满足「选了哪个订阅就只在它下面优选」）。
+   * 任一前提不成立 → ok=false 原样返回（自动模式降级为节点钉选，绝不破坏原文）。
+   *
+   * @param yaml 合并后的最终配置（将被注入修改）
+   * @param smartName smart 组名（须与生成器/钉选侧一致）
+   * @param smartHead smart 组的头部键值行（name/type/uselightgbm/url/exclude-filter...，
+   *                  由调用方按用户设置生成；成员 proxies 由本函数按原文节点补齐）
+   */
+  static injectSmartPrimary(yaml: string, smartName: string, smartHead: string[]): SmartInjectResult {
+    const out = new SmartInjectResult();
+    out.yaml = yaml;
+    if (!ProfileConfigMerger.hasKey(yaml, 'rules')) {
+      out.reason = 'no rules section';
+      return out;
+    }
+    // ① 主选择组：最后一条 MATCH 规则的 target（MATCH 是兜底规则，惯例在最后）
+    const lines = yaml.replace(/\r/g, '').split('\n');
+    let primary = '';
+    for (const line of lines) {
+      const m = line.trim().match(/^-\s*MATCH\s*,(.+)$/);
+      if (m !== null) {
+        primary = m[1].trim();
+      }
+    }
+    if (primary.length === 0) {
+      out.reason = 'no MATCH rule';
+      return out;
+    }
+    primary = primary.replace(/^["']|["']$/g, '').trim();
+    if (primary.length === 0 || primary === 'DIRECT' || primary === 'REJECT') {
+      out.reason = `MATCH target not a selector: ${primary}`;
+      return out;
+    }
+    // ② 定位 proxy-groups 段与主选择组块
+    const sectionStart = lines.findIndex((l) => l.startsWith('proxy-groups:'));
+    if (sectionStart < 0) {
+      out.reason = 'no proxy-groups section';
+      return out;
+    }
+    let sectionEnd = lines.length;
+    for (let i = sectionStart + 1; i < lines.length; i++) {
+      const l = lines[i];
+      if (l.trim().length > 0 && !l.startsWith(' ') && !l.startsWith('\t')
+        && !l.trimStart().startsWith('#') && !l.startsWith('-')) {
+        sectionEnd = i;
+        break;
+      }
+    }
+    const namePrefixes = [
+      `  - name: ${primary}`,
+      `  - name: "${primary}"`,
+      `  - name: '${primary}'`
+    ];
+    let groupStart = -1;
+    for (let i = sectionStart + 1; i < sectionEnd; i++) {
+      if (namePrefixes.includes(lines[i])) {
+        groupStart = i;
+        break;
+      }
+    }
+    if (groupStart < 0) {
+      out.reason = `primary group not found: ${primary}`;
+      return out;
+    }
+    let groupEnd = sectionEnd;
+    for (let i = groupStart + 1; i < sectionEnd; i++) {
+      if (lines[i].startsWith('  - ')) {
+        groupEnd = i;
+        break;
+      }
+    }
+    const groupBody = lines.slice(groupStart, groupEnd);
+    const isSelect = groupBody.some((l) => l.trim().replace(/^["']|["']$/g, '') === 'type: select'
+      || l.trim() === 'type: select');
+    if (!isSelect) {
+      out.reason = `primary group not select type: ${primary}`;
+      return out;
+    }
+    // ③ smart 组成员 = 原文自己的节点名（proxies 段的 `- ` 条目，排除空段）
+    const memberNames = YamlMerger.sequenceItemNames(yaml, 'proxies');
+    if (memberNames.length === 0) {
+      out.reason = 'profile has no static proxies (provider-only); smart pool unknown';
+      return out;
+    }
+    // ③b 主选择组首位插入 smart 组
+    const proxiesIdx = groupBody.findIndex((l) => l.trim() === 'proxies:');
+    const smartMember = `      - ${ProfileConfigMerger.yamlQuote(smartName)}`;
+    if (proxiesIdx >= 0) {
+      groupBody.splice(proxiesIdx + 1, 0, smartMember);
+    } else {
+      // 组只有 use:（provider 组）或没写成员：补一个 proxies: 列表，与 use: 并存合法
+      groupBody.splice(1, 0, '    proxies:', smartMember);
+    }
+    // ④ smart 组定义追加到 proxy-groups 段尾
+    const smartBlock = smartHead.slice();
+    for (const name of memberNames) {
+      smartBlock.push(`      - ${ProfileConfigMerger.yamlQuote(name)}`);
+    }
+    const rebuilt = lines.slice(0, groupStart)
+      .concat(groupBody)
+      .concat(lines.slice(groupEnd, sectionEnd))
+      .concat(smartBlock)
+      .concat(lines.slice(sectionEnd));
+    out.ok = true;
+    out.reason = `primary=${primary} members=${memberNames.length}`;
+    out.yaml = rebuilt.join('\n');
+    return out;
   }
 
   /** 原文是否显式启用 dns（`dns.enable: true`）。 */

@@ -321,7 +321,10 @@ transpile('commons/config/RuntimeConfigBuilder.ets', 'RuntimeConfigBuilder.ts', 
   '../utils/AppLogger': './stubs.ts',
   // 2026-10-22（FlClash 同构）：overlay + 订阅原文合并
   '../flclash/ProfileConfigMerger': './ProfileConfigMerger.ts',
+  // 2026-10-25：smart 组注入需要测速地址真源（ND06 只有一处规则）
+  '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
 });
+transpile('commons/latency/LatencyTestUrl.ets', 'LatencyTestUrl.ts', {});
 
 /** 临时副本的 stubs 补丁：harness 的 stubs.ts 未必覆盖后来新增的 @kit.* 具名导出。 */
 function patchTempStubs() {

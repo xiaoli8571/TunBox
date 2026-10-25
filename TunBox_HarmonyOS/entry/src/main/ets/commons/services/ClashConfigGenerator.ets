@@ -693,14 +693,30 @@ export class ClashConfigGenerator {
         lines.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
       }
       lines.push('    proxies:');
-      for (const n of staticNodes) {
+      // 【2026-10-25 产品口径：单订阅优选】smart 池只收**当前选中节点所属订阅**的
+      // 节点（无订阅归属的本地/直链节点一并保留）；池不足 2 个时退回全量，宁可
+      // 跨订阅优选也不让自动模式在单订阅小池上失效。PROXY 选择组仍含全部节点，
+      // 手动跨订阅选点不受影响。
+      const smartScopeId: string = groupSelected.subscriptionId;
+      let smartPool: ProxyNode[] = smartScopeId.length > 0
+        ? staticNodes.filter((n: ProxyNode): boolean =>
+          n.subscriptionId === smartScopeId || n.subscriptionId.length === 0)
+        : staticNodes;
+      if (smartPool.length < 2) {
+        smartPool = staticNodes;
+      }
+      for (const n of smartPool) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
       }
       // smart 组同样要 `use:` provider：provider 提供的节点不在静态列表里，
       // 少了这一段自动选点会看不到这些节点。
-      if (providerPlan.entries.length > 0) {
+      const scopedProviderEntries = smartScopeId.length > 0
+        ? providerPlan.entries.filter((entry: RawProviderEntry): boolean =>
+          entry.subscriptionId === smartScopeId)
+        : providerPlan.entries;
+      if (scopedProviderEntries.length > 0) {
         lines.push('    use:');
-        for (const entry of providerPlan.entries) {
+        for (const entry of scopedProviderEntries) {
           lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
         }
       }
