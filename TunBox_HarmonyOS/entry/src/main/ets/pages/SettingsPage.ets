@@ -79,7 +79,6 @@ export struct SettingsView {
   @State geoAssets: GeoAssetStatus[] = [];
   @State assetSource: string = 'auto';
   @State geoUpdatingId: string = '';
-  @State audioKeepAliveEnabled: boolean = false;
   // ── 网络（IPv6 双栈，产品默认开）──
   @State ipv6Enabled: boolean = true;
   /** 是否允许明文 HTTP 订阅（默认关闭；关闭时只接受 https） */
@@ -132,7 +131,6 @@ export struct SettingsView {
     this.refreshAppRoutingSummary();
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
-    this.audioKeepAliveEnabled = this.settings.audioKeepAliveEnabled;
     this.ipv6Enabled = this.settings.ipv6Enabled;
     this.allowInsecureSubscriptionHttp = this.settings.allowInsecureSubscriptionHttp;
     this.assetSource = this.settings.assetSource;
@@ -216,22 +214,6 @@ export struct SettingsView {
     this.switchTo = this.orchestrator.lastFailoverToName();
   }
 
-
-
-  private setAudioKeepAlive(v: boolean): void {
-    const previous = this.audioKeepAliveEnabled;
-    this.audioKeepAliveEnabled = v;
-    SettingsService.patchSettings((s: AppSettings): void => {
-      s.audioKeepAliveEnabled = v;
-    }).then((): void => {
-      this.audioKeepAliveEnabled = v;
-      this.settings.audioKeepAliveEnabled = v;
-      promptAction.showToast({ message: '已保存，重新连接后生效' });
-    }).catch((): void => {
-      this.audioKeepAliveEnabled = previous;
-      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
-    });
-  }
 
   // ── 网络（IPv6 双栈）─────────────────────────────────────────────
 
@@ -536,8 +518,8 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder })
             .onClick(() => { this.openRulesPage(); })
 
-            // ── 系统（2026-10-23 用户口径：原「外观与网络」改名「系统」，音频保活并进来）──
-            // 卡片里放「一次性设定、平时不碰」的项目：IPv6、测速地址、明文 HTTP、音频保活。
+            // ── 系统（2026-10-23 用户口径：原「外观与网络」改名「系统」）──
+            // 卡片里放「一次性设定、平时不碰」的项目：IPv6、测速地址、明文 HTTP。
             // 主题跟随系统已移到「关于与隐私」卡（用户要求夹在版本与隐私政策之间）。
             Column({ space: 10 }) {
               this.SectionHeader($r('app.media.ic_settings'), $r('app.string.settings_system_title'))
@@ -604,18 +586,6 @@ export struct SettingsView {
               Text('默认关闭；明文 http 不加密、可被篡改，仅自建面板无证书时临时开启。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
 
-              // 音频保活（原「后台连接」卡，2026-10-23 用户要求并入「系统」）
-              Divider().color(TunBoxColors.cardBorder)
-
-              Row() {
-                Text('音频保活（下次连接）')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-                Toggle({ type: ToggleType.Switch, isOn: this.audioKeepAliveEnabled })
-                  .selectedColor(TunBoxColors.primary)
-                  .onChange((v: boolean): void => this.setAudioKeepAlive(v))
-              }.width('100%').alignItems(VerticalAlign.Center)
-              Text('小音量播放 + 媒体卡片维持后台（会增加耗电）；连接期间每 30 秒自检一次。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)

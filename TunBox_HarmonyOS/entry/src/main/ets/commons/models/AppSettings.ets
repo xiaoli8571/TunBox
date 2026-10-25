@@ -194,8 +194,6 @@ export class AppSettingsJson {
    * 阈值常量见 SubscriptionQuotaService：流量剩 <10% 或 3 天内到期。
    */
   quotaNotifyEnabled: boolean = true;
-  /** Optional low-volume audio playback; opt-in and applied on the next connection. */
-  audioKeepAliveEnabled: boolean = false;
   /**
    * geo 资产下载源偏好（geoip.metadb / Model.bin / 去广告 MRS）：
    * auto=实测可达性默认序 / jsdelivr=CDN 优先 / ghproxy=加速前缀优先 / github=官方直链优先。
@@ -328,7 +326,6 @@ export class AppSettings {
   ipv6Enabled: boolean = true;
   /** 订阅配额提醒开关（默认 true；阈值见 SubscriptionQuotaService） */
   quotaNotifyEnabled: boolean = true;
-  audioKeepAliveEnabled: boolean = false;
   /** geo 资产下载源偏好：auto/jsdelivr/ghproxy/github（非法回落 auto） */
   assetSource: string = 'auto';
   /**
@@ -380,7 +377,6 @@ export class AppSettings {
     j.coreLogLevel = this.coreLogLevel;
     j.ipv6Enabled = this.ipv6Enabled;
     j.quotaNotifyEnabled = this.quotaNotifyEnabled;
-    j.audioKeepAliveEnabled = this.audioKeepAliveEnabled;
     j.assetSource = this.assetSource;
     j.quotaAlertMarks = this.quotaAlertMarks;
     return j;
@@ -541,7 +537,6 @@ export class AppSettings {
     // 旧配置里存过 false 的也一律置 true —— 否则升级后「开关没了却也不提醒」，
     // 等于悄悄把功能弄丢。
     s.quotaNotifyEnabled = true;
-    s.audioKeepAliveEnabled = j.audioKeepAliveEnabled === true;
     const source = typeof j.assetSource === 'string' ? j.assetSource.trim().toLowerCase() : '';
     s.assetSource = (source === 'jsdelivr' || source === 'ghproxy' || source === 'github')
       ? source : 'auto';

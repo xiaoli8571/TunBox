@@ -43,8 +43,6 @@ import type { BusinessError } from '@kit.BasicServicesKit';
 import { AppLogger } from '../utils/AppLogger';
 import { TaskProgressUpdater, ContinuousTaskKind } from './TaskProgressUpdater';
 import type { ContinuousTaskVerdict } from './BackgroundTaskWatch';
-import { AudioKeepAlive } from './AudioKeepAlive';
-import { SettingsService } from './SettingsService';
 
 const TAG = 'UiGuardian';
 const WATCHDOG_INTERVAL_MS: number = 30000;
@@ -176,38 +174,6 @@ export class UiGuardian {
       return result;
     }
 
-    // Audio is opt-in. Never combine it with dataTransfer or its progress obligations.
-    let audioEnabled: boolean = false;
-    try { audioEnabled = (await SettingsService.load()).audioKeepAliveEnabled; } catch (e) {
-      AppLogger.warn(TAG, `audio preference unavailable; retaining default: ${AppLogger.errText(e)}`);
-    }
-    if (generation !== UiGuardian.generation) { return result; }
-    if (audioEnabled) {
-      const playing = await AudioKeepAlive.start(context, (): void => {
-        UiGuardian.onAudioInterrupted(context);
-      });
-      if (generation !== UiGuardian.generation) {
-        await AudioKeepAlive.stop();
-        return result;
-      }
-      if (playing) {
-        try {
-          const res = await backgroundTaskManager.startBackgroundRunning(context, ['audioPlayback'], agent);
-          result.ok = true;
-          result.kind = ContinuousTaskKind.AUDIO_PLAYBACK;
-          result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
-          result.continuousTaskId = res?.continuousTaskId ?? -1;
-          result.detail = 'audioPlayback';
-          await UiGuardian.acceptApplication(context, generation, result);
-          return result;
-        } catch (e) {
-          AppLogger.warn(TAG, `audio task unavailable; retaining default: ${AppLogger.errText(e)}`);
-        }
-      }
-      await AudioKeepAlive.stop();
-    }
-    if (generation !== UiGuardian.generation) { return result; }
-
     // ① 优先 taskKeeping（VPN 隧道保活的正确类型）
     try {
       const request = new backgroundTaskManager.ContinuousTaskRequest();
@@ -255,7 +221,6 @@ export class UiGuardian {
   private static async acceptApplication(context: Context, generation: number,
     result: ContinuousTaskApplyResult): Promise<void> {
     if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) {
-      await AudioKeepAlive.stop();
       try { await backgroundTaskManager.stopBackgroundRunning(context); } catch (e) {
         AppLogger.warn(TAG, `stale task cleanup failed: ${AppLogger.errText(e)}`);
       }
@@ -377,12 +342,7 @@ export class UiGuardian {
           UiGuardian.suspended = true;
           UiGuardian.registered = false;
           TaskProgressUpdater.detach();
-          await AudioKeepAlive.stop();
           AppLogger.warn(TAG, 'background task is suspended; waiting for system/user action');
-          return;
-        }
-        if (UiGuardian.currentKind === ContinuousTaskKind.AUDIO_PLAYBACK && !AudioKeepAlive.isActive()) {
-          UiGuardian.onAudioInterrupted(context);
           return;
         }
         UiGuardian.registered = true;
@@ -401,7 +361,6 @@ export class UiGuardian {
       if (UiGuardian.suspended) { return; }
       UiGuardian.registered = false;
       TaskProgressUpdater.detach();
-      await AudioKeepAlive.stop();
       if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
       if (UiGuardian.missingSince === 0) {
         UiGuardian.missingSince = Date.now();
@@ -416,16 +375,6 @@ export class UiGuardian {
     } finally {
       if (checkId === UiGuardian.watchdogCheckId) { UiGuardian.watchdogBusy = false; }
     }
-  }
-
-  private static onAudioInterrupted(context: Context): void {
-    if (UiGuardian.autoEngageSuppressed) { return; }
-    UiGuardian.autoEngageSuppressed = true;
-    UiGuardian.suppressReason = 'audio interrupted; reconnect explicitly to resume playback';
-    AppLogger.warn(TAG, UiGuardian.suppressReason);
-    UiGuardian.release(context).catch((e: Error): void => {
-      AppLogger.warn(TAG, `interrupted audio cleanup failed: ${AppLogger.errText(e)}`);
-    });
   }
 
   /**
@@ -500,7 +449,6 @@ export class UiGuardian {
     // 先记录"此前是否持有登记"再清账：监听者据此判断这次事件与本进程是否相关。
     verdict.hadRegistration = UiGuardian.registered;
     UiGuardian.generation++;
-    AudioKeepAlive.stop().catch((): void => {});
     if (UiGuardian.registered) {
       AppLogger.warn(TAG, 'guardian registration cleared by external cancel');
     }
@@ -552,7 +500,6 @@ export class UiGuardian {
     UiGuardian.suspended = suspended;
     if (suspended) {
       UiGuardian.generation++;
-      AudioKeepAlive.stop().catch((): void => {});
       UiGuardian.registered = false;
       TaskProgressUpdater.detach();
       if (verdict.requireUserAction) {
@@ -566,11 +513,6 @@ export class UiGuardian {
       return;
     }
     // 恢复：任务重新激活 → 重新记账（dataTransfer 还要把进度心跳接回来）
-    if (UiGuardian.currentKind === ContinuousTaskKind.AUDIO_PLAYBACK) {
-      // Playback was stopped on suspend. Do not claim active audio or seize audio focus on resume.
-      UiGuardian.registered = false;
-      return;
-    }
     UiGuardian.registered = true;
     if (UiGuardian.currentKind === ContinuousTaskKind.DATA_TRANSFER && UiGuardian.lastNotificationId >= 0) {
       TaskProgressUpdater.attach(UiGuardian.lastNotificationId, UiGuardian.currentKind);
@@ -584,7 +526,6 @@ export class UiGuardian {
     UiGuardian.noteReleased();
     // Serialized behind pending starts: a late platform reply cannot revive a disconnected session.
     const operation = UiGuardian.taskWrites.then(async (): Promise<void> => {
-      await AudioKeepAlive.stop();
       if (!hadTask) { return; }
       try {
         await backgroundTaskManager.stopBackgroundRunning(context);
@@ -608,7 +549,6 @@ export class UiGuardian {
     UiGuardian.suspended = false;
     UiGuardian.missingSince = 0;
     UiGuardian.watchdogAttempts = 0;
-    AudioKeepAlive.stop().catch((): void => {});
     UiGuardian.registered = false;
     UiGuardian.currentKind = ContinuousTaskKind.NONE;
     UiGuardian.lastNotificationId = -1;

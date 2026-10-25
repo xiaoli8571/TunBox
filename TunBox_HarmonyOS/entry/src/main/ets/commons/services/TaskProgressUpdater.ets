@@ -62,9 +62,7 @@ export enum ContinuousTaskKind {
   /** 数据传输类型：允许周期更新实况窗进度 */
   DATA_TRANSFER = 'dataTransfer',
   /** 计算任务类型：不得修改长时任务通知内容 */
-  TASK_KEEPING = 'taskKeeping',
-  /** Audio task: AVSession/renderer own playback; no live-view progress. */
-  AUDIO_PLAYBACK = 'audioPlayback'
+  TASK_KEEPING = 'taskKeeping'
 }
 
 /** 更新周期：官方窗口为 10 分钟，这里 5 分钟留一倍冗余 */
