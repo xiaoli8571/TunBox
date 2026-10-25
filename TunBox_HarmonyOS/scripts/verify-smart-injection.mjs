@@ -84,24 +84,58 @@ const SMART_HEAD = [
   '    exclude-filter: "(剩余流量|套餐到期|官网|客服)"'
 ];
 
-function groupMembers(yaml, groupName) {
+function groupBlock(yaml, groupName, typeFilter) {
   const lines = yaml.split('\n');
   const nameLines = [`  - name: ${groupName}`, `  - name: "${groupName}"`, `  - name: '${groupName}'`];
-  const start = lines.findIndex((l) => nameLines.includes(l));
-  if (start < 0) { return null; }
+  for (let start = 0; start < lines.length; start++) {
+    if (!nameLines.includes(lines[start])) { continue; }
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].startsWith('  - ') || (!lines[i].startsWith(' ') && lines[i].trim().length > 0)) { end = i; break; }
+    }
+    const block = lines.slice(start, end);
+    if (typeFilter === undefined || block.some((l) => l.trim() === `type: ${typeFilter}`)) {
+      return block;
+    }
+    start = end - 1; // 同名组还有别的 type，继续找
+  }
+  return null;
+}
+
+function groupMembers(yaml, groupName, typeFilter) {
+  const block = groupBlock(yaml, groupName, typeFilter);
+  if (block === null) { return null; }
   const members = [];
   let inProxies = false;
-  for (let i = start + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (l.startsWith('  - ')) { break; }              // 下一个组
+  for (const l of block) {
     if (l.trim() === 'proxies:') { inProxies = true; continue; }
-    if (!l.startsWith(' ') || (l.startsWith('  -') && !l.startsWith('   '))) { break; } // 出段
-    if (/^\s{2,4}[^ ]/.test(l)) { inProxies = false; continue; }               // 组内其它键 → 退出成员列表
-    if (inProxies && /^ {6,}-\s/.test(l)) {
+    if (/^\s{2,4}[^ \-]/.test(l) || /^\s{2,4}use:/.test(l)) { inProxies = false; }
+    if (inProxies && /^ {4,}-\s/.test(l)) {
       members.push(l.trim().replace(/^-\s+/, '').replace(/^['"]|['"]$/g, ''));
     }
   }
   return members;
+}
+
+/** 结构体检：组内成员行（6+ 空格的 `- `）前面必须有 proxies:/use: 头 —— 直接复刻
+ *  真机 16:33 那份坏配置的死法（成员悬空在标量键后 → did not find expected key）。 */
+function groupsWellFormed(yaml) {
+  const lines = yaml.split('\n');
+  let sectionStart = lines.findIndex((l) => l.startsWith('proxy-groups:'));
+  if (sectionStart < 0) { return true; }
+  let pendingListKey = false;
+  for (let i = sectionStart + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.startsWith(' ') && l.trim().length > 0) { break; } // 出段
+    if (l.startsWith('  - ')) { pendingListKey = false; continue; } // 新组
+    if (l.trim() === 'proxies:' || l.trim() === 'use:') { pendingListKey = true; continue; }
+    if (/^ {6,}-\s/.test(l)) {
+      if (!pendingListKey) { return false; } // 悬空成员
+      continue;
+    }
+    if (l.trim().length > 0) { pendingListKey = false; } // 其它标量键
+  }
+  return true;
 }
 
 // ── 用例 1：机场多组结构（selector 主组 + 内嵌 url-test 自动组）──────────────
@@ -139,21 +173,23 @@ if (r1.ok) {
   const primaryMembers = groupMembers(r1.yaml, '🚀 节点选择');
   ok(primaryMembers !== null && primaryMembers[0] === SMART_NAME,
     '主选择组首位 = smart 组', JSON.stringify(primaryMembers));
-  const smartMembers = groupMembers(r1.yaml, SMART_NAME);
+  // ⚠ 必须按 type:smart 定位：机场自带的 url-test 组与注入组同名，先来先到会抓错块
+  const smartMembers = groupMembers(r1.yaml, SMART_NAME, 'smart');
   ok(smartMembers !== null && smartMembers.includes('🇯🇵 日本•移联01') && smartMembers.includes('🇺🇸 美国03'),
     `smart 组成员 = 原文节点（${smartMembers ? smartMembers.length : 0} 个）`);
   ok(smartMembers !== null && !smartMembers.some((m) => m.includes('剩余流量')),
     'smart 组不含信息条（成员本就来自真实节点表）');
   // 原 url-test 组不被污染
-  const autoMembers = groupMembers(r1.yaml, '♻️ 自动选择');
+  const autoMembers = groupMembers(r1.yaml, SMART_NAME, 'url-test');
   ok(autoMembers !== null && autoMembers.length === 3 && !autoMembers.includes(SMART_NAME),
     '机场自带 url-test 组原样保留');
   ok(r1.yaml.includes('  - name: "♻️ 自动选择"\n    type: smart'), 'smart 组定义已追加（type: smart）');
-  // 规则未被动过
+  ok(groupBlock(r1.yaml, SMART_NAME, 'smart').some((l) => l.trim() === 'proxies:'),
+    '注入的 smart 块带 proxies: 头（真机 16:33 死法回归位）');
   ok(r1.yaml.includes('MATCH,🚀 节点选择'), 'MATCH 规则原样保留');
-  // 生成 YAML 无重复组名（uniqueKeys 安全：name 是序列项不是映射键，但同段两个同名组会歧义）
   const smartDefs = r1.yaml.split('\n').filter((l) => l.startsWith('  - name: "') && l.includes(SMART_NAME));
   ok(smartDefs.length === 2, '两个 ♻️ 组共存（机场 url-test + 注入 smart）无重名冲突');
+  ok(groupsWellFormed(r1.yaml), 'proxy-groups 全段结构体检通过（无悬空成员行）');
 }
 
 // ── 用例 2：裸节点骨架（withSyntheticGroups 形态）───────────────────────────
@@ -183,6 +219,7 @@ ok(r2.ok, '注入成功', r2.reason);
 if (r2.ok) {
   const m = groupMembers(r2.yaml, '手动选择');
   ok(m !== null && m[0] === SMART_NAME && m.includes('DIRECT'), '首位插入且 DIRECT 保留', JSON.stringify(m));
+  ok(groupsWellFormed(r2.yaml), '结构体检通过');
 }
 
 // ── 用例 3：MATCH,DIRECT → 拒绝注入 ────────────────────────────────────────
@@ -225,6 +262,48 @@ const providerOnly = [
 ].join('\n');
 const r6 = ProfileConfigMerger.injectSmartPrimary(providerOnly, SMART_NAME, SMART_HEAD.slice());
 ok(!r6.ok && r6.reason.includes('provider-only'), `拒绝注入（${r6.reason}）`);
+
+// ── 用例 7：4 空格成员缩进（机场常见风格，硬编码 6 空格=缩进断裂）──────────
+section('── 用例 7：4 空格成员缩进对齐 ──');
+const tightIndent = [
+  'proxies:',
+  '  - {name: "香港01", server: h1.example.com, port: 443, type: ss, cipher: aes-128-gcm, password: p}',
+  '  - {name: "香港02", server: h2.example.com, port: 443, type: ss, cipher: aes-128-gcm, password: p}',
+  'proxy-groups:',
+  '  - name: "🚀 节点选择"',
+  '    type: select',
+  '    proxies:',
+  '    - "香港01"',
+  '    - "香港02"',
+  'rules:',
+  '  - MATCH,🚀 节点选择'
+].join('\n');
+const r7 = ProfileConfigMerger.injectSmartPrimary(tightIndent, SMART_NAME, SMART_HEAD.slice());
+ok(r7.ok, '注入成功', r7.reason);
+if (r7.ok) {
+  const m = groupMembers(r7.yaml, '🚀 节点选择');
+  ok(m !== null && m[0] === SMART_NAME && m.length === 3, '首位插入成功', JSON.stringify(m));
+  ok(groupsWellFormed(r7.yaml), '结构体检通过（成员缩进已对齐 4 空格风格）');
+  const smartLine = r7.yaml.split('\n').find((l) => l.includes(SMART_NAME) && l.trim().startsWith('-'));
+  ok(smartLine !== undefined && smartLine.startsWith('    - '), `成员缩进=4 空格（${JSON.stringify(smartLine)}）`);
+}
+
+// ── 用例 8：流式成员表（proxies: [a, b]）→ 拒绝注入 ────────────────────────
+section('── 用例 8：流式 proxies 拒绝 ──');
+const flowStyle = [
+  'proxies:',
+  '  - {name: "香港01", server: h1.example.com, port: 443, type: ss, cipher: aes-128-gcm, password: p}',
+  '  - {name: "香港02", server: h2.example.com, port: 443, type: ss, cipher: aes-128-gcm, password: p}',
+  'proxy-groups:',
+  '  - name: "🚀 节点选择"',
+  '    type: select',
+  '    proxies: ["香港01", "香港02"]',
+  'rules:',
+  '  - MATCH,🚀 节点选择'
+].join('\n');
+const r8 = ProfileConfigMerger.injectSmartPrimary(flowStyle, SMART_NAME, SMART_HEAD.slice());
+ok(!r8.ok && r8.reason.includes('flow-style'), `拒绝注入（${r8.reason}）`);
+ok(r8.yaml === flowStyle, '原文未被修改');
 
 // ── 汇总 ──────────────────────────────────────────────────────────────────
 console.log(`\n-----------------------------------------`);

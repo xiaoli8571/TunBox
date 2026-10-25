@@ -285,16 +285,38 @@ export class ProfileConfigMerger {
       return out;
     }
     // ③b 主选择组首位插入 smart 组
+    // ③c 流式成员表（`proxies: [a, b]`）不介入：块/流两种写法并存 = 重复键整份拒载
+    const flowProxies = groupBody.some((l) => /^proxies:\s*\[/.test(l.trim()));
+    if (flowProxies) {
+      out.reason = `primary group uses flow-style proxies: ${primary}`;
+      return out;
+    }
+    const quotedSmart = ProfileConfigMerger.yamlQuote(smartName);
     const proxiesIdx = groupBody.findIndex((l) => l.trim() === 'proxies:');
-    const smartMember = `      - ${ProfileConfigMerger.yamlQuote(smartName)}`;
     if (proxiesIdx >= 0) {
-      groupBody.splice(proxiesIdx + 1, 0, smartMember);
+      // 成员缩进必须对齐既有成员（机场风格不一：`- a` 常见 4/6 空格两种，
+      // 硬编码 6 空格插进 4 空格序列 = 缩进断裂 → did not find expected key，
+      // 2026-10-25 真机实锤 16:33 那份坏配置的第二个雷）。
+      let memberIndent = '      ';
+      for (let i = proxiesIdx + 1; i < groupBody.length; i++) {
+        const l = groupBody[i];
+        if (l.trim().length === 0) { continue; }
+        if (/^\s*-\s/.test(l)) {
+          memberIndent = l.substring(0, l.length - l.trimStart().length);
+        }
+        break;
+      }
+      groupBody.splice(proxiesIdx + 1, 0, `${memberIndent}- ${quotedSmart}`);
     } else {
       // 组只有 use:（provider 组）或没写成员：补一个 proxies: 列表，与 use: 并存合法
-      groupBody.splice(1, 0, '    proxies:', smartMember);
+      groupBody.splice(1, 0, '    proxies:', `      - ${quotedSmart}`);
     }
-    // ④ smart 组定义追加到 proxy-groups 段尾
+    // ④ smart 组定义追加到 proxy-groups 段尾。
+    // ⚠⚠ 成员前必须有 `proxies:` 头 —— 2026-10-25 16:33 真机实锤：头一行漏写时
+    // 成员行悬空在标量键后面，内核报 `yaml: line N: did not find expected key`
+    // 整份拒载（自动模式每次连接都注入 → 每次连接都报错）。
     const smartBlock = smartHead.slice();
+    smartBlock.push('    proxies:');
     for (const name of memberNames) {
       smartBlock.push(`      - ${ProfileConfigMerger.yamlQuote(name)}`);
     }
