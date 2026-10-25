@@ -681,8 +681,12 @@ export struct HomePage {
       this.currentNodeName = preferred.name;
       return;
     }
-    if (this.subs.nodes.length > 0) {
-      this.currentNodeName = this.subs.nodes[0].name;
+    // 回退绝不能裸拿 nodes[0]（2026-10-25 真机实锤：冷启动 preferred 未解析时
+    // 显示了机场信息条目「剩余流量：596.2GB」）。fallbackConnectionNode 已过滤
+    // 信息条目并覆盖 profile 回落，与连接实际会用的目标同源。
+    const fallback = this.subs.fallbackConnectionNode();
+    if (fallback !== null) {
+      this.currentNodeName = fallback.name;
       return;
     }
     this.currentNodeName = '';

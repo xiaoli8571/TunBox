@@ -20,6 +20,7 @@ import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPo
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
+import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ClashApiService } from '../commons/services/ClashApiService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ProfileStore } from '../commons/flclash/ProfileStore';
@@ -763,6 +764,14 @@ export struct SubscriptionPage {
    * 手动选的节点（0.6.3 用户实锤）。未连接回落到 preferredNodeId 的节点。
    */
   private currentNodeDisplay(): string {
+    // 自动模式（用户口径 2026-10-25：最简单直接显示「自动选择」）：
+    // 内核真相可得时附带实际出口（♻️ 自动选择 · AWS-SG），取不到只显示组名。
+    if (this.autoSelectMode === AutoSelectModes.AUTO) {
+      if (this.liveNodeName.length > 0) {
+        return `${ClashConfigGenerator.SMART_GROUP_NAME} · ${this.liveNodeName}`;
+      }
+      return ClashConfigGenerator.SMART_GROUP_NAME;
+    }
     if (ConnectionOrchestrator.instance().state === ConnState.CONNECTED) {
       if (this.liveNodeName.length > 0) { return this.liveNodeName; }
       const node = this.activeNode();

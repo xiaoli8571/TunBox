@@ -2089,31 +2089,46 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 显示「未选择」/上一次手动节点，而内核实际走的是智能优选的另一个节点）。
    */
   async resolveLiveNodeName(): Promise<string> {
-    if (this.api === null) { return ''; }
+    if (this.api === null) {
+      AppLogger.info(TAG, 'resolveLiveNodeName: no api channel');
+      return '';
+    }
     const json = await this.api.proxiesJson();
-    if (json === null) { return ''; }
+    if (json === null) {
+      AppLogger.info(TAG, 'resolveLiveNodeName: /proxies unavailable');
+      return '';
+    }
     try {
       const parsed = JSON.parse(json) as Record<string, Object>;
       const table = parsed['proxies'] as Record<string, Object>;
       if (table === undefined || table === null) { return ''; }
-      let name = table['PROXY'] !== undefined ? 'PROXY' : 'GLOBAL';
+      // 入口优先级：PROXY → GLOBAL → smart 组直连（2026-10-25 真机：自动模式下
+      // 订阅页拿不到内核真相，兜底直接读 smart 组自身的 now）。
+      const hasProxy = table['PROXY'] !== undefined;
+      const hasGlobal = table['GLOBAL'] !== undefined;
+      if (!hasProxy && !hasGlobal && table[ClashConfigGenerator.SMART_GROUP_NAME] === undefined) {
+        AppLogger.info(TAG, 'resolveLiveNodeName: no PROXY/GLOBAL/smart group in table');
+        return '';
+      }
+      const name = hasProxy ? 'PROXY' : (hasGlobal ? 'GLOBAL' : ClashConfigGenerator.SMART_GROUP_NAME);
+      let cursor = name;
       for (let depth = 0; depth < 3; depth++) {
-        const entry = table[name] as Record<string, Object>;
+        const entry = table[cursor] as Record<string, Object>;
         if (entry === undefined || entry === null) {
-          return depth === 0 ? '' : name;
+          return depth === 0 ? '' : cursor;
         }
         const now = entry['now'];
-        if (typeof now !== 'string' || now.length === 0 || now === name) { return name; }
+        if (typeof now !== 'string' || now.length === 0 || now === cursor) { return cursor; }
         const next = table[now] as Record<string, Object>;
         const type = (next !== undefined && next !== null && typeof next['type'] === 'string')
           ? next['type'] as string : '';
         if (type === 'Selector' || type === 'URLTest' || type === 'Fallback' || type === 'Smart') {
-          name = now;
+          cursor = now;
           continue;
         }
         return now;
       }
-      return name;
+      return cursor;
     } catch (e) {
       return '';
     }

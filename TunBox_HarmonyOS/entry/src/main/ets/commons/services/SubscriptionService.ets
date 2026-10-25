@@ -379,7 +379,16 @@ export class SubscriptionService {
     try {
       const nodesRaw = await this.store.get(KEY_NODES, '[]') as string;
       const restoreDiagnostics = new SubscriptionImportDiagnostics();
-      this.nodes = SubscriptionService.mapNodes(JSON.parse(nodesRaw) as Object, restoreDiagnostics);
+      const restored = SubscriptionService.mapNodes(JSON.parse(nodesRaw) as Object, restoreDiagnostics);
+      // 存量表信息条目过滤（2026-10-25 真机实锤：冷启动显示「剩余流量：596.2GB」）：
+      // 解析/刷新路径已过滤（e3e7a37），但旧版本落盘的节点表在**水合**时原样回来，
+      // 假节点常驻表内直到下次成功刷新 —— 显示回退（nodes[0]）就会拿它当当前节点。
+      const infoBefore = restored.length;
+      this.nodes = restored.filter((n: ProxyNode): boolean => !NodeUsability.isInfoEntry(n.name));
+      if (this.nodes.length < infoBefore) {
+        AppLogger.warn(TAG, `hydrate dropped ${infoBefore - this.nodes.length} info-entry node(s) `
+          + '(e.g. 剩余流量/到期时间; persisted by pre-filter versions)');
+      }
       this.lastRestoreInvalidCount = restoreDiagnostics.invalidCount;
       this.lastRestoreInvalidReasons = restoreDiagnostics.invalidReasons;
       if (restoreDiagnostics.invalidCount > 0) {
