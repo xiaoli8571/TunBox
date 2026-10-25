@@ -105,3 +105,7 @@ TunBox-Windows/
 # 本地工具链 / 内核源码克隆（各带自己的 .git，不入本仓）
 .tooling/
 kernel/
+
+# ---- 大体积归档二进制不入库（GitHub 100MB 硬限；2026-10-25 推送被拒后清理）----
+_archive/**/*.exe
+_archive/**/*.7z
