@@ -481,7 +481,9 @@ export struct SubscriptionPage {
     const currentProfile = ProfileStore.currentId();
     this.activeSubId = currentProfile.length > 0
       ? currentProfile : this.settings.preferredNodeSubscriptionId;
-    this.activeNodeId = this.settings.preferredNodeId;
+    // 作用域化：旧偏好指向其他订阅时不算「已选」（findNode 全局搜会拿错）
+    const scopedPreferred = this.service.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
+    this.activeNodeId = scopedPreferred !== null ? scopedPreferred.id : '';
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     // 只查模型是否已就位（本地文件判断，不播种、不下载、不联网）
     this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
@@ -931,6 +933,7 @@ export struct SubscriptionPage {
       this.activeSubId = node.subscriptionId;
     }
     this.settings.preferredNodeId = node.id;
+    this.settings.preferredNodeName = node.name;
     if (node.subscriptionId.length > 0) {
       this.settings.preferredNodeSubscriptionId = node.subscriptionId;
       this.settings.selectedSubscriptionId = node.subscriptionId;
@@ -957,10 +960,10 @@ export struct SubscriptionPage {
       this.showToast('已在使用内核智能选点');
       return;
     }
-    const pool: ProxyNode[] = this.service.nodes;
-    let target: ProxyNode | null = this.service.findNode(this.settings.preferredNodeId);
-    if (target === null && pool.length > 0) {
-      target = pool[0];
+    // 重连目标必须属于当前订阅：跨订阅旧偏好在这里只会让重连钉错节点
+    let target: ProxyNode | null = await this.service.resolvePreferredNode();
+    if (target === null) {
+      target = this.service.fallbackConnectionNode();
     }
     if (target === null) {
       this.showToast('没有可用节点');
@@ -1429,6 +1432,7 @@ export struct SubscriptionPage {
     if (activeRemoved) {
       this.settings.preferredNodeId = '';
       this.settings.preferredNodeSubscriptionId = '';
+      this.settings.preferredNodeName = '';
       await SettingsService.save(this.settings);
       this.activeNodeId = '';
       this.activeSubId = '';
@@ -1455,6 +1459,7 @@ export struct SubscriptionPage {
     if (wasSelected) {
       this.settings.preferredNodeId = '';
       this.settings.preferredNodeSubscriptionId = '';
+      this.settings.preferredNodeName = '';
       await SettingsService.save(this.settings);
       this.activeNodeId = '';
       this.activeSubId = '';

@@ -137,8 +137,9 @@ export class FormStateSync {
       const subscriptions = SubscriptionService.instance();
       await subscriptions.init(context);
       const settings = await SettingsService.load();
-      const selected: ProxyNode | null = subscriptions.findNode(settings.preferredNodeId)
-        ?? (subscriptions.nodes.length > 0 ? subscriptions.nodes[0] : null);
+      // 作用域化：跨订阅旧偏好不再上卡片；fallbackConnectionNode 已滤信息条目
+      const selected: ProxyNode | null = subscriptions.preferredNodeInCurrentProfile(settings.preferredNodeId)
+        ?? subscriptions.fallbackConnectionNode();
       const nodeName = selected === null ? '' : selected.name;
       const orchestrator = ConnectionOrchestrator.instance();
       orchestrator.init(context);

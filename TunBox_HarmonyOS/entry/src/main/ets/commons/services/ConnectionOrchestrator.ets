@@ -4139,7 +4139,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       //   宽松语义：钉选失败 = 内核按配置里 PROXY 组首个成员（=本次目标节点）走，
       //   这正是我们生成 YAML 时 unshift 保证的顺序。读回日志用于事后定位。
       const pinSmartGroup = built.options.useSmart && settings.autoSelectMode === AutoSelectModes.AUTO
-        && yaml.includes(`name: ${ClashConfigGenerator.SMART_GROUP_NAME}`);
+        // 生成器写的是带引号形式（`- name: "♻️ 自动选择"`）；旧检查不带引号永远匹配
+        // 不上 → 自动模式一直在钉选用户手动节点（2026-10-25 真机实证「没有去优选」）。
+        && yaml.includes(`name: "${ClashConfigGenerator.SMART_GROUP_NAME}"`);
       const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name;
       // A provider-only profile can start with its own default group policy.
       // Explicit user picks must be confirmed through the actual group graph.

@@ -2582,7 +2582,9 @@ export class SubscriptionService {
       // 过渡期：profile 已落盘但 App 侧解析为 0 时**保留旧节点**（不清空 UI），
       // 节点真源由内核 /proxies 提供（CoreCatalog）。待 UI 全面切到内核后删除此分支。
       if (parsed.length > 0 || !profileReady) {
+        const oldSubNodes = this.nodes.filter((n) => n.subscriptionId === id);
         this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
+        await this.reanchorPreferredAfterReplace(id, oldSubNodes);
       }
       this.ensureUniqueNames();
       // 【2026-10-22 · FlClash 同构】节点数 = **原文 proxies 条目数**（FlClash
@@ -2810,7 +2812,9 @@ export class SubscriptionService {
       if (parsedGroups.length > 0) {
         this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== id).concat(parsedGroups);
       }
+      const oldSubNodesLocal = this.nodes.filter((n) => n.subscriptionId === id);
       this.nodes = this.nodes.filter((n) => n.subscriptionId !== id).concat(parsed);
+      await this.reanchorPreferredAfterReplace(id, oldSubNodesLocal);
       this.ensureUniqueNames();
       // 本地伪订阅：节点数同样取原文 proxies 条目数（与远程刷新/FlClash 同口径）
       const declaredLocal = structuredYaml ? YamlMerger.proxyItemGroups(dispatch.body).length : 0;
@@ -3351,6 +3355,114 @@ export class SubscriptionService {
     }
     const anyReal = this.nodes.find((node: ProxyNode): boolean => !NodeUsability.isInfoEntry(node.name));
     return anyReal !== undefined ? anyReal : (this.nodes.length > 0 ? this.nodes[0] : null);
+  }
+
+  /**
+   * 订阅刷新重解析按位置重排节点 id（`<subId>-mN`）。若用户偏好节点属于本订阅，
+   * 在旧表被替换的同一时刻按 (订阅, 节点名) 重锚 preferredNodeId —— 否则旧 id
+   * 在新表里可能指向**另一个节点**（2026-10-25 真机实证：关应用前选 YF香港，
+   * 冷启动自动刷新后同 id 变成 新加坡01AWS，连接钉错节点报「选择未生效」）。
+   * 写时重锚兜住**存量数据**（无 preferredNodeName 快照的旧选择，并顺手回填快照）；
+   * 读时重锚（resolvePreferredNode）继续兜其余漂移路径。机场下架该节点 → 清偏好
+   * 回落 fallback，绝不让漂移 id 静默指错人。
+   */
+  private async reanchorPreferredAfterReplace(subId: string, oldSubNodes: ProxyNode[]): Promise<void> {
+    if (oldSubNodes.length === 0) {
+      return;
+    }
+    try {
+      const s: AppSettings = await SettingsService.load();
+      if (s.preferredNodeId.length === 0) {
+        return;
+      }
+      const old = oldSubNodes.find((n: ProxyNode): boolean => n.id === s.preferredNodeId);
+      if (old === undefined) {
+        return; // 偏好不在本订阅，不越界处理
+      }
+      const fresh = this.nodes.find((n: ProxyNode): boolean =>
+        n.subscriptionId === subId && n.name === old.name);
+      if (fresh === undefined) {
+        await SettingsService.patchSettings((p: AppSettings): void => {
+          p.preferredNodeId = '';
+          p.preferredNodeSubscriptionId = '';
+          p.preferredNodeName = '';
+        });
+        AppLogger.info(TAG, `preferred node gone after refresh (sub=${subId}, name=${old.name}); cleared`);
+        return;
+      }
+      if (fresh.id === old.id && s.preferredNodeName === old.name) {
+        return; // 无漂移
+      }
+      await SettingsService.patchSettings((p: AppSettings): void => {
+        p.preferredNodeId = fresh.id;
+        p.preferredNodeSubscriptionId = subId;
+        p.preferredNodeName = fresh.name;
+      });
+      AppLogger.info(TAG, `preferred node re-anchored on refresh: ${old.name} ${old.id} -> ${fresh.id}`);
+    } catch (e) {
+      AppLogger.warn(TAG, `preferred re-anchor failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 同步作用域校验（展示路径用）：偏好节点只有属于**当前激活订阅**才算数。
+   * 切换订阅后遗留的旧偏好（findNode 是全局搜、不分订阅）在这里判无效 → 调用方
+   * 回落 fallbackConnectionNode()。不做重锚、不写盘。
+   */
+  preferredNodeInCurrentProfile(preferredNodeId: string): ProxyNode | null {
+    if (preferredNodeId.length === 0) {
+      return null;
+    }
+    const n = this.findNode(preferredNodeId);
+    if (n === null) {
+      return null;
+    }
+    if (n.subscriptionId.length > 0 && n.subscriptionId !== ProfileStore.currentId()) {
+      return null;
+    }
+    return n;
+  }
+
+  /**
+   * 解析用户偏好的连接节点（连接路径用），三层语义：
+   * ① id 命中、属于当前订阅、名字与快照一致（防位置 id 漂移指错节点）→ 直接用；
+   * ② id 悬空/漂移，但偏好本就属于当前订阅（preferredNodeSubscriptionId 相符）
+   *    → 按 preferredNodeName 在当前订阅内重锚，命中即回写自愈
+   *    （订阅刷新按位置重排 id、冷启动自动更新后手动选择不再丢）；
+   * ③ 偏好指向其他订阅（切换订阅后的遗留）→ 判无效返回 null，不跨订阅猜。
+   * 返回 null = 当前订阅下无可用偏好，调用方回落 fallbackConnectionNode()。
+   */
+  async resolvePreferredNode(): Promise<ProxyNode | null> {
+    const s: AppSettings = await SettingsService.load();
+    if (s.preferredNodeId.length === 0 && s.preferredNodeName.length === 0) {
+      return null;
+    }
+    const current = ProfileStore.currentId();
+    const byId = s.preferredNodeId.length > 0 ? this.findNode(s.preferredNodeId) : null;
+    const idOk = byId !== null
+      && (byId.subscriptionId.length === 0 || byId.subscriptionId === current)
+      && (s.preferredNodeName.length === 0 || byId.name === s.preferredNodeName);
+    if (idOk && byId !== null) {
+      return byId;
+    }
+    // 跨订阅遗留：明确判无效，绝不按名猜到别的订阅的节点
+    if (s.preferredNodeSubscriptionId.length > 0 && s.preferredNodeSubscriptionId !== current) {
+      return null;
+    }
+    if (s.preferredNodeName.length > 0 && current.length > 0) {
+      const byName = this.nodes.find((n: ProxyNode): boolean =>
+        n.subscriptionId === current && n.name === s.preferredNodeName
+        && !NodeUsability.isInfoEntry(n.name));
+      if (byName !== undefined) {
+        await SettingsService.patchSettings((p: AppSettings): void => {
+          p.preferredNodeId = byName.id;
+          p.preferredNodeSubscriptionId = current;
+        });
+        AppLogger.info(TAG, `preferred node re-anchored by name: ${byName.name} (${byName.id})`);
+        return byName;
+      }
+    }
+    return null;
   }
 
   findNode(id: string): ProxyNode | null {

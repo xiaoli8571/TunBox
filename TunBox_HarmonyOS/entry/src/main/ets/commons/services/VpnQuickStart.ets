@@ -74,13 +74,13 @@ export class VpnQuickStart {
       await SettingsService.init(context);
       const subscriptions = SubscriptionService.instance();
       await subscriptions.init(context);
-      const settings = await SettingsService.load();
       const orchestrator = ConnectionOrchestrator.instance();
       orchestrator.init(context);
 
       // 【2026-10-24 加固】首选节点可能是存量节点表里的订阅信息条目（「剩余流量：xxx」
       // 这类，内核里无此名、钉选必失败）—— 视为未选中，回落到 fallback 的真节点。
-      const preferred = subscriptions.findNode(settings.preferredNodeId);
+      // 【2026-10-25】改走 resolvePreferredNode：跨订阅旧偏好判无效 + 刷新 id 漂移按名自愈。
+      const preferred = await subscriptions.resolvePreferredNode();
       const node: ProxyNode | null = (preferred !== null && !NodeUsability.isInfoEntry(preferred.name))
         ? preferred
         : subscriptions.fallbackConnectionNode();

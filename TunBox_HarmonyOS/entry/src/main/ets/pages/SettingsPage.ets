@@ -203,7 +203,8 @@ export struct SettingsView {
   }
 
   private refreshNodeAndSwitchInfo(): void {
-    const node = this.subs.findNode(this.settings.preferredNodeId);
+    // 作用域化：跨订阅旧偏好不再当「当前节点」显示
+    const node = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
     if (node !== null) {
       this.currentNodeName = node.name;
     } else {

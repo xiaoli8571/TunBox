@@ -649,7 +649,7 @@ export struct HomePage {
       if (this.isConnecting || this.isConnected) {
         return;
       }
-      const node = this.selectedNode();
+      const node = await this.selectedNode();
       if (node === null) {
         promptAction.showToast({ message: '暂无可用节点，请先在「订阅」页添加并刷新' });
         return;
@@ -665,8 +665,9 @@ export struct HomePage {
     }
   }
 
-  private selectedNode(): ProxyNode | null {
-    const preferred = this.subs.findNode(this.settings.preferredNodeId);
+  private async selectedNode(): Promise<ProxyNode | null> {
+    // 作用域化 + 重锚：切订阅后的旧偏好不再当连接目标；刷新导致 id 漂移时按名自愈
+    const preferred = await this.subs.resolvePreferredNode();
     return preferred !== null ? preferred : this.subs.fallbackConnectionNode();
   }
 
@@ -676,7 +677,7 @@ export struct HomePage {
       this.currentNodeName = ClashConfigGenerator.SMART_GROUP_NAME;
       return;
     }
-    const preferred = this.subs.findNode(this.settings.preferredNodeId);
+    const preferred = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
     if (preferred !== null) {
       this.currentNodeName = preferred.name;
       return;
@@ -839,7 +840,7 @@ export struct HomePage {
     this.pendingStart = true;
     try {
       await this.awaitSubsReady();
-      const node = this.selectedNode();
+      const node = await this.selectedNode();
       const nodeName = node === null ? '' : node.name;
       if (this.isConnected) {
         await FormStateSync.publish(context, FormStateSync.disconnecting(nodeName));

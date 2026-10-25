@@ -82,6 +82,8 @@ export class AppSettingsJson {
   forceBlockSites: string[] = [];
   preferredNodeId: string = '';
   preferredNodeSubscriptionId: string = '';
+  /** 偏好节点的名字快照：订阅重解析按位置重排 id 时用于重锚（冷启动不丢手动选择） */
+  preferredNodeName: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
@@ -248,6 +250,8 @@ export class AppSettings {
   forceBlockSites: string[] = [];
   preferredNodeId: string = '';
   preferredNodeSubscriptionId: string = '';
+  /** 偏好节点名字快照（重锚用），与 AppSettingsJson.preferredNodeName 对应 */
+  preferredNodeName: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
@@ -350,6 +354,7 @@ export class AppSettings {
     j.forceBlockSites = this.forceBlockSites;
     j.preferredNodeId = this.preferredNodeId;
     j.preferredNodeSubscriptionId = this.preferredNodeSubscriptionId;
+    j.preferredNodeName = this.preferredNodeName;
     j.autoUpdateSubscription = this.autoUpdateSubscription;
     j.selectedSubscriptionId = this.selectedSubscriptionId;
     j.testLatencyUrl = this.testLatencyUrl;
@@ -464,6 +469,7 @@ export class AppSettings {
     s.preferredNodeId = typeof j.preferredNodeId === 'string' ? j.preferredNodeId : '';
     s.preferredNodeSubscriptionId = typeof j.preferredNodeSubscriptionId === 'string'
       ? j.preferredNodeSubscriptionId : '';
+    s.preferredNodeName = typeof j.preferredNodeName === 'string' ? j.preferredNodeName : '';
     s.autoUpdateSubscription = typeof j.autoUpdateSubscription === 'boolean' ? j.autoUpdateSubscription : true;
     s.selectedSubscriptionId = typeof j.selectedSubscriptionId === 'string' ? j.selectedSubscriptionId : '';
     // 测速地址：**只做「历史 http 默认值 → https」的单向升级**（C3）。

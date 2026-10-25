@@ -324,7 +324,7 @@ export class ClashConfigGenerator {
     lines.push('tun:');
     // headless 测速模式: tun.enable=false, 内核只开 mixed/API 端口, 不建隧道不碰 VPN 权限
     lines.push('  enable: ' + (tunEnabled ? 'true' : 'false'));
-    lines.push('  stack: gvisor');  // fd 注入 + 沙箱无 iptables, 只有 gvisor 可用
+    lines.push('  stack: mips');  // mihomo v1.19.33 自研用户态栈(mipstack 已编入 libgojni.so), fd 注入路径与 gvisor 同构
     // DNS 接管(TUN 层): 所有目标端口 53 的 DNS 请求一律劫持进内核解析。
     // 与 `dns.enable` 恒同开：内核 DNS 恒启用（设置页已无此开关），设备侧的
     // VpnConfig.dnsAddresses 也恒指向 sentinel —— 三处必须同步，否则劫持到的查询

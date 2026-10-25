@@ -303,8 +303,9 @@ struct NodeSelectionPage {
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.restoreSortState();
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
-    this.selectedName = this.settings.preferredNodeId.length > 0 && this.subs.findNode(this.settings.preferredNodeId) !== null
-      ? this.subs.findNode(this.settings.preferredNodeId)!.name
+    // 作用域化展示：跨订阅旧偏好不再当「已选」；回落与连接同源（fallback 已滤信息条目）
+    const scopedSel = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
+    this.selectedName = scopedSel !== null ? scopedSel.name
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
     // 异步初始化完成后统一重建筛选项，隐藏空 direct 并清理失效筛选。
     this.refreshSubChips();
@@ -316,7 +317,7 @@ struct NodeSelectionPage {
     // 定位到分组后**自动展开**该分组——用户不必再手动展开看具体节点。
     if (this.filterSubId.length === 0 && this.autoSelectMode !== AutoSelectModes.AUTO
       && this.settings.preferredNodeId.length > 0) {
-      const cur = this.subs.findNode(this.settings.preferredNodeId);
+      const cur = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
       if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
         && this.subs.subscriptions.some((s: Subscription) => s.id === cur.subscriptionId)) {
         this.filterSubId = cur.subscriptionId;
@@ -1288,9 +1289,12 @@ struct NodeSelectionPage {
     }
     if (removedSelected) {
       this.settings.preferredNodeId = '';
-      // 字段级写：只改这一个字段，不覆盖别人刚写进去的值
+      this.settings.preferredNodeName = '';
+      // 字段级写：只改偏好三件套，不覆盖别人刚写进去的值
       await SettingsService.patchSettings((s: AppSettings): void => {
         s.preferredNodeId = '';
+        s.preferredNodeName = '';
+        s.preferredNodeSubscriptionId = '';
       });
       this.selectedName = this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '';
     }
@@ -1389,16 +1393,10 @@ struct NodeSelectionPage {
       await SettingsService.patchSettings((s: AppSettings): void => {
         s.autoSelectMode = AutoSelectModes.AUTO;
       });
-      const pool: ProxyNode[] = this.subs.nodes;
-      let target: ProxyNode | null = null;
-      for (const n of pool) {
-        if (n.id === this.settings.preferredNodeId) {
-          target = n;
-          break;
-        }
-      }
-      if (target === null && pool.length > 0) {
-        target = pool[0];
+      // 重连目标必须属于当前订阅（跨订阅旧偏好只会钉错节点），与连接路径同源
+      let target: ProxyNode | null = await this.subs.resolvePreferredNode();
+      if (target === null) {
+        target = this.subs.fallbackConnectionNode();
       }
       if (target === null) {
         promptAction.showToast({ message: '没有可用节点' });
@@ -1429,10 +1427,16 @@ struct NodeSelectionPage {
       AppLogger.info(TAG, `manual node pick (${node.name}); auto mode disabled`);
     }
     this.settings.preferredNodeId = node.id;
+    this.settings.preferredNodeName = node.name;
+    if (node.subscriptionId.length > 0) {
+      this.settings.preferredNodeSubscriptionId = node.subscriptionId;
+    }
     this.selectedName = node.name;
-    // 字段级写：只改这一个字段
+    // 字段级写：只改偏好三件套（id/名字快照/所属订阅）
     await SettingsService.patchSettings((s: AppSettings): void => {
       s.preferredNodeId = node.id;
+      s.preferredNodeName = node.name;
+      s.preferredNodeSubscriptionId = node.subscriptionId;
     });
     // 节点切换始终执行完整重连。Mihomo controller 返回 2xx 只能证明请求被接受，
     // 不能证明现有连接已迁移到新节点；此前因此错误提示“未重建隧道”，但流量仍走旧节点。
