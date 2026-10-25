@@ -62,8 +62,8 @@ import { BodyDispatch, BodyDispatchResult, BodyKind } from './BodyDispatch.ts';
 import { YamlNodeAdapter } from './YamlNodeAdapter.ts';
 // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退走**规范解析层**，不再走 ProxyNode.fromUri
 import { parse as parseUriNode, ParseError, ParsedNode } from './UriNodeParser.ts';
+import { NodeUsability, UnusableCategory } from './NodeUsability.ts';
 import { UnusableLedger, UnusableRecord } from './UnusableLedger.ts';
-import { NodeUsability } from './NodeUsability.ts';
 
 const TAG = 'SubscriptionService';
 const PREF_NAME = 'tunbox_subscriptions';

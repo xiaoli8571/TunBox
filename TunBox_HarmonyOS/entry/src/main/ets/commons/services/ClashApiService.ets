@@ -21,6 +21,10 @@ import { LatencyDnsVerdict } from '../latency/LatencyDnsVerdict';
 import { LatencyProbeKind, LatencyProbeResult } from '../latency/LatencyKinds';
 
 const TAG = 'ClashApiService';
+/** 钉选收敛窗口：内核冷启动时 GET /proxies 的表可能还没把 provider 节点/组列全，
+ *  首个 PUT 可能 400 —— 在窗口内重试到表收敛，而不是把瞬态当永久失败。 */
+const SELECT_CONVERGE_TIMEOUT_MS: number = 3000;
+const SELECT_CONVERGE_INTERVAL_MS: number = 400;
 
 export interface LatencyResult {
   nodeName: string;
@@ -312,15 +316,39 @@ export class ClashApiService {
   }
 
   async selectNode(nodeName: string): Promise<boolean> {
-    // 「失败时重试一次」（本函数头注释承诺但旧实现缺失）：内核刚起时首个 PUT 偶发
-    // 400/超时是已知瞬态，connect 恰恰在内核刚起时调用本函数 —— 不重试会把瞬态
-    // 当永久失败。重试前给 300ms 让内核 controller 收敛（立即重试大概率还是 400）；
-    // 第二次失败才如实返回 false（调用方 fail-fast，见 b9.no-fake-success 契约）。
-    if (await this.selectNodeOnce(nodeName)) {
-      return true;
+    // 有界收敛窗口（0.6.3 真机实证）：隧道已通（生成侧把目标节点 unshift 到 PROXY
+    // 组首位，内核默认就走它），但冷启动头一秒 GET /proxies 可能还没列出该节点 /
+    // 首个 PUT 偶发 400 —— 旧实现只重试一次（300ms）就把瞬态判成「钉不上」，连接
+    // 被 fail-fast 拒绝，用户看到「节点选择未生效」却明明能上网，重进一次才好。
+    // 窗口内每轮先走完整钉选+读回；若 PUT 链失败但内核真相已选中目标（store-
+    // selections 恢复 / unshift 首位默认），直接认定已生效 —— 比只信 PUT 204 更强，
+    // 且 b9「选点未生效不得标记成功」契约不变：false 只在窗口耗尽后返回。
+    const deadline = Date.now() + SELECT_CONVERGE_TIMEOUT_MS;
+    while (true) {
+      if (await this.selectNodeOnce(nodeName)) {
+        return true;
+      }
+      if (await this.kernelAlreadySelected(nodeName)) {
+        AppLogger.info(TAG, `selectNode: PUT path failed but kernel already routes via ${nodeName}`);
+        return true;
+      }
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), SELECT_CONVERGE_INTERVAL_MS));
     }
-    await new Promise<void>((resolve) => setTimeout(() => resolve(), 300));
-    return this.selectNodeOnce(nodeName);
+  }
+
+  /** 内核真相兜底：规则面 PROXY 组或 GLOBAL 组的 `now` 已等于目标即视为已生效。 */
+  private async kernelAlreadySelected(nodeName: string): Promise<boolean> {
+    const groups: string[] = ['PROXY', 'GLOBAL'];
+    for (const group of groups) {
+      const now = await this.groupSelection(group);
+      if (now !== null && now === nodeName) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private async selectNodeOnce(nodeName: string): Promise<boolean> {

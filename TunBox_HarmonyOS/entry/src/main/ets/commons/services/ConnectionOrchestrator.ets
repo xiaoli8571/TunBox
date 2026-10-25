@@ -2080,6 +2080,45 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.lastNodeName;
   }
 
+  /**
+   * 内核真相的当前出口节点名：从规则面 PROXY 组（表里没有 PROXY 则 GLOBAL）沿
+   * `now` 链下钻到叶子（PROXY → ♻️ 自动选择 → 具体节点），最多三层。
+   * 返回 '' = 内核不可达 / 表里两个组都没有。
+   * 供「当前连接节点」类展示用 —— lastNodeName 是连接时**请求**的节点，
+   * 自动(smart)模式下内核实际选中的节点可能不同（0.6.3 用户实锤：订阅页
+   * 显示「未选择」/上一次手动节点，而内核实际走的是智能优选的另一个节点）。
+   */
+  async resolveLiveNodeName(): Promise<string> {
+    if (this.api === null) { return ''; }
+    const json = await this.api.proxiesJson();
+    if (json === null) { return ''; }
+    try {
+      const parsed = JSON.parse(json) as Record<string, Object>;
+      const table = parsed['proxies'] as Record<string, Object>;
+      if (table === undefined || table === null) { return ''; }
+      let name = table['PROXY'] !== undefined ? 'PROXY' : 'GLOBAL';
+      for (let depth = 0; depth < 3; depth++) {
+        const entry = table[name] as Record<string, Object>;
+        if (entry === undefined || entry === null) {
+          return depth === 0 ? '' : name;
+        }
+        const now = entry['now'];
+        if (typeof now !== 'string' || now.length === 0 || now === name) { return name; }
+        const next = table[now] as Record<string, Object>;
+        const type = (next !== undefined && next !== null && typeof next['type'] === 'string')
+          ? next['type'] as string : '';
+        if (type === 'Selector' || type === 'URLTest' || type === 'Fallback' || type === 'Smart') {
+          name = now;
+          continue;
+        }
+        return now;
+      }
+      return name;
+    } catch (e) {
+      return '';
+    }
+  }
+
   isCurrentNodeValid(): boolean {
     return this.lastNode !== null && ClashConfigGenerator.proxyYamlLine(this.lastNode).length > 0;
   }

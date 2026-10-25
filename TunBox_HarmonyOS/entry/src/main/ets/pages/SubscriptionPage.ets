@@ -19,7 +19,7 @@ import { ProxyNode } from '../commons/models/ProxyNode';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { ClashApiService } from '../commons/services/ClashApiService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ProfileStore } from '../commons/flclash/ProfileStore';
@@ -336,6 +336,8 @@ export struct SubscriptionPage {
   private activatedId: string = '';
   private activatedAt: number = 0;
   @State activeNodeId: string = '';
+  /** 内核真相的当前出口节点名（连接中由 resolveLiveNodeName 解析；''=不可得/未连接） */
+  @State liveNodeName: string = '';
   /** 自动选点模式（manual 手动固定 / auto 内核 smart 优选），与设置页同一份持久化 */
   @State autoSelectMode: string = AutoSelectModes.MANUAL;
   /**
@@ -484,6 +486,7 @@ export struct SubscriptionPage {
     this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
     this.nodeColumns = await SettingsService.loadNodeColumns();
     this.reload();
+    this.refreshLiveNode();
     if (!this.latencyBound) {
       this.latencyBound = true;
       LatencyStoreBridge.addListener(this.latencyListener);
@@ -751,6 +754,30 @@ export struct SubscriptionPage {
 
   private activeNode(): ProxyNode | null {
     return this.service.findNode(this.activeNodeId);
+  }
+
+  /**
+   * 「当前连接节点」显示值。连接中优先用内核真相（resolveLiveNodeName 沿
+   * PROXY→♻️自动选择→节点 的 now 链下钻）：自动(smart)模式下内核实际选点
+   * 与 preferredNodeId/lastNodeName 无关 —— 旧实现显示「未选择」或上一次
+   * 手动选的节点（0.6.3 用户实锤）。未连接回落到 preferredNodeId 的节点。
+   */
+  private currentNodeDisplay(): string {
+    if (ConnectionOrchestrator.instance().state === ConnState.CONNECTED) {
+      if (this.liveNodeName.length > 0) { return this.liveNodeName; }
+      const node = this.activeNode();
+      return node !== null ? node.name : '未选择';
+    }
+    return '未选择';
+  }
+
+  /** 轻量刷新内核当前出口（单次 GET /proxies）；失败静默回落旧显示。 */
+  private refreshLiveNode(): void {
+    ConnectionOrchestrator.instance().resolveLiveNodeName().then((name: string): void => {
+      this.liveNodeName = name;
+    }).catch((): void => {
+      this.liveNodeName = '';
+    });
   }
 
   /**
@@ -1559,7 +1586,7 @@ export struct SubscriptionPage {
                     .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                   Row({ space: 6 }) {
                     Text('当前连接节点').fontSize(12).fontColor(TunBoxColors.textMuted)
-                    Text(this.activeNode() !== null ? (this.activeNode() as ProxyNode).name : '未选择')
+                    Text(this.currentNodeDisplay())
                       .fontSize(12).fontColor(TunBoxColors.primary).fontWeight(FontWeight.Medium)
                       .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                   }.margin({ top: 2 })
