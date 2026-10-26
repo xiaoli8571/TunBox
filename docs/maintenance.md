@@ -51,3 +51,16 @@ scratch 与 `%TEMP%` 里的东西默认都是临时的，不进仓库、不复�
 2. `git status` 只剩本轮要提交的文件，`TunBox-Window/` 的内容变动不属于本仓库。
 3. `dist/` 只保留当前发布版本（必要时留上一版做回滚）；重复 `.zip`、更早版本删掉。
 4. 本轮结论已写进 `docs/`（发布说明 / 复盘 / 闸门），不只在对话里。
+
+## 底栏玻璃材质：HdsTabs 实验结论（2026-10-26，已回滚）
+
+- 目标：按 HarmonyX（`entry/src/main/ets/pages/Index.ets`）的写法，用 `HdsTabs` +
+  `barFloatingStyle.systemMaterialEffect(IMMERSIVE/ADAPTIVE)` 做系统沉浸光感底栏。
+- 实测结论：`barFloatingStyle.barWidth`（无论百分比还是 vp 数值）在 3 个页签下**不生效**，
+  `uitest dumpLayout` 里 `TabBar` 仍是全屏宽 `[0,2323]-[1600,2456]`（屏 1600×2560），
+  页签命中区 28..1572，因此条体要么贴满整屏、要么与页签几何不一致（放大后错位）。
+- HarmonyX 之所以正常，是因为它有 5 个页签，浮起条体按内容自然撑到接近满宽，
+  它本身也没有设 `barWidth`；直接照抄结构在我们 3 页签场景拿不到同样宽度。
+- 处理：`MainPage.ets` 回滚为自绘 `FloatingBottomBar`（92% 宽 + `backgroundBlurStyle` 玻璃），
+  删除本轮的 `HdsTabs` 版本；2026-10-17 的重构也记录过同样结论（移除 HdsTabs 沉浸材质页签）。
+- 若再尝试：必须先 `dumpLayout` 量到条体真实 bounds 再动样式，不允许按截图目测下结论。
