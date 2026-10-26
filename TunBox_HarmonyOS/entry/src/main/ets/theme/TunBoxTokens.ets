@@ -67,6 +67,16 @@ export class TunBoxColors {
     return ThemeService.isDark() ? 'rgba(59, 130, 246, 0.42)' : '#D0E1FD';
   }
 
+  /** 代理模式三段按钮的选中胶囊（2026-10-26 用户「蓝色再稍微加重一点点」）：
+   *  比 primaryLight(#EFF4FF) 深一档，仍属低饱和品牌蓝，不是实心主色按钮。 */
+  static get modeChipFill(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(59, 130, 246, 0.32)' : '#E1EBFF';
+  }
+
+  static get modeChipBorder(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(59, 130, 246, 0.60)' : '#BACFFA';
+  }
+
   // ── 语义状态色 ──
   static get success(): ResourceColor {
     // 深色为荧光绿 #10B981（用户深色规范）
@@ -113,6 +123,23 @@ export class TunBoxColors {
 
   static get bgGradientEnd(): ResourceColor {
     return ThemeService.isDark() ? '#0F131D' : '#EBF1FD';
+  }
+
+  // ── 底栏底部渐隐底（2026-10-26 二次修正）──
+  /** 底栏本体仍然「零渲染」（完全透明，见 FloatingBottomBar）；这里只在底栏下方铺一条
+   *  全宽、无模糊的底部渐隐：从页面底色 0 透明度渐变到接近不透明，让滚到底的内容文字
+   *  自然淡出、不再和底栏图标/文字重叠。三项颜色都用页面渐变终点色（bgGradientEnd）
+   *  加不同 alpha，因此和页面底色无缝衔接，浅色/深色主题一致。 */
+  static get dockScrimTop(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(15, 19, 29, 0.00)' : 'rgba(235, 241, 253, 0.00)';
+  }
+
+  static get dockScrimMid(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(15, 19, 29, 0.62)' : 'rgba(235, 241, 253, 0.62)';
+  }
+
+  static get dockScrimBottom(): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(15, 19, 29, 0.97)' : 'rgba(235, 241, 253, 0.97)';
   }
 
   /** 卡片表面：浅色=纯白高光卡片（2026-10-17 用户浅色规范「核心卡片容器 #FFFFFF」+ 1px #E5EDF8 内描边）。
@@ -276,6 +303,8 @@ export class TunBoxGeometry {
   static readonly dockHeight: number = 64;
   static readonly dockRadius: number = 32;
   static readonly dockBottomMargin: number = 0;
+  /** 底栏底部渐隐底高度：盖住底栏本体 + 上方一段过渡，让内容在进入底栏前淡出 */
+  static readonly dockScrimHeight: number = 170;
   /** 页面底部为悬浮栏留白（栏高 + 下边距 + 余量） */
   static readonly dockClearance: number = 70;
   /** 首页「天体轨域」启动按钮（CelestialPowerOrb）：

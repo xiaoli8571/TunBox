@@ -993,23 +993,31 @@ export struct HomePage {
     }
   }
 
-  /** 代理模式三段按钮（选中=品牌蓝底白字；未选中=白卡描边） */
+  /** 代理模式三段按钮（2026-10-26 用户定稿：透明按钮 + 小椭圆高亮）：
+   *  整条三段按钮没有底；只有选中项带一个小胶囊（宽度=文字+左右 20vp，高 34vp），
+   *  胶囊用 modeChipFill/modeChipBorder（比 primaryLight 蓝一档，用户要求「再加重一点点」）。
+   *  胶囊不再铺满 1/3 栏宽（用户「椭圆范围小一点，不用这么长」），点击热区仍是整个 1/3 槽位。 */
   @Builder
   ProxyModeButton(mode: string, label: string) {
-    Text(label)
-      .fontSize(14)
-      .fontWeight(this.proxyMode === mode ? FontWeight.Bold : FontWeight.Medium)
-      .fontColor(this.proxyMode === mode ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
-      .textAlign(TextAlign.Center)
-      .height(40)
-      .borderRadius(TunBoxGeometry.pillRadius)
-      .backgroundColor(this.proxyMode === mode ? TunBoxColors.primary : TunBoxColors.surfaceCard)
-      .border({
-        width: 1,
-        color: this.proxyMode === mode ? Color.Transparent : TunBoxColors.cardBorder
-      })
-      .layoutWeight(1)
-      .onClick(() => this.applyProxyMode(mode))
+    Row() {
+      Text(label)
+        .fontSize(14)
+        .fontWeight(this.proxyMode === mode ? FontWeight.Bold : FontWeight.Medium)
+        .fontColor(this.proxyMode === mode ? TunBoxColors.primary : TunBoxColors.textSecondary)
+        .textAlign(TextAlign.Center)
+        .height(34)
+        .padding({ left: 20, right: 20 })
+        .borderRadius(TunBoxGeometry.pillRadius)
+        .backgroundColor(this.proxyMode === mode ? TunBoxColors.modeChipFill : Color.Transparent)
+        .border({
+          width: 1,
+          color: this.proxyMode === mode ? TunBoxColors.modeChipBorder : Color.Transparent
+        })
+    }
+    .layoutWeight(1)
+    .height(40)
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => this.applyProxyMode(mode))
   }
 
   build() {

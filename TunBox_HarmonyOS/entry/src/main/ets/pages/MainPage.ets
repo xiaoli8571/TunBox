@@ -19,7 +19,7 @@
  *    首页「规则管理」卡片等入口写该键即可切到目标页签。
  */
 import { FloatingBottomBar } from '../components/FloatingBottomBar';
-import { TunBoxColors, TunBoxMotion } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { HomePage } from './HomePage';
@@ -141,6 +141,27 @@ struct MainPage {
       }
       .width('100%')
       .height('100%')
+
+      // 底部渐隐底（2026-10-26 用户要求「稍微加一点点底色」）：底栏本体仍然完全透明，
+      // 这里只在底部铺一条全宽、无模糊的页面底色渐隐，让滚动内容进入底栏前自然淡出，
+      // 不再和底栏图标/文字重叠；颜色=页面渐变终点色的不同 alpha，与页面底色无缝衔接。
+      // 0.42 起过渡、0.68 处已接近不透明（≈0.94）——底栏图标所在的 40~70vp 带里
+      // 内容只剩几个百分点的残影，再往上才是柔和淡出，视觉上像页面底部自然淡出。
+      Column()
+        .width('100%')
+        .height(TunBoxGeometry.dockScrimHeight)
+        .linearGradient({
+          angle: 180,
+          colors: [
+            [TunBoxColors.dockScrimTop, 0.0],
+            [TunBoxColors.dockScrimMid, 0.42],
+            [TunBoxColors.dockScrimBottom, 0.68],
+            [TunBoxColors.dockScrimBottom, 1.0]
+          ]
+        })
+        // 只做视觉遮挡，不吃触摸：内容区（含底栏下方）照常可点可滚
+        .hitTestBehavior(HitTestMode.None)
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
 
       // 底部悬浮导航栏（文档 §2.2，浮在内容之上，栏体完全透明）
       FloatingBottomBar({

@@ -1,7 +1,9 @@
 /**
  * 底部悬浮导航栏 —— 严格对齐《TunBox-UI重构笔记》§2.2 FloatingBottomBar
  *
- * 几何：92% 宽 / 64 高 / 32 圆角 / 底部外边距 0（沉浸式贴手势区）。
+ * 几何：86% 宽 / 64 高 / 32 圆角 / 底部外边距 0（沉浸式贴手势区）。
+ *  2026-10-26 用户要求「三个按钮间距稍微缩小一点点」：栏宽 92% → 86%
+ *  （两侧各收 3%，三个页签整体向中间靠一点，页签间距随之略微变小）。
  *
  * 材质（2026-10-26 用户最终定稿「不折不扣的透明」）：**零渲染底**。
  * 栏体不再有任何可见像素——无着色填充、无 backdropBlur 模糊、无描边、无投影；
@@ -118,7 +120,8 @@ export struct FloatingBottomBar {
         .justifyContent(FlexAlign.Center)
       }, (item: DockTab) => `${item.id}`)
     }
-    .width('92%')
+    // 2026-10-26 用户要求「三个按钮间距稍微缩小一点点」：92% → 86%（页签向中间靠一点）
+    .width('86%')
     .height(TunBoxGeometry.dockHeight)
     .borderRadius(TunBoxGeometry.dockRadius)
     // 2026-10-26 终稿：栏体零渲染。以下四行刻意保持「无填充 / 无模糊 / 无描边 / 无投影」，

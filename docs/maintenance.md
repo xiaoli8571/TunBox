@@ -71,10 +71,27 @@ scratch 与 `%TEMP%` 里的东西默认都是临时的，不进仓库、不复�
 栏体本身不画任何像素：无 `backgroundColor` 填充、无 `backdropBlur` / `backgroundBlurStyle`、
 无 `border` 描边、无 `shadow` 投影。背后内容 1:1 透出，不做磨砂。
 
+2026-10-26 当天用户验收后的两次补充（都已进 0.6.8 重打包）：
+
+1. **三个页签间距略收**：栏宽 `92%` → `86%`（两侧各收 3%，页签整体向中间靠一点）。
+2. **底部渐隐底（不是给底栏加底）**：完全透明导致滚动内容文字与页签文字重叠，用户要求
+   「稍微加一点点底色」。做法是在 `MainPage` 的 Stack 里、底栏**之前**加一条全宽
+   `Column`（高 `TunBoxGeometry.dockScrimHeight = 170`）：
+   `linearGradient(angle 180)`，颜色全部是页面渐变终点色 `bgGradientEnd` 的不同 alpha
+   （`dockScrimTop 0` → `dockScrimMid 0.62 @0.42` → `dockScrimBottom 0.97 @0.68` → `0.97 @1.0`），
+   因此和页面底色无缝衔接、浅深主题一致；`.hitTestBehavior(HitTestMode.None)` 保证只挡视觉
+   不吃触摸。效果：内容在进入底栏前淡出，页签所在 40~70vp 带里只剩几个百分点残影。
+   **注意**：这是页面级渐隐层，不是底栏底色——底栏组件本身仍然零渲染，别把渐变挪进
+   `FloatingBottomBar` 根容器，否则又会变成一条可见的"底"。
+3. **首页代理模式三段按钮（规则 / 全局 / 直连）**：按钮本体透明（无底无边），选中项用
+   小号椭圆高亮 `modeChipFill` + `modeChipBorder`（比 `primaryLight` 蓝一档，用户要求
+   「再加重一点点」），胶囊宽度=文字+左右各 20vp、高 34vp（用户「椭圆范围小一点，不用这么长」），
+   点击热区仍是整个 1/3 槽位。见 `HomePage.ProxyModeButton`。
+
 实现位置（改之前先读完这段）：
 
 - `entry/src/main/ets/components/FloatingBottomBar.ets` 的根 `Row` 属性链：
-  `.width('92%')` / `.height(64)` / `.borderRadius(32)` 只用于布局与命中区，
+  `.width('86%')` / `.height(64)` / `.borderRadius(32)` 只用于布局与命中区，
   `.backgroundColor(Color.Transparent)` 是唯一与"面"有关的属性。**禁止再加回**
   `backdropBlur` / `backgroundBlurStyle` / `shadow` / `border` —— 任一项都会让底栏重新
   变成一条可见胶囊。
