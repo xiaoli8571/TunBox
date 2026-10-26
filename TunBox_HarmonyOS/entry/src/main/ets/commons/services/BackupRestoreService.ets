@@ -253,11 +253,13 @@ export class BackupRestoreService {
     //     没有这一段时：卸载重装后 profiles/*.yaml 与 Asset 里的节点密码都不存在，
     //     界面能看到节点，但内核没有节点来源 / 没有密码 → 选不了节点、连不上。
     const profilesRestored = await BackupRestoreService.restoreProfiles(parsed, subIds, restoredSubs);
-    // 5.2 旧备份（2.0 及更早没有 profiles）：给缺原文的启用订阅排队后台补拉一次，
-    //     否则恢复后订阅列表在、内核节点表永远是空的（用户看到的「刷新不出来」）。
+    // 5.2 恢复后统一按订阅链接后台重拉一次：
+    //     · 2.0 旧备份没有 profiles —— 不拉就永远没有内核节点来源（「刷新不出来」）；
+    //     · 2.1 备份自带 profile —— 仍然重拉一次，把节点/流量/到期信息更新到最新，
+    //       失败也不影响离线可用（profile 已在盘上）。串行、单条失败只记日志。
     const needRefresh: string[] = [];
     for (const s of restoredSubs) {
-      if (s.enabled && !ProfileStore.exists(s.id)) {
+      if (s.enabled) {
         needRefresh.push(s.id);
       }
     }
@@ -296,7 +298,7 @@ export class BackupRestoreService {
     out.message = `恢复成功，已导入 ${restoredSubs.length} 个订阅` +
       (restoredNodes.length > 0 ? `/${restoredNodes.length} 个节点` : '') +
       (profilesRestored > 0 ? `、${profilesRestored} 份配置原文` : '') +
-      (needRefresh.length > 0 ? `；${needRefresh.length} 个订阅缺少配置原文，正在后台重新拉取` : '');
+      (needRefresh.length > 0 ? `；正在后台按订阅链接更新 ${needRefresh.length} 个订阅` : '');
     return out;
   }
 
