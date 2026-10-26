@@ -49,5 +49,5 @@ scratch 与 `%TEMP%` 里的东西默认都是临时的，不进仓库、不复�
 
 1. `bash TunBox_HarmonyOS/scripts/clean-workspace.sh` 通过，无 `SKIP`。
 2. `git status` 只剩本轮要提交的文件，`TunBox-Window/` 的内容变动不属于本仓库。
-3. `dist/` 只保留当前发布版本；重复 `.zip`、旧版本删掉。
+3. `dist/` 只保留当前发布版本（必要时留上一版做回滚）；重复 `.zip`、更早版本删掉。
 4. 本轮结论已写进 `docs/`（发布说明 / 复盘 / 闸门），不只在对话里。
