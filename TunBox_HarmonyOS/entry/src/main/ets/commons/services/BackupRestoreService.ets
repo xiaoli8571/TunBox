@@ -12,11 +12,25 @@ import { ProxyNode } from '../models/ProxyNode';
 import { ProxyGroup, ProxyGroupJson } from '../models/ProxyGroup';
 import { SettingsService } from './SettingsService';
 import { SubscriptionService, SubscriptionJson, ProxyNodeJson } from './SubscriptionService';
+import { CredentialStore, SubscriptionCredentialSource } from './CredentialStore';
+import { ProfileStore } from '../flclash/ProfileStore';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'BackupRestore';
 export const BACKUP_APP = 'TunBox';
-export const BACKUP_VERSION = '2.0';
+export const BACKUP_VERSION = '2.1';
+
+/** 单份订阅的配置原文（含节点密码，恢复后无需联网即可起隧道）。 */
+export class ProfileBackupEntry {
+  id: string = '';
+  yaml: string = '';
+}
+
+/** 订阅自定义 header 值（只存在 Asset，不进 preferences）。 */
+export class SubscriptionSecretEntry {
+  id: string = '';
+  headerValue: string = '';
+}
 
 export class BackupFile {
   app: string = BACKUP_APP;
@@ -27,6 +41,12 @@ export class BackupFile {
   proxyGroups: ProxyGroupJson[] = [];
   hiddenNodes: string[] = [];
   settings: AppSettingsJson | null = null;
+  /** 2.1 起：配置原文（内核真正的节点来源） */
+  profiles: ProfileBackupEntry[] = [];
+  /** 2.1 起：订阅 header 凭据 */
+  subscriptionSecrets: SubscriptionSecretEntry[] = [];
+  /** 2.1 起：导出时的当前订阅（恢复后直接切回它） */
+  currentProfileId: string = '';
 }
 
 export class RestoreOutcome {
@@ -57,8 +77,10 @@ export class BackupRestoreService {
     return JSON.stringify(file, null, 2);
   }
 
-  /** 导出（含 settings 全量快照）—— HomePage 备份弹窗调用此入口 */
-  static exportJsonWithSettings(settings: AppSettings): string {
+  /** 导出（含 settings 全量快照 + 配置原文 + 订阅凭据）—— HomePage 备份弹窗调用此入口。
+   *  2.1 起备份是自包含的：只带订阅元数据时，卸载重装后既没有 profiles/*.yaml
+   *  （内核节点来源）也没有 Asset 里的节点密码，恢复后就会「选不了节点 / 连不上」。 */
+  static async exportJsonWithSettings(settings: AppSettings): Promise<string> {
     const svc = SubscriptionService.instance();
     const subsJson: SubscriptionJson[] = [];
     for (const s of svc.subscriptions) {
@@ -75,7 +97,48 @@ export class BackupRestoreService {
     file.proxyGroups = BackupRestoreService.groupsToJson();
     file.hiddenNodes = svc.listHiddenKeys();
     file.settings = settings.toJson();
+    file.profiles = BackupRestoreService.collectProfiles(svc);
+    file.subscriptionSecrets = await BackupRestoreService.collectSubscriptionSecrets(svc);
+    file.currentProfileId = ProfileStore.isReady() ? ProfileStore.currentId() : '';
     return JSON.stringify(file, null, 2);
+  }
+
+  /** 收集每份订阅的配置原文（内核真正的节点来源，含节点密码）。 */
+  private static collectProfiles(svc: SubscriptionService): ProfileBackupEntry[] {
+    const out: ProfileBackupEntry[] = [];
+    if (!ProfileStore.isReady()) {
+      return out;
+    }
+    for (const s of svc.subscriptions) {
+      if (!ProfileStore.exists(s.id)) {
+        continue;
+      }
+      const yaml = ProfileStore.read(s.id);
+      if (yaml.length === 0) {
+        continue;
+      }
+      const entry = new ProfileBackupEntry();
+      entry.id = s.id;
+      entry.yaml = yaml;
+      out.push(entry);
+    }
+    return out;
+  }
+
+  /** 收集订阅自定义 header 值（Asset Store 里，卸载即丢）。 */
+  private static async collectSubscriptionSecrets(svc: SubscriptionService): Promise<SubscriptionSecretEntry[]> {
+    const out: SubscriptionSecretEntry[] = [];
+    for (const s of svc.subscriptions) {
+      const value = await CredentialStore.subscriptionCredential(s.id, '');
+      if (value.length === 0) {
+        continue;
+      }
+      const entry = new SubscriptionSecretEntry();
+      entry.id = s.id;
+      entry.headerValue = value;
+      out.push(entry);
+    }
+    return out;
   }
 
   private static groupsToJson(): ProxyGroupJson[] {
@@ -186,10 +249,42 @@ export class BackupRestoreService {
     // 5. 整体覆盖 + 落盘（restoreBackup 内 initNodes + persist）
     const svc = SubscriptionService.instance();
     await svc.restoreBackup(restoredSubs, restoredNodes, restoredGroups, restoredHidden);
+    // 5.1 恢复配置原文 + 订阅 header 凭据，并把 current profile 切回去。
+    //     没有这一段时：卸载重装后 profiles/*.yaml 与 Asset 里的节点密码都不存在，
+    //     界面能看到节点，但内核没有节点来源 / 没有密码 → 选不了节点、连不上。
+    const profilesRestored = await BackupRestoreService.restoreProfiles(parsed, subIds, restoredSubs);
+    // 5.2 旧备份（2.0 及更早没有 profiles）：给缺原文的启用订阅排队后台补拉一次，
+    //     否则恢复后订阅列表在、内核节点表永远是空的（用户看到的「刷新不出来」）。
+    const needRefresh: string[] = [];
+    for (const s of restoredSubs) {
+      if (s.enabled && !ProfileStore.exists(s.id)) {
+        needRefresh.push(s.id);
+      }
+    }
+    if (needRefresh.length > 0) {
+      setTimeout((): void => {
+        const runBackfill = async (): Promise<void> => {
+          for (const id of needRefresh) {
+            try {
+              await svc.refreshSubscription(id);
+            } catch (e) {
+              AppLogger.warn(TAG, `post-restore refresh failed: ${AppLogger.errText(e)}`);
+            }
+          }
+        };
+        runBackfill();
+      }, 800);
+    }
     // 6. 恢复 settings 全量（强制代理/直连网站、应用分流、自定义规则、代理模式等）
     if (parsed.settings !== null && typeof parsed.settings === 'object') {
       try {
         const settings = AppSettings.fromJson(parsed.settings as AppSettingsJson);
+        // 代理模式是本机当前运行状态，不从备份覆盖：备份里常是被测出来的 global，
+        // 恢复后用户会看到「装完就是全局模式」，且全局 + 缺节点时连不上。
+        const live = await SettingsService.load();
+        if (live.proxyMode === 'global' || live.proxyMode === 'direct' || live.proxyMode === 'rule') {
+          settings.proxyMode = live.proxyMode;
+        }
         await SettingsService.save(settings);
       } catch (e) {
         AppLogger.warn(TAG, `settings restore skipped: ${AppLogger.errText(e)}`);
@@ -199,7 +294,75 @@ export class BackupRestoreService {
     out.subCount = restoredSubs.length;
     out.nodeCount = restoredNodes.length;
     out.message = `恢复成功，已导入 ${restoredSubs.length} 个订阅` +
-      (restoredNodes.length > 0 ? `/${restoredNodes.length} 个节点` : '，请刷新获取节点');
+      (restoredNodes.length > 0 ? `/${restoredNodes.length} 个节点` : '') +
+      (profilesRestored > 0 ? `、${profilesRestored} 份配置原文` : '') +
+      (needRefresh.length > 0 ? `；${needRefresh.length} 个订阅缺少配置原文，正在后台重新拉取` : '');
     return out;
+  }
+
+  /**
+   * 写回 profiles/*.yaml 并切回 current，再把订阅 header 凭据补进 Asset。
+   * 备份里没有 profiles 段（2.0 旧备份）时返回 0，由调用方排队后台刷新。
+   */
+  private static async restoreProfiles(parsed: BackupFile, subIds: Set<string>,
+    subs: Subscription[]): Promise<number> {
+    if (!ProfileStore.isReady()) {
+      return 0;
+    }
+    let restored = 0;
+    if (Array.isArray(parsed.profiles)) {
+      for (const entry of parsed.profiles) {
+        if (entry === null || typeof entry !== 'object') {
+          continue;
+        }
+        const id = typeof entry.id === 'string' ? entry.id : '';
+        const yaml = typeof entry.yaml === 'string' ? entry.yaml : '';
+        if (id.length === 0 || yaml.length === 0 || !subIds.has(id)) {
+          continue;
+        }
+        if (yaml.length > 8 * 1024 * 1024) {
+          continue;
+        }
+        if (ProfileStore.write(id, yaml)) {
+          restored++;
+        }
+      }
+    }
+    // current profile：优先备份里的那个，失效则退回第一个「启用且有原文」的订阅。
+    let current = typeof parsed.currentProfileId === 'string' ? parsed.currentProfileId : '';
+    if (current.length === 0 || !ProfileStore.exists(current)) {
+      current = '';
+      for (const s of subs) {
+        if (s.enabled && ProfileStore.exists(s.id)) {
+          current = s.id;
+          break;
+        }
+      }
+    }
+    if (current.length > 0) {
+      await ProfileStore.setCurrent(current);
+    }
+    // 订阅 header 值落在 Asset（preferences 里永远是空的），重装后只能从备份补。
+    const sources: SubscriptionCredentialSource[] = [];
+    if (Array.isArray(parsed.subscriptionSecrets)) {
+      for (const entry of parsed.subscriptionSecrets) {
+        if (entry === null || typeof entry !== 'object') {
+          continue;
+        }
+        const id = typeof entry.id === 'string' ? entry.id : '';
+        const headerValue = typeof entry.headerValue === 'string' ? entry.headerValue : '';
+        if (id.length === 0 || headerValue.length === 0 || !subIds.has(id)) {
+          continue;
+        }
+        const source = new SubscriptionCredentialSource();
+        source.id = id;
+        source.headerValue = headerValue;
+        sources.push(source);
+      }
+    }
+    if (sources.length > 0) {
+      await CredentialStore.canonicalize([], sources, true);
+    }
+    return restored;
   }
 }

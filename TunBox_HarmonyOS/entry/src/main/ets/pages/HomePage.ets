@@ -919,7 +919,7 @@ export struct HomePage {
       if (uris.length === 0) {
         return;
       }
-      let json = BackupRestoreService.exportJsonWithSettings(this.settings);
+      let json = await BackupRestoreService.exportJsonWithSettings(this.settings);
       if (password.length >= 4) {
         const enc = BackupCrypto.encrypt(json, password);
         if (!enc.ok) {

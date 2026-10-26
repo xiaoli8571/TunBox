@@ -364,6 +364,12 @@ struct NodeSelectionPage {
     return st;
   }
 
+  /** 状态徽标数据来自普通字段 sortSnapshot（不是 @State），ForEach 的 key 不带状态签名时，
+   *  同一节点的行会被复用，徽标会永远停在首次渲染的值。把状态签名并进 key 才会重建该行。 */
+  private statusKey(st: NodeStatusView): string {
+    return st.hasData ? `1-${st.failCount}-${st.rateLabel}` : '0';
+  }
+
   private rebuildRows(): void {
     const rows: NodeRow[] = [];
     const activeNames: string[] = [];
@@ -1773,8 +1779,8 @@ struct NodeSelectionPage {
                         // 长按进入批量多选（2026-10-20）：先勾上被长按的这个节点
                         this.enterSelectMode(row.node.id);
                       }))
-                    }, (row: NodeRow) => this.groupKey(groupRow.group) + '#m#' + row.node.id + '#'
-                      + this.testingName)
+                    }, (row: NodeRow) => this.groupKey(groupRow.group) + '#m#' + row.node.id + '#' + this.testingName
+                      + '#' + this.statusKey(row.status))
                   }
                 }
                 .width('100%')
@@ -1806,7 +1812,7 @@ struct NodeSelectionPage {
                 // 长按进入批量多选（2026-10-20）
                 this.enterSelectMode(row.node.id);
               }))
-            }, (row: NodeRow) => row.node.id + '#' + this.testingName)
+            }, (row: NodeRow) => row.node.id + '#' + this.testingName + '#' + this.statusKey(row.status))
           }.edgeEffect(EdgeEffect.Spring)
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
@@ -1869,11 +1875,13 @@ struct NodeSelectionPage {
     }
   }
 
-  /** 批量多选的勾选圆点（只在选择态渲染：未选空心、选中实心 + 白勾） */
+  /** 批量多选的勾选圆点（只在选择态渲染：未选空心、选中实心 + 白勾）。
+   *  这里必须按 id 现查状态：@Builder 的按值参数不会随 @State 刷新，
+   *  之前把 boolean 传进来，点一行圆点不变色（2026-10-26 排查同类显示 bug）。 */
   @Builder
-  SelectDot(selected: boolean) {
+  SelectDot(nodeId: string) {
     Row() {
-      if (selected) {
+      if (this.isNodeSelected(nodeId)) {
         Image($r('app.media.ic_check'))
           .width(12).height(12)
           .fillColor(Color.White)
@@ -1882,8 +1890,8 @@ struct NodeSelectionPage {
     .width(20).height(20)
     .borderRadius(10)
     .borderWidth(1.5)
-    .borderColor(selected ? Ui.primary : Ui.borderStrong)
-    .backgroundColor(selected ? Ui.primary : Color.Transparent)
+    .borderColor(this.isNodeSelected(nodeId) ? Ui.primary : Ui.borderStrong)
+    .backgroundColor(this.isNodeSelected(nodeId) ? Ui.primary : Color.Transparent)
     .justifyContent(FlexAlign.Center)
     .alignItems(VerticalAlign.Center)
   }
@@ -1951,7 +1959,7 @@ struct NodeSelectionPage {
     Row() {
       Row({ space: 12 }) {
         if (this.selectMode) {
-          this.SelectDot(this.isNodeSelected(row.node.id))
+          this.SelectDot(row.node.id)
         }
         CountryFlagIcon({ nodeName: row.node.name, iconSize: 26 })
         Column({ space: 3 }) {

@@ -14,18 +14,49 @@ struct SiteInputDialog {
   controller?: CustomDialogController;
   @State text: string = '';
   onAdd: (text: string) => boolean = () => false;
+
+  /** 输入即时预检：与页面 add() 用同一套域名规则，合法才允许提交。 */
+  private entries(): string[] { return SiteRoutingPolicy.parseInput(this.text); }
+
+  private errorText(): string {
+    const entries = this.entries();
+    if (entries.length === 0) { return ''; }
+    for (const domain of entries) {
+      const error = SiteRoutingPolicy.domainError(domain);
+      if (error.length > 0) { return `${domain}：${error}`; }
+    }
+    return '';
+  }
+
+  private canAdd(): boolean { return this.entries().length > 0 && this.errorText().length === 0; }
+
+  private previewText(): string {
+    const entries = this.entries();
+    const head = entries.slice(0, 2).join('；');
+    return `已识别 ${entries.length} 个域名：${head}` + (entries.length > 2 ? ' …' : '');
+  }
+
   build() {
-    Column({ space: 14 }) {
+    Column({ space: 12 }) {
       Text('添加 / 批量导入网站').fontSize(19).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
       Text('每行一个纯域名，例如 example.com。无需 https://，不要填写路径、端口或通配符；规则包含其子域名。')
         .fontSize(12).fontColor(Ui.textSecondary)
-      TextArea({ text: this.text, placeholder: 'example.com\nexample.org' }).height(180).maxLength(131072)
+      TextArea({ text: this.text, placeholder: 'example.com\nexample.org' }).height(170).maxLength(131072)
         .backgroundColor(Ui.inputBackground).fontColor(Ui.textPrimary).onChange((value: string) => { this.text = value; })
+      // 输入即识别：全部行都是合法域名时按钮立刻变实心蓝，不合法行就地标红。
+      if (this.text.trim().length > 0) {
+        Text(this.errorText().length > 0 ? this.errorText() : this.previewText())
+          .fontSize(11)
+          .fontColor(this.errorText().length > 0 ? TunBoxColors.danger : TunBoxColors.textSecondary)
+          .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+      }
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong).fontColor(Ui.textPrimary)
           .onClick(() => this.controller?.close())
         Button('添加到当前名单').layoutWeight(2)
-          .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand)
+          .backgroundColor(this.canAdd() ? TunBoxColors.primary : Ui.buttonDisabled)
+          .fontColor(this.canAdd() ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+          .enabled(this.canAdd())
           .onClick(() => { if (this.onAdd(this.text)) { this.controller?.close(); } })
       }
     }
@@ -204,6 +235,14 @@ struct SiteRoutingPage {
   }
   onBackPress(): boolean { this.back(); return true; }
 
+  /** 数量必须在这里按 kind 现算：@Builder 的按值参数不会随状态刷新，
+   *  之前把 count 当参数传进来，添加后标签一直停在 0（2026-10-26 真机反馈）。 */
+  private countOf(kind: string): number {
+    if (kind === 'direct') { return this.direct.length; }
+    if (kind === 'block') { return this.block.length; }
+    return this.proxy.length;
+  }
+
   /**
    * 三态策略分段（2026-10-23 用户口径：**样式与应用分流页的三段条一致**——
    * 同宽 92% 轨道 / controlTrackSoft 底 / 圆角 12 / padding 4，选中块
@@ -213,7 +252,7 @@ struct SiteRoutingPage {
    * 数量是这一页最关键的上下文，去掉就只剩名字。kind 值与判定逻辑不变。
    */
   @Builder
-  KindTab(kind: string, label: string, count: number) {
+  KindTab(kind: string, label: string) {
     Row({ space: 5 }) {
       Circle({ width: 6, height: 6 })
         .fill(kind === 'direct' ? TunBoxColors.success : kind === 'block' ? TunBoxColors.danger : TunBoxColors.primary)
@@ -222,7 +261,7 @@ struct SiteRoutingPage {
         .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
         .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textSecondary)
         .maxLines(1)
-      Text(`${count}`).fontSize(12)
+      Text(`${this.countOf(kind)}`).fontSize(12)
         .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
         .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textMuted)
         .maxLines(1)
@@ -262,9 +301,9 @@ struct SiteRoutingPage {
         Column({ space: 12 }) {
           // 三态策略分段条（样式对齐应用分流页：92% 轨道 + controlTrackSoft + 圆角 12 + padding 4）
           Row({ space: 4 }) {
-            this.KindTab('proxy', '强制代理', this.proxy.length)
-            this.KindTab('direct', '强制直连', this.direct.length)
-            this.KindTab('block', '强制拦截', this.block.length)
+            this.KindTab('proxy', '强制代理')
+            this.KindTab('direct', '强制直连')
+            this.KindTab('block', '强制拦截')
           }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft)
             .alignSelf(ItemAlign.Center)
             .enabled(this.ready && !this.busy)
