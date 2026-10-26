@@ -192,22 +192,23 @@ export class TunBoxColors {
     return ThemeService.isDark() ? '#0C1220' : '#F0F4FC';
   }
 
-  // ── 顶部导航栏 / 底部悬浮毛玻璃栏（文档 §2.1 / §2.2）──
+  // ── 顶部导航栏 / 底部悬浮栏（文档 §2.1 / §2.2）──
   static get navFill(): ResourceColor {
     return ThemeService.isDark() ? 'rgba(18, 21, 28, 0.90)' : 'rgba(244, 246, 251, 0.90)';
   }
 
+  /** 底栏填充：契约=完全透明（2026-10-26 定稿）。FloatingBottomBar 已不再画任何底色，
+   *  模糊/描边/投影也一并移除；任何层若需要「底栏同款透明底」直接用这个 token。 */
   static get dockFill(): ResourceColor {
-    // 2026-10-17 用户要求「底部菜单栏整体实现全透明」：底栏不再有着色层，
-    // 只保留 backdropBlur(24) 磨砂模糊 + 细描边/投影维持悬浮轮廓，
-    // 背后滚动的内容与渐变底直接透出（深浅主题一致）。
     return Color.Transparent;
   }
 
+  /** 底栏描边（2026-10-26 起底栏零渲染，当前无引用；其它悬浮层需要细描边时可复用） */
   static get dockEdge(): ResourceColor {
     return ThemeService.isDark() ? 'rgba(255, 255, 255, 0.14)' : 'rgba(255, 255, 255, 0.60)';
   }
 
+  /** 底栏投影（2026-10-26 起底栏零渲染，当前无引用） */
   static get dockShadow(): ResourceColor {
     return ThemeService.isDark() ? 'rgba(0, 0, 0, 0.60)' : 'rgba(10, 89, 247, 0.08)';
   }

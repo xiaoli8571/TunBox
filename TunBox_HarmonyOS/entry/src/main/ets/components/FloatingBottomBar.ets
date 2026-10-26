@@ -1,11 +1,17 @@
 /**
- * 底部悬浮毛玻璃导航栏 —— 严格对齐《TunBox-UI重构笔记》§2.2 FloatingBottomBar
+ * 底部悬浮导航栏 —— 严格对齐《TunBox-UI重构笔记》§2.2 FloatingBottomBar
  *
- * 几何：92% 宽 / 64 高 / 32 圆角 / 底部外边距 20；材质（2026-10-17 用户要求
- * 「底部菜单栏整体实现全透明」）：无着色填充（dockFill = 全透明），仅保留
- * backdropBlur(24) 磨砂模糊让背后内容柔化透出 + 白 60% 细描边与品牌蓝 8% 投影
- * 维持悬浮轮廓。演进记录：backgroundBlurStyle 材质自带不透明蒙层（调填充透明度
- * 无效）→ 改 backdropBlur 纯模糊；填充由 白88% → 45% → 28% 一路压低，最终归零。
+ * 几何：92% 宽 / 64 高 / 32 圆角 / 底部外边距 0（沉浸式贴手势区）。
+ *
+ * 材质（2026-10-26 用户最终定稿「不折不扣的透明」）：**零渲染底**。
+ * 栏体不再有任何可见像素——无着色填充、无 backdropBlur 模糊、无描边、无投影；
+ * 只有三个页签项（图标 / 文字 / 选中胶囊 / 点击光晕）画在内容之上，背后内容
+ * 1:1 透出。演进记录：backgroundBlurStyle 材质自带不透明蒙层 → backdropBlur(24)
+ * 仍有磨砂白雾（在纯渐变页脚上读起来就是一条白胶囊，实测截图即为此现象）→ 全部移除。
+ * 之所以不用 HdsTabs 的 systemMaterialEffect：IMMERSIVE/ADAPTIVE 本身就是磨砂材质
+ * （做不到「完全透明」），MaterialType.NONE 才等价于无材质，而 HdsTabs 在 3 页签下
+ * barFloatingStyle.barWidth 不生效（2026-10-26 dumpLayout 实测，见 docs/maintenance.md），
+ * 自绘栏在「零材质」目标下视觉完全等价且不引入该回归。
  * 三项：主页(0) 订阅(1) 设置(2)；选中项=椭圆胶囊高亮（primaryLight 底 + primaryBorder 描边，
  * 图标与名称同一行、图标在前，2026-10-17 用户要求）；点击瞬间光亮：图标位置先满亮
  * dockGlow（瞬时上屏），50ms 后 280ms 扩散淡出、不常驻（2026-10-17 用户要求）。
@@ -115,13 +121,10 @@ export struct FloatingBottomBar {
     .width('92%')
     .height(TunBoxGeometry.dockHeight)
     .borderRadius(TunBoxGeometry.dockRadius)
-    .backgroundColor(TunBoxColors.dockFill)
-    // 2026-10-17 三次修正（用户要求「底部菜单栏整体实现全透明」）：填充层归零
-    // （dockFill = 全透明），只保留 backdropBlur 纯背景模糊 —— 背后内容按半径
-    // 模糊后直接透出，无任何着色，深浅主题一致；悬浮轮廓交给细描边与投影。
-    .backdropBlur(24)
-    .shadow({ radius: 24, color: TunBoxColors.dockShadow, offsetY: 8 })
-    .border({ width: 1, color: TunBoxColors.dockEdge })
+    // 2026-10-26 终稿：栏体零渲染。以下四行刻意保持「无填充 / 无模糊 / 无描边 / 无投影」，
+    // 不要再加 backdropBlur / backgroundBlurStyle / shadow / border —— 任何一项都会让
+    // 栏体重新变成一条可见的白胶囊，与「完全透明」直接冲突。
+    .backgroundColor(Color.Transparent)
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .margin({ bottom: TunBoxGeometry.dockBottomMargin })
   }

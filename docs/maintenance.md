@@ -64,3 +64,42 @@ scratch 与 `%TEMP%` 里的东西默认都是临时的，不进仓库、不复�
 - 处理：`MainPage.ets` 回滚为自绘 `FloatingBottomBar`（92% 宽 + `backgroundBlurStyle` 玻璃），
   删除本轮的 `HdsTabs` 版本；2026-10-17 的重构也记录过同样结论（移除 HdsTabs 沉浸材质页签）。
 - 若再尝试：必须先 `dumpLayout` 量到条体真实 bounds 再动样式，不允许按截图目测下结论。
+
+## 底栏「完全透明」定稿（2026-10-26，用户最终要求）
+
+**结论：底栏栏体零渲染。** `FloatingBottomBar` 只画页签项（图标 / 文字 / 选中胶囊 / 点击光晕），
+栏体本身不画任何像素：无 `backgroundColor` 填充、无 `backdropBlur` / `backgroundBlurStyle`、
+无 `border` 描边、无 `shadow` 投影。背后内容 1:1 透出，不做磨砂。
+
+实现位置（改之前先读完这段）：
+
+- `entry/src/main/ets/components/FloatingBottomBar.ets` 的根 `Row` 属性链：
+  `.width('92%')` / `.height(64)` / `.borderRadius(32)` 只用于布局与命中区，
+  `.backgroundColor(Color.Transparent)` 是唯一与"面"有关的属性。**禁止再加回**
+  `backdropBlur` / `backgroundBlurStyle` / `shadow` / `border` —— 任一项都会让底栏重新
+  变成一条可见胶囊。
+- 选中项的 `primaryLight` 胶囊 + `primaryBorder` 描边属于**页签项高亮**（前景），
+  不是栏体底色；点击瞬间的 `dockGlow` 光晕同理。
+
+为什么不是「HDS 沉浸光感材质」：
+
+- 官方材质的 `IMMERSIVE` / `ADAPTIVE` 本身是磨砂材质，物理上做不到「完全透明」；
+  官方材质枚举里 `hdsMaterial.MaterialType.NONE`（`=0`，注释 "No material effect."）
+  才是「无材质」那一档。即：官方推荐配置做到「完全透明」= 材质选 NONE。
+- 自绘零渲染栏与 NONE 的显示结果等价，且绕开 2026-10-26 实测到的 HdsTabs
+  `barFloatingStyle.barWidth` 在 3 页签下不生效的问题（见上一节）。
+
+真机取证（MLR-AL00，1600×2560，`com.tunbox.client`）：
+
+- 改前（`backdropBlur(24)` + 白 60% 描边 + 投影）：首页渐变背景上目视为一条磨砂白胶囊；
+  截图底栏区域像素均值 `(236.5, 240.8, 253.3)`，与页面同列背景 `(237, 241, 253)` 的差异
+  主要来自 1px 白描边（≈255）与投影，肉眼看就是"一层白"。
+- 改后：底栏区域与页面背景像素一致；订阅页列表滚到底时，节点卡文字在页签项下方
+  **清晰可读、不模糊**（真透明，不是磨砂）；点击「订阅」页签仍能正常切页（透明不影响命中区）。
+- 验证产物：`entry-default-signed.hap`（debug 签名）装真机；`verify-ui-resource-bindings.mjs`
+  底栏三图标编号 PASS。
+
+装机注意：真机只认 debug 签名（release 证书装上报 `9568322 not trusted app source`）。
+流程是 `switch-signing.ps1 -Mode debug` → 构建 → `hdc install -r entry-default-signed.hap`；
+**提交前必须** `switch-signing.ps1 -Mode release`，再跑 `verify-build-profile.mjs`。
+

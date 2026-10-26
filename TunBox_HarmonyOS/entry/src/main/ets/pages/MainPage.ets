@@ -1,16 +1,18 @@
 /**
- * MainPage —— 应用主容器页（自绘悬浮毛玻璃导航栏，严格对齐《TunBox-UI重构笔记》§2.2）
+ * MainPage —— 应用主容器页（自绘悬浮导航栏，严格对齐《TunBox-UI重构笔记》§2.2）
  *
  * 2026-10-17 UI 重构（用户决策「完全按文档」）：移除 HdsTabs 系统沉浸材质页签，
- * 改为自绘悬浮毛玻璃栏（2026-10-17 用户要求回到三页签：主页 / 订阅 / 设置；规则页走
+ * 改为自绘悬浮栏（2026-10-17 用户要求回到三页签：主页 / 订阅 / 设置；规则页走
  * router 推入式子页，与节点/连接等页同级）。
+ * 2026-10-26 用户最终定稿：底栏「完全透明」—— 栏体零渲染（无填充/无模糊/无描边/无投影），
+ * 只留页签项浮在内容之上；见 components/FloatingBottomBar.ets 头注释。
  * 因此不再有宽屏侧边页签形态（文档未定义该形态），四种窗口尺寸共用同一底部悬浮栏。
  *
  * 页面容器（与旧版宿主语义一致，只是页签栏换成自绘）：
  *  - 内容层：四个页签组件按需创建（visited 懒挂载）后常驻（visibility 切换），
  *    保持旧 TabContent 的懒创建 + keep-alive 行为，避免启动时四页同时 bootstrap；
  *  - 悬浮栏：Stack(alignContent: Bottom) 浮在内容之上，内容自然延伸到栏体之下
- *    （毛玻璃才有可透内容，栏体不会退化成实色圆角片）；
+ *    （透明栏才有可透内容，栏体不会退化成实色圆角片）；
  *  - 刷新桥：切页签 / 从推入式子页返回时，用 TabLifecycleBridge 通知对应页签执行
  *    原 onPageShow 语义的刷新（桥的迟注册兜底覆盖「首次进入」）；
  *  - 跨页跳转：AppStorage 'tb_main_tab' 是页签真相源（@StorageLink），
@@ -140,7 +142,7 @@ struct MainPage {
       .width('100%')
       .height('100%')
 
-      // 底部悬浮毛玻璃导航栏（文档 §2.2，浮在内容之上）
+      // 底部悬浮导航栏（文档 §2.2，浮在内容之上，栏体完全透明）
       FloatingBottomBar({
         currentTab: this.activeIndex,
         onSelect: (index: number): void => { this.selectTab(index); }
