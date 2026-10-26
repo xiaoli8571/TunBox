@@ -12,6 +12,17 @@ export class AppRoutingCustomApp {
   label: string = '';
 }
 
+/** 手动输入解析后的一条应用：「名称|包名」可一次粘贴多行，label 只用于显示。 */
+export class AppRoutingEntry {
+  bundleName: string = '';
+  label: string = '';
+
+  constructor(bundleName: string, label: string) {
+    this.bundleName = bundleName;
+    this.label = label;
+  }
+}
+
 /** 一次 VPN 会话的不可降级策略快照；默认状态不能启动。 */
 export class AppRoutingRuntime {
   mode: string = '';
@@ -35,6 +46,15 @@ export class AppRoutingPolicy {
     return result;
   }
 
+  /** 单个包名是否为合法的鸿蒙 BundleName（输入框即时高亮与保存校验同一口径）。 */
+  static isBundleName(value: string): boolean {
+    const name = value.trim();
+    if (name.length < 3 || name.length > AppRoutingPolicy.MAX_BUNDLE_LENGTH) {
+      return false;
+    }
+    return new RegExp('^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z0-9_]+)+$').test(name);
+  }
+
   static packagesError(packages: string[], label: string): string {
     if (!Array.isArray(packages)) {
       return label + '格式无效，请重新确认应用名单';
@@ -44,10 +64,72 @@ export class AppRoutingPolicy {
       return label + '最多支持 256 个应用，请减少名单后保存（不会自动截断）';
     }
     for (const name of normalized) {
-      if (name.length < 3 || name.length > AppRoutingPolicy.MAX_BUNDLE_LENGTH ||
-        !/^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(name)) {
+      if (!AppRoutingPolicy.isBundleName(name)) {
         return label + '含无效包名：' + (name.length === 0 ? '（空包名）' : name) +
           '。包名须为 3–127 位字母、数字、下划线及点，禁止逗号和空白';
+      }
+    }
+    return '';
+  }
+
+  /** 行内分隔符：半角竖线、全角竖线、制表符。取最靠前的一个，名称里带空格/点号都不受影响。 */
+  private static separatorIndex(line: string): number {
+    const marks: string[] = ['|', '｜', '	'];
+    let found: number = -1;
+    for (const mark of marks) {
+      const at = line.indexOf(mark);
+      if (at > 0 && (found < 0 || at < found)) {
+        found = at;
+      }
+    }
+    return found;
+  }
+
+  /** 解析手动输入（每行一条），支持：
+   *    支付宝|com.alipay.mobile.client   —— 名称在前（推荐）
+   *    com.alipay.mobile.client|支付宝   —— 包名在前也能识别
+   *    com.alipay.mobile.client          —— 只填包名
+   *  两侧都不是合法包名时整行原样当成包名，交给 packagesError 明确报错，绝不静默丢弃。 */
+  static parseEntries(text: string, fallbackLabel: string): AppRoutingEntry[] {
+    const result: AppRoutingEntry[] = [];
+    const lines: string[] = text.split(String.fromCharCode(10));
+    const onlyOne: boolean = lines.filter((line: string) => line.trim().length > 0).length === 1;
+    for (const raw of lines) {
+      const line: string = raw.trim();
+      if (line.length === 0) {
+        continue;
+      }
+      const at: number = AppRoutingPolicy.separatorIndex(line);
+      let name: string = line;
+      let label: string = '';
+      if (at > 0) {
+        const left: string = line.substring(0, at).trim();
+        const right: string = line.substring(at + 1).trim();
+        if (AppRoutingPolicy.isBundleName(right)) {
+          name = right;
+          label = left;
+        } else if (AppRoutingPolicy.isBundleName(left)) {
+          name = left;
+          label = right;
+        }
+      }
+      // 名称备注输入框只对「单条输入」补默认值；多行时以每行自带的名称优先。
+      if (label.length === 0 && onlyOne) {
+        label = fallbackLabel.trim();
+      }
+      result.push(new AppRoutingEntry(name, label));
+    }
+    return result;
+  }
+
+  /** 输入框即时预检：全部行都能解析成合法包名才允许提交。 */
+  static entriesError(entries: AppRoutingEntry[]): string {
+    if (entries.length === 0) {
+      return '请至少输入一个包名';
+    }
+    for (const entry of entries) {
+      if (!AppRoutingPolicy.isBundleName(entry.bundleName)) {
+        return '不是有效包名：' + entry.bundleName + '（可写成 名称|包名）';
       }
     }
     return '';

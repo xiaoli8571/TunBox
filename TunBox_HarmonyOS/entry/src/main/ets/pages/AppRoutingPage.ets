@@ -4,7 +4,7 @@ import { Ui } from '../theme/UiTokens';
 import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { AppSettings } from '../commons/models/AppSettings';
-import { AppRoutingCustomApp, AppRoutingPolicy } from '../commons/services/AppRoutingPolicy';
+import { AppRoutingCustomApp, AppRoutingEntry, AppRoutingPolicy } from '../commons/services/AppRoutingPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 
@@ -21,21 +21,54 @@ struct RoutingInputDialog {
   @State label: string = '';
   @State packages: string = '';
   onAdd: (packages: string, label: string) => boolean = () => false;
+
+  /** 实时解析：一行「名称|包名」也算一条；只填包名时用名称备注兜底。 */
+  private entries(): AppRoutingEntry[] {
+    return AppRoutingPolicy.parseEntries(this.packages, this.label);
+  }
+
+  private errorText(): string {
+    if (this.packages.trim().length === 0) { return ''; }
+    return AppRoutingPolicy.entriesError(this.entries());
+  }
+
+  private canAdd(): boolean {
+    return this.errorText().length === 0 && this.entries().length > 0;
+  }
+
+  private previewText(): string {
+    const entries = this.entries();
+    const parts: string[] = [];
+    for (const entry of entries) {
+      parts.push((entry.label.length > 0 ? entry.label + ' · ' : '') + entry.bundleName);
+    }
+    return `已识别 ${entries.length} 项：` + parts.join('；');
+  }
+
   build() {
-    Column({ space: 14 }) {
+    Column({ space: 12 }) {
       Text('添加 / 批量导入').fontSize(19).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
-      Text('每行一个鸿蒙应用包名；名称备注只用于单个应用。请勿使用 Android 包名代替鸿蒙包名。')
+      Text('每行一条，支持「名称|包名」，例如 支付宝|com.alipay.mobile.client；也可以只填鸿蒙包名。请勿使用 Android 包名代替鸿蒙包名。')
         .fontSize(12).fontColor(Ui.textSecondary)
-      TextInput({ text: this.label, placeholder: '名称备注（可选）' }).maxLength(40)
+      TextInput({ text: this.label, placeholder: '名称备注（可选，只用于单条输入）' }).maxLength(40)
         .onChange((v: string) => { this.label = v; }).backgroundColor(Ui.inputBackground).fontColor(Ui.textPrimary)
-      TextArea({ text: this.packages, placeholder: 'com.tencent.wechat\ncom.ss.hm.ugc.aweme' })
-        .height(180).maxLength(65536).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground)
+      TextArea({ text: this.packages, placeholder: '支付宝|com.alipay.mobile.client' })
+        .height(170).maxLength(65536).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground)
         .onChange((v: string) => { this.packages = v; })
+      // 输入即识别：合法包名全部解析成功时按钮立刻变实心蓝并可点，不合法的行就地标红。
+      if (this.packages.trim().length > 0) {
+        Text(this.errorText().length > 0 ? this.errorText() : this.previewText())
+          .fontSize(11)
+          .fontColor(this.errorText().length > 0 ? TunBoxColors.danger : TunBoxColors.textSecondary)
+          .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
+      }
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong).fontColor(Ui.textPrimary)
           .onClick(() => this.controller?.close())
         Button('添加到当前名单').layoutWeight(2)
-          .backgroundColor(Ui.primaryBlueFill).fontColor(Ui.textOnBrand)
+          .backgroundColor(this.canAdd() ? TunBoxColors.primary : Ui.buttonDisabled)
+          .fontColor(this.canAdd() ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+          .enabled(this.canAdd())
           .onClick(() => { if (this.onAdd(this.packages, this.label)) { this.controller?.close(); } })
       }
     }
@@ -94,6 +127,9 @@ struct AppRoutingPage {
   @State ready: boolean = false;
   @State dirty: boolean = false;
   @State resultText: string = '';
+  /** 批量删除：先勾选草稿，统一确认后移除；保存前不改当前 VPN。 */
+  @State batchMode: boolean = false;
+  @State pendingDeletes: string[] = [];
   private original: string = '';
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   private inputDialog: CustomDialogController = new CustomDialogController({
@@ -165,6 +201,8 @@ struct AppRoutingPage {
     this.rows = rows.filter((r: RoutingRow) => (!this.selectedOnly || r.selected)
       && (r.label.toLowerCase().includes(keyword) || r.bundleName.toLowerCase().includes(keyword)))
       .sort((a: RoutingRow, b: RoutingRow) => a.label.localeCompare(b.label));
+    // 批量删除的勾选只保留仍存在的条目（搜索过滤不清空勾选，删除后不留幽灵计数）
+    this.pendingDeletes = this.pendingDeletes.filter((name: string) => rows.some((r: RoutingRow) => r.bundleName === name));
     this.dirty = this.fingerprint() !== this.original;
   }
 
@@ -193,19 +231,23 @@ struct AppRoutingPage {
   }
 
   private addPackages(text: string, label: string): boolean {
-    const packages = AppRoutingPolicy.normalizePackages(text.split(new RegExp('\\r?\\n')).filter((line: string) => line.trim().length > 0));
-    if (packages.length === 0) { this.toast('请至少输入一个包名'); return false; }
+    // 每行支持「名称|包名」「包名|名称」与纯包名；名称逐条进手动目录用于显示。
+    const entries = AppRoutingPolicy.parseEntries(text, label);
+    const error = AppRoutingPolicy.entriesError(entries);
+    if (error.length > 0) { this.toast(error); return false; }
+    const packages = AppRoutingPolicy.normalizePackages(entries.map((entry: AppRoutingEntry) => entry.bundleName));
     const next = AppRoutingPolicy.normalizePackages(this.current().concat(packages));
-    const error = AppRoutingPolicy.validationError(this.mode,
+    const validationError = AppRoutingPolicy.validationError(this.mode,
       this.mode === 'include' ? next : this.included,
       this.mode === 'exclude' ? next : this.excluded, this.needsReview);
-    if (error.length > 0) { this.toast(error); return false; }
+    if (validationError.length > 0) { this.toast(validationError); return false; }
     const apps = this.customApps.slice();
-    for (const name of packages) {
+    for (const entry of entries) {
+      const name = entry.bundleName.trim();
       if (!apps.some((app: AppRoutingCustomApp) => app.bundleName === name)) {
         const app = new AppRoutingCustomApp();
         app.bundleName = name;
-        app.label = packages.length === 1 ? label.trim() : '';
+        app.label = entry.label.trim();
         apps.push(app);
       }
     }
@@ -214,6 +256,53 @@ struct AppRoutingPage {
     this.setCurrent(next);
     this.toast(`已添加到草稿：${packages.length} 项，保存后生效`);
     return true;
+  }
+
+  /** 进入/退出批量删除：进入时清空上一轮勾选，退出不改变草稿。 */
+  private toggleBatchMode(): void {
+    if (this.busy) { return; }
+    this.batchMode = !this.batchMode;
+    this.pendingDeletes = [];
+  }
+
+  private toggleDelete(name: string): void {
+    if (this.busy) { return; }
+    this.pendingDeletes = this.pendingDeletes.includes(name)
+      ? this.pendingDeletes.filter((p: string) => p !== name)
+      : this.pendingDeletes.concat([name]);
+  }
+
+  private selectVisibleForDelete(select: boolean): void {
+    this.pendingDeletes = select ? this.rows.map((r: RoutingRow) => r.bundleName) : [];
+  }
+
+  /** 批量删除：一份确认，一次清掉两份名单 + 手动目录，预置条目同时记入已删除名单。 */
+  private async deleteSelected(): Promise<void> {
+    if (this.busy || !this.ready) { return; }
+    const names = this.pendingDeletes.slice();
+    if (names.length === 0) { this.toast('请先勾选要删除的应用'); return; }
+    const presetCount = names.filter((name: string) => PRESET_APPS.some((p: PresetApp) => p.bundleName === name)).length;
+    try {
+      const response = await promptAction.showDialog({ title: '批量删除应用条目',
+        message: `将移除 ${names.length} 项（两份名单及手动目录）`
+          + `${presetCount > 0 ? `，其中 ${presetCount} 个预置条目保存后不再出现` : ''}。保存前不会改变当前 VPN。`,
+        buttons: [{ text: '取消', color: $r('app.color.ui_text_secondary') }, { text: '删除', color: $r('app.color.ui_text_error') }] });
+      if (response.index !== 1) { return; }
+      this.included = this.included.filter((p: string) => !names.includes(p));
+      this.excluded = this.excluded.filter((p: string) => !names.includes(p));
+      this.customApps = this.customApps.filter((app: AppRoutingCustomApp) => !names.includes(app.bundleName));
+      const removed = this.removedPresets.slice();
+      for (const name of names) {
+        if (PRESET_APPS.some((p: PresetApp) => p.bundleName === name) && !removed.includes(name)) {
+          removed.push(name);
+        }
+      }
+      this.removedPresets = removed;
+      this.pendingDeletes = [];
+      this.batchMode = false;
+      this.rebuild();
+      this.toast(`已移除 ${names.length} 项，点「保存」后生效`);
+    } catch (e) { /* 取消不改变草稿。 */ }
   }
 
   private async removeEntry(name: string): Promise<void> {
@@ -380,14 +469,19 @@ struct AppRoutingPage {
           }.width('100%').height(42).padding({ left: 12, right: 12 })
             .backgroundColor(TunBoxColors.surfaceCard).borderRadius(TunBoxGeometry.controlRadius)
             .border({ width: 1, color: TunBoxColors.cardBorder })
-          // 既有过滤行（切换逻辑不变；'▾' 文字符号去掉）
+          // 过滤行：左侧统计与「已选择」筛选；右侧排序 + 批量删除入口（批量删除在任何模式下都能用）
           Row({ space: 12 }) {
-            Text(this.selectedOnly ? `已选择 (${this.current().length})` : `可用目录 (${this.rows.length})`)
-              .fontColor(TunBoxColors.primary).fontSize(13)
-              .onClick(() => { this.selectedOnly = !this.selectedOnly; this.rebuild(); })
+            Text(this.batchMode ? `已勾选 (${this.pendingDeletes.length})`
+              : (this.selectedOnly ? `已选择 (${this.current().length})` : `可用目录 (${this.rows.length})`))
+              .fontColor(this.batchMode && this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.primary).fontSize(13)
+              .onClick(() => { if (this.batchMode) { return; } this.selectedOnly = !this.selectedOnly; this.rebuild(); })
             Blank()
             Text(this.nameSort ? '名称排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondary)
-              .onClick(() => { this.nameSort = !this.nameSort; this.rebuild(); })
+              .onClick(() => { if (this.batchMode) { return; } this.nameSort = !this.nameSort; this.rebuild(); })
+            Text(this.batchMode ? '完成' : '批量删除').fontSize(12)
+              .fontColor(this.batchMode ? TunBoxColors.primary : TunBoxColors.textSecondary)
+              .padding({ left: 4, top: 4, bottom: 4 })
+              .onClick(() => this.toggleBatchMode())
           }.width('100%')
           // 应用行（文档 §3.3：44 方形首字图标 / 应用名 15 Bold + 类别来源 chip /
           // bundleName 11 textMuted 单行省略 / 右侧 Checkbox select 色 primary；
@@ -410,20 +504,35 @@ struct AppRoutingPage {
                     }.width('100%')
                     Text(row.bundleName).fontSize(11).fontColor(TunBoxColors.textMuted).maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
-                    Text('移除条目').fontSize(11).fontColor(TunBoxColors.primary)
-                      .padding({ top: 5, bottom: 5 }).onClick(() => this.removeEntry(row.bundleName))
+                    if (!this.batchMode) {
+                      Text('移除条目').fontSize(11).fontColor(TunBoxColors.primary)
+                        .padding({ top: 5, bottom: 5 }).onClick(() => this.removeEntry(row.bundleName))
+                    }
                   }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                  Checkbox({ name: row.bundleName }).select(row.selected).selectedColor(TunBoxColors.primary)
-                    .enabled(this.mode !== 'all' && !this.busy).onChange((checked: boolean) => {
+                  Checkbox({ name: row.bundleName })
+                    .select(this.batchMode ? this.pendingDeletes.includes(row.bundleName) : row.selected)
+                    .selectedColor(this.batchMode ? TunBoxColors.danger : TunBoxColors.primary)
+                    .enabled(this.batchMode ? !this.busy : (this.mode !== 'all' && !this.busy))
+                    .onChange((checked: boolean) => {
+                      if (this.batchMode) {
+                        // 进入批量模式时 .select() 变化也会触发一次 onChange，必须先对齐模型状态再动手
+                        if (checked !== this.pendingDeletes.includes(row.bundleName)) { this.toggleDelete(row.bundleName); }
+                        return;
+                      }
                       // guard 必须查实时名单状态（rebuild 每次 new 新 row 对象，
                       // ForEach 复用组件时闭包捕获的可能是旧对象）
                       if (checked !== this.current().includes(row.bundleName)) { this.toggle(row.bundleName); }
                     })
                 }.width('100%').padding(14).borderRadius(18)
                   .backgroundColor(TunBoxColors.surfaceCard)
-                  .border({ width: 1, color: TunBoxColors.cardBorder })
+                  .border({
+                    width: 1,
+                    color: this.batchMode && this.pendingDeletes.includes(row.bundleName)
+                      ? TunBoxColors.danger : TunBoxColors.cardBorder
+                  })
               }
-            }, (row: RoutingRow) => `${row.bundleName}:${row.selected}`)
+            }, (row: RoutingRow) => `${row.bundleName}:${row.selected}:`
+              + `${this.batchMode && this.pendingDeletes.includes(row.bundleName) ? 1 : 0}`)
             if (this.rows.length === 0) {
               ListItem() { Text('没有匹配项，可手动添加鸿蒙包名。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
             }
@@ -432,31 +541,49 @@ struct AppRoutingPage {
         }.width('100%').layoutWeight(1).padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
         }).width('100%')
-        // 底部固定操作 Dock（文档 §3.3）：既有辅助行保留在主按钮上方（11~12 字号）；
-        // 按钮回调与可用条件（ready && !busy && mode !== 'all'）不变
+        // 底部固定操作 Dock（文档 §3.3）：批量删除模式换成「删除所选」，其余入口保持原样
         Column({ space: 8 }) {
           Row({ space: 16 }) {
-            Text('全选当前结果').fontSize(12).fontColor(TunBoxColors.primary).onClick(() => this.selectVisible(true))
-            Text('取消当前结果').fontSize(12).fontColor(TunBoxColors.textSecondary).onClick(() => this.selectVisible(false))
+            Text('全选当前结果').fontSize(12).fontColor(TunBoxColors.primary)
+              .onClick(() => { if (this.batchMode) { this.selectVisibleForDelete(true); } else { this.selectVisible(true); } })
+            Text(this.batchMode ? '取消全选' : '取消当前结果').fontSize(12).fontColor(TunBoxColors.textSecondary)
+              .onClick(() => { if (this.batchMode) { this.selectVisibleForDelete(false); } else { this.selectVisible(false); } })
             Blank()
-            Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(11).fontColor(TunBoxColors.textMuted)
-          }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
+            Text(this.batchMode ? `已勾选 ${this.pendingDeletes.length} 项` : (this.dirty ? '草稿未保存' : '无未保存更改'))
+              .fontSize(11)
+              .fontColor(this.batchMode && this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.textMuted)
+          }.width('100%').enabled(this.ready && !this.busy && (this.batchMode || this.mode !== 'all'))
           Row({ space: 12 }) {
-            Button() {
-              Row({ space: 6 }) {
-                Image($r('app.media.ic_plus')).width(16).height(16).fillColor(TunBoxColors.textOnPrimary)
-                Text('添加/导入应用').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textOnPrimary)
+            if (this.batchMode) {
+              Button(`删除所选（${this.pendingDeletes.length}）`).layoutWeight(1).height(46)
+                .fontSize(14).fontWeight(FontWeight.Bold)
+                .fontColor(this.pendingDeletes.length > 0 ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+                .backgroundColor(this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.controlTrackSoft)
+                .borderRadius(TunBoxGeometry.controlRadius)
+                .enabled(this.pendingDeletes.length > 0 && !this.busy)
+                .onClick(() => { this.deleteSelected(); })
+              Button('完成').height(46).padding({ left: 20, right: 20 })
+                .fontSize(14).fontWeight(FontWeight.Medium)
+                .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+                .borderRadius(TunBoxGeometry.controlRadius)
+                .onClick(() => this.toggleBatchMode())
+            } else {
+              Button() {
+                Row({ space: 6 }) {
+                  Image($r('app.media.ic_plus')).width(16).height(16).fillColor(TunBoxColors.textOnPrimary)
+                  Text('添加/导入应用').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textOnPrimary)
+                }
               }
-            }
-            .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primary)
-            .borderRadius(TunBoxGeometry.controlRadius)
-            .onClick(() => this.inputDialog.open())
-            Button('导出规则').height(46).padding({ left: 20, right: 20 })
-              .fontSize(14).fontWeight(FontWeight.Medium)
-              .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+              .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primary)
               .borderRadius(TunBoxGeometry.controlRadius)
-              .onClick(() => this.exportList())
-          }.width('100%').enabled(this.ready && !this.busy && this.mode !== 'all')
+              .onClick(() => this.inputDialog.open())
+              Button('导出规则').height(46).padding({ left: 20, right: 20 })
+                .fontSize(14).fontWeight(FontWeight.Medium)
+                .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+                .borderRadius(TunBoxGeometry.controlRadius)
+                .onClick(() => this.exportList())
+            }
+          }.width('100%').enabled(this.ready && !this.busy && (this.batchMode || this.mode !== 'all'))
         }.width('100%').padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 10, bottom: 24
         }).backgroundColor(TunBoxColors.surfaceCard)

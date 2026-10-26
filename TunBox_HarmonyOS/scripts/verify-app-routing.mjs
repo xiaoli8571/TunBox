@@ -224,6 +224,43 @@ check('EXEC session recovery rejects missing/corrupted snapshot', () => {
   r.mode = 'all'; r.packages = ['com.demo.a']; assert.notEqual(P.runtimeError(r), '');
   r.mode = 'future'; assert.notEqual(P.runtimeError(r), '');
 });
+check('EXEC manual input parses name|bundle (both orders, full-width bar, tab)', () => {
+  const one = P.parseEntries('支付宝|com.alipay.mobile.client', '');
+  assert.equal(one.length, 1);
+  assert.equal(one[0].bundleName, 'com.alipay.mobile.client');
+  assert.equal(one[0].label, '支付宝');
+  const reversed = P.parseEntries('com.alipay.mobile.client|支付宝', '');
+  assert.equal(reversed[0].bundleName, 'com.alipay.mobile.client');
+  assert.equal(reversed[0].label, '支付宝');
+  const wide = P.parseEntries('微信 ｜ com.tencent.wechat', '');
+  assert.equal(wide[0].bundleName, 'com.tencent.wechat');
+  assert.equal(wide[0].label, '微信');
+  const tabbed = P.parseEntries('抖音\tcom.ss.hm.ugc.aweme', '');
+  assert.equal(tabbed[0].bundleName, 'com.ss.hm.ugc.aweme');
+  assert.equal(tabbed[0].label, '抖音');
+});
+check('EXEC manual input keeps label field for single line and per-line names for batch', () => {
+  const single = P.parseEntries('com.tencent.wechat', '  微信  ');
+  assert.equal(single[0].label, '微信');
+  const batch = P.parseEntries('支付宝|com.alipay.mobile.client', '备注不生效');
+  assert.equal(batch[0].label, '支付宝');
+  const mixed = P.parseEntries('支付宝|com.alipay.mobile.client\ncom.tencent.wechat', '备注不生效');
+  assert.equal(mixed.length, 2);
+  assert.equal(mixed[1].label, '');
+  assert.equal(mixed[1].bundleName, 'com.tencent.wechat');
+  assert.deepEqual(P.parseEntries('  \n \n', ''), []);
+});
+check('EXEC manual input never drops an unparsable line and blocks submit', () => {
+  assert.notEqual(P.entriesError([]), '');
+  const ok = P.parseEntries('支付宝|com.alipay.mobile.client', '');
+  assert.equal(P.entriesError(ok), '');
+  const bad = P.parseEntries('支付宝 com.alipay', '');
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].bundleName, '支付宝 com.alipay');
+  assert.notEqual(P.entriesError(bad), '');
+  assert.ok(P.isBundleName('com.demo.app'));
+  assert.ok(!P.isBundleName('com.demo app'));
+});
 const connect = orchestrator.slice(orchestrator.indexOf('  private async connectExclusive('));
 const onCreate = extension.slice(extension.indexOf('  async onCreate('));
 const rebuild = extension.slice(extension.indexOf('  private async rebuildTunnel('), extension.indexOf('  private startNetworkAuthority('));
