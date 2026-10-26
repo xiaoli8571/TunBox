@@ -414,11 +414,10 @@ export class ClashApiService {
       }
       return false;
     }
-    // GLOBAL 是尽力而为：存在其他 Selector 时GLOBAL 的偶发失败/404 不拖垮整链
-    // （规则模式下流量不走 GLOBAL；mode=global 且只有 GLOBAL 可钉时才强制）。
-    if (expected.size > 1 && expected.has('GLOBAL')) {
-      expected.delete('GLOBAL');
-    }
+    // GLOBAL 必须与其他 Selector 一起钉选：mihomo 切到 global 模式后实际走 GLOBAL。
+    // 如果这里因为还存在其他 Selector 就删掉 GLOBAL，用户先选节点再切全局时 GLOBAL
+    // 会保留旧成员（甚至 DIRECT），表现为全局模式不生效。GLOBAL PUT 失败仍按下方逻辑
+    // 尽力而为，但只要组存在就必须尝试更新并在读回阶段确认。
     for (const pair of expected) {
       const group = pair[0];
       const member = pair[1];

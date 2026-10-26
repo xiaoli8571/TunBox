@@ -115,6 +115,9 @@ export class ConnectionOrchestrator {
   static recycles = [];
   static recoverCalls = 0;
   static recoverResult = true;
+  // LatencyEngine 模块级会把自己注册进这个探针表（recycleProbe）；
+  // 桩缺这个静态字段 ⇒ TypeError: Cannot read properties of undefined (reading 'includes')
+  static testCoreBusyProbes = [];
   static reset() {
     ConnectionOrchestrator.recycles = [];
     ConnectionOrchestrator.recoverCalls = 0;

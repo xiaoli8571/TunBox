@@ -271,12 +271,12 @@ export class TunBoxGeometry {
   static readonly cardPaddingLarge: number = 18;
   /** 顶部导航栏高 56vp */
   static readonly navHeight: number = 56;
-  /** 底部悬浮栏：64 高 / 32 圆角 / 下边距 20（文档 §2.2） */
+  /** 底部悬浮栏：64 高 / 32 圆角；沉浸式下贴近系统手势区。 */
   static readonly dockHeight: number = 64;
   static readonly dockRadius: number = 32;
-  static readonly dockBottomMargin: number = 20;
+  static readonly dockBottomMargin: number = 0;
   /** 页面底部为悬浮栏留白（栏高 + 下边距 + 余量） */
-  static readonly dockClearance: number = 96;
+  static readonly dockClearance: number = 70;
   /** 首页「天体轨域」启动按钮（CelestialPowerOrb）：
    *  最外呼吸光晕 / 点阵轨道 / 渐变轨环(弧线) / 核心亚克力盘。
    *

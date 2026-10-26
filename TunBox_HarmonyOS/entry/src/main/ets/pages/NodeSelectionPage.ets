@@ -223,13 +223,9 @@ struct NodeSelectionPage {
   /** 固定监听器实例，避免每次返回节点页都追加匿名监听，造成重复刷新和页面卡顿。 */
   private readonly latencyListener: () => void = (): void => {
     this.latencyTick = this.latencyTick + 1;
-    // 边测边排序：测速进行中，每合并一批新延迟就把可见列表按当前延迟重排一次，
-    // 用户实时看到节点「冒泡」到前面，而不是等整批测完。结束时 rebuildRows 按
-    // 持久化排序恢复（AUTO 保持低→高），不会乱。
-    // 通知已由 LatencyController 合并到 ≤200ms/次，重排成本 O(N log N) 可忽略。
-    if (this.batchTesting) {
-      this.resortLiveByLatency();
-    }
+    // 批量测速期间只刷新延迟显示，不再边测边重排列表。
+    // 大订阅下频繁替换 this.nodes 会导致 List 在滚动期间持续重建/位移，造成明显掉帧；
+    // 整批结束后由 commitLatencySnapshot + rebuildRows 一次性按最终测速结果排序。
   };
   private latencyListenerBound: boolean = false;
   /** 页面切入时先完成首帧绘制，再启动设置/订阅加载，避免初始化与转场争抢 UI 线程。 */
@@ -667,24 +663,6 @@ struct NodeSelectionPage {
     return row;
   }
 
-  /**
-   * 批量测速期间的实时重排：按当前延迟值升序，未测/失败(负值)沉底并保持原相对顺序。
-   * 与批末 rebuildRows 的快照排序口径一致（buildAuto 也是有效延迟升序、失败沉底），
-   * 所以中途的实时顺序与最终顺序平滑衔接，不会跳变。
-   */
-  private resortLiveByLatency(): void {
-    const arr: NodeRow[] = this.nodes.slice();
-    const key = (row: NodeRow): number => {
-      // 合成行没有延迟，永远置顶（否则会被当成"未测"沉到最底）
-      if (row.isSmart === true) {
-        return -1;
-      }
-      const v = LatencyStoreBridge.latencyFor(row.node.name);
-      return (v === null || v < 0) ? Number.MAX_SAFE_INTEGER : v;
-    };
-    arr.sort((a: NodeRow, b: NodeRow): number => key(a) - key(b));
-    this.nodes = arr;
-  }
 
   private groupKey(group: ProxyGroup): string {
     return group.subscriptionId + '\u0000' + group.name;
@@ -1796,13 +1774,13 @@ struct NodeSelectionPage {
                         this.enterSelectMode(row.node.id);
                       }))
                     }, (row: NodeRow) => this.groupKey(groupRow.group) + '#m#' + row.node.id + '#'
-                      + this.latencyTick.toString() + '#' + this.testingName)
+                      + this.testingName)
                   }
                 }
                 .width('100%')
               }
             }, (groupRow: ProxyGroupRow) => this.groupKey(groupRow.group) + '#'
-              + this.expandedGroupKeys.join('|') + '#' + this.latencyTick.toString() + '#' + this.testingName)
+              + this.expandedGroupKeys.join('|') + '#' + this.testingName)
           }.edgeEffect(EdgeEffect.Spring)
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
@@ -1828,7 +1806,7 @@ struct NodeSelectionPage {
                 // 长按进入批量多选（2026-10-20）
                 this.enterSelectMode(row.node.id);
               }))
-            }, (row: NodeRow) => row.node.id + '#' + this.latencyTick.toString() + '#' + this.testingName)
+            }, (row: NodeRow) => row.node.id + '#' + this.testingName)
           }.edgeEffect(EdgeEffect.Spring)
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })

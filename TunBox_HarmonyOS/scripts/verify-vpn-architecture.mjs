@@ -513,7 +513,7 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     notHas('latency.no-kernel-group-endpoint', bgSrc, 'testGroupDetailedResult(');
     const flcDelay = readFileSync(join(etsRoot, 'commons/flclash/FlclashDelay.ets'), 'utf8');
     has('latency.flclash-concurrency-32', flcDelay, 'FLCLASH_DELAY_CONCURRENCY: number = 32');
-    has('latency.flclash-timeout-5000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 5000');
+    has('latency.flclash-timeout-3000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 3000');
     has('latency.flclash-url-gstatic', flcDelay, 'https://www.gstatic.com/generate_204');
     has('latency.group-test-from-page', readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8'),
       'BackgroundLatencyService.runKernelGroupTest(');

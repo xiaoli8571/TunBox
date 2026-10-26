@@ -122,6 +122,7 @@ export struct FloatingBottomBar {
     .backdropBlur(24)
     .shadow({ radius: 24, color: TunBoxColors.dockShadow, offsetY: 8 })
     .border({ width: 1, color: TunBoxColors.dockEdge })
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .margin({ bottom: TunBoxGeometry.dockBottomMargin })
   }
 }

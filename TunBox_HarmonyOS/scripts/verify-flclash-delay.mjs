@@ -76,6 +76,11 @@ export const http = {
     throw new Error('@kit.NetworkKit 在 Node 侧不可用（必须注入 transport 桩）');
   }
 };
+export const socket = {
+  constructTCPSocketInstance: (): Object => {
+    throw new Error('@kit.NetworkKit TCPSocket 在 Node 侧不可用（必须注入 transport 桩）');
+  }
+};
 `);
 
 write('AppLogger.ts', `
@@ -91,10 +96,31 @@ export class AppLogger {
 const rawSrc = fs.readFileSync(SRC, 'utf8');
 const stagedSrc = rawSrc
   .replace(/from '@kit\.NetworkKit'/g, "from './fakeHttp.ts'")
+  // 2026-10-26：TCP 直连传输层引入 @kit.ArkTS（TextDecoder）与 @kit.BasicServicesKit
+  // （BusinessError 类型）；沙箱仍需零 @kit 依赖，各补一个最小桩。
+  .replace(/from '@kit\.ArkTS'/g, "from './fakeArkTs.ts'")
+  .replace(/from '@kit\.BasicServicesKit'/g, "from './fakeKit.ts'")
   // 2026-10-22：测速地址改为引用单一真源 LatencyTestUrl（ND06），
   // 沙箱是扁平目录，specifier 要一起改写并补最小桩。
   .replace(/from '\.\.\/latency\/LatencyTestUrl'/g, "from './LatencyTestUrl.ts'")
   .replace(/from '\.\.\/utils\/AppLogger'/g, "from './AppLogger.ts'");
+
+write('fakeArkTs.ts', `
+// TextDecoder 桩：桩传输层不用它（引擎测试一律注入 NodeTransport）。
+export const util = {
+  TextDecoder: {
+    create: (enc: string) => ({
+      decodeWithStream: (buf: Uint8Array): string => new TextDecoder(enc).decode(buf)
+    })
+  }
+};
+`);
+
+write('fakeKit.ts', `
+export class BusinessError extends Error {
+  code: number = 0;
+}
+`);
 
 write('LatencyTestUrl.ts', `
 export class LatencyTestUrl {
@@ -110,7 +136,8 @@ write('FlclashDelay.ts', stagedSrc);
 const M = await import(pathToFileURL(path.join(stage, 'FlclashDelay.ts')).href);
 const {
   DelayTarget, DelayResult, FlclashDelayRun, FlclashDelayPolicy,
-  FLCLASH_DELAY_CONCURRENCY, FLCLASH_DELAY_TIMEOUT_MS, FLCLASH_DELAY_GUARD_MS, FLCLASH_DELAY_URL,
+  FLCLASH_DELAY_CONCURRENCY, FLCLASH_DELAY_MAX_CONCURRENCY, flclashDelayConcurrency,
+  FLCLASH_DELAY_TIMEOUT_MS, FLCLASH_DELAY_GUARD_MS, FLCLASH_DELAY_URL,
   delayTestKey
 } = M;
 const { AppLogger } = await import(pathToFileURL(path.join(stage, 'AppLogger.ts')).href);
@@ -251,10 +278,11 @@ console.log(`桩内核已就绪：${BASE}`);
 console.log(`常量：concurrency=${FLCLASH_DELAY_CONCURRENCY} timeout=${FLCLASH_DELAY_TIMEOUT_MS} guard=${FLCLASH_DELAY_GUARD_MS} url=${FLCLASH_DELAY_URL}`);
 
 // ── C0 常量与非网络语义 ───────────────────────────────────────────────────
-check('C0 常量与 FlClash 对齐（32 / 5000 / 30000 / gstatic 204）', () => {
-  eq(FLCLASH_DELAY_CONCURRENCY, 32, 'concurrency');
-  eq(FLCLASH_DELAY_TIMEOUT_MS, 5000, 'timeout');
-  eq(FLCLASH_DELAY_GUARD_MS, 30000, 'guard');
+check('C0 常量口径（32 基线 / 64 上限 / 3000 / 10000 / gstatic 204）', () => {
+  eq(FLCLASH_DELAY_CONCURRENCY, 32, 'concurrency 基线');
+  eq(FLCLASH_DELAY_MAX_CONCURRENCY, 64, 'concurrency 上限');
+  eq(FLCLASH_DELAY_TIMEOUT_MS, 3000, 'timeout');
+  eq(FLCLASH_DELAY_GUARD_MS, 10000, 'guard');
   eq(FLCLASH_DELAY_URL, URL_DEFAULT, 'url');
   eq(delayTestKey(URL_DEFAULT, 'a'), `${URL_DEFAULT}\u0000a`, 'delayTestKey');
   const t = new DelayTarget('香港 01');
@@ -262,11 +290,27 @@ check('C0 常量与 FlClash 对齐（32 / 5000 / 30000 / gstatic 204）', () => 
   eq(t.testUrl, URL_DEFAULT, 'DelayTarget.testUrl 默认');
 });
 
-// ── C1 并发上限 32 ────────────────────────────────────────────────────────
-await checkAsync('C1 并发池不超过 32（40 个 300ms 任务，桩内核在途峰值）', async () => {
+// ── C0b 自适应并发曲线（2026-10-26 提速轮） ────────────────────────────────
+check('C0b 并发自适应：≤32 一波、40 → 40、80 → 64、600 → 64', () => {
+  eq(flclashDelayConcurrency(0), 1, '0 目标兜底 1');
+  eq(flclashDelayConcurrency(1), 1, '1');
+  eq(flclashDelayConcurrency(24), 24, '24 一波发完');
+  eq(flclashDelayConcurrency(32), 32, '32 = 基线');
+  eq(flclashDelayConcurrency(40), 40, '40 一波发完');
+  eq(flclashDelayConcurrency(64), 64, '64 = 上限');
+  eq(flclashDelayConcurrency(80), 64, '80 封顶 64');
+  eq(flclashDelayConcurrency(600), 64, '600 封顶 64');
+  eq(new FlclashDelayPolicy().widthFor(24), 24, '默认策略 24 目标用 24 路');
+  eq(new FlclashDelayPolicy().widthFor(80), 64, '默认策略 80 目标用 64 路');
+  eq(new FlclashDelayPolicy(32, 3000, 10000, false).widthFor(80), 32, '关闭自适应时严格 32');
+});
+
+// ── C1 固定并发上限（adaptive=false，显式策略） ───────────────────────────
+await checkAsync('C1 关闭自适应时并发不超过策略值（40 个 300ms 任务，固定 32 路）', async () => {
   resetStats();
   AppLogger.lines.length = 0;
-  const engine = new FlclashDelayRun(BASE, 'secret', new NodeTransport());
+  const engine = new FlclashDelayRun(BASE, 'secret', new NodeTransport(),
+    new FlclashDelayPolicy(32, 3000, 10000, false));
   const targets = Array.from({ length: 40 }, (_, i) => new DelayTarget(`slow${i}`));
   const t0 = Date.now();
   const { results, summaries } = await run(engine, targets);
@@ -282,6 +326,25 @@ await checkAsync('C1 并发池不超过 32（40 个 300ms 任务，桩内核在�
   eq(summaries[0].cancelled, 0, 'cancelled');
   eq(engine.isRunning(), false, '跑完应 isRunning=false');
   console.log(`     在途峰值=${stats.maxInflight} 耗时=${ms}ms 结果=${results.length}`);
+});
+
+// ── C1b 自适应用例：40 个任务一波发完（峰值 40 > 基线 32） ─────────────────
+await checkAsync('C1b 自适应策略下 40 个 300ms 任务一波完成（峰值 40）', async () => {
+  resetStats();
+  AppLogger.lines.length = 0;
+  const engine = new FlclashDelayRun(BASE, 'secret', new NodeTransport());
+  const targets = Array.from({ length: 40 }, (_, i) => new DelayTarget(`slow${i}`));
+  const t0 = Date.now();
+  const { results, summaries } = await run(engine, targets);
+  const ms = Date.now() - t0;
+  eq(results.length, 40, '结果条数');
+  eq(stats.maxInflight, 40, '自适应应把 40 个目标同时发出去');
+  ok(ms >= 220 && ms < 600, `40 任务 / 40 并发应一波 ≈ 300ms，实测 ${ms}ms`);
+  eq(summaries[0].concurrency, 40, 'summary.concurrency');
+  eq(summaries[0].peakInflight, 40, 'summary.peakInflight');
+  ok(summaries[0].wallMs >= 200, 'summary.wallMs 应被填充');
+  ok(summaries[0].p50ElapsedMs >= 200, `p50=${summaries[0].p50ElapsedMs}`);
+  console.log(`     在途峰值=${stats.maxInflight} 耗时=${ms}ms p50=${summaries[0].p50ElapsedMs}ms`);
 });
 
 // ── C2 -1 / -2 语义 ───────────────────────────────────────────────────────
@@ -322,7 +385,7 @@ await checkAsync('C6 URL 编码 + url/timeout 参数 + Bearer 头', async () => 
   eq(req.name, '香港 01', 'proxy 名需 decode 回原文');
   ok(req.proxyNameParam !== '香港 01', `proxy 名必须 encodeURIComponent，实际 ${req.proxyNameParam}`);
   eq(req.url, 'https://example.com/204', '测速 URL 可被调用方覆盖');
-  eq(req.timeout, '5000', 'timeout 参数');
+  eq(req.timeout, '3000', 'timeout 参数');
   eq(req.authorization, 'Bearer sekret', 'Authorization 头');
   // secret 为空 ⇒ 不带鉴权头
   resetStats();
@@ -336,7 +399,8 @@ await checkAsync('C6 URL 编码 + url/timeout 参数 + Bearer 头', async () => 
 await checkAsync('C3 取消：在途 abort、未开始跳过、一条结论都不写', async () => {
   resetStats();
   AppLogger.lines.length = 0;
-  const engine = new FlclashDelayRun(BASE, 'secret', new NodeTransport());
+  const engine = new FlclashDelayRun(BASE, 'secret', new NodeTransport(),
+    new FlclashDelayPolicy(32, 3000, 10000, false));
   const targets = Array.from({ length: 40 }, (_, i) => new DelayTarget(`hang${i}`));
   const results = [];
   let doneCount = 0;

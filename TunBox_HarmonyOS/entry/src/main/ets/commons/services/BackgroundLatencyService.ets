@@ -105,7 +105,9 @@ export class BackgroundLatencyService {
     }
     // FlClash 的组测速用的是**内核组里**的成员名（`group.all`），不是 App 侧列表：
     // 原文接管 proxy-groups 后，两边的名字只有一处真源 —— 内核。
-    const model = await CoreCatalogService.refresh(api, true);
+    // 走快照 TTL：组测速前强制重拉 /proxies 对 600 节点是多花一次 80KB 网络+解析，
+    // 而节点集在用户点测速的这一两秒内不会变（订阅刷新走自己的重建路径）。
+    const model = await CoreCatalogService.refresh(api, false);
     const names: string[] = [];
     if (model !== null) {
       for (const node of CoreCatalogService.flattenNodes('rule')) {

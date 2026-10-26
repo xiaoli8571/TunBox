@@ -24,6 +24,9 @@ const http = { RequestMethod:{GET:'GET',PUT:'PUT'}, response:null, createHttp(){
 }};
 const sandbox = vm.createContext({setTimeout:(fn,ms)=>setTimeout(fn,ms===30000?25:ms),clearTimeout,
   Date,Map,Set,Promise,JSON,Math,console,http,AppLogger:logger,
+  // FlclashLatencyService 末尾会把 recycleProbe 注册进这个静态表（模块级副作用）；
+  // vm 沙箱剥掉了 import，必须自带桩，否则 ReferenceError（存量红，2026-10-26 补）。
+  ConnectionOrchestrator:{testCoreBusyProbes:[],instance:()=>({})},
   LatencyTestUrl:{DEFAULT_URL:'https://www.gstatic.com/generate_204'}});
 function load(file, exports) {
   const code=fs.readFileSync(path.join(sources,file),'utf8').replace(/^import\b[\s\S]*?;\r?\n/gm,'').replace(/^export /gm,'');
@@ -173,7 +176,7 @@ await test('the actual subscription page never reports completion for a skipped 
   const Page=vm.runInContext(stripTypeScriptTypes(`(class {${method}})`,{mode:'transform'}),pageContext);
   const instance=new Page();Object.assign(instance,{speedTestingIds:[],showToast:t=>messages.push(t),
     async activateProfile(){},refreshCoreNodes(){}});
-  await instance.speedTestSub('s');assert.ok(messages.some(t=>t.includes('未开始测速')));
+  await instance.speedTestSub('s');assert.ok(messages.some(t=>t.includes('测速通道未就绪')),messages.join('|'));
   assert.ok(!messages.some(t=>t.includes('测速完成')));
 });
 await test('mixed node failures complete without classification or timeout-count prompts',async()=>{

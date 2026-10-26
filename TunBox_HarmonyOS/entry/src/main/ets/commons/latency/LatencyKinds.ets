@@ -248,7 +248,7 @@ export class LatencyTimeout {
    * 单节点探测超时（毫秒）—— 2026-10-20 晚用户要求由 5000 改为 **3000**（等 5 秒太久）。
    *
    * 沿革：5000 → 3000（嫌等太久）→ 1000（2026-10-18）→ 2500（同日回退）→ 5000（2026-10-19）
-   *      → **3000**（2026-10-20 用户拍板）。
+   *      → **3000**（2026-10-26 用户再次拍板，嫌 5 秒太久）。
    * 1000ms 已被真机证伪：飞鸟云 35 个 hysteria2（QUIC/UDP）节点首握需 1~2 RTT，
    * 同一批 **3s** 能测出 143/558/560ms，1s 时 measured=0/timeout=31（全部误杀）
    * —— 3000 是「已验证能测出这批节点」的取值，不是拍脑袋。
@@ -256,7 +256,7 @@ export class LatencyTimeout {
    * TCP/TLS 探测预算，3s）是**两个不同场景的尺子**，不要求同值；旧注释「必须同值
    * （闸门断言）」不成立——不存在该闸门，引擎批实传本值、离线探测用 3000。
    */
-  static readonly DEFAULT_TIMEOUT_MS: number = 5000;
+  static readonly DEFAULT_TIMEOUT_MS: number = 3000;
   /** mihomo 的 timeout 用 16 位整数解析，> 32767 直接 400。 */
   static readonly MAX_TIMEOUT_MS: number = 30000;
 }

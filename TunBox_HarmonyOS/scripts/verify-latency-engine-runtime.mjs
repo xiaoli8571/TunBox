@@ -211,6 +211,8 @@ export class ConnectionOrchestrator {
   static recycles = [];
   static recoverCalls = 0;
   static recoverResult = true;
+  // LatencyEngine 模块级会把自己注册进这个探针表（recycleProbe）
+  static testCoreBusyProbes = [];
   /** 可配置的 DNS 快照：{ pins: {...}, attempted: [...] } */
   static snapshot = null;
   /** hostSnapshot() 被调用的次数（引擎应当**每批一次**） */

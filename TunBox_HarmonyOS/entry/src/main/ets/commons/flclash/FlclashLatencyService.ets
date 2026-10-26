@@ -97,7 +97,8 @@ export class FlclashLatencySession {
         this.clearOwnTesting();
         this.resolveDone(this.progress);
         AppLogger.info(TAG, `delay batch done: total=${summary.total} measured=${summary.measured} `
-          + `timeout=${summary.timedOut} failed=${summary.failed} cancelled=${summary.cancelled}`);
+          + `timeout=${summary.timedOut} failed=${summary.failed} cancelled=${summary.cancelled} `
+          + `wall=${summary.wallMs}ms conc=${summary.concurrency} peak=${summary.peakInflight}`);
       });
   }
 

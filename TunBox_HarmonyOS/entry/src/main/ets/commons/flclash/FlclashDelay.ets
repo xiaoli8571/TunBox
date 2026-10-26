@@ -33,18 +33,68 @@
  * 测试：scripts/verify-flclash-delay.mjs（网络层通过 DelayHttpTransport 注入桩，
  *       默认实现 ArkDelayHttpTransport 用 @kit.NetworkKit）。
  */
-import { http } from '@kit.NetworkKit';
+import { http, socket } from '@kit.NetworkKit';
+import { util } from '@kit.ArkTS';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { LatencyTestUrl } from '../latency/LatencyTestUrl';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'FlclashDelay';
 
-/** 并发池大小（FlClash maxConcurrentDelayTests） */
+/** 并发池基线（FlClash maxConcurrentDelayTests） */
 export const FLCLASH_DELAY_CONCURRENCY: number = 32;
-/** 传给**内核**的单节点测速超时（mihomo defaultDelayTestTimeout / ?timeout= 参数） */
-export const FLCLASH_DELAY_TIMEOUT_MS: number = 5000;
-/** 客户端守护：一次 REST 往返最多等这么久，超时＝不作结论（FlClash delayTestGuardDuration） */
-export const FLCLASH_DELAY_GUARD_MS: number = 30000;
+/**
+ * 并发池上限。
+ *
+ * 【为什么允许超过 32】真机实测内核 `hub/route/proxies.go:getProxyDelay` **没有任何
+ * 并发信号量**（每个请求独立 goroutine + 自己的 ctx 超时），客户端并发数就是真实
+ * 同时在拨测的节点数；而一批测速的总时长 ≈ ceil(N / 并发) × 单波最慢节点耗时。
+ * 2026-10-26 真机基线（80 节点 / 32 并发）批次 30~32s，24 节点一波 7.3s ⇒ 时长被
+ * 波数主导。把「≤64 个目标一波发完」后 80 节点降到 2 波。
+ *
+ * 为什么不无限：一次 600 个节点同时拨 gstatic 会同时打开 600 条代理连接，
+ * 弱 Wi-Fi 下互相抢带宽反而制造假超时（技能里 32 路在途压垮 /version 探针的现场）。
+ * 2026-10-26 用户要求「并发再稍微提高一点」⇒ 32 → 64（配合 TCP 直连传输层，
+ * 并发才真的落到内核；在 @ohos.net.http 上试过 80/96，同 host 连接池直接噎住，
+ * p50 反而涨到 10s、46 个节点无结论）。
+ */
+export const FLCLASH_DELAY_MAX_CONCURRENCY: number = 64;
+/** 是否用 TCP 直连传输层（false = 回退 @ohos.net.http，见 ArkTcpDelayHttpTransport 注释） */
+export const FLCLASH_DELAY_USE_TCP_TRANSPORT: boolean = true;
+
+/**
+ * 一批目标应该用多少路并发。
+ *
+ * 语义：≤ 基线（32）时按目标数一波发完；超过基线后一路抬到「目标数」，
+ * 但不超过上限（64）。即 24 → 24（一波）、40 → 40（一波）、80 → 64（2 波）、
+ * 600 → 64（10 波，原来 32 并发时是 19 波）。
+ */
+export function flclashDelayConcurrency(total: number): number {
+  if (total <= 0) {
+    return 1;
+  }
+  if (total <= FLCLASH_DELAY_CONCURRENCY) {
+    return total;
+  }
+  return Math.min(FLCLASH_DELAY_MAX_CONCURRENCY, total);
+}
+/**
+ * 传给**内核**的单节点测速超时（mihomo `?timeout=` 参数）。
+ *
+ * 2026-10-26 用户拍板 3000ms（「等 5 秒太久」），与 `LatencyTimeout.DEFAULT_TIMEOUT_MS`
+ * 同值（闸门 verify-flclash-delay 的 C0 断言两处相等，不要只改一边）。
+ * 历史：5000（对齐三家 5s/8s/10s）→ **3000**（用户再次要求缩短）。
+ */
+export const FLCLASH_DELAY_TIMEOUT_MS: number = 3000;
+/**
+ * 客户端守护：一次 REST 往返最多等这么久，到期＝不作结论。
+ *
+ * FlClash 的 30s 包的是 core IPC；TunBox 走本地 REST，30s 的真实含义是
+ * 「ArkTS http 栈卡死的请求会把整批墙钟钉在 30s」——2026-10-26 真机实测 80 节点
+ * 批次 wall=30.1s、p90=27.7s、cancelled=2，这 2 条就是被 http 层挂死后由守护收尾。
+ * 收紧到「内核 3s + 7s 余量」：正常请求 3s 内必回，卡死的最多拖 10s。
+ */
+export const FLCLASH_DELAY_GUARD_MS: number = 10000;
 /** 默认测速 URL（mihomo defaultTestURL，调用方可按节点/组覆盖） */
 // 测速地址的真源在 commons/latency/LatencyTestUrl（ND06：默认地址常量只允许一处）。
 // 这里只是给 FlClash 复刻层一个本地命名，**不得**再写第二份字面量。
@@ -107,7 +157,9 @@ export class FlclashDelaySummary {
   timedOut: number = 0;
   /** 拿到 -2 的任务数 */
   failed: number = 0;
-  /** 未产出结论的任务数：取消时在途被 abort、取消后未开始、30s 守护到期、传输层异常 */
+  /**
+   * 未产出结论的任务数：取消时在途被 abort、取消后未开始、30s 守护到期、传输层异常
+   */
   cancelled: number = 0;
   /**
    * 内核不可用判定。REST 通道无法把「内核没起来」与「单个节点失败」区分开
@@ -115,6 +167,19 @@ export class FlclashDelaySummary {
    * 规格 §4.4 又明确要求去掉 core_not_ready 连击作废 ⇒ 恒为 false，仅为契约占位。
    */
   coreUnavailable: boolean = false;
+
+  // ── 性能画像（2026-10-26 提速轮加的现场指标，只写日志，不参与判定） ──
+  /** 本批实际使用的并发路数 */
+  concurrency: number = 0;
+  /** 在途请求峰值（验证「客户端真并发」是否等于配置值） */
+  peakInflight: number = 0;
+  /** 从领到任务到请求真正发出的平均等待（ms）——大批次排队瓶颈看这个 */
+  avgQueueWaitMs: number = 0;
+  /** 客户端侧单请求耗时分位（ms） */
+  p50ElapsedMs: number = 0;
+  p90ElapsedMs: number = 0;
+  /** 整批墙钟耗时（ms） */
+  wallMs: number = 0;
 }
 
 /** 结果回调：每拿到一条真结论调用一次 */
@@ -194,18 +259,248 @@ export class ArkDelayHttpTransport implements DelayHttpTransport {
   }
 }
 
+/**
+ * HTTP 报文行分隔符（CR + LF）。
+ *
+ * 用 `String.fromCharCode` 构造而不是写转义字面量：本仓库曾经因为
+ * 「python heredoc / 工具层吃掉一层反斜杠」把 `\r\n` 写成真实换行，
+ * 源码被切成多行、编译直接报 `Expected ',', got 'string literal'`。
+ * 这样写既不会坏，也一眼看得出是 CRLF。
+ */
+const HTTP_CRLF: string = String.fromCharCode(13, 10);
+
+/**
+ * 本地核心 REST 的 URL 拆解（手写：ArkTS 没有 WHATWG URL）。
+ * 只服务 `http://host:port/path?...` 这种形态，够用且零依赖。
+ */
+class LocalHttpTarget {
+  host: string = '127.0.0.1';
+  port: number = 9090;
+  /** 含 query 的 path（已编码，直接进请求行） */
+  path: string = '/';
+  /** Host 头里的 authority（host:port） */
+  authority: string = '127.0.0.1:9090';
+}
+
+function parseLocalHttpUrl(url: string): LocalHttpTarget {
+  const out = new LocalHttpTarget();
+  let rest: string = url;
+  if (rest.startsWith('http://')) {
+    rest = rest.substring('http://'.length);
+  } else if (rest.startsWith('https://')) {
+    rest = rest.substring('https://'.length);
+  }
+  const slash: number = rest.indexOf('/');
+  let authority: string = rest;
+  if (slash >= 0) {
+    authority = rest.substring(0, slash);
+    rest = rest.substring(slash);
+  } else {
+    rest = '/';
+  }
+  const colon: number = authority.lastIndexOf(':');
+  if (colon > 0) {
+    out.host = authority.substring(0, colon);
+    out.port = parseInt(authority.substring(colon + 1), 10);
+    if (!(out.port > 0)) {
+      out.port = 9090;
+    }
+  } else {
+    out.host = authority.length > 0 ? authority : '127.0.0.1';
+  }
+  out.authority = authority.length > 0 ? authority : '127.0.0.1:9090';
+  out.path = rest.length > 0 ? rest : '/';
+  return out;
+}
+
+/**
+ * TCP 直连传输层（HTTP/1.1 over `@kit.NetworkKit` TCPSocket）。
+ *
+ * 【为什么需要它 —— 2026-10-26 真机取证】
+ * `@ohos.net.http` 对**同一个 host** 的并发连接只有个位数容量：80 个并发 delay
+ * 请求时 hilog 同时出现 285 次 `code=2300028 Operation timeout`，
+ * 批次画像 `p50=10000ms p90=10001ms`（= 全部排在 http 栈里等守护）、
+ * `measured=23 cancelled=46` —— 并发越高反而越测不出来。
+ * 客户端并发要真正落到内核，必须自己开连接：每个 delay 请求一条 TCP 到本地内核。
+ *
+ * 语义与 ArkDelayHttpTransport 完全一致：拿到 HTTP 响应才 resolve（非 2xx 也 resolve），
+ * 连接失败/超时/abort ⇒ reject。请求头带 `Connection: close`，靠内核关连接收尾。
+ */
+export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
+  send(url: string, headers: Record<string, string>, timeoutMs: number): DelayRequestHandle {
+    const target: LocalHttpTarget = parseLocalHttpUrl(url);
+    const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
+    const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
+    let settled: boolean = false;
+    let text: string = '';
+    let timer: number = -1;
+    let resolveFn: (value: DelayHttpReply) => void = (): void => {};
+    let rejectFn: (reason: Object) => void = (): void => {};
+
+    const cleanup = (): void => {
+      if (timer >= 0) {
+        clearTimeout(timer);
+        timer = -1;
+      }
+      try {
+        tcp.off('message');
+        tcp.off('close');
+        tcp.off('error');
+      } catch (e) {
+        // 已注销 / 未注册：忽略
+      }
+    };
+    const closeQuietly = (): void => {
+      try {
+        tcp.close();
+      } catch (e) {
+        // 已关闭：忽略
+      }
+    };
+    const fail = (err: Object): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      closeQuietly();
+      rejectFn(err);
+    };
+    const succeed = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      closeQuietly();
+      resolveFn(ArkTcpDelayHttpTransport.parseReply(text));
+    };
+
+    const promise: Promise<DelayHttpReply> = new Promise<DelayHttpReply>(
+      (resolve: (value: DelayHttpReply) => void, reject: (reason: Object) => void) => {
+        resolveFn = resolve;
+        rejectFn = reject;
+      });
+
+    tcp.on('message', (info: socket.SocketMessageInfo): void => {
+      try {
+        // 不传 DecodeWithStreamOptions（ArkTS 禁结构体字面量）；mihomo /delay 的
+        // 响应头与 JSON 体都是 ASCII（{"delay":n} / {"message":"Timeout"}），
+        // 分片独立解码不会出现半个多字节字符。
+        text += decoder.decodeWithStream(new Uint8Array(info.message));
+      } catch (e) {
+        fail(e);
+        return;
+      }
+      // 提前收尾：Content-Length 已知且 body 已经收全就不等 close（省一次事件循环）
+      const headEnd: number = text.indexOf(HTTP_CRLF + HTTP_CRLF);
+      if (headEnd >= 0) {
+        const head: string = text.substring(0, headEnd);
+        // 不显式标注 RegExpMatchArray（ArkTS 禁结构类型，推断即可）
+        const m = /content-length:\s*(\d+)/i.exec(head);
+        if (m !== null) {
+          const need: number = parseInt(m[1], 10);
+          const have: number = text.length - (headEnd + 4);
+          if (need >= 0 && have >= need) {
+            succeed();
+          }
+        }
+      }
+    });
+    tcp.on('close', (): void => {
+      succeed();
+    });
+    tcp.on('error', (err: BusinessError): void => {
+      fail(err);
+    });
+
+    timer = setTimeout((): void => {
+      fail(new Error('tcp transport timeout'));
+    }, timeoutMs);
+
+    const requestLines: string[] = [];
+    requestLines.push(`GET ${target.path} HTTP/1.1`);
+    requestLines.push(`Host: ${target.authority}`);
+    requestLines.push('Accept: application/json');
+    const auth: string | undefined = headers['Authorization'];
+    if (auth !== undefined) {
+      requestLines.push(`Authorization: ${auth}`);
+    }
+    requestLines.push('Connection: close');
+    requestLines.push('');
+    requestLines.push('');
+    const payload: string = requestLines.join(HTTP_CRLF);
+
+    tcp.connect({
+      address: { address: target.host, port: target.port, family: 1 },
+      timeout: timeoutMs
+    }).then((): Promise<void> => {
+      if (settled) {
+        return Promise.resolve();
+      }
+      return tcp.send({ data: payload });
+    }).catch((e: Object): void => {
+      fail(e);
+    });
+
+    return new DelayRequestHandle(promise, (): void => {
+      fail(new Error('aborted'));
+    });
+  }
+
+  /** `HTTP/1.1 200 OK
+Header: v
+
+body` → 状态码 + body */
+  static parseReply(raw: string): DelayHttpReply {
+    const headEnd: number = raw.indexOf(HTTP_CRLF + HTTP_CRLF);
+    if (headEnd < 0) {
+      return new DelayHttpReply(0, '');
+    }
+    const head: string = raw.substring(0, headEnd);
+    const body: string = raw.substring(headEnd + 4);
+    const firstLineEnd: number = head.indexOf(HTTP_CRLF);
+    const statusLine: string = firstLineEnd >= 0 ? head.substring(0, firstLineEnd) : head;
+    const parts: string[] = statusLine.split(' ');
+    const code: number = parts.length >= 2 ? parseInt(parts[1], 10) : 0;
+    if (!(code > 0)) {
+      return new DelayHttpReply(0, '');
+    }
+    // chunked 编解码不在此实现：mihomo 对 /delay 一律 Content-Length 明文 JSON
+    return new DelayHttpReply(code, body);
+  }
+}
+
 /** 单批运行的策略（默认值 = FlClash 常量；缩小时仅供验证脚本压缩时间） */
 export class FlclashDelayPolicy {
-  concurrency: number = FLCLASH_DELAY_CONCURRENCY;
+  /** 并发**上限**（默认 64；显式构造时按传入值封顶） */
+  concurrency: number = FLCLASH_DELAY_MAX_CONCURRENCY;
   timeoutMs: number = FLCLASH_DELAY_TIMEOUT_MS;
   guardMs: number = FLCLASH_DELAY_GUARD_MS;
+  /**
+   * 是否按目标数自适应并发（默认 true）。
+   *
+   * 关闭时行为与旧版完全一致（严格 policy.concurrency 路），验证脚本用这个
+   * 保留「固定 N 路」的行为用例。
+   */
+  adaptive: boolean = true;
 
-  constructor(concurrency: number = FLCLASH_DELAY_CONCURRENCY,
+  constructor(concurrency: number = FLCLASH_DELAY_MAX_CONCURRENCY,
     timeoutMs: number = FLCLASH_DELAY_TIMEOUT_MS,
-    guardMs: number = FLCLASH_DELAY_GUARD_MS) {
-    this.concurrency = concurrency > 0 ? concurrency : FLCLASH_DELAY_CONCURRENCY;
+    guardMs: number = FLCLASH_DELAY_GUARD_MS,
+    adaptive: boolean = true) {
+    this.concurrency = concurrency > 0 ? concurrency : FLCLASH_DELAY_MAX_CONCURRENCY;
     this.timeoutMs = timeoutMs > 0 ? timeoutMs : FLCLASH_DELAY_TIMEOUT_MS;
     this.guardMs = guardMs > 0 ? guardMs : FLCLASH_DELAY_GUARD_MS;
+    this.adaptive = adaptive;
+  }
+
+  /** 本批实际使用的并发路数 */
+  widthFor(total: number): number {
+    if (!this.adaptive) {
+      return Math.max(1, Math.min(this.concurrency, total));
+    }
+    return Math.max(1, Math.min(this.concurrency, flclashDelayConcurrency(total)));
   }
 }
 
@@ -224,6 +519,17 @@ class DelayRunState {
   inflight: Map<string, DelayRequestHandle> = new Map<string, DelayRequestHandle>();
   /** key → 强制收尾（保证 abort 后立刻解开 worker，不依赖 promise 必然 reject） */
   pending: Map<string, () => void> = new Map<string, () => void>();
+  // ── 性能画像（2026-10-26） ──
+  /** 批次开始时刻（墙钟） */
+  beganAt: number = Date.now();
+  /** 在途峰值 */
+  peakInflight: number = 0;
+  /** 领任务 → 请求发出的累计等待（ms） */
+  queueWaitSumMs: number = 0;
+  queueWaitCount: number = 0;
+  /** 单请求耗时样本（最多 512 条，够算 p50/p90，不随 600 节点线性涨内存） */
+  elapsedSamples: number[] = [];
+  elapsedDropped: number = 0;
 }
 
 /**
@@ -245,7 +551,8 @@ export class FlclashDelayRun {
    * @param policy  并发/超时/守护，默认 FlClash 常量
    */
   constructor(baseUrl: string, secret: string,
-    transport: DelayHttpTransport = new ArkDelayHttpTransport(),
+    transport: DelayHttpTransport = FLCLASH_DELAY_USE_TCP_TRANSPORT
+      ? new ArkTcpDelayHttpTransport() : new ArkDelayHttpTransport(),
     policy: FlclashDelayPolicy = new FlclashDelayPolicy()) {
     this.baseUrl = baseUrl;
     this.secret = secret;
@@ -320,7 +627,10 @@ export class FlclashDelayRun {
     await Promise.resolve();
     try {
       const workers: Promise<void>[] = [];
-      const width: number = Math.min(this.policy.concurrency, queue.length);
+      const width: number = this.policy.widthFor(queue.length);
+      if (width > 1 || queue.length > 1) {
+        AppLogger.info(TAG, `batch dispatchable: nodes=${queue.length} concurrency=${width}`);
+      }
       for (let i = 0; i < width; i++) {
         workers.push(this.worker(queue, state, onResult));
       }
@@ -357,16 +667,18 @@ export class FlclashDelayRun {
         return;
       }
       state.nextIndex = index + 1;
-      await this.runOne(queue[index], state, onResult);
+      await this.runOne(queue[index], state, onResult, Date.now());
     }
   }
 
   /**
    * 单任务：发请求 → 起 30s 守护 → 等响应。
    * 守护计时起点是「请求真正发出」（排队时间不计入）。
+   *
+   * @param queuedAt 领到任务墙钟时刻；与发出时刻之差就是排队等待（性能画像用）
    */
   private runOne(target: DelayTarget, state: DelayRunState,
-    onResult: DelayResultSink): Promise<void> {
+    onResult: DelayResultSink, queuedAt: number = 0): Promise<void> {
     if (state.cancelled) {
       return Promise.resolve();
     }
@@ -383,7 +695,14 @@ export class FlclashDelayRun {
     }
     state.started += 1;
     const startedAt: number = Date.now();
+    if (queuedAt > 0) {
+      state.queueWaitSumMs += startedAt - queuedAt;
+      state.queueWaitCount += 1;
+    }
     state.inflight.set(target.key, handle);
+    if (state.inflight.size > state.peakInflight) {
+      state.peakInflight = state.inflight.size;
+    }
     return new Promise<void>((resolve: () => void) => {
       let settled: boolean = false;
       let timer: number = -1;
@@ -398,6 +717,13 @@ export class FlclashDelayRun {
         }
         state.inflight.delete(target.key);
         state.pending.delete(target.key);
+        // 性能画像：单请求墙钟（含排队后发出到收尾），最多留 512 个样本
+        const elapsed: number = Date.now() - startedAt;
+        if (state.elapsedSamples.length < 512) {
+          state.elapsedSamples.push(elapsed);
+        } else {
+          state.elapsedDropped += 1;
+        }
         if (result !== null && !state.cancelled) {
           if (result.value > 0) {
             state.measured += 1;
@@ -510,6 +836,34 @@ export class FlclashDelayRun {
     summary.timedOut = state.timedOut;
     summary.failed = state.failed;
     summary.cancelled = state.cancelledCount;
+    // ── 性能画像 ──
+    summary.concurrency = this.policy.widthFor(total);
+    summary.peakInflight = state.peakInflight;
+    summary.avgQueueWaitMs = state.queueWaitCount > 0
+      ? Math.round(state.queueWaitSumMs / state.queueWaitCount) : 0;
+    summary.wallMs = Date.now() - state.beganAt;
+    const sorted: number[] = state.elapsedSamples.slice();
+    sorted.sort((a: number, b: number): number => a - b);
+    summary.p50ElapsedMs = FlclashDelayRun.percentile(sorted, 0.5);
+    summary.p90ElapsedMs = FlclashDelayRun.percentile(sorted, 0.9);
+    AppLogger.info(TAG, `batch profile: concurrency=${summary.concurrency} peakInflight=${summary.peakInflight} `
+      + `avgQueueWait=${summary.avgQueueWaitMs}ms p50=${summary.p50ElapsedMs}ms `
+      + `p90=${summary.p90ElapsedMs}ms wall=${summary.wallMs}ms samples=${sorted.length}`);
     return summary;
+  }
+
+  /** 顺序数组的分位值（q∈[0,1]），空数组返回 0 */
+  static percentile(sorted: number[], q: number): number {
+    if (sorted.length === 0) {
+      return 0;
+    }
+    const idx: number = Math.floor(q * (sorted.length - 1));
+    if (idx <= 0) {
+      return sorted[0];
+    }
+    if (idx >= sorted.length) {
+      return sorted[sorted.length - 1];
+    }
+    return sorted[idx];
   }
 }

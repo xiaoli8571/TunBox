@@ -1076,6 +1076,9 @@ export struct SubscriptionPage {
     }
     this.groupTesting = true;
     try {
+      // 通道冷启动要 3~5s（配置生成 + 重启扩展 + 预热），先给用户即时反馈，
+      // 不能点了没反应（2026-10-26：与订阅行内测速的两段式提示同口径）。
+      this.showToast('准备测速通道…');
       const api = await ConnectionOrchestrator.instance().ensureLatencyApi(true);
       if (api === null) {
         this.showToast('内核不可用，已跳过（未写入超时）');
@@ -1855,7 +1858,7 @@ export struct SubscriptionPage {
                           GridCol() {
                             this.nodeCard(node)
                           }
-                        }, (node: ProxyNode) => `${node.id}|${node.id === this.activeNodeId ? 1 : 0}|${this.latencyTick}`)
+                        }, (node: ProxyNode) => `${node.id}|${node.id === this.activeNodeId ? 1 : 0}`)
                       }
                       .width('100%')
                     }

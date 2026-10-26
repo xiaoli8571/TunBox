@@ -172,9 +172,11 @@ ok('失败结果写 LatencyProbeKind 真分类（timeout / switch_failed / netwo
   && /import \{[^}]*LatencyProbeKind[^}]*\} from/.test(flcServiceSrc));
 ok('不再写表外失败分类字面量（: \'failed\' 会让 describe() 落到 --）',
   !/result\.value === FLCLASH_DELAY_TIMED_OUT \? 'timeout' : 'failed'/.test(flcServiceSrc));
-ok('并发/超时/测速地址对齐 FlClash（32 / 5000ms / gstatic https）',
+// 2026-10-26（用户拍板）：超时 5000 → 3000（「等 5 秒太久」）；并发基线仍 32，
+// 上限由 FLCLASH_DELAY_MAX_CONCURRENCY 管（64，配 TCP 直连传输层才真的并发）。
+ok('并发基线 32 / 单节点超时 3000ms / 测速地址 gstatic https',
   /FLCLASH_DELAY_CONCURRENCY: number = 32/.test(flcSrc)
-  && /FLCLASH_DELAY_TIMEOUT_MS: number = 5000/.test(flcSrc)
+  && /FLCLASH_DELAY_TIMEOUT_MS: number = 3000/.test(flcSrc)
   && /https:\/\/www\.gstatic\.com\/generate_204/.test(flcSrc));
 ok('大订阅与小订阅同一条路径（不存在「≥120 节点改内核组测」的分叉）',
   !/KERNEL_GROUP_TEST_MIN_NODES/.test(bgSrc));
@@ -203,8 +205,9 @@ const kindsSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
 // 2026-10-21（用户对标三家）：超时由 3s 回到 **5s**（FlClash 8s / Verge 10s / CMFA 5s），
 // 在途并发由 50 收敛为 8 = OHOS http 栈对同一 host 的连接池容量（排队改在应用层闸门里发生）。
-ok('单节点测速超时为 5000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS，用户拍板对齐三家）',
-  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*5000/.test(kindsSrc));
+// 2026-10-26（用户第二次要求缩短）：5000 → 3000，与 FLCLASH_DELAY_TIMEOUT_MS 同值。
+ok('单节点测速超时为 3000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
+  /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*3000/.test(kindsSrc));
 ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',
   /return\s+LatencyTimeout\.DEFAULT_TIMEOUT_MS;/.test(stateSrc)
   && !/DEFAULT_TIMEOUT_MS:\s*number\s*=\s*\d+/.test(stateSrc));

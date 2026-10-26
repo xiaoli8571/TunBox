@@ -13,6 +13,7 @@ import { UiGuardian } from '../commons/services/UiGuardian';
 import { BackgroundTaskWatch } from '../commons/services/BackgroundTaskWatch';
 import { SubscriptionUpdateScheduler } from '../commons/services/SubscriptionUpdateScheduler';
 import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
+import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
 
@@ -24,6 +25,8 @@ export default class EntryAbility extends UIAbility {
   private windowReady: boolean = false;
   /** 自愈编排单航班：冷启动与回前台都走它，避免重复拉起隧道 */
   private healTask: Promise<string> | null = null;
+  /** 冷启动空闲预热测速通道的定时器（-1 = 未挂） */
+  private latencyPrewarmTimer: number = -1;
 
   /**
    * 按屏幕对角线英寸设置转场时长的规范下限（华为应用市场上架要求）：
@@ -103,6 +106,33 @@ export default class EntryAbility extends UIAbility {
     SubscriptionUpdateScheduler.instance().onAppStart(this.context);
     // 冷启动仅接管已存在的真实会话；证据不足时保留意图，不因打开应用拆建隧道。
     this.scheduleSelfHeal('cold-start');
+    this.scheduleLatencyPrewarm();
+  }
+
+  /**
+   * 冷启动后**空闲预热测速通道**（2026-10-26，用户要求「点了测速立刻开测」）。
+   *
+   * 未连接时测速走 headless 测速内核，冷启动这套流程（读 1.1MB profile →
+   * 合并生成配置 → 停/启扩展 → 就绪轮询 → 预热窗口）在真机上要 2~5s，
+   * 用户看到的就是「点测速 → 准备测速通道… → 等好几秒」。三家客户端的内核本就常驻，
+   * 不存在这个等待。
+   *
+   * 这里把这段准备挪到**用户还没点测速**的时候：
+   *  - 延迟 4s：不与首帧/首页 bootstrap 抢主线程（启动速度是单独优化过的指标）；
+   *  - 只预热、不探测：`prewarmChannel` 不写任何延迟结论、不动排序；
+   *  - 已连接/连接中：`ensureTestCore` 的安全门禁直接跳过，不会碰用户的隧道；
+   *  - 失败静默：预热失败不影响任何功能，用户真点测速时照常按需启动。
+   */
+  private scheduleLatencyPrewarm(): void {
+    if (this.latencyPrewarmTimer >= 0) {
+      return;
+    }
+    this.latencyPrewarmTimer = setTimeout((): void => {
+      this.latencyPrewarmTimer = -1;
+      BackgroundLatencyService.prewarmChannel(this.context).catch((e: Object): void => {
+        AppLogger.warn(TAG, `latency prewarm failed: ${AppLogger.errText(e)}`);
+      });
+    }, 4000);
   }
 
   /** 应用已在前台/后台存活时, 快捷方式与卡片点击走这里 */

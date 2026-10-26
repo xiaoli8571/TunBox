@@ -255,13 +255,22 @@ const TEST_CORE_NEGATIVE_COOLDOWN_MS = 45000;
  * 现在内核就绪时登记「预计变热时刻」（testCoreWarmAt），调用方只等到那一刻：
  * 复用路径窗口早已过去 → 一句都不等 → 秒开。
  */
-const TEST_CORE_WARMUP_MS = 1500;
+const TEST_CORE_WARMUP_MS = 1000;
 /**
  * 预热/测速内核的空闲回收窗口（毫秒）。
- * 与 LatencyEngine.LATENCY_CORE_IDLE_MS 同值；这里独立定义是为了避免
- * ConnectionOrchestrator ←→ LatencyEngine 的循环 import。
+ *
+ * 【2026-10-26 由 90s 放宽到 10 分钟】用户反馈「点了测速，要先『准备测速通道』
+ * 好几秒才开始，别的客户端点下去就测」。真机时间线（冷通道）：点击 →
+ * 读 profile 1.1MB + 合并生成配置 ~1.5s → 停旧扩展 600ms → 启扩展 ~165ms →
+ * 就绪轮询 ~200ms → 预热窗口 1.0s ⇒ 约 3.5~5s 才有第一个探测。
+ * 90s 的回收窗口意味着用户看完结果、翻两下页面再点一次，就要把这 5s 重付一遍。
+ *
+ * 代价：测速核（headless mihomo）在空闲期常驻（约 30~60MB 内存 + 一个回环端口）。
+ * 这是「点下去立刻开测」必须付的成本 —— 三家桌面端内核本身就常驻，不存在
+ * 「每次测速都冷启动一个内核」的行为。空闲回收仍在（不是永不回收），
+ * 只是窗口改成与用户操作节奏同量级。
  */
-const TEST_CORE_IDLE_RECYCLE_MS = 90000;
+const TEST_CORE_IDLE_RECYCLE_MS = 600000;
 
 /** vpn_start_params.json 的落盘结构（键名与扩展侧 readStartParamsFallback 解析一致） */
 class StartParamsRecord {
