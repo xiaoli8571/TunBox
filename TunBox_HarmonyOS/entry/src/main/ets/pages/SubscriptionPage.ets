@@ -20,8 +20,7 @@ import { NodeUsability } from '../commons/subscription/NodeUsability';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
-import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
+import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { ClashApiService } from '../commons/services/ClashApiService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ProfileStore } from '../commons/flclash/ProfileStore';
@@ -338,8 +337,11 @@ export struct SubscriptionPage {
   private activatedId: string = '';
   private activatedAt: number = 0;
   @State activeNodeId: string = '';
-  /** 内核真相的当前出口节点名（连接中由 resolveLiveNodeName 解析；''=不可得/未连接） */
-  @State liveNodeName: string = '';
+  /**
+   * 「当前连接节点」显示值 —— 只用 orchestrator.displayNodeName 解析，与主页启动
+   * 按钮同源同结果（2026-10-25 用户要求）。不要在这里另写取值逻辑。
+   */
+  @State currentNodeName: string = '';
   /** 自动选点模式（manual 手动固定 / auto 内核 smart 优选），与设置页同一份持久化 */
   @State autoSelectMode: string = AutoSelectModes.MANUAL;
   /**
@@ -490,7 +492,7 @@ export struct SubscriptionPage {
     this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
     this.nodeColumns = await SettingsService.loadNodeColumns();
     this.reload();
-    this.refreshLiveNode();
+    this.refreshDisplayNode();
     if (!this.latencyBound) {
       this.latencyBound = true;
       LatencyStoreBridge.addListener(this.latencyListener);
@@ -708,6 +710,19 @@ export struct SubscriptionPage {
     } catch (e) {
       AppLogger.warn(TAG, `ensure profile applied failed: ${AppLogger.errText(e)}`);
     }
+    // 出口 IP 卡片必须跟着订阅走（2026-10-25 用户报障：切到别的订阅后公网 IP
+    // 仍显示上一个订阅节点的出口）。
+    // 根因：HomePage 的公网 IP 只在 after-connect / after-disconnect / node-switched
+    // 三个钩子上刷新，而「切换订阅」走的是 ensureProfileApplied → 自动选择模式下
+    // 会经 reconnectWithNode 重建隧道，但那条路径直接作用于 orchestrator，
+    // HomePage 的 applyConnectResult 不会被执行 → 没有任何一方推进
+    // public_ip_revision → 卡片保留旧值。内核与实际出口其实已经切过去了
+    // （真机日志：`profile applied: ... -> 34df6fd6 (tunnel)` 之后内核配置里
+    //  旧订阅节点归零），只是 UI 没有重新取数。
+    // 这里在配置应用完成后统一推进一次 revision：无论本次是完整重连还是热重载，
+    // 出口都可能已经变化，让 HomePage 重新查询是安全且必要的最小动作。
+    const publicIpRevision: number = AppStorage.get<number>('public_ip_revision') ?? 0;
+    AppStorage.setOrCreate('public_ip_revision', publicIpRevision + 1);
     // 配置就绪后再拉内核目录，保证显示的就是这份 profile 的节点
     let api: ClashApiService | null = null;
     try {
@@ -723,6 +738,8 @@ export struct SubscriptionPage {
     this.coreNodesProfileId = appliedNow === id ? id : '';
     this.syncCandidateCount();
     this.latencyTick = this.latencyTick + 1;
+    // 切订阅后节点作用域变了：旧订阅的偏好在这里判无效，卡片要换成新订阅的节点。
+    this.refreshDisplayNode();
     AppLogger.info(TAG, `profile activated: id=${id} coreNodes=${this.coreNodes.length} `
       + `previous=${previous}`);
   }
@@ -761,40 +778,20 @@ export struct SubscriptionPage {
     return this.subs.length > 0 ? this.subs[0] : null;
   }
 
-  private activeNode(): ProxyNode | null {
-    return this.service.findNode(this.activeNodeId);
-  }
-
   /**
-   * 「当前连接节点」显示值。连接中优先用内核真相（resolveLiveNodeName 沿
-   * PROXY→♻️自动选择→节点 的 now 链下钻）：自动(smart)模式下内核实际选点
-   * 与 preferredNodeId/lastNodeName 无关 —— 旧实现显示「未选择」或上一次
-   * 手动选的节点（0.6.3 用户实锤）。未连接回落到 preferredNodeId 的节点。
+   * 刷新「当前连接节点」显示值。
+   *
+   * 取值**完全委托** `orchestrator.displayNodeName()` —— 与主页启动按钮调用的是
+   * 同一个方法、同一套顺序，因此两处显示的必然是同一个节点（2026-10-25 用户要求：
+   * 接口完全一致）。
+   *
+   * 旧实现在这里自己算，且按 `state === CONNECTED` 分叉：未连接时无条件返回
+   * 「未选择」，完全无视用户已经手动选好的节点 —— 真机上「手动选了吹雪云节点、
+   * 卡片仍显示未选择」就是这么来的。现在不再看连接状态。
    */
-  private currentNodeDisplay(): string {
-    // 自动模式（用户口径 2026-10-25：最简单直接显示「自动选择」）：
-    // 内核真相可得时附带实际出口（♻️ 自动选择 · AWS-SG），取不到只显示组名。
-    if (this.autoSelectMode === AutoSelectModes.AUTO) {
-      if (this.liveNodeName.length > 0) {
-        return `${ClashConfigGenerator.SMART_GROUP_NAME} · ${this.liveNodeName}`;
-      }
-      return ClashConfigGenerator.SMART_GROUP_NAME;
-    }
-    if (ConnectionOrchestrator.instance().state === ConnState.CONNECTED) {
-      if (this.liveNodeName.length > 0) { return this.liveNodeName; }
-      const node = this.activeNode();
-      return node !== null ? node.name : '未选择';
-    }
-    return '未选择';
-  }
-
-  /** 轻量刷新内核当前出口（单次 GET /proxies）；失败静默回落旧显示。 */
-  private refreshLiveNode(): void {
-    ConnectionOrchestrator.instance().resolveLiveNodeName().then((name: string): void => {
-      this.liveNodeName = name;
-    }).catch((): void => {
-      this.liveNodeName = '';
-    });
+  private refreshDisplayNode(): void {
+    this.currentNodeName = ConnectionOrchestrator.instance().displayNodeName(
+      this.settings.preferredNodeId, this.settings.autoSelectMode);
   }
 
   /**
@@ -945,6 +942,8 @@ export struct SubscriptionPage {
       this.settings.selectedSubscriptionId = node.subscriptionId;
     }
     await SettingsService.save(this.settings);
+    // 选完立即刷新顶部「当前连接节点」，不等重连完成、也不依赖下次进页面。
+    this.refreshDisplayNode();
     // 已连接时完整重连让新节点即时生效；未连接时仅保存选择。
     const didRestart = await ConnectionOrchestrator.instance()
       .reconnectWithNode(node, this.service, 'preferredNode=' + node.id);
@@ -978,6 +977,8 @@ export struct SubscriptionPage {
     this.settings.autoSelectMode = AutoSelectModes.AUTO;
     await SettingsService.save(this.settings);
     this.autoSelectMode = AutoSelectModes.AUTO;
+    // 模式已变：卡片应立刻显示「♻️ 自动选择」，与主页按钮同步。
+    this.refreshDisplayNode();
     const didRestart = await ConnectionOrchestrator.instance()
       .reconnectWithNode(target, this.service, 'autoSelectMode=auto');
     if (didRestart) {
@@ -1445,6 +1446,7 @@ export struct SubscriptionPage {
     }
     this.exitNodeSelectMode();
     this.reload();
+    this.refreshDisplayNode();
     this.showToast(removedCount === ids.length ? `已删除 ${removedCount} 个节点`
       : `已删除 ${removedCount}/${ids.length} 个（部分失败，可重试）`);
   }
@@ -1471,6 +1473,7 @@ export struct SubscriptionPage {
       this.activeSubId = '';
     }
     this.reload();
+    this.refreshDisplayNode();
     this.showToast(node !== null ? `已删除「${node.name}」` : '节点已删除');
   }
 
@@ -1606,7 +1609,7 @@ export struct SubscriptionPage {
                     .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                   Row({ space: 6 }) {
                     Text('当前连接节点').fontSize(12).fontColor(TunBoxColors.textMuted)
-                    Text(this.currentNodeDisplay())
+                    Text(this.currentNodeName.length > 0 ? this.currentNodeName : '未选择')
                       .fontSize(12).fontColor(TunBoxColors.primary).fontWeight(FontWeight.Medium)
                       .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                   }.margin({ top: 2 })
@@ -1789,51 +1792,60 @@ export struct SubscriptionPage {
                       // 【2026-10-22 · FlClash 同构】「定义不完整」说明条已删除 ——
                       // App 不判节点可用性；节点能不用用只由内核决定（见卡片头注释）。
                       // 2026-10-19 用户要求：原「点击选用节点 · 长按可删除单个节点 ·
-                      // 点行头闪电图标测速」提示行**去掉**，这一行改放操作按钮：
-                      // 闪电测速 / 编辑 / 删除（闪电在编辑左边）。
+                      // 点行头闪电图标测速」提示行**去掉**，这一行改放操作按钮
+                      // （当时顺序是 测速 / 编辑 / 删除，2026-10-26 已按用户要求改为
+                      //   删除 / 编辑 / 测速，见下条）。
                       // 原来在节点下方的「编辑 / 删除」行同步删除，避免重复入口。
-                      // [anchor] 订阅展开区操作行（测速 / 编辑 / 删除）
-                      // 2026-10-21 用户要求：三个入口横向铺开 —— 测速居左、编辑居中、删除居右；
-                      // 字号 +1、图标 +1，并给每个入口补上下内边距放大点击热区。
+                      // [anchor] 订阅展开区操作行（删除 / 编辑 / 测速）
+                      // 2026-10-26 用户要求：把「测速」和「删除」互换位置 ——
+                      // 原顺序 测速·编辑·删除 改为 删除·编辑·测速（删除居左、测速居右）。
+                      // 同一次要求：三个入口的字号抬到与订阅分组名称同一档（14），
+                      // 并同步放大图标、补足上下内边距 —— 用户反馈 13 号字太小、
+                      // 点击热区不够，手指不好点中。
                       // 用 Blank() 撑开三段（而不是 Row({ space })），间距天然均分且不随条件块漂移。
                       Row() {
-                        // 闪电测速（左）
-                        Row({ space: 4 }) {
-                          if (this.speedTestingIds.includes(sub.id)) {
-                            LoadingProgress().width(14).height(14).color(TunBoxColors.primary)
-                          } else {
-                            Image($r('app.media.ic_bolt')).width(14).height(14)
-                              .fillColor(TunBoxColors.primary)
-                          }
-                          Text('测速').fontSize(13).fontColor(TunBoxColors.primary)
-                        }
-                        .padding({ left: 2, right: 8, top: 6, bottom: 6 })
-                        .accessibilityText('闪电测速')
-                        .onClick(() => this.speedTestSub(sub.id))
-                        Blank()
                         // 手工导入分组（DIRECT_GROUP_ID）没有可编辑/可删除的订阅实体
                         if (sub.id !== DIRECT_GROUP_ID) {
-                          Row({ space: 4 }) {
-                            Image($r('app.media.ic_tune')).width(14).height(14)
-                              .fillColor(TunBoxColors.textMuted)
-                            Text('编辑').fontSize(13).fontColor(TunBoxColors.textMuted)
-                          }
-                          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-                          .accessibilityText('编辑订阅')
-                          .onClick(() => this.openEdit(sub))
-                          Blank()
-                          Row({ space: 4 }) {
-                            Image($r('app.media.ic_delete')).width(14).height(14)
+                          // 删除（左）
+                          Row({ space: 5 }) {
+                            Image($r('app.media.ic_delete')).width(16).height(16)
                               .fillColor(TunBoxColors.danger)
-                            Text('删除').fontSize(13).fontColor(TunBoxColors.danger)
+                            Text('删除').fontSize(14).fontColor(TunBoxColors.danger)
                           }
-                          .padding({ left: 8, right: 2, top: 6, bottom: 6 })
+                          .padding({ left: 2, right: 8, top: 8, bottom: 8 })
                           .accessibilityText('删除订阅')
                           .onClick(() => {
                             this.deleteTargetId = sub.id;
                             this.deleteDialog.open();
                           })
+                          Blank()
+                          // 编辑（中）
+                          Row({ space: 5 }) {
+                            Image($r('app.media.ic_tune')).width(16).height(16)
+                              .fillColor(TunBoxColors.textMuted)
+                            Text('编辑').fontSize(14).fontColor(TunBoxColors.textMuted)
+                          }
+                          .padding({ left: 8, right: 8, top: 8, bottom: 8 })
+                          .accessibilityText('编辑订阅')
+                          .onClick(() => this.openEdit(sub))
+                          Blank()
+                        } else {
+                          // 单节点分组只有测速一个入口，同样贴右对齐，视觉与其它卡片一致
+                          Blank()
                         }
+                        // 闪电测速（右）
+                        Row({ space: 5 }) {
+                          if (this.speedTestingIds.includes(sub.id)) {
+                            LoadingProgress().width(16).height(16).color(TunBoxColors.primary)
+                          } else {
+                            Image($r('app.media.ic_bolt')).width(16).height(16)
+                              .fillColor(TunBoxColors.primary)
+                          }
+                          Text('测速').fontSize(14).fontColor(TunBoxColors.primary)
+                        }
+                        .padding({ left: 8, right: 2, top: 8, bottom: 8 })
+                        .accessibilityText('闪电测速')
+                        .onClick(() => this.speedTestSub(sub.id))
                       }
                       .width('100%')
                       .alignItems(VerticalAlign.Center)

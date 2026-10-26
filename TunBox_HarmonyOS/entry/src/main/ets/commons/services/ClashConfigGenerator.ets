@@ -256,7 +256,9 @@ export class ClashConfigGenerator {
     // 长连接与会话复用参数：降低频繁握手、弱网切换后的僵尸连接和后台功耗。
     lines.push('keep-alive-idle: 30');
     lines.push('keep-alive-interval: 15');
-    lines.push('udp-timeout: 300');
+    // 【2026-10-25 修正】顶层**没有** `udp-timeout` 这个键（RawConfig 里只有
+    // `tun.udp-timeout`），内核不校验未知键 → 这行一直被静默忽略，是死配置。
+    // 已下移到 tun 段（见下面 tun 块），语义位置才是对的。
     // 【C22】该字段是 string（mihomo process.FindProcessMode）。裸写 off 在
     // YAML 1.1 语境下会被解析成 bool（内核用的是 YAML 1.2 解析器，裸 off 目前
     // 是 !!str，实测能过；加引号是为了消除语义歧义，与真实内核实测结论一致：
@@ -337,6 +339,25 @@ export class ClashConfigGenerator {
     // 故不启用；Kill Switch 由 Extension 的默认路由（IPv4 0.0.0.0/0 + 可选 IPv6 ::/0）
     // 与内核存活监控保证。
     lines.push('  mtu: 1400');          // 缺省值；Extension 按物理承载改写并下发 VpnConfig.mtu
+    // ── mips 栈 TCP 拥塞控制（2026-10-25 gVisor → mips 迁移后的栈级调优）──────
+    // 这是 mips 下**唯一**真正生效的栈级性能旋钮：内核把 tun.congestion-controller
+    // 透传为 sing-tun 的 StackOptions.TCPCongestionControl → mipstack 的
+    // TCPSocketDefaults，作用于每一条被 TUN 接管的 TCP 连接。
+    // 取值必须是 mipstack 已注册的算法，否则 NewMipstack 直接返回
+    // "invalid TCP congestion control" → TUN 起不来（不是静默忽略，写错会炸）。
+    // 已用本项目 go.mod 同一 pin（mipstack 20261019124225）运行时实测：
+    //   AvailableCongestionControls() = [bbr bbr3 cubic reno]
+    // 选 bbr3：模型驱动 + 有界丢包，弱网/高 RTT（移动网络、跨境线路）下的吞吐与
+    // 丢包恢复明显优于内核默认的 cubic（cubic 在丢包链路上会大幅退让）。
+    // 回退只需改这一行：cubic（内核默认）/ bbr（更激进）/ reno。
+    lines.push('  congestion-controller: bbr3');
+    // `udp-timeout` 的合法位置只有 tun 段（顶层那个键不存在，见上方注释）。
+    // ⚠ 口径务必记住：该键**只被 gVisor 栈消费**（sing-tun 只把 UDPTimeout 交给
+    // stack_gvisor.go），mips 栈完全不读它。mips 下真正给 UDP 会话收尸的是 mihomo
+    // 自己的 tunnel.udpTimeout（60s，见 tunnel/tunnel.go 与 connection.go 的
+    // SetReadDeadline），与 tun 栈无关。留在这里是为了将来回落 gVisor 时仍然正确；
+    // mips 下它是**无效项**，不要再指望靠调它改 UDP 老化。
+    lines.push('  udp-timeout: 300');
     lines.push('');
     // ── hosts: 代理服务器域名的防投毒固定解析(UI 进程 DoH 预解析结果) ──
     // 内核拨号代理服务器时直接命中这些真实 IP, 不再走运行期(可能被污染的)DNS。

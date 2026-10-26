@@ -22,8 +22,7 @@ import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { SettingsService } from '../commons/services/SettingsService';
 import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo, AppDiagnostics } from '../commons/models/PublicIpInfo';
-import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
+import { AppSettings } from '../commons/models/AppSettings';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { UiGuardian } from '../commons/services/UiGuardian';
@@ -672,25 +671,11 @@ export struct HomePage {
   }
 
   private refreshDisplayNode(): void {
-    if (this.settings.autoSelectMode === AutoSelectModes.AUTO
-      && this.orchestrator.ensureSmartModelReady()) {
-      this.currentNodeName = ClashConfigGenerator.SMART_GROUP_NAME;
-      return;
-    }
-    const preferred = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
-    if (preferred !== null) {
-      this.currentNodeName = preferred.name;
-      return;
-    }
-    // 回退绝不能裸拿 nodes[0]（2026-10-25 真机实锤：冷启动 preferred 未解析时
-    // 显示了机场信息条目「剩余流量：596.2GB」）。fallbackConnectionNode 已过滤
-    // 信息条目并覆盖 profile 回落，与连接实际会用的目标同源。
-    const fallback = this.subs.fallbackConnectionNode();
-    if (fallback !== null) {
-      this.currentNodeName = fallback.name;
-      return;
-    }
-    this.currentNodeName = '';
+    // 与订阅页顶部概览卡共用同一条取值路径（orchestrator.displayNodeName），
+    // 两处显示必然一致。旧实现在这里各算一套，订阅页那份按连接状态分叉 →
+    // 未连接时显示「未选择」，与主页按钮不一致（2026-10-25 用户实锤）。
+    this.currentNodeName = this.orchestrator.displayNodeName(
+      this.settings.preferredNodeId, this.settings.autoSelectMode);
   }
 
   /** 实时速率数值与单位拆分（文档 §3.1：数值 26 Bold + 单位 13 textSecondary） */

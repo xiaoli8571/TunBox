@@ -1269,11 +1269,77 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 不在这里改 applied：等测速核/隧道真的按新 profile 起来后由 confirmProfileApplied 落定。
       return true;
     }
+    // ── 自动选择模式：切换订阅必须完整重连（2026-10-25 用户口径）────────────
+    // 热重载（PUT /configs）刻意不拆隧道：它保留旧会话与旧出口，对「只是规则变了」
+    // 是对的，用户也不会掉线。但自动选择模式下用户的意图是「让内核重新优选」——
+    // 新订阅的节点集、smart 组的候选池、LightGBM 的评分都需要重新评估，
+    // 而热重载会沿用旧的内核选择状态（store-selected 也按旧节点名记住了旧出口），
+    // 表现为**切了订阅却还用旧订阅的出口**，用户必须手动断开再连才生效。
+    //
+    // 与手动选节点保持一致：那条路径走 reconnectWithNode（disconnect + connect），
+    // 所以「手动指定节点会自动重连，自动选择却不动」成了可感知的不对称。
+    // 这里对齐：自动选择模式下走同一条完整重连路径。
+    // 手动模式保持热重载不变（不打断用户正在用的固定节点）。
+    if (await this.shouldFullReconnectOnProfileSwitch()) {
+      const switched = await this.reconnectForProfileSwitch(current, reason);
+      if (switched) {
+        return true;
+      }
+      // 拿不到可拨号的目标节点时退回热重载：至少让内核配置跟上新 profile，
+      // 不要把「重连不了」变成「连原本能用的配置也不更新」。
+      AppLogger.warn(TAG, `auto-select profile switch: no dial target; falling back to hot reload (${reason})`);
+    }
     AppLogger.info(TAG, `profile changed (${this.appliedProfileId} -> ${current}); hot reload for ${reason}`);
     const result = await this.applyRulesChanged(reason);
     const ok = result === 'hot' || result === 'reconnect' || result === 'ad-unavailable';
     // applied 由 reloadFromPath 成功时的 confirmProfileApplied('hot-reload') 落定
     return ok;
+  }
+
+  /** 切换订阅时是否应该完整重连而不是热重载（当前口径：自动选择模式）。 */
+  private async shouldFullReconnectOnProfileSwitch(): Promise<boolean> {
+    if (this.state !== ConnState.CONNECTED) {
+      return false;
+    }
+    if (this.restarting) {
+      // 已有重启在途：让编排器按原路径收敛，避免叠加第二条连接流水线。
+      return false;
+    }
+    try {
+      const settings: AppSettings = await SettingsService.load();
+      return settings.autoSelectMode === AutoSelectModes.AUTO;
+    } catch (e) {
+      // 读不到设置不能据此拆掉用户正在用的隧道。
+      return false;
+    }
+  }
+
+  /**
+   * 自动选择模式下切换订阅：按新订阅重新拨号（完整 disconnect + connect）。
+   *
+   * 目标节点必须属于**新 profile**：跨订阅旧偏好会让重连钉到新配置里不存在的名字，
+   * 表现为「选择未生效」——与 SubscriptionPage.enableAutoSelect 的取舍一致。
+   * smart 组本身不是可拨号目标，仍需一个真实节点做初始拨号。
+   */
+  private async reconnectForProfileSwitch(profileId: string, reason: string): Promise<boolean> {
+    const subs: SubscriptionService = this.lastSubs !== null
+      ? this.lastSubs : SubscriptionService.instance();
+    let target: ProxyNode | null = null;
+    try {
+      const preferred = await subs.resolvePreferredNode();
+      target = preferred !== null && preferred.subscriptionId === profileId ? preferred : null;
+    } catch (e) {
+      target = null;
+    }
+    if (target === null) {
+      const fallback = subs.fallbackConnectionNode();
+      target = fallback !== null && fallback.subscriptionId === profileId ? fallback : null;
+    }
+    if (target === null) {
+      return false;
+    }
+    AppLogger.info(TAG, `auto-select profile switch: full reconnect (${reason}) target=${target.name}`);
+    return this.reconnectWithNode(target, subs, `profile-switch:${reason}`);
   }
 
   async applyRulesChanged(reason: string): Promise<string> {
@@ -2078,6 +2144,36 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   currentNodeName(): string {
     return this.lastNodeName;
+  }
+
+  /**
+   * 展示用「当前连接节点」名称 —— **主页启动按钮与订阅页顶部概览卡共用这一个方法**，
+   * 两处显示必然是同一节点（2026-10-25 用户要求：接口完全一致，不许各写一套）。
+   *
+   * 取值顺序（沿用主页既有的 refreshDisplayNode 语义，不新增分支）：
+   *   ① 自动模式且 smart 模型就位 → 「♻️ 自动选择」（出口由内核挑，名字不固定）
+   *   ② preferredNodeId 在当前订阅内命中 → 该节点名（用户手动选点走这条）
+   *   ③ fallbackConnectionNode() → 当前订阅第一个可用真实节点 / 「订阅默认出口」
+   *   ④ '' → 当前订阅确实没有可用节点，由调用方给可行动文案
+   *
+   * 关键：这里**不看连接状态、也不查内核 /proxies**。用户选的是哪个节点，与此刻
+   * 是否连上无关；旧订阅页实现按 `state === CONNECTED` 分叉、未连接固定回「未选择」，
+   * 真机上「手动选了吹雪云节点仍显示未选择」就是它造成的。
+   */
+  displayNodeName(preferredNodeId: string, autoSelectMode: string): string {
+    if (autoSelectMode === AutoSelectModes.AUTO && this.ensureSmartModelReady()) {
+      return ClashConfigGenerator.SMART_GROUP_NAME;
+    }
+    const svc = SubscriptionService.instance();
+    const preferred = svc.preferredNodeInCurrentProfile(preferredNodeId);
+    if (preferred !== null) {
+      return preferred.name;
+    }
+    const fallback = svc.fallbackConnectionNode();
+    if (fallback !== null) {
+      return fallback.name;
+    }
+    return '';
   }
 
   /**

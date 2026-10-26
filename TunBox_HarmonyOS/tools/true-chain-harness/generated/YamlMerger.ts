@@ -1175,6 +1175,115 @@ export class YamlMerger {
   }
 
   /**
+   * 解码双引号标量内的 YAML 转义序列。
+   *
+   * 为什么不能只还原 `\"` 和 `\\`（2026-10-25 真机定案）：
+   * 订阅导入时 `config.PrepareProfile`（内核 Go 侧）会把整份文档重新 marshal，
+   * 非 BMP 字符（节点名里的国旗 emoji）被写成 `"\U0001F1EF\U0001F1F5日本•移联01"`。
+   * 内核按 YAML 规范把它解成真 emoji，但本函数此前只还原 `\"`/`\\`，读出的名字
+   * 带着字面反斜杠 —— 于是「名为 emoji 的节点」与「引用字面反斜杠的组成员」
+   * 永远对不上，内核报 `proxy group[N]: ♻️ 自动选择: '\U0001F1EF...' not found`
+   * 整份拒载，自动选择启动即失败。
+   *
+   * 覆盖 YAML 1.2 双引号标量允许的全部转义：`\0 \a \b \t \n \v \f \r \e \" \/
+   * \\ \N \_ \L \P \xXX \uXXXX \UXXXXXXXX`，以及行尾折行（`\` 后换行折叠）。
+   * 无法识别的转义原样保留（不猜、不吞），避免把用户的真实值改坏。
+   */
+  static unescapeDoubleQuoted(inner: string): string {
+    if (inner.indexOf('\\') < 0) {
+      return inner;
+    }
+    let out: string = '';
+    let i: number = 0;
+    while (i < inner.length) {
+      const ch = inner.charAt(i);
+      if (ch !== '\\') {
+        out += ch;
+        i += 1;
+        continue;
+      }
+      if (i + 1 >= inner.length) {
+        out += ch;
+        i += 1;
+        continue;
+      }
+      const esc = inner.charAt(i + 1);
+      i += 2;
+      if (esc === '0') {
+        out += String.fromCharCode(0x00);
+      } else if (esc === 'a') {
+        out += String.fromCharCode(0x07);
+      } else if (esc === 'b') {
+        out += String.fromCharCode(0x08);
+      } else if (esc === 't') {
+        out += String.fromCharCode(0x09);
+      } else if (esc === 'n') {
+        out += String.fromCharCode(0x0a);
+      } else if (esc === 'v') {
+        out += String.fromCharCode(0x0b);
+      } else if (esc === 'f') {
+        out += String.fromCharCode(0x0c);
+      } else if (esc === 'r') {
+        out += String.fromCharCode(0x0d);
+      } else if (esc === 'e') {
+        out += String.fromCharCode(0x1b);
+      } else if (esc === '"') {
+        out += '"';
+      } else if (esc === '/') {
+        out += '/';
+      } else if (esc === '\\') {
+        out += '\\';
+      } else if (esc === 'N') {
+        out += String.fromCharCode(0x85);
+      } else if (esc === '_') {
+        out += String.fromCharCode(0xa0);
+      } else if (esc === 'L') {
+        out += String.fromCharCode(0x2028);
+      } else if (esc === 'P') {
+        out += String.fromCharCode(0x2029);
+      } else if (esc === 'x') {
+        const hex = inner.substring(i, i + 2);
+        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 2;
+        } else {
+          out += '\\x';
+        }
+      } else if (esc === 'u') {
+        const hex = inner.substring(i, i + 4);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 4;
+        } else {
+          out += '\\u';
+        }
+      } else if (esc === 'U') {
+        const hex = inner.substring(i, i + 8);
+        if (/^[0-9a-fA-F]{8}$/.test(hex)) {
+          const cp = parseInt(hex, 16);
+          if (cp <= 0x10ffff) {
+            out += String.fromCodePoint(cp);
+            i += 8;
+          } else {
+            out += '\\U';
+          }
+        } else {
+          out += '\\U';
+        }
+      } else if (esc === '\n') {
+        // 行尾折行：续行开头的缩进由下面的空白跳过逻辑处理
+        while (i < inner.length && (inner.charAt(i) === ' ' || inner.charAt(i) === '\t')) {
+          i += 1;
+        }
+      } else {
+        // 未知转义：原样保留，绝不猜
+        out += '\\' + esc;
+      }
+    }
+    return out;
+  }
+
+  /**
    * 解码受限 YAML 标量。支持常见标量修饰符（`&anchor` / `!tag` / `|` `>` 块标量指示符）、
    * 单双引号与转义、`*alias` 别名、flow 序列/映射（`[h3]`、`{a: b}`，跨行会被折叠），
    * 以及行内注释。仅对**未闭合**的引号/集合与无法承载的块标量体抛 YamlNodeError。
@@ -1224,7 +1333,7 @@ export class YamlMerger {
       if (first === "'") {
         return inner.replace(/''/g, "'");
       }
-      return inner.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      return YamlMerger.unescapeDoubleQuoted(inner);
     }
     // 裸标量里的 " #" 之后是 YAML 行内注释, 截掉; 值本身含 '#'(如密码)则保留
     const commentIdx = value.indexOf(' #');
