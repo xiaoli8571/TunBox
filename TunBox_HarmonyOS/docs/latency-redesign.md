@@ -528,3 +528,23 @@ provider 声明段），与延迟判定口径无关：
 ## 十八、2026-10-24 指纹变更说明（稳定性审查：hysteria v1 带宽/混淆键补发射）
 
 全链路稳定性审查发现 hysteria v1（`hysteria://`）存在四处连环缺陷并修复：① `UriNodeParser.splitAuthority` 强制要求 userinfo@（hysteria v1 标准链接凭据在 `?auth=`、无 userinfo）⇒ v1 链接整条静默丢弃，且无 userinfo 的 trojan/anytls/hysteria2 转换形态同遭殃——已改为 userinfo 可选；② URI 布尔参数只认字面 `true`（`allow_insecure=1`/`insecure=0` 数字形态不归一）⇒ 自签证书机场节点全部握手失败——已接受 `'1'`；③ 生成器 hysteria v1 分支漏发 `up`/`down` 带宽与 `obfs` 混淆键（内核 `HysteriaOption` 的 `Up`/`Down`/`Obfs` 同键名）——本次指纹变更即此项，与延迟测试引擎无关，仅节点行生成；④ `parseDetailed` 的 YAML 分支覆盖式重算诊断计数，明文链接全部解析失败时 invalidCount 归零（用户无从得知节点为何变少）——已改增量聚合。harness 侧同步修复 `protocol-regression.mjs` 从未跑通的四段（auth-str 键名按内核权威修正、REALITY 测试数据补 43 字符合法公钥、CredentialStore/fileIo/AppStorage 桩补全）。配置生成器指纹更新为 `244EE3123FADECB7`。
+
+## 十三、2026-10-27 指纹变更说明（恢复设置页「DNS 接管」开关）
+
+指纹：`dc81cce4e9a28701` → `f5a39652cea9b329`（期间若干次生成器改动）→ `12fdcbccb25478d3`（本次）。
+
+**为什么加回来**：用户 2026-10-27 明确要求「鸿蒙版本帮我加一个 DNS 开关」。
+
+**实现口径（三处同源，YAML 为唯一真源）**：
+- 生成器：`settings.dnsOverrideEnabled === false` ⇒ `pushDnsSection` 只写 `dns: { enable: false }` 后 return，
+  `generate()` 的 `tun.dns-hijack` 同开关 gate；
+- 扩展：新增 `TunFlags.dnsOverride`（`readDnsEnable` 读 YAML 顶格 `dns:` 下的 `enable:`，读不到 = false），
+  据此决定 `VpnConfig.dnsAddresses` 是否下发 —— **关闭时省略该字段**，系统沿用物理网络 DNS；
+- 合并：`ProfileConfigMerger.merge(overlay, profile, allowProfileDns)`，关闭时不搬订阅原文 dns 段
+  （否则订阅自带 `dns.enable: true` 会把用户的关闭动作架空）。
+
+**为什么这次不会重演 2026-10-21 之前的黑洞**：旧实现把「本次连接是否接管 DNS」存在扩展自己
+（`TunFlags.dnsOverride` 默认 true）+ 编排器快照里，YAML 读失败时设备 DNS 仍被指向 sentinel，
+而内核没接管 ⇒ 整机解析黑洞。现在扩展侧默认 **false**，并且只从 YAML 读，不接 want、不缓存。
+
+默认值 **true**：与 0.4.3～0.6.8 的恒接管行为一致，升级用户无感；显式 false 才关闭。

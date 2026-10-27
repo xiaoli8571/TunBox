@@ -923,7 +923,7 @@ section('[15] DNS 恒接管 + fake-ip：range6 落在 TUN 的 /64，AAAA 走隧�
   const cfg = generateConfig({});
   const blk = dnsOf(cfg);
   ok(blk.length > 0, 'dns: 段恒存在（开关已删，无法整段关闭）');
-  ok(blk.includes('  enable: true'), 'dns.enable 恒为 true');
+  ok(blk.includes('  enable: true'), 'dns.enable 默认 true（设置页「DNS 接管」默认开）');
   ok(blk.includes('  enhanced-mode: fake-ip'), 'enhanced-mode 是 fake-ip（v6 也交给隧道）');
   ok(blk.includes('  fake-ip-range: 198.18.0.1/16'), 'v4 假池 198.18.0.1/16');
   ok(blk.includes('  fake-ip-range6: fdfe:dcba:9876::/64'), 'v6 假池 = TUN 自己的 /64（有 on-link 路由）');

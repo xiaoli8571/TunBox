@@ -265,12 +265,13 @@ export class ClashConfigGenerator {
     // `find-process-mode: off` 与 `find-process-mode: "off"` 内核都接受）。
     lines.push('find-process-mode: "off"');
     lines.push('');
-    // ── DNS：恒接管，无开关（2026-10-21 产品定案）──
-    // 设置页的「DNS 覆写」开关已删除。`dns:` 整段由 pushDnsSection 恒产出，
-    // VpnExtensionAbility 恒把 VpnConfig.dnsAddresses 指向 TUN 内 sentinel，
-    // `tun.dns-hijack: any:53` 恒开 —— 三处同生同灭，不存在「内核跑 DNS 但设备
-    // 没指过来」或「设备指过来但内核没接管 ⇒ 全局解析黑洞」的中间态。
-    // 与 FlClash 同构：它也没有这个开关（VpnService.kt 恒设 DNS=198.18.0.2）。
+    // ── DNS：设置页「DNS 接管」开关（默认开，2026-10-27 恢复）──
+    // 开（默认）：`dns:` 整段由 pushDnsSection 产出 + `tun.dns-hijack: any:53`，
+    // VpnExtensionAbility 把 VpnConfig.dnsAddresses 指向 TUN 内 sentinel —— 三处同源。
+    // 关：只写 `dns: { enable: false }`、不写 dns-hijack，扩展也不下发 dnsAddresses
+    // ⇒ 系统沿用物理网络 DNS，TunBox 完全不碰解析（无常驻 DNS 劫持、无 fake-ip）。
+    // 唯一真源是 YAML 的 dns.enable 行：扩展 readTunFlagsFromConfig 读回它，
+    // 所以设置页 → YAML → 扩展 的闭环不可能出现「内核不跑 DNS 却仍劫持 53」的黑洞。
     // 强制拦截站点：DNS 层 REJECT 预匹配（nameserver-policy）与后面路由层兜底
     // 共用同一份规范化结果 —— 只算一次，避免两处各自 normalize 出不同集合。
     const blockSites = ClashConfigGenerator.normalizeDomains(settings.forceBlockSites);
@@ -327,12 +328,14 @@ export class ClashConfigGenerator {
     // headless 测速模式: tun.enable=false, 内核只开 mixed/API 端口, 不建隧道不碰 VPN 权限
     lines.push('  enable: ' + (tunEnabled ? 'true' : 'false'));
     lines.push('  stack: mips');  // mihomo v1.19.33 自研用户态栈(mipstack 已编入 libgojni.so), fd 注入路径与 gvisor 同构
-    // DNS 接管(TUN 层): 所有目标端口 53 的 DNS 请求一律劫持进内核解析。
-    // 与 `dns.enable` 恒同开：内核 DNS 恒启用（设置页已无此开关），设备侧的
-    // VpnConfig.dnsAddresses 也恒指向 sentinel —— 三处必须同步，否则劫持到的查询
-    // 没人应答，设备原本正常的系统 DNS 会被打断。
-    lines.push('  dns-hijack:');
-    lines.push('    - any:53');
+    // DNS 接管(TUN 层): 目标端口 53 的 DNS 请求劫持进内核解析。
+    // 与 `dns.enable` 严格同开：设置页「DNS 接管」关闭时这里也**不写** dns-hijack，
+    // 否则查询被劫持进一个没启用 DNS 的内核 ⇒ 整机解析黑洞。
+    // 设备侧 VpnConfig.dnsAddresses 由扩展读同一份 YAML 的 dns.enable 行决定 —— 三处同源。
+    if (settings.dnsOverrideEnabled !== false) {
+      lines.push('  dns-hijack:');
+      lines.push('    - any:53');
+    }
     lines.push('  auto-route: false');   // 路由由 VpnExtensionAbility 安装（默认路由 = 系统级 Kill Switch）
     lines.push('  auto-detect-interface: false');
     // 说明：strict-route 依赖 nftables/iptables，OHOS gvisor+fd 注入沙箱不可用，
@@ -1115,8 +1118,12 @@ export class ClashConfigGenerator {
   /**
    * DNS 段（全仓唯一写入点）：`dns:` 整块由本方法产出。
    *
-   * 2026-10-21：设置页「DNS 覆写」开关已删除 —— 本方法**恒被调用**，`enable: true` 恒写。
-   * 设备侧（VpnConfig.dnsAddresses）与 `tun.dns-hijack` 也恒开，三处同生同灭。
+   * 2026-10-27：设置页恢复「DNS 接管」开关（`AppSettings.dnsOverrideEnabled`，默认 true）。
+   *   · true（默认）⇒ 整段照旧（enable/listen/fake-ip/DoT/policy/…）；
+   *   · false ⇒ **只写** `dns: { enable: false }`，并让 generate() 不写 `tun.dns-hijack`；
+   *     扩展侧读**同一份 YAML 的 dns.enable 行**决定是否下发 VpnConfig.dnsAddresses。
+   * 三处同源（YAML 是唯一真源），不存在「内核不跑 DNS 却仍劫持 53」的黑洞中间态
+   * （2026-10-21 之前的老实现正是败在这一点：TunFlags.dnsOverride 默认值与内核不一致）。
    *
    * 调用点只允许 generate() 一处（隧道与测速核共用同一份 dns 段；
    * 闸门 verify-config-single-source 会比对两份产物的一致性）。
@@ -1124,6 +1131,12 @@ export class ClashConfigGenerator {
   private static pushDnsSection(lines: string[], settings: AppSettings, dnsPort: number,
     useGeoip: boolean, ipv6Enabled: boolean, blockSites: string[],
     subDnsUpstreams: SubDnsUpstreamPolicy[] = [], subDnsPolicies: string[][] = []): void {
+    // 开关关闭：只留一个「内核不跑 DNS」的事实，其余键一个都不写。
+    if (settings.dnsOverrideEnabled === false) {
+      lines.push('dns:');
+      lines.push('  enable: false');
+      return;
+    }
     lines.push('dns:');
     lines.push('  enable: true');
     lines.push(`  listen: 127.0.0.1:${dnsPort}`);

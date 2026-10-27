@@ -201,12 +201,21 @@ class StartParamsSnapshot {
  * 不用 want 参数下发：内核认的配置和 TUN 装的地址必须是同一份事实，
  * YAML 是唯一真源，也就天然免疫 want 丢失 / 进程被杀重启后的参数陈旧。
  *
- * DNS 接管不在其中：`dns.enable: true` 由生成器**恒写**（设置页已无开关），
- * 所以本层也恒下发 VpnConfig.dnsAddresses，没有第二个可漂移的状态位。
+ * DNS 接管同样从这份 YAML 读回（`dns.enable`，见 readTunFlagsFromConfig）：
+ * 开 ⇒ 下发 VpnConfig.dnsAddresses = sentinel；关 ⇒ **不下发**，系统沿用物理网络 DNS。
+ * 唯一真源仍是 YAML，所以不会出现「内核不跑 DNS 却仍把设备 DNS 指过来」的黑洞。
  */
 class TunFlags {
   /** 内核 ipv6 总闸（顶层 `ipv6:`）：同时决定 TUN 是否装 v6 地址 + ::/0 */
   public ipv6: boolean = false;
+  /**
+   * 内核 DNS 总闸（`dns.enable:`，与 `tun.dns-hijack` 同源同生灭）。
+   *
+   * 默认 **false**（读不到/读失败 ⇒ 保守：不把设备 DNS 指到 sentinel）。
+   * 反了会怎样：YAML 读失败时内核没接管 DNS，而设备 DNS 被指到 TUN sentinel
+   * ⇒ 整机解析黑洞（2026-10-21 前 TunFlags.dnsOverride 默认 true 踩过）。
+   */
+  public dnsOverride: boolean = false;
 }
 
 export default class TunBoxVpnExtension extends VpnExtensionAbility implements NetworkStateListener {
@@ -692,7 +701,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
    * 关键不变量：**TUN 装什么，必须与内核认的完全一致**。
    *   · `ipv6: true` → 内核开出站 v6 + dns.ipv6；TUN 必须同时装 v6 地址与 ::/0，
    *     否则 v6 要么被平台塞进 TUN 却无人处理（黑洞），要么绕过 TUN 直连（泄漏）。
-   * DNS 不在读取范围：生成器恒写 `dns.enable: true`，本层恒下发 sentinel。
+   * DNS 也从这份 YAML 读回（`dns.enable`）：开 ⇒ 下发 sentinel，关 ⇒ 不下发 dnsAddresses。
    * 所以这里不接 want 参数、也不缓存：每次 onCreate 现读，天然与配置同源，
    * want 丢失 / 进程被杀重启 / 用户改完开关后重连，三种情况都不会参数陈旧。
    */
@@ -705,6 +714,8 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       // 退回「IPv4-only」，而内核仍按 YAML 开着双栈 —— 正是本文件头部警告的
       // 「TUN 与内核不一致」。
       flags.ipv6 = TunBoxVpnExtension.readTopLevelBool(text, 'ipv6');
+      // DNS：同一份 YAML 的 dns.enable 行。读不到 ⇒ false（保守：不劫持、不改设备 DNS）
+      flags.dnsOverride = TunBoxVpnExtension.readDnsEnable(text);
     } catch (e) {
       // 读不到 → 退回保守形态（IPv4-only）：宁可少开，也不要装一条
       // 内核并不认的 ::/0 把设备的 v6 打进黑洞。
@@ -728,6 +739,42 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private static isTrueScalar(raw: string): boolean {
     const v = raw.toLowerCase();
     return v === 'true' || v === 'yes' || v === 'on' || v === '1';
+  }
+
+  /**
+   * 读 `dns.enable`（顶层 `dns:` 下二空格缩进的子键）。
+   *
+   * 两段式：先定位**顶格** `dns:` 行，再在其后第一段缩进内容里找 `enable:`，
+   * 遇到下一个顶格键就结束 —— 不会误吃 YAML 覆盖层里别处的 `enable:`。
+   * 值与内核同口径（yaml.v3 的 true/yes/on/1）；读不到/解析失败返回 false，
+   * 宁可「不接管」也不要「内核没跑 DNS 却把设备 DNS 指过去」（解析黑洞）。
+   */
+  private static readDnsEnable(text: string): boolean {
+    const lines: string[] = text.split('\n');
+    let inDns: boolean = false;
+    for (const raw of lines) {
+      const line: string = raw.endsWith('\r') ? raw.substring(0, raw.length - 1) : raw;
+      if (!inDns) {
+        if (/^dns:[ \t]*(?:#.*)?$/.test(line)) {
+          inDns = true;
+        }
+        continue;
+      }
+      const trimmed: string = line.trim();
+      if (trimmed.length === 0 || trimmed.startsWith('#')) {
+        continue;
+      }
+      // 回到顶格 ⇒ dns 段到此结束
+      if (!/^[ \t]/.test(line)) {
+        return false;
+      }
+      const m: RegExpMatchArray | null =
+        line.match(/^[ \t]+enable:[ \t]*("?)([A-Za-z0-9]+)\1[ \t]*(?:#.*)?$/);
+      if (m !== null) {
+        return TunBoxVpnExtension.isTrueScalar(m[2]);
+      }
+    }
+    return false;
   }
 
   /**
@@ -1379,9 +1426,11 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     // MTU 按当前物理承载动态取值（蜂窝链路降低分片风险，Wi-Fi/以太网 1400）。
     this.activeMtu = this.mtuForNetwork(this.lastNetworkType);
     const tunFlags = this.readTunFlagsFromConfig(configPath);
-    // DNS 恒接管：生成器恒写 `dns.enable: true` + `dns-hijack: any:53`，
-    // 这里恒把设备 DNS 指向 TUN sentinel（与 FlClash 同构），没有第二个状态位。
-    const dnsAddresses: string[] = DNS_SERVERS;
+    // DNS 接管：与 YAML 的 `dns.enable` 同源（readTunFlagsFromConfig 读回）。
+    // 开 ⇒ 设备 DNS 指向 TUN sentinel，53 被 tun.dns-hijack 送进内核解析；
+    // 关 ⇒ **不下发** dnsAddresses（undefined = 字段省略），系统沿用物理网络 DNS ——
+    // 与生成器不写 dns-hijack 严格配套，否则就是「劫持到没人应答的内核」黑洞。
+    const dnsAddresses: string[] | undefined = tunFlags.dnsOverride ? DNS_SERVERS : undefined;
     // 路由表：v4 默认 + （双栈时）v6 默认，见 buildTunRoutes。
     const tunRoutes: vpnExtension.RouteInfo[] = this.buildTunRoutes(tunFlags);
     const config: vpnExtension.VpnConfig = tunFlags.ipv6 ? {
@@ -1410,7 +1459,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     };
     this.tunConfig = config;
     AppLogger.info(TAG, `vpn config: ${tunFlags.ipv6 ? 'dual-stack' : 'ipv4-only'}, `
-      + `dns=${dnsAddresses.join(',')}, routes=${tunRoutes.length}, `
+      + `dns=${tunFlags.dnsOverride ? DNS_SERVERS.join(',') : 'off'}, routes=${tunRoutes.length}, `
       + `mtu=${this.activeMtu}, net=${this.lastNetworkType}`);
 
     try {

@@ -192,6 +192,20 @@ export class AppSettingsJson {
    */
   ipv6Enabled: boolean = true;
   /**
+   * DNS 接管开关（设置页「DNS 接管」，默认 **true**）。
+   *
+   * true（默认，与 0.4.3～0.6.8 行为一致）：
+   *   `dns.enable: true` + `tun.dns-hijack: any:53` + VpnConfig.dnsAddresses 指向 TUN 的
+   *   sentinel（172.19.0.2）三处同开 —— 全设备 DNS 进内核，走 DoT 加密上游 + fake-ip。
+   * false：生成 `dns: { enable: false }`、**不写** `tun.dns-hijack`，扩展也**不下发**
+   *   dnsAddresses —— 系统沿用物理网络的 DNS，TunBox 完全不碰解析。
+   *
+   * 三处必须由「同一份 YAML 的 dns.enable 行」驱动（扩展 readTunFlagsFromConfig 读回），
+   * 禁止在别处再存一份状态：否则出现「内核不跑 DNS 却仍劫持 53」⇒ 整机解析黑洞
+   * （2026-10-21 前的老实现踩过：TunFlags.dnsOverride 默认 true 而内核没接管）。
+   */
+  dnsOverrideEnabled: boolean = true;
+  /**
    * 订阅配额提醒（流量不足/即将到期发系统通知）。默认开启。
    * 阈值常量见 SubscriptionQuotaService：流量剩 <10% 或 3 天内到期。
    */
@@ -328,6 +342,8 @@ export class AppSettings {
   coreLogLevel: string = 'warning';
   /** IPv6 双栈开关（默认 true；语义见 AppSettingsJson.ipv6Enabled 注释） */
   ipv6Enabled: boolean = true;
+  /** DNS 接管开关（默认 true；语义见 AppSettingsJson.dnsOverrideEnabled 注释） */
+  dnsOverrideEnabled: boolean = true;
   /** 订阅配额提醒开关（默认 true；阈值见 SubscriptionQuotaService） */
   quotaNotifyEnabled: boolean = true;
   /** geo 资产下载源偏好：auto/jsdelivr/ghproxy/github（非法回落 auto） */
@@ -381,6 +397,7 @@ export class AppSettings {
     j.sniffingEnabled = this.sniffingEnabled;
     j.coreLogLevel = this.coreLogLevel;
     j.ipv6Enabled = this.ipv6Enabled;
+    j.dnsOverrideEnabled = this.dnsOverrideEnabled;
     j.quotaNotifyEnabled = this.quotaNotifyEnabled;
     j.assetSource = this.assetSource;
     j.quotaAlertMarks = this.quotaAlertMarks;
@@ -537,8 +554,11 @@ export class AppSettings {
       || level === 'error' || level === 'silent') ? level : 'warning';
     // IPv6 双栈：缺字段取默认 true（升级上来的老配置默认开启），
     // 只有显式 false 才关闭 —— 与「默认开」的产品口径一致。
-    // DNS 接管已无开关（恒开），老配置里残留的 dnsOverrideEnabled 直接忽略。
     s.ipv6Enabled = j.ipv6Enabled === false ? false : true;
+    // DNS 接管开关：缺字段取 **true**（与 0.4.3～0.6.8 的恒接管行为一致，升级用户无感），
+    // 显式 false 才关闭。关闭后生成器写 `dns: { enable: false }` 且不写 dns-hijack，
+    // 扩展读同一行决定是否下发 dnsAddresses —— 三处同源，不存在中间态。
+    s.dnsOverrideEnabled = j.dnsOverrideEnabled === false ? false : true;
     // 2026-10-23 用户口径：配额提醒恒开（设置页已去掉这个开关，默认就是开）。
     // 旧配置里存过 false 的也一律置 true —— 否则升级后「开关没了却也不提醒」，
     // 等于悄悄把功能弄丢。

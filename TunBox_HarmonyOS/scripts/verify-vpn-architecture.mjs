@@ -242,8 +242,8 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   // DNS 恒接管（2026-10-21 产品定案：设置页开关删除）：整段 dns 无条件产出。
   has('gen.dns.always-emitted', genSrc,
     'ClashConfigGenerator.pushDnsSection(lines, settings, dnsPort, useGeoip, ipv6Enabled, blockSites,');
-  notHas('gen.dns.no-enable-false-branch', genSrc, "lines.push('  enable: false')");
-  ok('gen.dns.no-override-setting', !genSrc.includes('dnsOverrideEnabled'));
+  has('gen.dns.enable-false-branch', genSrc, "lines.push('  enable: false')");
+  ok('gen.dns.override-setting', genSrc.includes('dnsOverrideEnabled'));
   has('gen.keepalive-idle', genSrc, 'keep-alive-idle:');
   has('gen.keepalive-interval', genSrc, 'keep-alive-interval:');
   has('gen.udp-timeout', genSrc, 'udp-timeout:');
@@ -272,7 +272,7 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.dns.proxy-server-nameserver', genSrc, 'proxy-server-nameserver:');
   // dns-hijack 必须恒开（内核 DNS 恒启用）：任何条件包裹都会重现「设备指过来但内核没接管」。
   has('gen.dns.hijack-any53', genSrc, "lines.push('    - any:53')");
-  notHas('gen.dns.no-hijack-gate', genSrc, 'dnsOverrideEnabled');
+  has('gen.dns.hijack-gate', genSrc, 'dnsOverrideEnabled');
   // C22：mihomo RawConfig.Profile 的正确键名是 `store-selected`
   // （`store-selections` 是错的 —— 内核不认这个键，配置里的「记住选中节点」不生效）
   has('gen.profile.store-selected', genSrc, 'store-selected: true');
@@ -298,8 +298,8 @@ const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets
   // 否则 TUN 与内核会分叉（v6 黑洞或泄漏）。
   has('ext.tun-flags-from-yaml', extSrc, 'readTunFlagsFromConfig(configPath)');
   // DNS 恒接管：dnsAddresses 恒为 sentinel，不能再有条件表达式（那是旧开关的残留）。
-  has('ext.dns-always-sentinel', extSrc, 'const dnsAddresses: string[] = DNS_SERVERS;');
-  ok('ext.no-dns-override-setting', !extSrc.includes('dnsOverride'));
+  has('ext.dns-conditional-sentinel', extSrc, 'tunFlags.dnsOverride ? DNS_SERVERS : undefined');
+  ok('ext.dns-override-setting', extSrc.includes('dnsOverride'));
   ok('ext.no-readNestedBool', !extSrc.includes('readNestedBool'));
   // DNS 必须指向 TUN 内 sentinel（对齐 FlClash VpnService.kt:300 `DNS = "198.18.0.2"`），
   // 不能是公共 DNS：后者能否被 `dns-hijack: any:53` 截住取决于默认路由，

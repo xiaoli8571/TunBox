@@ -81,6 +81,8 @@ export struct SettingsView {
   @State geoUpdatingId: string = '';
   // ── 网络（IPv6 双栈，产品默认开）──
   @State ipv6Enabled: boolean = true;
+  /** DNS 接管开关（默认开）：关闭后系统沿用物理网络 DNS，TunBox 不碰解析 */
+  @State dnsOverrideEnabled: boolean = true;
   /** 是否允许明文 HTTP 订阅（默认关闭；关闭时只接受 https） */
   @State allowInsecureSubscriptionHttp: boolean = false;
   /**
@@ -132,6 +134,7 @@ export struct SettingsView {
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.ipv6Enabled = this.settings.ipv6Enabled;
+    this.dnsOverrideEnabled = this.settings.dnsOverrideEnabled !== false;
     this.allowInsecureSubscriptionHttp = this.settings.allowInsecureSubscriptionHttp;
     this.assetSource = this.settings.assetSource;
     this.testLatencyUrl = this.settings.testLatencyUrl;
@@ -246,8 +249,8 @@ export struct SettingsView {
    *   ② TUN：扩展进程读**同一份 YAML 的 ipv6 行**决定是否装 v6 地址与 ::/0。
    * 也就是说这里只负责把值写进设置，其余联动都是「一份配置、两处读同一真源」。
    *
-   * DNS 不在这里：内核 DNS 恒接管（生成器恒写 enable/dns-hijack，扩展恒下发 sentinel），
-   * 原来的「DNS 覆写」开关已于 2026-10-21 随产品定案删除。
+   * DNS 不在这里：DNS 接管由下方 setDnsOverrideEnabled 单独控制
+   * （生成器写 `dns.enable` / `dns-hijack`，扩展读同一份 YAML 决定是否下发 dnsAddresses）。
    */
   private setIpv6Enabled(v: boolean): void {
     this.ipv6Enabled = v;
@@ -255,6 +258,29 @@ export struct SettingsView {
     // 字段级写：只改这一个字段（整单覆盖会把别的写者刚写的值盖回旧值）
     SettingsService.patchSettings((s: AppSettings): void => {
       s.ipv6Enabled = v;
+    }).then((): void => {
+      this.applyNetworkSwitch();
+    }).catch((): void => {
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
+  /**
+   * DNS 接管开关（默认开）。关掉 = 完全不碰系统解析：TunBox 不劫持 53、不下发
+   * dnsAddresses、不产生 fake-ip，设备沿用物理网络/运营商的 DNS。
+   *
+   * 联动同样只有「一份真源」：写进设置 → 生成器写 `dns: { enable: false }` 且不写
+   * `tun.dns-hijack` → 扩展读**同一份 YAML** 的 dns.enable 决定不下发 dnsAddresses。
+   * 三处不可能各说各话（这正是 2026-10-21 之前那版开关最致命的坑：扩展自己存了一个
+   * 默认 true 的状态位，YAML 读失败时设备 DNS 被指向没接管的内核 ⇒ 整机解析黑洞）。
+   *
+   * 关闭时 DNS 层 REJECT 预匹配也一并退场，站点拦截仍由路由层规则兜底。
+   */
+  private setDnsOverrideEnabled(v: boolean): void {
+    this.dnsOverrideEnabled = v;
+    this.settings.dnsOverrideEnabled = v;
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.dnsOverrideEnabled = v;
     }).then((): void => {
       this.applyNetworkSwitch();
     }).catch((): void => {
@@ -533,6 +559,18 @@ export struct SettingsView {
                   .onChange((v: boolean): void => this.setIpv6Enabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('IPv6 也走代理；关闭则纯 IPv4。改动会自动重连。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+
+              Divider().color(TunBoxColors.cardBorder)
+
+              Row() {
+                Text('DNS 接管')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.dnsOverrideEnabled })
+                  .selectedColor(TunBoxColors.primary)
+                  .onChange((v: boolean): void => this.setDnsOverrideEnabled(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('开启后全局 DNS 走 TunBox 加密上游（DoT）；关闭则沿用系统 DNS。改动会自动重连。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
 
               Divider().color(TunBoxColors.cardBorder)

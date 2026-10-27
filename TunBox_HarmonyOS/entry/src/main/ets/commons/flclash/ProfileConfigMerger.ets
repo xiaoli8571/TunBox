@@ -403,8 +403,12 @@ export class ProfileConfigMerger {
 
   /**
    * 合并。overlay = TunBox 生成的完整运行配置，profile = 订阅原文。
+   *
+   * `allowProfileDns=false`（设置页「DNS 接管」关闭）时**不搬原文 dns 段** ——
+   * 否则订阅自带 `dns.enable: true` 会把用户的关闭动作架空虚化。
    */
-  static merge(overlayYaml: string, profileYaml: string): ProfileMergeResult {
+  static merge(overlayYaml: string, profileYaml: string,
+    allowProfileDns: boolean = true): ProfileMergeResult {
     const out = new ProfileMergeResult();
     if (overlayYaml.trim().length === 0) {
       out.error = 'overlay config is empty';
@@ -476,8 +480,10 @@ export class ProfileConfigMerger {
       applied.push(key);
     }
 
-    // dns：原文显式启用时整段用原文（FlClash isEnableDns 语义）
-    if (ProfileConfigMerger.hasEnabledDns(profileYaml)) {
+    // dns：原文显式启用时整段用原文（FlClash isEnableDns 语义）。
+    // 「DNS 接管」关闭时**不吃原文 dns**（否则订阅一套 dns.enable: true 就把开关架空了），
+    // overlay 的 `dns: { enable: false }` 原样保留。
+    if (allowProfileDns && ProfileConfigMerger.hasEnabledDns(profileYaml)) {
       const dnsRaw = ProfileConfigMerger.sectionText(profileYaml, 'dns');
       if (dnsRaw.length > 0) {
         base = ProfileConfigMerger.removeKey(base, 'dns');

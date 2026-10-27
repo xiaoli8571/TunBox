@@ -194,14 +194,16 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 上 `::/0` 为 0 条（只挂在 wlan0），即 **v6 一直从物理网卡绕过代理**；同时 `dns.ipv6: false`
 让隧道 DNS 对 AAAA 一律回 `ancount=0`，v6-only 站点必然打不开。
 
-现状（2026-10-21 起）：设置页「网络」只有**一个开关** `IPv6 双栈`（默认开）。
-「DNS 覆写」开关已删除：DNS **恒接管**（生成器恒写 `dns.enable: true` + `tun.dns-hijack: any:53`，
-Extension 恒下发 `VpnConfig.dnsAddresses = ['172.19.0.2']`），与 FlClash 同构（它也没有这个开关）。
+现状（2026-10-27 起）：设置页「网络」有**两个开关** —— `IPv6 双栈`（默认开）与
+`DNS 接管`（默认开）。后者 2026-10-21 曾按产品定案删除（DNS 恒接管），2026-10-27 用户要求恢复；
+恢复时按「YAML 是唯一真源」实现：生成器写 `dns.enable` + `tun.dns-hijack`，扩展
+`readTunFlagsFromConfig` 读**同一份 YAML 的 dns.enable 行**决定是否下发
+`VpnConfig.dnsAddresses`（关 = 不下发，系统沿用物理网络 DNS），不存在第二个可漂移状态位。
 
 | UI 项 | 设置字段 | 落点 |
 |---|---|---|
 | IPv6 双栈 | `ipv6Enabled` | YAML 顶层 `ipv6:` + `dns.ipv6:`；Extension 据此装 v6 地址 + `::/0` + `isIPv6Accepted` |
-| ~~DNS 覆写~~ | ~~`dnsOverrideEnabled`~~ | 已删除；DNS 恒接管（`dns.enable` / `dns-hijack` / `dnsAddresses` 三处无条件） |
+| DNS 接管 | `dnsOverrideEnabled` | YAML `dns.enable` / `tun.dns-hijack:`；Extension 读同一行决定 `VpnConfig.dnsAddresses`（关 = 不下发）。关掉时也不吃订阅原文的 `dns.enable: true`（`ProfileConfigMerger.merge(..., allowProfileDns=false)`） |
 
 `fake-ip-range6` **永不产出**，且 2026-10-21 起整个 fake-ip 退场：`enhanced-mode: redir-host`
 （`fake-ip-range` / `fake-ip-filter` / `store-fake-ip` 全部删除）。原因见 §5 与 `docs/latency-redesign.md` §十二：

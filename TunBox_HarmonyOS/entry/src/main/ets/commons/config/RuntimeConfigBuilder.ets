@@ -401,7 +401,8 @@ export class RuntimeConfigBuilder {
     // 有原文时合并失败必须拒绝，不能把内部占位节点当作用户的有效配置。
     let finalYaml = yaml;
     if (profile.profileYaml.trim().length > 0) {
-      const merged = ProfileConfigMerger.merge(yaml, profile.profileYaml);
+      const merged = ProfileConfigMerger.merge(yaml, profile.profileYaml,
+        profile.settings.dnsOverrideEnabled !== false);
       if (merged.ok) {
         finalYaml = merged.yaml;
         AppLogger.info(TAG, `profile merged: mode=${mode} applied=${merged.applied} `
