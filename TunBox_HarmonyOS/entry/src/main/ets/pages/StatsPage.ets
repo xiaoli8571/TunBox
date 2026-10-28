@@ -13,6 +13,7 @@
  * 之前「内存占用 / 运行时间不显示（实际是永不刷新）」就是这个原因。
  */
 import { promptAction } from '@kit.ArkUI';
+import { fileIo as fs } from '@kit.CoreFileKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
@@ -29,6 +30,7 @@ import {
 import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo } from '../commons/models/PublicIpInfo';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { ConnEvent, ConnEventKind } from '../commons/services/ConnectionEvents';
 
 const TAG = 'StatsPage';
 /** 速率曲线采样点数（与主页 RateChart 的 26 点窗口一致） */
@@ -177,11 +179,36 @@ export struct StatsPage {
   private tickCount: number = 0;
   private memoryBusy: boolean = false;
   private ipBusy: boolean = false;
+  /** RSS 回落只记一次日志（避免每秒刷屏） */
+  private rssReadLogged: boolean = false;
+  private ipQueuedTrigger: string = '';
+  private ipRequestId: number = 0;
+  private pageMounted: boolean = false;
+  private connEventToken: number = -1;
   private ready: boolean = false;
   private windowUpPeak: number = 1;
   private windowDownPeak: number = 1;
 
   aboutToAppear(): void {
+    this.pageMounted = true;
+    if (this.connEventToken < 0) {
+      this.connEventToken = this.orchestrator.subscribeConnEvents((event: ConnEvent): void => {
+        if (event.kind !== ConnEventKind.STATE) {
+          return;
+        }
+        const connected: boolean = event.state === ConnState.CONNECTED;
+        this.isConnected = connected;
+        this.clearIpInfo();
+        if (connected) {
+          this.queryIp('stats-connected');
+          this.refreshMemory();
+        } else {
+          this.memoryText = '--';
+          this.uptimeText = '--:--:--';
+          this.queryIp('stats-disconnected');
+        }
+      });
+    }
     if (this.shownBridge !== undefined) {
       this.shownBridge.setShowHandler((): void => { this.onShown(); });
     }
@@ -189,6 +216,13 @@ export struct StatsPage {
   }
 
   aboutToDisappear(): void {
+    if (this.connEventToken >= 0) {
+      this.orchestrator.unsubscribeConnEvents(this.connEventToken);
+      this.connEventToken = -1;
+    }
+    this.pageMounted = false;
+    this.ipRequestId += 1;
+    this.ipQueuedTrigger = '';
     if (this.shownBridge !== undefined) {
       this.shownBridge.setShowHandler(null);
     }
@@ -340,6 +374,11 @@ export struct StatsPage {
     this.uptimeText = `${h}:${m}:${s}`;
   }
 
+  /**
+   * 内存占用：优先内核 `/memory`；该端点在本内核上实测会 Operation timeout
+   * （真机日志 code=2300028），因此失败时回落到**扩展进程写出的 VmRSS 采样**
+   * （内核就活在扩展进程里，两者是同一份内存）。
+   */
   private async refreshMemory(): Promise<void> {
     if (this.memoryBusy) {
       return;
@@ -347,7 +386,12 @@ export struct StatsPage {
     this.memoryBusy = true;
     try {
       const inuse: number = await this.orchestrator.api.fetchMemoryInuse();
-      this.memoryText = inuse > 0 ? this.formatBytes(inuse) : '--';
+      if (inuse > 0) {
+        this.memoryText = this.formatBytes(inuse);
+        return;
+      }
+      const kb: number = this.readProcRssKb();
+      this.memoryText = kb > 0 ? this.formatBytes(kb * 1024) : '--';
     } catch (e) {
       this.memoryText = '--';
     } finally {
@@ -355,17 +399,56 @@ export struct StatsPage {
     }
   }
 
+  /** 读扩展进程写出的 `vpn_mem_kb.txt`（VmRSS，单位 kB）；不可用返回 -1 */
+  private readProcRssKb(): number {
+    const ctx: Context = getContext(this) as Context;
+    const path: string = `${ctx.cacheDir}/vpn_mem_kb.txt`;
+    try {
+      const text: string = fs.readTextSync(path);
+      const kb: number = Number(text.trim());
+      if (!this.rssReadLogged) {
+        this.rssReadLogged = true;
+        AppLogger.info(TAG, `rss sample read ok: ${kb} kB from ${path}`);
+      }
+      return Number.isFinite(kb) && kb > 0 ? kb : -1;
+    } catch (e) {
+      if (!this.rssReadLogged) {
+        this.rssReadLogged = true;
+        AppLogger.warn(TAG, `rss sample unreadable at ${path}: ${AppLogger.errText(e)}`);
+      }
+      return -1;
+    }
+  }
+
+  private clearIpInfo(): void {
+    this.ipRequestId += 1;
+    this.ipText = '';
+    this.ipCountry = '';
+    this.ipFlag = '';
+    this.ipCity = '';
+    this.ipIsp = '';
+    this.ipAsn = '';
+    this.ipTimezone = '';
+    this.ipState = 0;
+  }
+
   private async queryIp(trigger: string): Promise<void> {
     if (this.ipBusy) {
+      this.ipQueuedTrigger = trigger;
       return;
     }
+    const requestId: number = ++this.ipRequestId;
     this.ipBusy = true;
     this.ipState = 1;
     try {
       const info: PublicIpInfo = await PublicIpService.query('stats/' + trigger);
+      if (requestId !== this.ipRequestId) {
+        return;
+      }
       if (info.ip.length === 0) {
         this.ipState = 3;
-        this.ipText = '';
+        this.clearIpInfo();
+        this.ipState = 3;
         return;
       }
       this.ipState = 2;
@@ -377,10 +460,17 @@ export struct StatsPage {
       this.ipAsn = info.asn;
       this.ipTimezone = info.timezone;
     } catch (e) {
-      AppLogger.warn(TAG, `ip query failed: ${AppLogger.errText(e)}`);
-      this.ipState = 3;
+      if (requestId === this.ipRequestId) {
+        AppLogger.warn(TAG, `ip query failed: ${AppLogger.errText(e)}`);
+        this.ipState = 3;
+      }
     } finally {
       this.ipBusy = false;
+      if (this.pageMounted && this.ipQueuedTrigger.length > 0) {
+        const queued: string = this.ipQueuedTrigger;
+        this.ipQueuedTrigger = '';
+        this.queryIp(queued);
+      }
     }
   }
 
@@ -549,7 +639,7 @@ export struct StatsPage {
       Row({ space: 10 }) {
         Column({ space: 2 }) {
           Row({ space: 4 }) {
-            Circle({ width: 6, height: 6 }).fill(TunBoxColors.primary)
+            Image($r('app.media.ic_chevron_down')).width(12).height(12).fillColor(TunBoxColors.primary)
             Text('下载').fontSize(11).fontColor(TunBoxColors.textMuted)
           }
           Text(this.formatSpeed(this.downSpeed))
@@ -561,7 +651,9 @@ export struct StatsPage {
 
         Column({ space: 2 }) {
           Row({ space: 4 }) {
-            Circle({ width: 6, height: 6 }).fill(TunBoxColors.success)
+            Image($r('app.media.ic_chevron_down'))
+              .width(12).height(12).fillColor(TunBoxColors.success)
+              .rotate({ angle: 180 })
             Text('上传').fontSize(11).fontColor(TunBoxColors.textMuted)
           }
           Text(this.formatSpeed(this.upSpeed))
@@ -615,7 +707,7 @@ export struct StatsPage {
     Row({ space: 12 }) {
       Column({ space: 6 }) {
         Row({ space: 5 }) {
-          Image($r('app.media.ic_network')).width(14).height(14).fillColor(TunBoxColors.primary)
+          Image($r('app.media.ic_memory')).width(14).height(14).fillColor(TunBoxColors.primary)
           Text('内存占用')
             .fontSize(12).fontColor(TunBoxColors.textMuted)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -636,7 +728,7 @@ export struct StatsPage {
 
       Column({ space: 6 }) {
         Row({ space: 5 }) {
-          Image($r('app.media.ic_refresh')).width(14).height(14).fillColor(TunBoxColors.primary)
+          Image($r('app.media.ic_clock')).width(14).height(14).fillColor(TunBoxColors.primary)
           Text('运行时间')
             .fontSize(12).fontColor(TunBoxColors.textMuted)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -645,7 +737,6 @@ export struct StatsPage {
         .alignItems(VerticalAlign.Center)
         Text(this.uptimeText)
           .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
-          .fontFamily('monospace')
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }

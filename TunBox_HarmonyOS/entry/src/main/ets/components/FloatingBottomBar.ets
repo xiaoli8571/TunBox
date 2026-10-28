@@ -21,6 +21,7 @@
  * 保证反向切页也有转场动画），未传回调时退化为直接写 currentTab。
  */
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { ThemeService } from '../theme/ThemeService';
 
 interface DockTab {
   id: number;
@@ -74,7 +75,7 @@ export struct FloatingBottomBar {
 
   private tabs: DockTab[] = [
     { id: 0, title: '主页', icon: $r('app.media.ic_dashboard') },
-    { id: 1, title: '数据', icon: $r('app.media.ic_network') },
+    { id: 1, title: '数据', icon: $r('app.media.ic_chart') },
     { id: 2, title: '设置', icon: $r('app.media.ic_settings') }
   ];
 
@@ -124,10 +125,14 @@ export struct FloatingBottomBar {
     .width('86%')
     .height(TunBoxGeometry.dockHeight)
     .borderRadius(TunBoxGeometry.dockRadius)
-    // 2026-10-26 终稿：栏体零渲染。以下四行刻意保持「无填充 / 无模糊 / 无描边 / 无投影」，
-    // 不要再加 backdropBlur / backgroundBlurStyle / shadow / border —— 任何一项都会让
-    // 栏体重新变成一条可见的白胶囊，与「完全透明」直接冲突。
-    .backgroundColor(Color.Transparent)
+    // 保留内容透出感，只给 Dock 加一层极轻的半透明渐变底色，提升文字和图标在
+    // 明暗内容上的可读性；不使用模糊、阴影或实心底色。
+    .linearGradient({
+      angle: 180,
+      colors: ThemeService.isDark()
+        ? [['rgba(15, 19, 29, 0.12)', 0.0], ['rgba(15, 19, 29, 0.24)', 1.0]]
+        : [['rgba(255, 255, 255, 0.18)', 0.0], ['rgba(235, 241, 253, 0.30)', 1.0]]
+    })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .margin({ bottom: TunBoxGeometry.dockBottomMargin })
   }

@@ -45,6 +45,7 @@
  * 守护承担；本文件只负责隧道数据面与其内部自愈。
  */
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
+import { hidebug } from '@kit.PerformanceAnalysisKit';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { ReconnectReason } from '../commons/services/ConnectionEvents';
 import { common } from '@kit.AbilityKit';
@@ -109,6 +110,16 @@ const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt';
 /** 回退文件可接受的写入年龄上限：超过即视为陈旧，宁可拒绝也不复用历史意图 */
 const START_PARAMS_MAX_AGE_MS = 180000;
 /** 兼容旧 UI 的事件状态快照文件，不再周期性写入。 */
+/**
+ * 进程内存采样文件（2026-10-28）：内核跑在**本扩展进程**里，所以本进程的
+ * VmRSS 就是「内核进程内存占用」。App 侧 `/memory` 端点实测会 Operation timeout
+ * （真机日志 code=2300028），因此由扩展进程自己采样写盘，UI 优先读 /memory、
+ * 失败再回落到这个文件。
+ */
+const MEM_FILE = 'vpn_mem_kb.txt';
+const MEM_TMP_FILE = 'vpn_mem_kb.txt.tmp';
+/** 内存采样周期（ms）：比心跳慢，避免高频 stat 拖慢 ArkTS 线程 */
+const MEM_SAMPLE_MS = 5000;
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
 /** 存活租约的原子替换临时文件（先写 .tmp，再 rename 覆盖心跳本体） */
 const HEARTBEAT_TMP_FILE = 'vpn_heartbeat.txt.tmp';
@@ -236,6 +247,10 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private coreMonitorTimer: number = -1;
   /** 存活租约独立刷新定时器（与内核探针解耦，见 LEASE_REFRESH_MS 注释）。 */
   private leaseTimer: number = -1;
+  /** 进程内存采样定时器（与租约独立：一个证明活着，一个采样内存） */
+  private memTimer: number = -1;
+  private memSampleWarned: boolean = false;
+  private memSampleLogged: boolean = false;
   /** 连续判定"内核已死"的次数（累计到 CORE_DEATH_CONFIRMATIONS 才动手）。 */
   private coreDeathStrikes: number = 0;
   private recoveryTimer: number = -1;
@@ -1074,6 +1089,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private startCoreMonitor(): void {
     this.stopCoreMonitor();
     this.startLeaseTimer();
+    this.startMemSampler();
     this.coreDeathStrikes = 0;
     this.coreMonitorTimer = UnifiedScheduler.every((): void => {
       if (this.connection === null || this.recoveryRunning || this.rebuilding || !this.networkAvailable) {
@@ -1126,6 +1142,67 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
    * 重启内核（recoverCore）期间隧道仍然存在（Kill Switch 生效中），扩展进程也是
    * 活着的，此时心跳必须继续刷新，否则 UI 会误以为扩展死了而拆隧道。
    */
+  /**
+   * 进程内存采样：读 `/proc/self/status` 的 VmRSS 写 `vpn_mem_kb.txt`（原子替换）。
+   *
+   * 与租约定时器**分离**：租约回调必须极轻（历史事故：回调里做原生调用把 ArkTS
+   * 线程阻塞 → 心跳停更 → UI 判死拆隧道）。这里单独 5s 一次，失败只记一次日志。
+   */
+  private startMemSampler(): void {
+    this.stopMemSampler();
+    this.touchMemorySample();
+    this.memTimer = UnifiedScheduler.every((): void => {
+      if (this.cleanupPromise !== null) {
+        return;
+      }
+      this.touchMemorySample();
+    }, MEM_SAMPLE_MS);
+  }
+
+  private stopMemSampler(): void {
+    if (this.memTimer >= 0) {
+      UnifiedScheduler.clear(this.memTimer);
+      this.memTimer = -1;
+    }
+  }
+
+  private touchMemorySample(): void {
+    if (this.heartbeatDir.length === 0) {
+      return;
+    }
+    try {
+      // 2026-10-28：鸿蒙沙箱的 /proc/self/status 被裁剪（实测拿不到 VmRSS 行），
+      // 改用系统 API `hidebug.getPss()`（Pss+SwapPss，单位 KB）。
+      // 内核就跑在本扩展进程里，所以这个值就是「内核进程内存占用」。
+      const kb: number = Number(hidebug.getPss());
+      if (!Number.isFinite(kb) || kb <= 0) {
+        if (!this.memSampleWarned) {
+          this.memSampleWarned = true;
+          AppLogger.warn(TAG, `memory sample: getPss returned ${kb}`);
+        }
+        return;
+      }
+      if (!this.memSampleLogged) {
+        this.memSampleLogged = true;
+        AppLogger.info(TAG, `memory sample ok: ${kb} kB -> ${this.heartbeatDir}/${MEM_FILE}`);
+      }
+      const target = `${this.heartbeatDir}/${MEM_FILE}`;
+      const tmp = `${this.heartbeatDir}/${MEM_TMP_FILE}`;
+      const hb = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(hb.fd, `${kb}`);
+      } finally {
+        fs.closeSync(hb);
+      }
+      fs.renameSync(tmp, target);
+    } catch (e) {
+      if (!this.memSampleWarned) {
+        this.memSampleWarned = true;
+        AppLogger.warn(TAG, `memory sample failed: ${AppLogger.errText(e)}`);
+      }
+    }
+  }
+
   private startLeaseTimer(): void {
     this.stopLeaseTimer();
     this.touchLivenessLease(Date.now());
@@ -1268,12 +1345,13 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     this.platformTunFd = -1;
     this.stopCoreMonitor();
     this.stopLeaseTimer();
+    this.stopMemSampler();
     this.stopNetworkAuthority();
     this.stopProtectMonitor();
     // 状态文件清理：删除权威态与兼容心跳文件，防止其他进程在陈旧窗口内把
     // "已断开"误判为"内核还活着"（与 orchestrator.clearTunnelMarkers 双保险）。
     if (this.heartbeatDir.length > 0) {
-      const stale: string[] = [HEARTBEAT_FILE, HEARTBEAT_TMP_FILE, STATUS_FILE];
+      const stale: string[] = [HEARTBEAT_FILE, HEARTBEAT_TMP_FILE, STATUS_FILE, MEM_FILE, MEM_TMP_FILE];
       for (const name of stale) {
         try {
           fs.unlinkSync(`${this.heartbeatDir}/${name}`);

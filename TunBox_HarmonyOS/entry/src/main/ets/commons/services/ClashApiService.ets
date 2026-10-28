@@ -309,26 +309,48 @@ export class ClashApiService {
       const resp = await req.request(`${this.baseUrl()}/memory`, {
         method: http.RequestMethod.GET,
         header: this.authHeader(),
-        connectTimeout: 1500,
-        readTimeout: 1500,
+        connectTimeout: 3000,
+        readTimeout: 3000,
         usingCache: false
       });
+      const body: string = typeof resp.result === 'string' ? resp.result as string : '';
       if (resp.responseCode !== 200) {
+        // 401 = secret 与内核不一致；404 = 该内核没有 /memory 路由；0/负数 = 连接失败
+        AppLogger.warn(TAG, `memory endpoint http=${resp.responseCode} body=${body.substring(0, 120)}`);
         return -1;
       }
-      const body: string = typeof resp.result === 'string' ? resp.result as string : '';
       if (body.length === 0) {
+        AppLogger.warn(TAG, 'memory endpoint returned empty body');
         return -1;
       }
       const json: Record<string, Object> = JSON.parse(body) as Record<string, Object>;
-      const inuse: Object | undefined = json['inuse'];
-      return typeof inuse === 'number' ? inuse as number : -1;
+      // 不同内核版本的字段名不一致：mihomo 上游用 `inuse`，mihomo-smart 这版是 `memory`。
+      // 两个都认，另外容忍字符串数字（部分分支把数值序列化成字符串）。
+      const candidates: string[] = ['memory', 'inuse', 'inuseBytes', 'in_use'];
+      for (let i = 0; i < candidates.length; i++) {
+        const raw: Object | undefined = json[candidates[i]];
+        if (typeof raw === 'number') {
+          AppLogger.info(TAG, `memory inuse=${raw as number} (key=${candidates[i]})`);
+          return raw as number;
+        }
+        if (typeof raw === 'string') {
+          const parsed: number = Number(raw as string);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            AppLogger.info(TAG, `memory inuse=${parsed} (key=${candidates[i]}, string)`);
+            return parsed;
+          }
+        }
+      }
+      AppLogger.warn(TAG, `memory endpoint unknown payload: ${body.substring(0, 160)}`);
+      return -1;
     } catch (e) {
+      AppLogger.warn(TAG, `memory fetch failed: ${AppLogger.errText(e)}`);
       return -1;
     } finally {
       req.destroy();
     }
   }
+
 
   /** 健康探测（对应 MihomoApiHealthProbe）：GET /version */
   async healthProbe(): Promise<boolean> {
