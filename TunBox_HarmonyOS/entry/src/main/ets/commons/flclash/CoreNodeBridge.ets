@@ -17,11 +17,12 @@ import { CoreNode } from './CoreCatalog';
 const PREFIX = 'core:';
 
 export class CoreNodeBridge {
-  static toProxyNode(node: CoreNode): ProxyNode {
+  static toProxyNode(node: CoreNode, subscriptionId: string = ''): ProxyNode {
     const out = new ProxyNode();
     out.id = `${PREFIX}${node.name}`;
     out.name = node.name;
     out.originalName = node.name;
+    out.subscriptionId = subscriptionId;
     out.proxyType = node.type.length > 0 ? node.type : 'unknown';
     out.type = ProxyNodeType.UNKNOWN;
     out.server = '';
@@ -29,10 +30,10 @@ export class CoreNodeBridge {
     return out;
   }
 
-  static toProxyNodes(nodes: CoreNode[]): ProxyNode[] {
+  static toProxyNodes(nodes: CoreNode[], subscriptionId: string = ''): ProxyNode[] {
     const out: ProxyNode[] = [];
     for (const node of nodes) {
-      out.push(CoreNodeBridge.toProxyNode(node));
+      out.push(CoreNodeBridge.toProxyNode(node, subscriptionId));
     }
     return out;
   }

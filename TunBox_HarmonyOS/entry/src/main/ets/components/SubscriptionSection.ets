@@ -22,7 +22,7 @@ import { ProxyNode } from '../commons/models/ProxyNode';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
@@ -31,6 +31,8 @@ import { ProfileConfigMerger } from '../commons/flclash/ProfileConfigMerger';
 import { SubConverter } from '../commons/flclash/SubConverter';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
+import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
+import { CoreGroup } from '../commons/flclash/CoreCatalog';
 import { AppLogger } from '../commons/utils/AppLogger';
 
 const TAG = 'SubscriptionSection';
@@ -282,6 +284,7 @@ export struct SubscriptionSection {
   @State private selectedGroup: string = '';
   @State private currentProfileId: string = '';
   @State private currentNodeName: string = '';
+  @State private coreRevision: number = 0;
   @State private latencyRevision: number = 0;
   @State private refreshingIds: string[] = [];
   @State private testingIds: string[] = [];
@@ -344,6 +347,7 @@ export struct SubscriptionSection {
   private nodeSetBound: boolean = false;
   private readonly orchListener: () => void = (): void => {
     this.reload();
+    this.refreshCoreCatalog();
   };
   private orchBound: boolean = false;
 
@@ -361,6 +365,7 @@ export struct SubscriptionSection {
       ConnectionOrchestrator.instance().addListener(this.orchListener);
     }
     this.reload();
+    this.refreshCoreCatalog();
     this.measureStatusBar();
     if (this.subs.length === 0) {
       setTimeout((): void => { this.reload(); }, 600);
@@ -442,8 +447,43 @@ export struct SubscriptionSection {
 
  
 
+  private coreCatalogFor(subId: string): boolean {
+    const state = ConnectionOrchestrator.instance().state;
+    return (state === ConnState.CONNECTED || state === ConnState.CONNECTING)
+      && CoreCatalogService.current() !== null
+      && CoreCatalogService.profileIdOfSnapshot() === subId;
+  }
+
   private groupsOf(subId: string): ProxyGroup[] {
+    const core = CoreCatalogService.current();
+    if (core !== null && subId === this.currentProfileId && this.coreCatalogFor(subId)) {
+      const out: ProxyGroup[] = [];
+      for (const source of core.groups) {
+        if (source.hidden) {
+          continue;
+        }
+        const group = new ProxyGroup();
+        group.subscriptionId = subId;
+        group.name = source.name;
+        group.groupType = source.type;
+        group.members = source.all.filter((node): boolean => !node.isGroup).map((node): string => node.name);
+        out.push(group);
+      }
+      return out;
+    }
     return this.service.groupsOf(subId);
+  }
+
+  private async refreshCoreCatalog(): Promise<void> {
+    const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+    if (orch.state !== ConnState.CONNECTED && orch.state !== ConnState.CONNECTING) {
+      return;
+    }
+    const profileId = ProfileRepository.currentId();
+    const model = await CoreCatalogService.refresh(orch.api, false, profileId);
+    if (model !== null) {
+      this.coreRevision = this.coreRevision + 1;
+    }
   }
 
   private activeGroupOf(subId: string): ProxyGroup | null {
@@ -460,15 +500,20 @@ export struct SubscriptionSection {
   }
 
   private panelNodes(): ProxyNode[] {
-    const group: ProxyGroup | null = this.activeGroupOf(this.panelSubId);
+    const core = CoreCatalogService.current();
     let arr: ProxyNode[];
-    if (group !== null) {
-      arr = this.service.expandProxyGroup(group);
+    if (core !== null && this.panelSubId === this.currentProfileId && this.coreCatalogFor(this.panelSubId)) {
+      const source: CoreGroup | null = core.findGroup(this.selectedGroup);
+      const nodes = source !== null ? source.all.filter((node): boolean => !node.isGroup)
+        : CoreCatalogService.flattenNodes('rule');
+      arr = CoreNodeBridge.toProxyNodes(nodes, this.panelSubId);
     } else {
-      arr = this.service.nodesOf(this.panelSubId).slice();
-    }
-    if (!this.sortByDelay) {
-      return arr;
+      const group: ProxyGroup | null = this.activeGroupOf(this.panelSubId);
+      if (group !== null) {
+        arr = this.service.expandProxyGroup(group);
+      } else {
+        arr = this.service.nodesOf(this.panelSubId).slice();
+      }
     }
     if (!this.sortByDelay) {
       return arr;
@@ -550,6 +595,10 @@ export struct SubscriptionSection {
   }
 
   private nodeCountText(sub: Subscription): string {
+    const core = CoreCatalogService.current();
+    if (core !== null && sub.id === this.currentProfileId && this.coreCatalogFor(sub.id)) {
+      return `${CoreCatalogService.flattenNodes('rule').length} 节点`;
+    }
     return `${this.service.nodesOf(sub.id).length} 节点`;
   }
 
@@ -873,6 +922,15 @@ export struct SubscriptionSection {
   }
 
   private async selectNode(node: ProxyNode): Promise<void> {
+    // /proxies 只提供名字和类型；连接仍必须回查 profile 中的真实节点以取得凭据。
+    if (CoreNodeBridge.isShadow(node)) {
+      const local = this.service.nodesOf(this.panelSubId).find((candidate): boolean => candidate.name === node.name);
+      if (local === undefined) {
+        this.toast('该内核节点缺少可用凭据，请刷新订阅后重试');
+        return;
+      }
+      node = local;
+    }
     this.closePanel();
     if (this.settings.autoSelectMode === AutoSelectModes.AUTO) {
       this.settings.autoSelectMode = AutoSelectModes.MANUAL;
@@ -1203,7 +1261,7 @@ export struct SubscriptionSection {
             ListItem() {
               this.NodeRow(node)
             }
-          }, (node: ProxyNode) => `${node.id}|${this.selectedGroup}|${this.latencyRevision}|${this.sortByDelay}`)
+          }, (node: ProxyNode) => `${node.id}|${this.selectedGroup}|${this.latencyRevision}|${this.coreRevision}|${this.sortByDelay}`)
         }
         .width('100%')
         .layoutWeight(1)

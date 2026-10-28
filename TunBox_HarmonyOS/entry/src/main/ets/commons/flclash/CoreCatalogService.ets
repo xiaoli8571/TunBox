@@ -42,6 +42,7 @@ export function isBuiltinPolicy(name: string): boolean {
 export class CoreCatalogService {
   private static model: CoreCatalogModel | null = null;
   private static fetchedAt: number = 0;
+  private static profileId: string = '';
   private static lastError: string = '';
 
   /** 最近一次成功的快照；从未成功过返回 null。 */
@@ -53,6 +54,10 @@ export class CoreCatalogService {
     return CoreCatalogService.fetchedAt;
   }
 
+  static profileIdOfSnapshot(): string {
+    return CoreCatalogService.profileId;
+  }
+
   static lastFailure(): string {
     return CoreCatalogService.lastError;
   }
@@ -60,19 +65,22 @@ export class CoreCatalogService {
   static clear(): void {
     CoreCatalogService.model = null;
     CoreCatalogService.fetchedAt = 0;
+    CoreCatalogService.profileId = '';
   }
 
   /**
    * 刷新快照。`force=false` 时 800ms 内复用上一份（页面反复 onPageShow 不重复打内核）。
    * 返回 null = 本次刷新失败（保留旧快照）。
    */
-  static async refresh(api: ClashApiService | null, force: boolean = false): Promise<CoreCatalogModel | null> {
+  static async refresh(api: ClashApiService | null, force: boolean = false,
+    profileId: string = ''): Promise<CoreCatalogModel | null> {
     if (api === null) {
       CoreCatalogService.lastError = 'core unavailable';
       return null;
     }
     const now = Date.now();
-    if (!force && CoreCatalogService.model !== null && now - CoreCatalogService.fetchedAt < SNAPSHOT_TTL_MS) {
+    if (!force && CoreCatalogService.model !== null && CoreCatalogService.profileId === profileId
+      && now - CoreCatalogService.fetchedAt < SNAPSHOT_TTL_MS) {
       return CoreCatalogService.model;
     }
     const json = await api.proxiesJson();
@@ -87,6 +95,7 @@ export class CoreCatalogService {
       return CoreCatalogService.model;
     }
     CoreCatalogService.model = parsed;
+    CoreCatalogService.profileId = profileId;
     CoreCatalogService.fetchedAt = now;
     CoreCatalogService.lastError = '';
     return parsed;
