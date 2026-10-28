@@ -74,6 +74,13 @@ export class SmartInjectResult {
   reason: string = '';
 }
 
+/** 把节点补进指定策略组的结果（ok=false 时 yaml 原样返回，调用方降级处理） */
+export class GroupMemberResult {
+  ok: boolean = false;
+  yaml: string = '';
+  reason: string = '';
+}
+
 export class ProfileConfigMerger {
   /**
    * 订阅原文是否是内核可解析的 Clash 配置。
@@ -149,6 +156,131 @@ export class ProfileConfigMerger {
   static yamlQuote(value: string): string {
     const sq: string = String.fromCharCode(39);
     return sq + value.split(sq).join(sq + sq) + sq;
+  }
+
+  /**
+   * 确保某节点是目标策略组的**真实成员**（原文接管模式下组常只列一部分节点）。
+   *
+   * ## 为什么需要它（2026-10-28 真机：选香港 → 连上变日本）
+   *
+   * 机场的 `proxy-groups` 只把部分节点列进主选择组；另外一些节点在 `proxies:` 里
+   * 存在、App 节点页也选得到，但**不在组的成员表**里。此时 `PUT /proxies/<组>` 必
+   * 被内核拒（不是成员），旧实现于是静默换成「组内首个叶子」。
+   * 用户意图是明确的：他选的那个节点。内核允许 select 组把任意 `proxies` 成员列为
+   * 成员，所以正确做法是把它补进组首位（与生成器 `unshift` 同一语义），而不是换节点。
+   *
+   * 只做「插入一行成员」，不重排、不重写其他段；任何结构不符合预期都返回 ok=false
+   * 由调用方降级（绝不把坏 YAML 交出去：内核对重复键是整份拒载）。
+   */
+  static ensureGroupMember(yaml: string, groupName: string, nodeName: string): GroupMemberResult {
+    const out = new GroupMemberResult();
+    out.yaml = yaml;
+    if (groupName.length === 0 || nodeName.length === 0) {
+      out.reason = '组名或节点名为空';
+      return out;
+    }
+    const lines: string[] = yaml.replace(/\r/g, '').split('\n');
+    const start: number = lines.findIndex((l: string): boolean => l.startsWith('proxy-groups:'));
+    if (start < 0) {
+      out.reason = '没有 proxy-groups 段';
+      return out;
+    }
+    let end: number = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      const l: string = lines[i];
+      if (l.trim().length > 0 && !l.startsWith(' ') && !l.startsWith('\t')
+        && !l.trimStart().startsWith('#')) {
+        end = i;
+        break;
+      }
+    }
+    // ① 定组项缩进（`- name:` 那一行的前导空格）
+    let groupIndent: number = -1;
+    for (let i = start + 1; i < end; i++) {
+      const m = lines[i].match(/^(\s*)-\s*name:\s*(.+)$/);
+      if (m !== null) {
+        groupIndent = m[1].length;
+        break;
+      }
+    }
+    if (groupIndent < 0) {
+      out.reason = '解析不出组项缩进';
+      return out;
+    }
+    // ② 定位目标组块
+    let gStart: number = -1;
+    let gEnd: number = end;
+    for (let i = start + 1; i < end; i++) {
+      const m = lines[i].match(/^(\s*)-\s*name:\s*(.+)$/);
+      if (m === null || m[1].length !== groupIndent) {
+        continue;
+      }
+      if (gStart >= 0) {
+        gEnd = i;
+        break;
+      }
+      const name: string = ProfileConfigMerger.unquote(m[2].trim());
+      if (name === groupName) {
+        gStart = i;
+      }
+    }
+    if (gStart < 0) {
+      out.reason = `找不到策略组 ${groupName}`;
+      return out;
+    }
+    // ③ 已是成员（逐字节比名字，调用方传的就是 YAML 里的写法）
+    const memberPrefix: RegExp = /^(\s*)-\s+(.+)$/;
+    let proxiesLine: number = -1;
+    for (let i = gStart + 1; i < gEnd; i++) {
+      const t: string = lines[i].trim();
+      if (t === 'proxies:' || t.startsWith('proxies:') ) {
+        proxiesLine = i;
+        continue;
+      }
+      const m = lines[i].match(memberPrefix);
+      if (m === null) {
+        continue;
+      }
+      if (lines[i].match(/^\s*-\s*name:/) !== null) {
+        break;
+      }
+      const member: string = ProfileConfigMerger.unquote(m[2].trim());
+      if (member === nodeName) {
+        out.ok = true;
+        out.reason = '已是成员';
+        return out;
+      }
+    }
+    // ④ 插入成员：优先插到 `proxies:` 列表首位（与生成器 unshift 同语义）
+    const indentOf = (line: string): number => line.length - line.trimStart().length;
+    const quoted: string = ProfileConfigMerger.yamlQuote(nodeName);
+    if (proxiesLine >= 0) {
+      const raw: string = lines[proxiesLine];
+      const indent: number = indentOf(raw);
+      const inline: string = raw.trim().substring('proxies:'.length).trim();
+      if (inline.length === 0) {
+        lines.splice(proxiesLine + 1, 0, `${' '.repeat(indent + 2)}- ${quoted}`);
+      } else if (inline === '[]') {
+        lines[proxiesLine] = `${' '.repeat(indent)}proxies:`;
+        lines.splice(proxiesLine + 1, 0, `${' '.repeat(indent + 2)}- ${quoted}`);
+      } else if (inline.charAt(0) === '[') {
+        const body: string = inline.substring(1, inline.length - 1).trim();
+        const next: string = body.length === 0 ? quoted : `${quoted}, ${body}`;
+        lines[proxiesLine] = `${' '.repeat(indent)}proxies: [${next}]`;
+      } else {
+        out.reason = 'proxies 段写法无法识别';
+        return out;
+      }
+    } else {
+      // 组里还没有成员表：补一个最小的 proxies: 块（放在 name 行之后）
+      lines.splice(gStart + 1, 0,
+        `${' '.repeat(groupIndent + 2)}proxies:`,
+        `${' '.repeat(groupIndent + 4)}- ${quoted}`);
+    }
+    out.yaml = lines.join('\n');
+    out.ok = true;
+    out.reason = proxiesLine >= 0 ? '成员已插入组首位' : '已补建成员表';
+    return out;
   }
 
   /**

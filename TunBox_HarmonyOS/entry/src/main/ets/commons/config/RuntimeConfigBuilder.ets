@@ -220,6 +220,11 @@ export class RuntimeConfigResult {
    * 要靠它去内核 `/proxies` 里找真实成员。空串 = YAML 里没有可用的策略组。
    */
   ruleGroupName: string = '';
+  /**
+   * `effectiveNodeName` 是否就是用户所选节点（见 `ConnectionTarget.matched`）。
+   * 连接路径据此决定「能不能覆盖内核旧出口」「要不要回写偏好」。
+   */
+  pinMatched: boolean = false;
 }
 
 /** proxy-groups 里一个组的解析结果（成员名已还原 YAML 转义）。 */
@@ -287,6 +292,16 @@ export class ConnectionTarget {
    * 不能覆盖新一代已经确认的出口。
    */
   generation: number = 0;
+  /**
+   * 本次解析出的节点是否就是**用户所选的那一个节点**（精确或仅 emoji/标点差异，
+   * 2026-10-28 收口）。
+   *
+   * `false` 只表示两种事实之一：① 用户根本没选（空偏好）；② 配置里找不到所选
+   * 节点，下面退回的是「地区自愈 / 组内首个叶子」的替身。
+   * 连接路径**必须**靠它区分「用户意图已落地」与「替身」，否则会把替身当成
+   * 用户选择写回偏好 —— 真机症状：未连接时选了香港，一连上变成上次的日本节点。
+   */
+  matched: boolean = false;
 
   constructor(groupName: string = '', nodeName: string = '',
     source: ConnectionTargetSource = ConnectionTargetSource.YAML,
@@ -578,9 +593,31 @@ export class RuntimeConfigBuilder {
     //   ① 组名 = 规则真正指向的 select 组（兜底 proxy-groups 首组）；
     //   ② 节点 = 用户所选节点若在该组/该配置里存在就用它，否则按「去 emoji 归一化 /
     //      地区关键词」自愈到组内同名地区的真实节点，再否则取组内首个叶子节点。
-    const resolvedPin: ConnectionTarget = RuntimeConfigBuilder.resolvePinTarget(
+    let resolvedPin: ConnectionTarget = RuntimeConfigBuilder.resolvePinTarget(
       finalYaml, options.selectedNodeName);
+    // ── 用户意图落地闸门（2026-10-28 收口）───────────────────────────────────
+    // 机场组常只把一部分节点列进主选择组（因为「没列进去的节点不该让用户选」不是
+    // 我们的产品口径）。此时用户在 App 里选得到、YAML 里 proxies 也有，但组的成员
+    // 表里没有它 → 钉选 PUT 必 400 → 旧实现静默换成组内首个叶子（真机：香港 → 日本）。
+    // 现在先把该节点补进规则组首位，让它成为**可钉的真实成员**；补不进去才降级。
+    if (!resolvedPin.matched && resolvedPin.groupName.length > 0) {
+      const yamlName: string = RuntimeConfigBuilder.proxyNameInYaml(finalYaml,
+        options.selectedNodeName);
+      if (yamlName.length > 0) {
+        const inj = ProfileConfigMerger.ensureGroupMember(finalYaml, resolvedPin.groupName, yamlName);
+        if (inj.ok) {
+          finalYaml = inj.yaml;
+          resolvedPin = RuntimeConfigBuilder.resolvePinTarget(finalYaml, yamlName);
+          AppLogger.info(TAG, `selected node injected into group "${resolvedPin.groupName}": `
+            + `"${yamlName}" (${inj.reason})`);
+        } else {
+          AppLogger.warn(TAG, `selected node "${yamlName}" not injectable into group `
+            + `"${resolvedPin.groupName}": ${inj.reason}`);
+        }
+      }
+    }
     result.ruleGroupName = resolvedPin.groupName;
+    result.pinMatched = resolvedPin.matched;
     // provider-only 订阅的组在文本里只有内部占位 outbound（__tunbox_overlay__），
     // 真实节点由 `use: provider` 在运行时注入 —— 这个占位符绝不能当钉选目标。
     const fromGenerator: string = ClashConfigGenerator.lastEffectiveNodeName.startsWith('__')
@@ -658,7 +695,53 @@ export class RuntimeConfigBuilder {
     // 来源标注：与用户所选**逐字节相同**才算 user；地区自愈/组内首叶子都算 yaml。
     out.source = (out.nodeName.length > 0 && out.nodeName === preferred)
       ? ConnectionTargetSource.USER : ConnectionTargetSource.YAML;
+    // 「是不是同一个节点」按归一化名判（emoji / 空格 / 分隔符差异不算换节点）。
+    // 地区自愈（`新加坡01aws` → `🇸🇬新加坡•移联01`）与组内首叶子**一律不算**：
+    // 它们是替身，不能让连接路径以为用户意图已经落地。
+    const wantKey: string = RuntimeConfigBuilder.nodeKey(preferred);
+    out.matched = wantKey.length > 0
+      && RuntimeConfigBuilder.nodeKey(out.nodeName) === wantKey;
     return out;
+  }
+
+  /**
+   * 在**内核**给回的成员名单里找用户所选节点（精确 → 归一化）。
+   *
+   * 为什么要单独一个函数（2026-10-28 真机定案）：连接路径旧实现用
+   * `leaf === target.name` **逐字节**比较内核成员名，App 侧名字与内核名只要差一个
+   * emoji/空格就判「不是这个节点」，于是走进「认内核旧出口」分支 —— 用户看到的
+   * 就是「未连接时选了香港、一连接又变回上次那个节点」。
+   *
+   * 返回**内核里的真实名字**（PUT 必须用这个名字），找不到返回空串。
+   */
+  static kernelLeafFor(members: string[], preferred: string): string {
+    const want: string = preferred.trim();
+    if (want.length === 0 || members.length === 0) { return ''; }
+    for (const m of members) {
+      if (m === want) { return m; }
+    }
+    const key: string = RuntimeConfigBuilder.nodeKey(want);
+    if (key.length === 0) { return ''; }
+    for (const m of members) {
+      if (RuntimeConfigBuilder.nodeKey(m) === key) { return m; }
+    }
+    return '';
+  }
+
+  /** 顶层 `proxies:` 里是否存在该节点；返回 YAML 里的真实写法（精确 → 归一化）。 */
+  static proxyNameInYaml(yaml: string, preferred: string): string {
+    const want: string = preferred.trim();
+    if (want.length === 0) { return ''; }
+    const names: string[] = RuntimeConfigBuilder.parseProxyNames(yaml);
+    for (const n of names) {
+      if (n === want) { return n; }
+    }
+    const key: string = RuntimeConfigBuilder.nodeKey(want);
+    if (key.length === 0) { return ''; }
+    for (const n of names) {
+      if (RuntimeConfigBuilder.nodeKey(n) === key) { return n; }
+    }
+    return '';
   }
 
   /** 在候选名集合里找用户意图对应的真实节点（精确 / 归一化 / 地区关键词三级）。 */

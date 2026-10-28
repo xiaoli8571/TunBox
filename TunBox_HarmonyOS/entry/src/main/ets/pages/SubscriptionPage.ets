@@ -963,10 +963,16 @@ export struct SubscriptionPage {
       this.syncCandidateCount();
       this.latencyTick = this.latencyTick + 1;
     }
-    // 切订阅：先还原该订阅**上次手动选的节点**，再让编排器应用配置。
-    // 否则全局偏好还停在上一家订阅的节点上，按跨订阅作用域判无效后
-    // 会掉到新订阅的第一个节点（用户感知「切回来随机选了一个」）。
-    await this.restoreRememberedNode(id);
+    // 切订阅时不要无条件改写全局 preferredNode*。
+    // 已连接/正在连接时，当前出口的唯一真源是 ConnectionTarget（内核实际出口），
+    // 提前把 remembered node 写回偏好会造成：只点订阅、不点节点，也把连接目标
+    // 悄悄改成该订阅历史节点，随后 ensureProfileApplied()/重连路径读取到的是被覆盖
+    // 的偏好而不是真实出口。
+    // 仅在未连接状态下恢复 remembered node，连接态保持现有出口与用户显式选点优先。
+    const orchState: ConnState = ConnectionOrchestrator.instance().state;
+    if (orchState !== ConnState.CONNECTED && orchState !== ConnState.CONNECTING) {
+      await this.restoreRememberedNode(id);
+    }
     try {
       await ConnectionOrchestrator.instance().ensureProfileApplied('subscription-page');
     } catch (e) {
@@ -1150,14 +1156,12 @@ export struct SubscriptionPage {
    * 合并通知）即重渲染重排，用户实时看到快节点「冒泡」到前面。
    */
   private nodesSortedByLatency(subId: string): ProxyNode[] {
-    // FlClash 同构：**只有内核里真正生效的那份 profile** 才用内核目录渲染。
-    // 用 currentId 判断会把「刚设成 current、但内核还没换过来」的订阅渲染成
-    // 上一份订阅的节点（用户实锤：吹雪云卡片里显示 oc2 的节点）。
-    // 三重一致才用内核目录：内核里生效的 profile == 当前 profile == 这张卡片。
-    // 任何一处不一致都回落该订阅自己的解析表 —— 宁可显示旧数据，也绝不把别人的节点画进来。
-    const source: ProxyNode[] = (subId === ProfileRepository.currentId() && this.coreNodesUsable())
-      ? this.coreNodes : this.service.nodesOf(subId);
-    const arr: ProxyNode[] = source.slice();
+    // 2026-10-28 订阅隔离修复：订阅展开区永远使用该订阅自己的解析节点表。
+    // 不再把 current/applied profile 对应的全局 coreNodes 注入某个订阅卡片。
+    // 原实现存在单例 coreNodes，在 profile 切换异步完成前会短暂携带上一订阅数据，
+    // 导致“展开 B 先看到 A 的节点，再闪回 B”的串台现象。
+    // 订阅页职责是展示订阅自身内容，因此这里强制按 subscriptionId 隔离。
+    const arr: ProxyNode[] = this.service.nodesOf(subId).slice();
     // 排序口径由「节点排序」按钮决定：delay=延迟优先（默认）/ default=订阅原始顺序。
     if (this.nodeListSortMode !== 'delay') {
       return arr;

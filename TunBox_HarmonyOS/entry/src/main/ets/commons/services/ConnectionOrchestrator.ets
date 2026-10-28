@@ -4180,7 +4180,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const effectiveNode: ProxyNode | null =
         (tunnelProfile.nodes ?? []).find((n: ProxyNode): boolean => n.name === effectiveName) ?? null;
       const pinNode: ProxyNode = effectiveNode !== null ? effectiveNode : target;
-      if (effectiveName !== target.name) {
+      if (effectiveName !== target.name && !built.pinMatched) {
         AppLogger.warn(TAG, `pin target "${target.name}" missing from final PROXY group; `
           + `pinning "${effectiveName}" instead`);
         this.lastNode = pinNode;
@@ -4476,36 +4476,48 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       //   ③ 都不成立 → 才走 resolvePinTarget（地区自愈）/ 内核叶子兜底。
       const kernelSel: KernelGroupSelection | null =
         await this.api.readKernelSelection(built.ruleGroupName);
+      // 用户意图是否**真的落在本次配置里**（精确/归一化命中，见 RuntimeConfigResult.pinMatched）。
+      // 地区自愈 / 组内首叶子都是替身，不算意图落地。
+      // 2026-10-28 用户报障定案：未连接时在同一订阅里改选节点，连上却用回「切订阅时
+      // 第一个选的节点」—— 根因就是这里：旧代码**逐字节**比较内核成员名，差一个 emoji
+      // 就判 userPickValid=false，于是走进「认内核旧出口」分支，把用户刚选的节点抛了。
+      const intentLive: boolean = built.pinMatched && target.name.length > 0;
       let userPickValid: boolean = false;
+      // PUT 必须发**内核里的真实名字**（App 侧名字可能与内核对不上，差 emoji/空格）。
+      let kernelPickName: string = '';
       if (kernelSel !== null && !pinSmartGroup) {
-        for (const leaf of kernelSel.leafMembers) {
-          if (leaf === target.name) { userPickValid = true; break; }
-        }
+        kernelPickName = RuntimeConfigBuilder.kernelLeafFor(kernelSel.leafMembers,
+          intentLive ? target.name : effectiveName);
+        userPickValid = kernelPickName.length > 0;
       }
       let finalNodeName: string = effectiveName;
       let fallbackNode: ProxyNode | null = null;
       let pinned: boolean = false;
       if (userPickValid) {
-        pinned = await this.api.selectNode(target.name);
-        if (pinned) { finalNodeName = target.name; }
+        pinned = await this.api.selectNode(kernelPickName);
+        if (pinned) { finalNodeName = kernelPickName; }
       }
+      if (!pinned && (effectiveName === target.name && target.id.startsWith('profile:'))) {
+        pinned = true;
+      }
+      // 显式钉选（本次配置里的目标节点）优先于内核旧状态：用户刚选的必须赢。
+      if (!pinned && pinTargetName.length > 0) {
+        pinned = await this.api.selectNode(pinTargetName);
+        if (pinned) { finalNodeName = pinTargetName; }
+      }
+      // 只有**没有可用用户意图**时，才认内核既有出口（store-selected 持久化的上次选择）。
+      // 有意图却因为名字差异落不下去时，诚实地用配置里的目标 + 日志，不得拿旧出口顶替。
       let adoptedByKernel: boolean = false;
-      if (!pinned && kernelSel !== null && !pinSmartGroup && kernelSel.nowIsLeaf) {
-        // 内核已持有合法出口 ⇒ 本次不写内核，直接认它（从此不再有「显示 vs 实际」漂移）。
+      if (!pinned && !intentLive && kernelSel !== null && !pinSmartGroup && kernelSel.nowIsLeaf) {
         pinned = true;
         adoptedByKernel = true;
         finalNodeName = kernelSel.now;
         AppLogger.info(TAG, `pin adopted kernel selection: group="${kernelSel.group}" `
           + `now="${kernelSel.now}" (skipped PUT)`);
       }
-      if (!pinned && (effectiveName === target.name && target.id.startsWith('profile:'))) {
-        pinned = true;
-      }
-      if (!pinned && pinTargetName.length > 0) {
-        pinned = await this.api.selectNode(pinTargetName);
-      }
-      if (adoptedByKernel) {
-        // 内核真源与偏好不一致时必须回写偏好，否则下次冷启动还会拿旧名字去试。
+      if (adoptedByKernel && target.name.length === 0) {
+        // 没有任何用户偏好时才把内核出口记成偏好；有偏好却落不下去的场合必须保留
+        // 用户选择，否则节点页的勾选会被默默改掉（用户会以为 App 在跟他抢控制权）。
         await this.selfHealPreferredNode(finalNodeName, tunnelProfile.nodes ?? [],
           target.subscriptionId);
       }
@@ -4537,19 +4549,23 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             + `from current subscription instead`);
           this.lastNode = fallbackNode;
           this.lastNodeName = finalNodeName;
-          try {
-            await SettingsService.patchSettings((p: AppSettings): void => {
-              p.preferredNodeId = fallbackNode !== null ? fallbackNode.id : '';
-              p.preferredNodeName = finalNodeName;
-              p.preferredNodeSubscriptionId = fallbackNode !== null
-                ? fallbackNode.subscriptionId : target.subscriptionId;
-              p.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
-                p.preferredNodeNamesBySubscription,
-                fallbackNode !== null ? fallbackNode.subscriptionId : target.subscriptionId,
-                finalNodeName);
-            });
-          } catch (e) {
-            AppLogger.warn(TAG, `self-heal fallback node failed: ${AppLogger.errText(e)}`);
+          // 只有用户本就没选（intentLive=false）时才把这枚兵子记成偏好；
+          // 用户明确选了却钉不上，保留他的选择，下次刷新/重连再试（不默默改勾选）。
+          if (!intentLive) {
+            try {
+              await SettingsService.patchSettings((p: AppSettings): void => {
+                p.preferredNodeId = fallbackNode !== null ? fallbackNode.id : '';
+                p.preferredNodeName = finalNodeName;
+                p.preferredNodeSubscriptionId = fallbackNode !== null
+                  ? fallbackNode.subscriptionId : target.subscriptionId;
+                p.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+                  p.preferredNodeNamesBySubscription,
+                  fallbackNode !== null ? fallbackNode.subscriptionId : target.subscriptionId,
+                  finalNodeName);
+              });
+            } catch (e) {
+              AppLogger.warn(TAG, `self-heal fallback node failed: ${AppLogger.errText(e)}`);
+            }
           }
         }
       }
