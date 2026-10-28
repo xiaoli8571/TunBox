@@ -1351,16 +1351,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 已有重启在途：让编排器按原路径收敛，避免叠加第二条连接流水线。
       return false;
     }
-    try {
-      const settings: AppSettings = await SettingsService.load();
-      if (settings.autoSelectMode === AutoSelectModes.AUTO) {
-        return true;
-      }
-    } catch (e) {
-      // 读不到设置不能据此拆掉用户正在用的隧道。
-      return false;
-    }
-    return !this.exitBelongsToProfile(profileId);
+    // 2026-10-28：订阅切换语义统一为“切订阅 = 切出口”。
+    // 之前仅在 AUTO 模式或出口不属于目标 profile 时才完整重连，
+    // 导致已连接状态下切换订阅经常只做热重载：UI 提示正在切换，
+    // 实际 ConnectionTarget 仍保持旧节点，主页继续显示旧出口。
+    // 这里统一要求 profile 发生切换时执行完整 reconnect，
+    // 让当前出口、内核选择、主页显示、订阅页状态始终收敛到同一事实来源。
+    return true;
   }
 
   /**
