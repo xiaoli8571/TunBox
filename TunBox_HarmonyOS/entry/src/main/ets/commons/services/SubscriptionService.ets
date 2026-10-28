@@ -20,7 +20,7 @@
  */
 import { RawBodyCache } from './RawProxyYaml';
 // FlClash 同构：订阅原文 = profile 文件（App 侧不再把节点当作权威来源）
-import { ProfileStore } from '../flclash/ProfileStore';
+import { ProfileRepository } from '../flclash/ProfileRepository';
 import { coreBridge } from '../../core/CoreBridge';
 // convertProxies（mihomo convert.ConvertsV2Ray 的 ArkTS 移植）：base64 / URI 列表订阅
 import { SubConverter } from '../flclash/SubConverter';
@@ -184,9 +184,9 @@ export class SubscriptionService {
         credFilled += 1;
       }
     }
-    const current = ProfileStore.currentId();
-    const details = ProfileStore.fingerprint(JSON.stringify(nodes));
-    return `${acc}|cred=${credFilled}|details=${details}|profile=${current}:${ProfileStore.revisionOf(current)}`;
+    const current = ProfileRepository.currentId();
+    const details = ProfileRepository.fingerprint(JSON.stringify(nodes));
+    return `${acc}|cred=${credFilled}|details=${details}|profile=${current}:${ProfileRepository.revisionOf(current)}`;
   }
 
   /**
@@ -203,6 +203,11 @@ export class SubscriptionService {
     if (SubscriptionService.nodeSetListeners.indexOf(listener) < 0) {
       SubscriptionService.nodeSetListeners.push(listener);
     }
+  }
+
+  static offNodeSetChanged(listener: (reason: string) => void): void {
+    const i = SubscriptionService.nodeSetListeners.indexOf(listener);
+    if (i >= 0) { SubscriptionService.nodeSetListeners.splice(i, 1); }
   }
 
   private static notifyNodeSetChanged(reason: string): void {
@@ -337,10 +342,10 @@ export class SubscriptionService {
     // 双轨落盘仓先就位（cacheDir 与内核 HomeDir 一致，见 RawSubscriptionStore 顶部注释）
     RawSubscriptionStore.init(context.cacheDir);
     // FlClash 同构：订阅原文落盘目录（filesDir/profiles/<id>.yaml）+ 当前 profile
-    await ProfileStore.init(context);
-    ProfileStore.attachPreparer((text: string): Promise<string> => coreBridge.prepareProfile(text));
+    await ProfileRepository.init(context);
+    ProfileRepository.attachPreparer((text: string): Promise<string> => coreBridge.prepareProfile(text));
     // convertProxies：非 YAML 订阅（整体 base64 / 逐行分享链接）转成 proxies 列表
-    ProfileStore.attachConverter((text: string): string => SubConverter.convert(text).proxiesYaml);
+    ProfileRepository.attachConverter((text: string): string => SubConverter.convert(text).proxiesYaml);
     // 本地转换订阅（设置页「订阅转换」产出的伪链接由它渲染）：必须在任何 fetch 之前就绪，
     // 否则首次刷新会读到空仓 → 被当成「一条不存在」的订阅
     await LocalSubConverter.init(context);
@@ -440,12 +445,12 @@ export class SubscriptionService {
     // 用户看到的就是「飞鸟云里全是另外三个订阅的节点」。
     // 启动时校正一次：current 不可用 → 落到第一个「已落盘且启用」的订阅。
     try {
-      const currentProfile = ProfileStore.currentId();
-      if (currentProfile.length === 0 || !ProfileStore.exists(currentProfile)) {
+      const currentProfile = ProfileRepository.currentId();
+      if (currentProfile.length === 0 || !ProfileRepository.exists(currentProfile)) {
         for (const candidate of this.subscriptions) {
           if (candidate.id !== DIRECT_GROUP_ID && candidate.enabled
-            && ProfileStore.exists(candidate.id)) {
-            await ProfileStore.setCurrent(candidate.id);
+            && ProfileRepository.exists(candidate.id)) {
+            await ProfileRepository.setCurrent(candidate.id);
             AppLogger.info(TAG, `current profile self-healed: ${currentProfile || '<none>'} -> ${candidate.id}`);
             break;
           }
@@ -2052,8 +2057,8 @@ export class SubscriptionService {
     this.subscriptions.push(s);
     await this.persist();
     // FlClash 同构：第一个订阅成为当前 Profile（同一时刻只有一份配置生效）
-    if (ProfileStore.currentId().length === 0) {
-      await ProfileStore.setCurrent(s.id);
+    if (ProfileRepository.currentId().length === 0) {
+      await ProfileRepository.setCurrent(s.id);
     }
     AppLogger.info(TAG, `subscription added: ${s.name}`);
     return s;
@@ -2075,10 +2080,10 @@ export class SubscriptionService {
     // 「不再需要即删干净」：删订阅即删其 provider 落盘原文与登记项
     RawSubscriptionStore.remove(id);
     RawBodyCache.drop(id);
-    ProfileStore.remove(id);
-    if (ProfileStore.currentId() === id) {
+    ProfileRepository.remove(id);
+    if (ProfileRepository.currentId() === id) {
       const next = this.subscriptions.find((x) => x.enabled);
-      await ProfileStore.setCurrent(next !== undefined ? next.id : '');
+      await ProfileRepository.setCurrent(next !== undefined ? next.id : '');
     }
     await this.persist();
     // 分阶段计时（真机排查用）：删除慢时据此区分"落盘"与"其余"
@@ -2097,9 +2102,9 @@ export class SubscriptionService {
     this.undoSnapshot = null;
     // FlClash 同构：撤销删除时把 profile 文件一起写回（否则「恢复」后没有可运行配置）
     if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0) {
-      await ProfileStore.validateAndStore(snapshot.rawSubscriptionId, snapshot.rawBody);
-      if (ProfileStore.currentId().length === 0) {
-        await ProfileStore.setCurrent(snapshot.rawSubscriptionId);
+      await ProfileRepository.validateAndStore(snapshot.rawSubscriptionId, snapshot.rawBody);
+      if (ProfileRepository.currentId().length === 0) {
+        await ProfileRepository.setCurrent(snapshot.rawSubscriptionId);
       }
     }
     if (snapshot.rawSubscriptionId.length > 0 && snapshot.rawBody.length > 0
@@ -2304,13 +2309,13 @@ export class SubscriptionService {
       // 时用 convertProxies（base64 / URI 列表）转成 proxies 列表再通过；两者都失败才拒。
       // 这里必须**先**判定，不能再用旧的 isClashBody 一刀切 —— 否则 base64 订阅会被
       // 误判成「非 Clash」而 FlClash 是能导入的。
-      const profileValidation = await ProfileStore.validateAndStore(sub.id, body);
+      const profileValidation = await ProfileRepository.validateAndStore(sub.id, body);
       // 首个成功落盘的订阅立刻成为当前 Profile（FlClash putProfile 语义），
       // 必须在**生成配置之前**定下来，否则本次刷新生成的仍是旧的全量配置。
       if (profileValidation.ok) {
-        const currentNow = ProfileStore.currentId();
-        if (currentNow.length === 0 || !ProfileStore.exists(currentNow)) {
-          await ProfileStore.setCurrent(sub.id);
+        const currentNow = ProfileRepository.currentId();
+        if (currentNow.length === 0 || !ProfileRepository.exists(currentNow)) {
+          await ProfileRepository.setCurrent(sub.id);
           AppLogger.info(TAG, `current profile initialized: ${sub.id}`);
         }
       }
@@ -2525,20 +2530,20 @@ export class SubscriptionService {
       // 【P0 修复】刷新期间订阅可能已被用户删除（网络拉取+解析横跨多个 await）。
       // removeSubscription 已清理该订阅的节点/组/profile/raw 文件；这里若继续落地，
       // nodes concat 会把已删节点复活、writeRawProvider 重建 raw 文件、
-      // ProfileStore.setCurrent 把 current 指回已删 id —— 存储与内存永久分叉。
+      // ProfileRepository.setCurrent 把 current 指回已删 id —— 存储与内存永久分叉。
       if (!this.subscriptions.some((s) => s.id === id)) {
         AppLogger.info(TAG, `subscription ${id} removed during refresh; results dropped`);
         // 刷新中途 validateAndStore/writeRawProvider 可能已重建 removeSubscription
-        // 删掉的文件：按同一套清理幂等收尾（RawBodyCache/ProfileStore 均可安全重复调用）。
+        // 删掉的文件：按同一套清理幂等收尾（RawBodyCache/ProfileRepository 均可安全重复调用）。
         RawSubscriptionStore.remove(id);
         RawBodyCache.drop(id);
-        ProfileStore.remove(id);
+        ProfileRepository.remove(id);
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR,
           '订阅已在刷新期间删除，本次结果已丢弃', diagnostics);
       }
       // FlClash 同构：profile 已落盘 ⇒ 节点由内核解析，App 侧解析出 0 条不是失败。
       // （典型：订阅只有 proxy-providers 段，或含 App 解析器不认识的协议。）
-      const profileReady = ProfileStore.exists(sub.id);
+      const profileReady = ProfileRepository.exists(sub.id);
       if (parsed.length === 0 && !profileReady) {
         // HTTP 200 但 0 条目：与「响应为空」「内容无法识别」区分，且给出 provider 专用提示
         sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
@@ -2619,9 +2624,9 @@ export class SubscriptionService {
           AppLogger.warn(TAG, `quota check failed: ${String(quotaError)}`);
         });
       // current profile 失效（被删/写盘失败）时回落到本次刷新成功的订阅
-      const currentId = ProfileStore.currentId();
-      if (currentId.length === 0 || !ProfileStore.exists(currentId)) {
-        await ProfileStore.setCurrent(id);
+      const currentId = ProfileRepository.currentId();
+      if (currentId.length === 0 || !ProfileRepository.exists(currentId)) {
+        await ProfileRepository.setCurrent(id);
         AppLogger.info(TAG, `current profile set to ${id}`);
       }
       return SubscriptionRefreshResult.ok(parsed.length, diagnostics);
@@ -2792,7 +2797,7 @@ export class SubscriptionService {
       // ── 进程级刷新写锁（与 refreshSubscription 主路径同一把链）：本地伪订阅的
       // 落地同样写 this.nodes / 整表 persist，不得与并发批次/其它单条刷新交错。
       return await this.runRefreshExclusive(async (): Promise<SubscriptionRefreshResult> => {
-      if (parsed.length === 0 && !ProfileStore.exists(id)) {
+      if (parsed.length === 0 && !ProfileRepository.exists(id)) {
         sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.EMPTY_ENTRIES,
           '重解析未得到节点（原文件内容可能已变化）', diagnostics);
@@ -2862,7 +2867,7 @@ export class SubscriptionService {
       `本地:${base.length > 0 ? base : '订阅'}`, `local://${base}`);
     sub.sortOrder = this.subscriptions.length;
     // FlClash 同构：本地文件同样落成 profile 文件（内核直接吃原文）
-    const localProfile = await ProfileStore.validateAndStore(sub.id, content);
+    const localProfile = await ProfileRepository.validateAndStore(sub.id, content);
     if (!localProfile.ok) {
       throw new Error(localProfile.message);
     }
@@ -2948,8 +2953,8 @@ export class SubscriptionService {
     SubscriptionParser.materializeDynamicGroups(parsedGroups, parsed);
     this.proxyGroups = this.proxyGroups.filter((g) => g.subscriptionId !== sub.id).concat(parsedGroups);
     this.subscriptions.push(sub);
-    if (ProfileStore.currentId().length === 0) {
-      await ProfileStore.setCurrent(sub.id);
+    if (ProfileRepository.currentId().length === 0) {
+      await ProfileRepository.setCurrent(sub.id);
     }
     this.nodes = this.nodes.concat(parsed);
     this.ensureUniqueNames();
@@ -2976,6 +2981,20 @@ export class SubscriptionService {
     this.noteConfigDrops(diagnostics);
     AppLogger.info(TAG, `local yaml imported: ${sub.name} (${parsed.length} nodes)`);
     return Math.max(parsed.length, localProfile.nodeCount, 1);
+  }
+
+  /**
+   * 按名字在**全部启用订阅**里找节点（显示层守卫用，不做任何偏好推导）。
+   *
+   * 用途：内核真源给出的出口名只有在当前节点表里真实存在时才能显示，
+   * 否则说明刚切过订阅，应回退到该订阅的偏好提示。
+   */
+  nodeByNameCurrent(name: string): ProxyNode | null {
+    if (name.length === 0) { return null; }
+    for (const n of this.nodes) {
+      if (n.name === name) { return n; }
+    }
+    return null;
   }
 
   nodesOf(subscriptionId: string): ProxyNode[] {
@@ -3334,13 +3353,13 @@ export class SubscriptionService {
   }
 
   hasUsableProfile(): boolean {
-    const id = ProfileStore.currentId();
-    return (id.length > 0 && ProfileStore.exists(id))
-      || this.subscriptions.some((sub: Subscription): boolean => sub.enabled && ProfileStore.exists(sub.id));
+    const id = ProfileRepository.currentId();
+    return (id.length > 0 && ProfileRepository.exists(id))
+      || this.subscriptions.some((sub: Subscription): boolean => sub.enabled && ProfileRepository.exists(sub.id));
   }
 
   fallbackConnectionNode(): ProxyNode | null {
-    const current = ProfileStore.currentId();
+    const current = ProfileRepository.currentId();
     // 【2026-10-24 加固】存量节点表可能残留订阅信息条目（「剩余流量：xxx GB」这类，
     // 旧解析混入、刷新后清除）——绝不能当连接目标（内核里没有这个名字，钉选必失败）。
     const local = this.nodes.find((node: ProxyNode): boolean =>
@@ -3365,7 +3384,7 @@ export class SubscriptionService {
    * 在新表里可能指向**另一个节点**（2026-10-25 真机实证：关应用前选 YF香港，
    * 冷启动自动刷新后同 id 变成 新加坡01AWS，连接钉错节点报「选择未生效」）。
    * 写时重锚兜住**存量数据**（无 preferredNodeName 快照的旧选择，并顺手回填快照）；
-   * 读时重锚（resolvePreferredNode）继续兜其余漂移路径。机场下架该节点 → 清偏好
+   * 读时重锚（resolvePreferenceHint）继续兜其余漂移路径。机场下架该节点 → 清偏好
    * 回落 fallback，绝不让漂移 id 静默指错人。
    */
   private async reanchorPreferredAfterReplace(subId: string, oldSubNodes: ProxyNode[]): Promise<void> {
@@ -3388,6 +3407,9 @@ export class SubscriptionService {
           p.preferredNodeId = '';
           p.preferredNodeSubscriptionId = '';
           p.preferredNodeName = '';
+          // 该订阅记住的也是这个已下架节点：一并忘掉，切回时不再尝试还原它。
+          p.preferredNodeNamesBySubscription = AppSettings.forgetPreferredNodeName(
+            p.preferredNodeNamesBySubscription, subId, old.name);
         });
         AppLogger.info(TAG, `preferred node gone after refresh (sub=${subId}, name=${old.name}); cleared`);
         return;
@@ -3399,6 +3421,8 @@ export class SubscriptionService {
         p.preferredNodeId = fresh.id;
         p.preferredNodeSubscriptionId = subId;
         p.preferredNodeName = fresh.name;
+        p.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+          p.preferredNodeNamesBySubscription, subId, fresh.name);
       });
       AppLogger.info(TAG, `preferred node re-anchored on refresh: ${old.name} ${old.id} -> ${fresh.id}`);
     } catch (e) {
@@ -3419,14 +3443,62 @@ export class SubscriptionService {
     if (n === null) {
       return null;
     }
-    if (n.subscriptionId.length > 0 && n.subscriptionId !== ProfileStore.currentId()) {
+    if (n.subscriptionId.length > 0 && n.subscriptionId !== ProfileRepository.currentId()) {
       return null;
     }
     return n;
   }
 
   /**
-   * 解析用户偏好的连接节点（连接路径用），三层语义：
+   * 用户偏好在**当前 profile** 内的稳定解析（id + 名称双锚，只读，不写盘）。
+   *
+   * ## 为什么需要它（2026-10-27 真机回归：手动选择后复选框变空、实际仍走该节点）
+   *
+   * 偏好落盘有两份事实：`preferredNodeId`（订阅刷新按位置重排会漂移，连接自愈
+   * 还可能把它清空）与 `preferredNodeName`（跨刷新稳定）。旧展示路径**只看 id**：
+   * 只要 id 被清空/漂移，即使 name 仍精确命中节点，复选框也会变空 —— 而内核侧
+   * 出口并未改变，于是出现「没勾选但连接的还是它」的割裂。
+   *
+   * 解析顺序（**名称是稳定锚，id 只作快速索引**）：
+   *   ① 名称在当前 profile 内精确命中 → 用它（订阅刷新后 id 变了也能找回）；
+   *   ② 名称缺失/未命中时，id 命中且属于当前 profile → 用它（兼容老数据）；
+   *   ③ 都不成立 → null（调用方回落 fallbackConnectionNode）。
+   */
+  resolveUserPreference(preferredId: string, preferredName: string): ProxyNode | null {
+    const current = ProfileRepository.currentId();
+    if (preferredName.length > 0) {
+      const byName = this.nodes.find((n: ProxyNode): boolean =>
+        n.name === preferredName
+          && !NodeUsability.isInfoEntry(n.name)
+          && (current.length === 0 || n.subscriptionId === current));
+      if (byName !== undefined) {
+        return byName;
+      }
+    }
+    if (preferredId.length === 0) {
+      return null;
+    }
+    const byId = this.findNode(preferredId);
+    if (byId === null) {
+      return null;
+    }
+    if (byId.subscriptionId.length > 0 && current.length > 0
+      && byId.subscriptionId !== current) {
+      return null;
+    }
+    return byId;
+  }
+
+  /**
+   * 解析**用户偏好缓存**给出的候选节点（提示用，不是"当前状态"）。
+   *
+   * ⚠ 契约（2026-10-27 架构收口）：本方法的返回值只能当"用户上次选了哪个"的提示，
+   * 由连接路径在内核主组成员里校验后才会真正 PUT；「当前是什么节点」的唯一真源是
+   * 内核 `/proxies` 主组 `now`（见 `ConnectionOrchestrator.lastConnectionTarget`）。
+   * 因此任何"当前节点"显示都不得直接读它 —— 必须走 `displayNodeName()` /
+   * `connectionTargetLabel()`。
+   *
+   * 三层语义：
    * ① id 命中、属于当前订阅、名字与快照一致（防位置 id 漂移指错节点）→ 直接用；
    * ② id 悬空/漂移，但偏好本就属于当前订阅（preferredNodeSubscriptionId 相符）
    *    → 按 preferredNodeName 在当前订阅内重锚，命中即回写自愈
@@ -3434,12 +3506,26 @@ export class SubscriptionService {
    * ③ 偏好指向其他订阅（切换订阅后的遗留）→ 判无效返回 null，不跨订阅猜。
    * 返回 null = 当前订阅下无可用偏好，调用方回落 fallbackConnectionNode()。
    */
-  async resolvePreferredNode(): Promise<ProxyNode | null> {
+  async resolvePreferenceHint(): Promise<ProxyNode | null> {
     const s: AppSettings = await SettingsService.load();
-    if (s.preferredNodeId.length === 0 && s.preferredNodeName.length === 0) {
-      return null;
+    const current = ProfileRepository.currentId();
+    // 本订阅**上次手动选的**节点名（切订阅后仍保留，用于切回时还原）。
+    const remembered = AppSettings.rememberedPreferredNodeName(
+      s.preferredNodeNamesBySubscription, current);
+
+    // 冷启动强制以当前订阅记忆为准：日志已证明 UI 显示节点与 connect() 实际
+    // 使用节点发生漂移（例如页面显示香港移联01，而连接链路进入新加坡01aws）。
+    // 当前订阅存在记忆节点且与全局 preferredNodeName 不一致时，先重锚再继续解析。
+    if (remembered.length > 0 && remembered !== s.preferredNodeName) {
+      const restored = await this.restoreRememberedPreferredNode(remembered, current);
+      if (restored !== null) {
+        return restored;
+      }
     }
-    const current = ProfileStore.currentId();
+
+    if (s.preferredNodeId.length === 0 && s.preferredNodeName.length === 0) {
+      return await this.restoreRememberedPreferredNode(remembered, current);
+    }
     const byId = s.preferredNodeId.length > 0 ? this.findNode(s.preferredNodeId) : null;
     const idOk = byId !== null
       && (byId.subscriptionId.length === 0 || byId.subscriptionId === current)
@@ -3447,9 +3533,9 @@ export class SubscriptionService {
     if (idOk && byId !== null) {
       return byId;
     }
-    // 跨订阅遗留：明确判无效，绝不按名猜到别的订阅的节点
+    // 跨订阅遗留：先看目标订阅自己记住的节点，绝不按名猜到别的订阅
     if (s.preferredNodeSubscriptionId.length > 0 && s.preferredNodeSubscriptionId !== current) {
-      return null;
+      return await this.restoreRememberedPreferredNode(remembered, current);
     }
     if (s.preferredNodeName.length > 0 && current.length > 0) {
       const byName = this.nodes.find((n: ProxyNode): boolean =>
@@ -3464,7 +3550,51 @@ export class SubscriptionService {
         return byName;
       }
     }
-    return null;
+    return await this.restoreRememberedPreferredNode(remembered, current);
+  }
+
+  /**
+   * 把「目标订阅上次手动选的节点」还原成当前生效偏好。
+   *
+   * 场景（2026-10-27 用户报障）：在吹雪云选了新加坡01 → 切到飞鸟云选了日本01 →
+   * 切回吹雪云时偏好仍是飞鸟云的节点，按跨订阅作用域判无效后掉到该订阅第一个
+   * 节点（用户感知为「随机选了一个」）。这里按订阅分槽记住的名字还原，命中即把
+   * preferredNode* 三件套改回该节点；节点已不存在则放弃（调用方回落第一个节点）。
+   */
+  private async restoreRememberedPreferredNode(remembered: string,
+    current: string): Promise<ProxyNode | null> {
+    if (remembered.length === 0 || current.length === 0) {
+      return null;
+    }
+    const target = this.nodes.find((n: ProxyNode): boolean =>
+      n.subscriptionId === current && n.name === remembered
+      && !NodeUsability.isInfoEntry(n.name));
+    if (target === undefined) {
+      return null;
+    }
+    await SettingsService.patchSettings((p: AppSettings): void => {
+      p.preferredNodeId = target.id;
+      p.preferredNodeSubscriptionId = current;
+      p.preferredNodeName = target.name;
+    });
+    AppLogger.info(TAG, `preferred node restored from subscription memory: `
+      + `${target.name} (${target.id}, sub=${current})`);
+    return target;
+  }
+
+  /**
+   * 冷启动/其他入口兜底：把**当前订阅**记住的节点还原成生效偏好。
+   *
+   * 正常切订阅走 SubscriptionPage.activateProfile（切过去之前就还原）；这里覆盖
+   * 「App 冷启动 / 订阅被自动删切换」等不经过那个页面的路径，避免首页继续显示
+   * 上一个订阅的节点或该订阅第一个节点。
+   */
+  async restoreRememberedNodeForCurrentProfile(): Promise<ProxyNode | null> {
+    const s: AppSettings = await SettingsService.load();
+    const current = ProfileRepository.currentId();
+    const remembered = AppSettings.rememberedPreferredNodeName(
+      s.preferredNodeNamesBySubscription, current);
+    return await this.restoreRememberedPreferredNode(remembered, current);
   }
 
   findNode(id: string): ProxyNode | null {

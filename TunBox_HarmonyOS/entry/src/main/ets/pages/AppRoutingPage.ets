@@ -345,15 +345,16 @@ struct AppRoutingPage {
         buttons: [{ text: '取消', color: $r('app.color.ui_text_secondary') }, { text: '仅保存', color: $r('app.color.ui_text_blue') }, { text: '保存并应用', color: $r('app.color.ui_text_blue') }]
       });
       if (response.index === 0) { return; }
-      // 加载最新设置，只覆盖本页字段，避免旧页面快照覆盖节点等其他设置。
-      const settings = await SettingsService.load();
-      settings.appRoutingMode = this.mode;
-      settings.appRoutingNeedsReview = false;
-      settings.includedApps = this.included.slice();
-      settings.excludedApps = this.excluded.slice();
-      settings.appRoutingCustomApps = this.customApps.slice();
-      settings.appRoutingRemovedPresets = this.removedPresets.slice();
-      await SettingsService.save(settings);
+      // 字段级写入（patchSettings）：只覆盖本页字段。旧写法 load()→改→save(整份) 会把
+      // 同一窗口内别的写者（设置页节点选择、订阅刷新）整份盖掉。
+      await SettingsService.patchSettings((current: AppSettings): void => {
+        current.appRoutingMode = this.mode;
+        current.appRoutingNeedsReview = false;
+        current.includedApps = this.included.slice();
+        current.excludedApps = this.excluded.slice();
+        current.appRoutingCustomApps = this.customApps.slice();
+        current.appRoutingRemovedPresets = this.removedPresets.slice();
+      });
       this.original = this.fingerprint();
       this.rebuild();
       this.resultText = '已保存，下次连接生效；当前隧道接管范围尚未改变。';

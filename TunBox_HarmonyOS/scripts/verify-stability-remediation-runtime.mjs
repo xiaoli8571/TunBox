@@ -73,7 +73,7 @@ try {
   });
   await test('successful profile application recognizes the actual hot outcome', async () => {
     const h = harness();
-    h.platform.ProfileStore = { currentId: () => 's', exists: () => true, revisionOf: () => 'new' };
+    h.platform.ProfileRepository = { currentId: () => 's', exists: () => true, revisionOf: () => 'new' };
     h.orch.appliedProfileId = 's'; h.orch.appliedProfileRevision = 'old';
     h.orch.applyRulesChanged = async () => 'hot';
     assert.equal(await h.orch.ensureProfileApplied('changed'), true);
@@ -169,10 +169,12 @@ try {
     h.orch.lastNetType = 'wifi'; h.orch.lastSubs = h.subs; h.orch.lastNodeName = 'test-node';
     return h;
   }
+  // 2026-10-28 Phase 3：重连链路已迁到 `connection/ReconnectManager`（状态独占定时器/尝试计数/
+  // 退避预算）。下面四条断言直击**真实模块**：`requestAsync` = 排程路径，`fireNow` = 尝试路径。
   await test('late intent lookup cannot schedule reconnect after a completed user stop', async () => {
     const h = networkFixture(), gate = deferred();
     h.orch.isUserIntentConnected = async () => { await gate.promise; return true; };
-    const pending = h.orch.evaluateIntentThenSchedule('network'); await flush();
+    const pending = h.orch.reconnectManager().requestAsync('network'); await flush();
     h.orch.requestDisconnect(); h.orch.disconnectRequested = false;
     gate.resolve(); await pending; assert.equal(h.timers.size, 0); h.stop();
   });
@@ -180,21 +182,22 @@ try {
     const h = networkFixture(), gate = deferred(); let starts = 0;
     h.orch.isUserIntentConnected = async () => { await gate.promise; return true; };
     h.orch.connect = async () => { starts++; return true; };
-    const pending = h.orch.runScheduledReconnect('network'); await flush();
+    const pending = h.orch.reconnectManager().fireNow('network'); await flush();
     h.orch.requestDisconnect(); h.orch.disconnectRequested = false;
     gate.resolve(); await pending; assert.equal(starts, 0); h.stop();
   });
   await test('network loss cancels a pending reconnect without creating another attempt', async () => {
     const h = networkFixture();
-    await h.orch.evaluateIntentThenSchedule('network'); assert.equal(h.timers.size, 1);
+    await h.orch.reconnectManager().requestAsync('network'); assert.equal(h.timers.size, 1);
     h.orch.onNetworkTypeChanged('none', 100);
     assert.equal(h.timers.size, 0); h.stop();
   });
   await test('an obsolete failed reconnect cannot schedule retries in the new session', async () => {
     const h = networkFixture(); let retries = 0;
+    const manager = h.orch.reconnectManager();
+    manager.request = () => { retries++; };
     h.orch.connect = async () => { h.orch.connectSeq += 2; return false; };
-    h.orch.requestReconnect = () => { retries++; };
-    await h.orch.runScheduledReconnect('network'); assert.equal(retries, 0); h.stop();
+    await manager.fireNow('network'); assert.equal(retries, 0); h.stop();
   });
   await test('headless DoH returning after stop cannot touch the shared VPN extension', async () => {
     const h = harness(), gate = deferred(); let touches = 0;
@@ -304,6 +307,13 @@ try {
       clearTimeout(id) { timers.delete(id); },
       setInterval(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
       clearInterval(id) { timers.delete(id); },
+      // 2026-10-27：页面周期任务已改走 UnifiedScheduler（全仓单 tick），
+      // 替身必须把 token 记进同一张 timers 表，否则「只有一个轮询定时器」的断言会假失败。
+      UnifiedScheduler: {
+        every(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
+        clear(id) { timers.delete(id); },
+        count() { return timers.size; }
+      },
     });
     const source = fs.readFileSync(path.join(sourceRoot, 'pages/ConnectionsPage.ets'), 'utf8');
     const body = (source.slice(source.indexOf('struct ConnectionsPage {'), source.indexOf('  build() {')) + '\n}')

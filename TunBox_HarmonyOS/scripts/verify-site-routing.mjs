@@ -85,6 +85,10 @@ const KEY_SETTINGS = 'app_settings_json';
 export const store = { raw: '', puts: 0, flushes: 0, async get() { if (boundary.loadError) throw new Error('read failed'); return this.raw; }, async put(key, value) { if (boundary.saveError) throw new Error('write failed'); this.raw = value; this.puts++; }, async flush() { this.flushes++; } };
 export class SettingsService {
   static store = store;
+  // 本闸门把 store 当**唯一真源**（用例会直接改写 store.raw 模拟「另一个页面写入」），
+  // 所以屏蔽进程内缓存：getter 恒为 null（每次 load 都读盘），setter 丢弃。
+  static get cache() { return null; }
+  static set cache(_v) {}
   static async init() {}
   static syncRawProviderGate() {} // unrelated raw subscription cleanup boundary
   // 测速快照分片与本闸门无关（闸门验的是路由规则的读写语义）：
@@ -92,7 +96,19 @@ export class SettingsService {
   static async loadNodeSortSnapshot() { return ''; }
   static async routeSnapshotWrite() {}
 ${method(service, 'load')}
-${method(service, 'save')}
+${method(service, 'save').replace('static async save(', 'private static async saveDeferred(')}
+  // 闸门不模拟 300ms 防抖窗口（防抖本身由 verify-preference-cache 覆盖）：
+  // save() 立即 flushNow，store.puts/flushes 才能在同一次 await 后可观测。
+  static scheduleFlush() {}
+  static async save(settings) {
+    await SettingsService.saveDeferred(settings);
+    await SettingsService.flushNow();
+  }
+${method(service, 'flushNow')}
+  // 字段级写入（生产：writeChain 串行 + mutator 拿新鲜 load()）。闸门的 load/save 已是真方法，
+  // 这里只需补 writeChain 与 patchSettings 本体，别让页面用到的 API 在桩里缺席。
+  static writeChain = Promise.resolve();
+${method(service, 'patchSettings')}
 }
 `;
 const code = latencyTestUrlStub + '\n' + sort + '\n' + read('commons/services/AppRoutingPolicy.ets') + '\n' + policy + '\n'
@@ -258,14 +274,21 @@ await check('EXEC load failure prevents editing save from clobbering settings', 
   assert.equal(p.ready, false); assert.equal(p.busy, false); await p.save(); assert.equal(store.puts, 0); B.loadError = false;
 });
 const save = method(page, 'save'), back = method(page, 'back');
-await check('SOURCE saving validates then reloads settings and writes the three site lists before apply', () => {
-  assert.ok(save.indexOf('SiteRoutingPolicy.validationError(') < save.indexOf('SettingsService.load()'));
-  assert.ok(save.indexOf('SettingsService.load()') < save.indexOf('settings.forceProxySites ='));
+await check('SOURCE saving validates then patch-writes the three site lists before apply', () => {
+  assert.ok(save.indexOf('SiteRoutingPolicy.validationError(') < save.indexOf('SettingsService.patchSettings('));
+  // 并发三向比较必须在**写锁内**（mutator 里）做：load 预检与写入之间的窗口就是 F2 本身。
+  assert.ok(save.indexOf('SettingsService.patchSettings(') < save.indexOf('JSON.stringify(current.forceProxySites)'),
+    'three-way concurrent-edit guard must run inside the patch mutator, not before it');
+  assert.ok(save.indexOf('JSON.stringify(current.forceProxySites)') < save.indexOf('current.forceProxySites ='),
+    'guard must reject before any field is assigned');
   // 0.4.0 起网站规则是三态（代理 / 直连 / 拦截）：保存必须同时写三份名单，
   // 漏写任何一份都会让该态规则在下次启动后静默丢失。
-  assert.deepEqual([...save.matchAll(/settings\.(\w+)\s*=(?!=)/g)].map(m => m[1]).sort(),
+  assert.deepEqual([...save.matchAll(/\bcurrent\.(\w+)\s*=(?!=)/g)].map(m => m[1]).sort(),
     ['forceBlockSites', 'forceDirectSites', 'forceProxySites']);
-  assert.ok(save.indexOf('await SettingsService.save(settings)') < save.indexOf('applyRulesChanged('));
+  // 冲突时 mutator 返回 false ⇒ patchSettings 不写盘（不只是“不生效”，而是真的不发那个写）。
+  assert.match(save, /return false;/);
+  assert.ok(!save.includes('SettingsService.save('), 'page must not hold a whole-object save()');
+  assert.ok(save.indexOf('await SettingsService.patchSettings(') < save.indexOf('applyRulesChanged('));
   assert.match(save, /result\.index === 2/); assert.ok(!save.includes('restartIfConnected('));
   assert.ok(save.includes('this.originalProxy') && save.includes('this.originalDirect')
     && save.includes('this.originalBlock'), 'three-way concurrent-edit guard must cover the block list too');

@@ -6,6 +6,7 @@
  * 操作：单条点击关闭（带确认）、一键关闭全部；展示流量/规则链/出口节点/持续时间。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui } from '../theme/UiTokens';
 import { TopNavBar } from '../components/TopNavBar';
@@ -70,7 +71,7 @@ struct ConnectionsPage {
     if (this.pollTimer >= 0) {
       return;
     }
-    this.pollTimer = setInterval((): void => {
+    this.pollTimer = UnifiedScheduler.every((): void => {
       this.refreshOnce();
     }, POLL_INTERVAL_MS);
   }
@@ -84,7 +85,7 @@ struct ConnectionsPage {
       this.bootstrapTimer = -1;
     }
     if (this.pollTimer >= 0) {
-      clearInterval(this.pollTimer);
+      UnifiedScheduler.clear(this.pollTimer);
       this.pollTimer = -1;
     }
   }

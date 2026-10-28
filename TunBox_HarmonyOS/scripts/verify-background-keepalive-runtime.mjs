@@ -56,6 +56,13 @@ function harness({ deny = [] } = {}) {
     wantAgent: { OperationType: { START_ABILITY: 1 }, WantAgentFlags: { UPDATE_PRESENT_FLAG: 1 },
       async getWantAgent() { return {}; } },
     AppLogger: { info: (...a) => logs.push(a), warn: (...a) => logs.push(a), errText: String },
+    // UiGuardian.watchSession 已改用 UnifiedScheduler；替身必须注册到同一张假定时器表，
+    // 否则 watchdog 永远不会 tick（或被判为未定义）。
+    UnifiedScheduler: {
+      every(fn, delay) { const key = ++id; timers.set(key, { fn, delay }); return key; },
+      clear(key) { timers.delete(key); },
+      count() { return timers.size; }
+    },
     ContinuousTaskKind: { NONE: 'none', TASK_KEEPING: 'taskKeeping',
       DATA_TRANSFER: 'dataTransfer' },
     TaskProgressUpdater: { attach: (...a) => { progressActive = a[1] === 'dataTransfer'; calls.push(['progress', ...a]); },

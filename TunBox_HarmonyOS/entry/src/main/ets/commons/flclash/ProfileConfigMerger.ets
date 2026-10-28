@@ -337,15 +337,41 @@ export class ProfileConfigMerger {
       return false;
     }
     const body = ProfileConfigMerger.sectionText(profileYaml, 'dns');
-    for (const raw of body.split('\n')) {
-      const line = raw.trim();
-      if (!line.startsWith('enable:')) {
-        continue;
-      }
-      const value = line.substring('enable:'.length).trim().toLowerCase();
-      return value === 'true' || value === '"true"' || value === '\'true\'';
+    for (const line of body.split('\n')) {
+      // 只读 DNS 直接子键；嵌套 policy/注释中的 enable 不能打开 DNS。
+      const match = /^  (?:enable|"enable"|'enable'):\s*(true|"true"|'true'|yes|on|1)\s*(?:#.*)?$/i.exec(line);
+      if (match !== null) { return true; }
     }
     return false;
+  }
+
+  /** 拆开 DNS 行内 map 的直接成员；引号、嵌套 map/list 中的逗号不分割。 */
+  private static dnsFlowLines(raw: string): string[] {
+    const fields: string[] = [];
+    let start: number = 1;
+    let depth: number = 0;
+    let quote: string = '';
+    for (let i = 1; i < raw.length; i++) {
+      const ch: string = raw.charAt(i);
+      if (quote.length > 0) {
+        if (quote === '"' && ch === '\\') { i++; continue; }
+        if (ch === quote) {
+          if (quote === "'" && raw.charAt(i + 1) === "'") { i++; continue; }
+          quote = '';
+        }
+        continue;
+      }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === '[' || ch === '{') { depth++; continue; }
+      if (ch === ']' || (ch === '}' && depth > 0)) { depth--; continue; }
+      if ((ch === ',' || ch === '}') && depth === 0) {
+        const field: string = raw.substring(start, i).trim();
+        if (field.length > 0) { fields.push('  ' + field); }
+        start = i + 1;
+        if (ch === '}') { return fields; }
+      }
+    }
+    return [];
   }
 
   /** 顶层是否存在该键（含 `key: []` / `key:` 空值写法）。 */
@@ -386,7 +412,14 @@ export class ProfileConfigMerger {
         && !line.trimStart().startsWith('#') && !line.startsWith('-')) { break; }
       body.push(line);
     }
-    if (head.substring(key.length + 1).trim().length > 0) { return head; }
+    const inline: string = head.substring(key.length + 1).trim();
+    if (key === 'dns' && inline.startsWith('{')) {
+      const fields: string[] = ProfileConfigMerger.dnsFlowLines(inline);
+      return fields.length > 0 ? ['dns:'].concat(fields).join('\n') : head;
+    }
+    // `dns: # comment` 仍是块式段，不能把其子键截掉。
+    if (inline.length > 0 && !inline.startsWith('#')) { return head; }
+    if (inline.startsWith('#')) { head = `${key}:`; }
     let indent = 999999;
     for (const line of body) {
       if (line.trim().length > 0 && !line.trimStart().startsWith('#')) {
@@ -404,8 +437,8 @@ export class ProfileConfigMerger {
   /**
    * 合并。overlay = TunBox 生成的完整运行配置，profile = 订阅原文。
    *
-   * `allowProfileDns=false`（设置页「DNS 接管」关闭）时**不搬原文 dns 段** ——
-   * 否则订阅自带 `dns.enable: true` 会把用户的关闭动作架空虚化。
+   * `allowProfileDns=true`（DNS 覆写关闭）时采用订阅原文 DNS；
+   * `allowProfileDns=false`（DNS 覆写开启）时保留应用生成的 DNS。
    */
   static merge(overlayYaml: string, profileYaml: string,
     allowProfileDns: boolean = true): ProfileMergeResult {
@@ -480,9 +513,8 @@ export class ProfileConfigMerger {
       applied.push(key);
     }
 
-    // dns：原文显式启用时整段用原文（FlClash isEnableDns 语义）。
-    // 「DNS 接管」关闭时**不吃原文 dns**（否则订阅一套 dns.enable: true 就把开关架空了），
-    // overlay 的 `dns: { enable: false }` 原样保留。
+    // dns：覆写关闭时订阅显式配置优先，保留其解析模式、上游与策略；
+    // 覆写开启时保留 TunBox 生成的 DNS 配置。订阅没有启用 DNS 时不替换默认块。
     if (allowProfileDns && ProfileConfigMerger.hasEnabledDns(profileYaml)) {
       const dnsRaw = ProfileConfigMerger.sectionText(profileYaml, 'dns');
       if (dnsRaw.length > 0) {

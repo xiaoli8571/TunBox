@@ -3,7 +3,10 @@
  *
  * 职责：把第二阶段新增的设置项以分组形式呈现，读写均走既有服务：
  *   - 读取：SettingsService.load() → AppSettings（页面首次进入取持久化真实值）
- *   - 写入：SettingsService.save()（内部 fromJson(toJson()) 归一化，与 UI 夹取形成双重夹取）
+ *   - 写入：SettingsService.patchSettings(mutator)（字段级写入：mutator 拿到刚从盘上读出的
+ *     最新设置，只改本页拥有的字段；内部 fromJson(toJson()) 归一化，与 UI 夹取形成双重夹取）。
+ *     ⚠ 不要再用 load() → 改字段 → save(整份)：两个写者各持一份内存副本时后写者会把
+ *     先写者的字段整片盖回旧值（审计 F2，2026-10-27 全量迁移完毕）。
  * 每项改动即时落盘并 showToast 反馈；返回主页后再次进入仍读回真实值（不丢状态）。
  *
  * 约束：本文件只调用既有服务的公开接口，不修改 Orchestrator/AppSettings/SettingsService。
@@ -81,7 +84,7 @@ export struct SettingsView {
   @State geoUpdatingId: string = '';
   // ── 网络（IPv6 双栈，产品默认开）──
   @State ipv6Enabled: boolean = true;
-  /** DNS 接管开关（默认开）：关闭后系统沿用物理网络 DNS，TunBox 不碰解析 */
+  /** DNS 覆写开关（默认开）：关闭时优先保留订阅中的 DNS 上游与策略 */
   @State dnsOverrideEnabled: boolean = true;
   /** 是否允许明文 HTTP 订阅（默认关闭；关闭时只接受 https） */
   @State allowInsecureSubscriptionHttp: boolean = false;
@@ -206,8 +209,9 @@ export struct SettingsView {
   }
 
   private refreshNodeAndSwitchInfo(): void {
-    // 作用域化：跨订阅旧偏好不再当「当前节点」显示
-    const node = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
+    // 作用域化：跨订阅旧偏好不再当「当前节点」显示；name+id 双锚防止只留 name 时丢选中。
+    const node = this.subs.resolveUserPreference(
+      this.settings.preferredNodeId, this.settings.preferredNodeName);
     if (node !== null) {
       this.currentNodeName = node.name;
     } else {
@@ -249,7 +253,7 @@ export struct SettingsView {
    *   ② TUN：扩展进程读**同一份 YAML 的 ipv6 行**决定是否装 v6 地址与 ::/0。
    * 也就是说这里只负责把值写进设置，其余联动都是「一份配置、两处读同一真源」。
    *
-   * DNS 不在这里：DNS 接管由下方 setDnsOverrideEnabled 单独控制
+   * DNS 不在这里：DNS 覆写由下方 setDnsOverrideEnabled 单独控制
    * （生成器写 `dns.enable` / `dns-hijack`，扩展读同一份 YAML 决定是否下发 dnsAddresses）。
    */
   private setIpv6Enabled(v: boolean): void {
@@ -266,11 +270,11 @@ export struct SettingsView {
   }
 
   /**
-   * DNS 接管开关（默认开）。关掉 = 完全不碰系统解析：TunBox 不劫持 53、不下发
-   * dnsAddresses、不产生 fake-ip，设备沿用物理网络/运营商的 DNS。
+   * DNS 覆写开关（默认开）。开启时使用应用生成的 DNS；关闭时优先保留订阅 DNS
+   * 上游、策略与 fake-ip 设置，不强制关闭内核 DNS。
    *
-   * 联动同样只有「一份真源」：写进设置 → 生成器写 `dns: { enable: false }` 且不写
-   * `tun.dns-hijack` → 扩展读**同一份 YAML** 的 dns.enable 决定不下发 dnsAddresses。
+   * 联动同样只有「一份真源」：写进设置 → 生成器按开关决定 DNS 配置来源，扩展读
+   * **同一份 YAML** 的 dns.enable 决定是否下发 dnsAddresses。
    * 三处不可能各说各话（这正是 2026-10-21 之前那版开关最致命的坑：扩展自己存了一个
    * 默认 true 的状态位，YAML 读失败时设备 DNS 被指向没接管的内核 ⇒ 整机解析黑洞）。
    *
@@ -564,13 +568,13 @@ export struct SettingsView {
               Divider().color(TunBoxColors.cardBorder)
 
               Row() {
-                Text('DNS 接管')
+                Text('DNS 覆写')
                   .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.dnsOverrideEnabled })
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setDnsOverrideEnabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
-              Text('开启后全局 DNS 走 TunBox 加密上游（DoT）；关闭则沿用系统 DNS。改动会自动重连。')
+              Text('开启后使用 TunBox 配置的加密上游（DoT）；关闭后优先保留订阅 DNS。改动会自动重连。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
 
               Divider().color(TunBoxColors.cardBorder)
@@ -709,6 +713,21 @@ export struct SettingsView {
                   .onChange((v: boolean): void => this.setFollowSystemTheme(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('关闭后由主页太阳按钮手动切换深浅色。')
+                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+              Divider().color(TunBoxColors.cardBorder)
+              // 2026-10-27：主页右上角「备份」迁到这里（关于与隐私卡内），功能不变。
+              Row() {
+                Text('配置备份与恢复')
+                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Image($r('app.media.ic_arrow_right'))
+                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+              }.width('100%').alignItems(VerticalAlign.Center)
+              .onClick(() => {
+                router.pushUrl({ url: 'pages/BackupPage' }).catch((): void => {
+                  promptAction.showToast({ message: '打开备份页面失败，请重试' });
+                });
+              })
+              Text('导出/导入订阅、节点与自定义规则；支持 AES-256 加密备份。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               Divider().color(TunBoxColors.cardBorder)
               Row() {

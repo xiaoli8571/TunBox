@@ -273,11 +273,14 @@ console.log('[B8] connect() 里 selectNode 先于 CONNECTED 且被 await');
   const ct = connect ? connect.text : '';
 
   const awaitIdx = ct.indexOf('await this.api.selectNode(');
-  const connectedIdx = ct.indexOf('this.state = ConnState.CONNECTED;');
+  // 2026-10-27：状态写入收敛到 setState()（单入口 + 事件推送），两种写法都接受。
+  const connectedRaw = ct.indexOf('this.state = ConnState.CONNECTED;');
+  const connectedSet = ct.indexOf('this.setState(ConnState.CONNECTED);');
+  const connectedIdx = connectedSet >= 0 ? connectedSet : connectedRaw;
   ok('b8.await-select-node-exists', awaitIdx >= 0,
     'connect() 里没有 `await this.api.selectNode(`（钉选要么没做，要么没 await）');
   ok('b8.connected-assignment-exists', connectedIdx >= 0,
-    'connect() 里找不到 `this.state = ConnState.CONNECTED;`');
+    'connect() 里找不到置 CONNECTED 的语句（this.state = … 或 this.setState(…）');
   ok('b8.pin-before-connected', awaitIdx >= 0 && connectedIdx >= 0 && awaitIdx < connectedIdx,
     `钉选必须在置 CONNECTED 之前完成（await=${awaitIdx}, connected=${connectedIdx}）—— 否则「已连接」上屏时走的是旧节点`);
 

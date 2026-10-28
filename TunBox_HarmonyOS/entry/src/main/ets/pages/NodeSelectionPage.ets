@@ -9,6 +9,7 @@
  * （旧实现真机表现为慢、成批假超时，以及"点了测速像没反应"）。
  */
 import { router, promptAction } from '@kit.ArkUI';
+import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
@@ -299,8 +300,11 @@ struct NodeSelectionPage {
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.restoreSortState();
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
-    // 作用域化展示：跨订阅旧偏好不再当「已选」；回落与连接同源（fallback 已滤信息条目）
-    const scopedSel = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
+    // 作用域化展示：跨订阅旧偏好不再当「已选」。
+    // 2026-10-27：name+id 双锚解析 —— 连接自愈可能只保留 name，
+    // 只按 id 找会让「实际连接中」的节点复选框变空（真机复现）。
+    const scopedSel = this.subs.resolveUserPreference(
+      this.settings.preferredNodeId, this.settings.preferredNodeName);
     this.selectedName = scopedSel !== null ? scopedSel.name
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
     // 异步初始化完成后统一重建筛选项，隐藏空 direct 并清理失效筛选。
@@ -313,7 +317,8 @@ struct NodeSelectionPage {
     // 定位到分组后**自动展开**该分组——用户不必再手动展开看具体节点。
     if (this.filterSubId.length === 0 && this.autoSelectMode !== AutoSelectModes.AUTO
       && this.settings.preferredNodeId.length > 0) {
-      const cur = this.subs.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
+      const cur = this.subs.resolveUserPreference(
+        this.settings.preferredNodeId, this.settings.preferredNodeName);
       if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
         && this.subs.subscriptions.some((s: Subscription) => s.id === cur.subscriptionId)) {
         this.filterSubId = cur.subscriptionId;
@@ -614,14 +619,14 @@ struct NodeSelectionPage {
   private startSmartPoll(): void {
     this.stopSmartPoll();
     this.refreshSmartActive();
-    this.smartPollTimer = setInterval(() => {
+    this.smartPollTimer = UnifiedScheduler.every(() => {
       this.refreshSmartActive();
     }, 3000);
   }
 
   private stopSmartPoll(): void {
     if (this.smartPollTimer !== -1) {
-      clearInterval(this.smartPollTimer);
+      UnifiedScheduler.clear(this.smartPollTimer);
       this.smartPollTimer = -1;
     }
   }
@@ -1378,7 +1383,7 @@ struct NodeSelectionPage {
         s.autoSelectMode = AutoSelectModes.AUTO;
       });
       // 重连目标必须属于当前订阅（跨订阅旧偏好只会钉错节点），与连接路径同源
-      let target: ProxyNode | null = await this.subs.resolvePreferredNode();
+      let target: ProxyNode | null = await this.subs.resolvePreferenceHint();
       if (target === null) {
         target = this.subs.fallbackConnectionNode();
       }
@@ -1421,6 +1426,9 @@ struct NodeSelectionPage {
       s.preferredNodeId = node.id;
       s.preferredNodeName = node.name;
       s.preferredNodeSubscriptionId = node.subscriptionId;
+      // 按订阅分槽记住手动选择：切走再切回来要还原这个节点（与订阅页同口径）。
+      s.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+        s.preferredNodeNamesBySubscription, node.subscriptionId, node.name);
     });
     // 节点切换始终执行完整重连。Mihomo controller 返回 2xx 只能证明请求被接受，
     // 不能证明现有连接已迁移到新节点；此前因此错误提示“未重建隧道”，但流量仍走旧节点。

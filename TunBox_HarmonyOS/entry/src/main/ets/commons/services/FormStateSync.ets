@@ -6,6 +6,7 @@
  * 不刷新订阅、不访问公网，也不做秒级轮询。
  */
 import { formBindingData, formProvider } from '@kit.FormKit';
+import { UnifiedScheduler } from './UnifiedScheduler';
 import { preferences } from '@kit.ArkData';
 import { ConnectionOrchestrator, ConnState } from './ConnectionOrchestrator';
 import { SettingsService } from './SettingsService';
@@ -137,8 +138,10 @@ export class FormStateSync {
       const subscriptions = SubscriptionService.instance();
       await subscriptions.init(context);
       const settings = await SettingsService.load();
-      // 作用域化：跨订阅旧偏好不再上卡片；fallbackConnectionNode 已滤信息条目
-      const selected: ProxyNode | null = subscriptions.preferredNodeInCurrentProfile(settings.preferredNodeId)
+      // 作用域化：跨订阅旧偏好不再上卡片；fallbackConnectionNode 已滤信息条目。
+      // 2026-10-27：name+id 双锚解析，避免连接自愈只保留 name 时卡片变空。
+      const selected: ProxyNode | null = subscriptions.resolveUserPreference(
+        settings.preferredNodeId, settings.preferredNodeName)
         ?? subscriptions.fallbackConnectionNode();
       const nodeName = selected === null ? '' : selected.name;
       const orchestrator = ConnectionOrchestrator.instance();
@@ -348,7 +351,7 @@ export class FormStateSync {
   /** Ability 销毁时停止刷新，避免后台残留定时器。 */
   static stopInfoRefresh(): void {
     if (FormStateSync.infoRefreshTimer >= 0) {
-      clearInterval(FormStateSync.infoRefreshTimer);
+      UnifiedScheduler.clear(FormStateSync.infoRefreshTimer);
       FormStateSync.infoRefreshTimer = -1;
     }
     FormStateSync.infoRefreshContext = null;
@@ -367,7 +370,7 @@ export class FormStateSync {
     if (FormStateSync.reconcileTimer >= 0) {
       return;
     }
-    FormStateSync.reconcileTimer = setInterval((): void => {
+    FormStateSync.reconcileTimer = UnifiedScheduler.every((): void => {
       const active = FormStateSync.reconcileContext;
       if (active === null || FormStateSync.reconcileRunning) {
         return;
@@ -383,7 +386,7 @@ export class FormStateSync {
 
   static stopReconcile(): void {
     if (FormStateSync.reconcileTimer >= 0) {
-      clearInterval(FormStateSync.reconcileTimer);
+      UnifiedScheduler.clear(FormStateSync.reconcileTimer);
       FormStateSync.reconcileTimer = -1;
     }
     FormStateSync.reconcileContext = null;
@@ -410,7 +413,7 @@ export class FormStateSync {
     if (FormStateSync.infoRefreshTimer >= 0) {
       return;
     }
-    FormStateSync.infoRefreshTimer = setInterval((): void => {
+    FormStateSync.infoRefreshTimer = UnifiedScheduler.every((): void => {
       const activeContext = FormStateSync.infoRefreshContext;
       if (activeContext === null || FormStateSync.infoRefreshRunning) {
         return;

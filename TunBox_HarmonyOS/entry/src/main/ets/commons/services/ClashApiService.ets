@@ -25,6 +25,8 @@ const TAG = 'ClashApiService';
  *  首个 PUT 可能 400 —— 在窗口内重试到表收敛，而不是把瞬态当永久失败。 */
 const SELECT_CONVERGE_TIMEOUT_MS: number = 3000;
 const SELECT_CONVERGE_INTERVAL_MS: number = 400;
+/** 内核 /proxies 里属于「策略组」而不是「节点」的 type（内核真相兜底要用）。 */
+const GROUP_TYPES: string[] = ['Selector', 'URLTest', 'Fallback', 'LoadBalance', 'Smart', 'Relay'];
 
 /** 钉选链上的一跳：组名 + 组类型（只有 type=Selector 允许 PUT）。 */
 export class SelectionHop {
@@ -35,6 +37,20 @@ export class SelectionHop {
     this.name = name;
     this.type = type;
   }
+}
+
+/** 内核里一个策略组的当前状态（唯一事实源，供「主组 → 当前出口」使用）。 */
+export class KernelGroupSelection {
+  /** 实际采用的组名（指定组不存在时回退 GLOBAL / 首个 Selector）。 */
+  group: string = '';
+  /** 该组当前选中的条目名（可能是节点，也可能是子组）。 */
+  now: string = '';
+  /** now 是否为「可直接作为出口的叶子节点」。 */
+  nowIsLeaf: boolean = false;
+  /** 组的全部成员（含子组/信息条目）。 */
+  members: string[] = [];
+  /** 只含真实叶子节点（排除子组与「剩余流量/到期」信息条目）。 */
+  leafMembers: string[] = [];
 }
 
 export interface LatencyResult {
@@ -182,6 +198,7 @@ export class ControllerProbe {
 }
 
 export class ClashApiService {
+  static readonly GROUP_TYPES: string[] = GROUP_TYPES;
   private apiPort: number = 9090;
   private secret: string = '';
 
@@ -374,6 +391,153 @@ export class ClashApiService {
       }
     } catch (e) { return false; }
     return false;
+  }
+
+  /**
+   * 读内核里某个策略组的**当前状态**（2026-10-27 架构收口：内核 = 唯一真源）。
+   *
+   * `profile.store-selected: true` 已开，且设备上 `cache.db` 持续写入 ⇒ mihomo 本来
+   * 就把每个组的 `now` 持久化了。旧实现无视它，每次冷启动拿 `settings.preferredNodeName`
+   * 去覆盖：换机场后那个名字属于旧订阅（真机为 `新加坡01aws`）→ 覆盖失败 → 134s 空转
+   * → 「节点选择未生效」。改成 FlClash 口径后，正常路径**根本不需要 PUT**。
+   */
+  async readKernelSelection(groupName: string): Promise<KernelGroupSelection | null> {
+    const json = await this.proxiesJson();
+    if (json === null) { return null; }
+    let table: Record<string, Object>;
+    try {
+      const root = JSON.parse(json) as Record<string, Object>;
+      table = root['proxies'] as Record<string, Object>;
+    } catch (e) {
+      return null;
+    }
+    if (table === undefined || table === null) { return null; }
+    const groupNames: Set<string> = new Set<string>();
+    for (const key of Object.keys(table)) {
+      const entry = table[key] as Record<string, Object>;
+      if (entry === undefined || entry === null) { continue; }
+      if (GROUP_TYPES.indexOf(entry['type'] as string) >= 0) { groupNames.add(key); }
+    }
+    const out = new KernelGroupSelection();
+    let groupEntry: Record<string, Object> | undefined =
+      groupName.length > 0 ? table[groupName] as Record<string, Object> : undefined;
+    if (groupEntry !== undefined && groupEntry !== null) {
+      out.group = groupName;
+    } else {
+      groupEntry = undefined;
+      const globalEntry = table['GLOBAL'] as Record<string, Object>;
+      if (globalEntry !== undefined && globalEntry !== null
+        && (globalEntry['type'] as string) === 'Selector') {
+        groupEntry = globalEntry;
+        out.group = 'GLOBAL';
+      } else {
+        for (const key of Object.keys(table)) {
+          const entry = table[key] as Record<string, Object>;
+          if (entry === undefined || entry === null || (entry['type'] as string) !== 'Selector') {
+            continue;
+          }
+          groupEntry = entry;
+          out.group = key;
+          break;
+        }
+      }
+    }
+    if (groupEntry === undefined || groupEntry === null) { return null; }
+    const nowRaw = groupEntry['now'] as string;
+    out.now = nowRaw === undefined || nowRaw === null ? '' : nowRaw;
+    const all = groupEntry['all'] as string[];
+    if (Array.isArray(all)) {
+      for (const m of all) {
+        if (m.length === 0) { continue; }
+        out.members.push(m);
+        if (groupNames.has(m)) { continue; }
+        if (m.indexOf('剩余') >= 0 || m.indexOf('到期') >= 0) { continue; }
+        const leaf = table[m] as Record<string, Object>;
+        if (leaf === undefined || leaf === null) { continue; }
+        out.leafMembers.push(m);
+      }
+    }
+    for (const leaf of out.leafMembers) {
+      if (leaf === out.now) { out.nowIsLeaf = true; break; }
+    }
+    AppLogger.info(TAG, `kernel selection: group="${out.group}" now="${out.now}" `
+      + `nowIsLeaf=${out.nowIsLeaf} members=${out.members.length} leaves=${out.leafMembers.length}`);
+    return out;
+  }
+
+  /**
+   * 内核真相兜底（2026-10-27 二次修，真机复现后定案）。
+   *
+   * App 侧节点表可能是**换机场前的旧订阅名字**（实测：偏好里是 `新加坡01aws`，
+   * 而最终 YAML 里只有 `🇸🇬新加坡•移联01`）。旧实现拿 App 表逐个试钉，47 个候选
+   * × 3s 收敛窗口 ≈ 141s 静默空转，用户看到「一直正在连接」。
+   *
+   * 这里只认内核 `/proxies`：在指定策略组里挑**第一个真实存在的叶子节点**去钉。
+   * 返回 null = 通道不可用或该组里没有可钉的叶子节点（调用方按失败处理）。
+   */
+  async selectLeafFromKernelGroup(groupName: string): Promise<string | null> {
+    const json = await this.proxiesJson();
+    if (json === null) { return null; }
+    let table: Record<string, Object>;
+    try {
+      const root = JSON.parse(json) as Record<string, Object>;
+      table = root['proxies'] as Record<string, Object>;
+    } catch (e) {
+      return null;
+    }
+    if (table === undefined || table === null) { return null; }
+    const groupNames: Set<string> = new Set<string>();
+    for (const key of Object.keys(table)) {
+      const entry = table[key] as Record<string, Object>;
+      if (entry === undefined || entry === null) { continue; }
+      if (ClashApiService.GROUP_TYPES.indexOf(entry['type'] as string) >= 0) {
+        groupNames.add(key);
+      }
+    }
+    const pick = (members: string[]): string => {
+      for (const m of members) {
+        if (m.length === 0 || m.startsWith('__')) { continue; }
+        if (groupNames.has(m)) { continue; }
+        if (m.indexOf('剩余') >= 0 || m.indexOf('到期') >= 0) { continue; }
+        const entry = table[m] as Record<string, Object>;
+        if (entry === undefined || entry === null) { continue; }
+        return m;
+      }
+      return '';
+    };
+    let target: string = '';
+    const named = groupName.length > 0 ? table[groupName] as Record<string, Object> : undefined;
+    if (named !== undefined && named !== null && Array.isArray(named['all'])) {
+      target = pick(named['all'] as string[]);
+    }
+    // 订阅常同时声明 PROXY / GLOBAL / 自动选择 / 故障转移 多个分组：规则组里没有可钉
+    // 叶子时，全局模式真正生效的是 GLOBAL，先试它（mihomo 在 global 模式只认 GLOBAL）。
+    if (target.length === 0) {
+      const global = table['GLOBAL'] as Record<string, Object>;
+      if (global !== undefined && global !== null && Array.isArray(global['all'])) {
+        target = pick(global['all'] as string[]);
+        if (target.length > 0) {
+          AppLogger.warn(TAG, `kernel fallback: pick "${target}" from GLOBAL (group "${groupName}" empty)`);
+        }
+      }
+    }
+    if (target.length === 0) {
+      // 组名未知（极端情况）：退到内核里第一个 Selector 组的首个叶子。
+      for (const key of Object.keys(table)) {
+        const entry = table[key] as Record<string, Object>;
+        if (entry === undefined || entry === null) { continue; }
+        if ((entry['type'] as string) !== 'Selector') { continue; }
+        if (!Array.isArray(entry['all'])) { continue; }
+        target = pick(entry['all'] as string[]);
+        if (target.length > 0) { break; }
+      }
+    }
+    if (target.length === 0) {
+      AppLogger.warn(TAG, `kernel fallback: no leaf in group "${groupName}"`);
+      return null;
+    }
+    AppLogger.warn(TAG, `kernel fallback: pick "${target}" from group "${groupName}"`);
+    return (await this.selectNode(target)) ? target : null;
   }
 
   private async selectNodeOnce(nodeName: string): Promise<boolean> {

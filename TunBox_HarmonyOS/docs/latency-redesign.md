@@ -548,3 +548,15 @@ provider 声明段），与延迟判定口径无关：
 而内核没接管 ⇒ 整机解析黑洞。现在扩展侧默认 **false**，并且只从 YAML 读，不接 want、不缓存。
 
 默认值 **true**：与 0.4.3～0.6.8 的恒接管行为一致，升级用户无感；显式 false 才关闭。
+
+## 十九、2026-10-27 指纹变更说明（DNS 恒接管 + 有效节点名外露）
+
+指纹：`12fdcbccb25478d3` → `46c1d5c19a30bd90`。两处改动**都与测速引擎无关**，只动配置生成/钉选契约。
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| ① | 新增 `static lastEffectiveNodeName: string`，在 `groupSelected` 定稿处写入 | 用户选中的节点可能因缺凭据/非法字段被 `validNodes` 过滤，生成器会回落 `validNodes[0]`；旧代码仍拿**原节点名**去 `PUT /proxies` ⇒ 内核 400「节点选择未生效」。编排器改为读这个账本，钉的就是配置里真正排第一的节点 |
+| ② | 删除 `dnsOverrideEnabled` 对 `dns:` 段与 `tun.dns-hijack` 的 gate（`pushDnsSection` 的 `enable:false` 分支 + `tun` 段的 `if` 一并移除） | DNS 恒接管：YAML 里 `dns.enable` 恒 true、`dns-hijack` 恒写 `any:53`。开关从此只决定「是否用显式启用的订阅 DNS 替代默认块」，**不能再关掉解析** —— 消除「内核没跑 DNS 却把设备 DNS 指向 sentinel」的黑洞 |
+
+> 复现门禁：`node scripts/verify-generator-fingerprint.mjs`（2/0）与
+> `node scripts/verify-config-generation-integrity.mjs`。

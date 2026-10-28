@@ -77,10 +77,25 @@ export class VpnQuickStart {
       const orchestrator = ConnectionOrchestrator.instance();
       orchestrator.init(context);
 
+      // 冷启动竞态兜底：HomePage 已有节点就绪看门狗，但桌面快捷方式/卡片启动
+      // 会直接走 VpnQuickStart，可能在订阅 hydrate 完成前立刻发起连接。
+      // 此时 preferredNode 解析到旧节点名，后续会报「节点选择未生效」。
+      // 这里等待最多 3s，让节点表完成恢复；就绪即返回，不额外增加热启动时延。
+      if (subscriptions.nodes.length === 0 && !subscriptions.hasUsableProfile()) {
+        const deadline: number = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          await new Promise<void>((resolve) => setTimeout((): void => resolve(), 200));
+          await subscriptions.init(context);
+          if (subscriptions.nodes.length > 0 || subscriptions.hasUsableProfile()) {
+            break;
+          }
+        }
+      }
+
       // 【2026-10-24 加固】首选节点可能是存量节点表里的订阅信息条目（「剩余流量：xxx」
       // 这类，内核里无此名、钉选必失败）—— 视为未选中，回落到 fallback 的真节点。
-      // 【2026-10-25】改走 resolvePreferredNode：跨订阅旧偏好判无效 + 刷新 id 漂移按名自愈。
-      const preferred = await subscriptions.resolvePreferredNode();
+      // 【2026-10-25】改走 resolvePreferenceHint：跨订阅旧偏好判无效 + 刷新 id 漂移按名自愈。
+      const preferred = await subscriptions.resolvePreferenceHint();
       const node: ProxyNode | null = (preferred !== null && !NodeUsability.isInfoEntry(preferred.name))
         ? preferred
         : subscriptions.fallbackConnectionNode();

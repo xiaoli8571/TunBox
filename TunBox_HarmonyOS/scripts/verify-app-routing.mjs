@@ -44,7 +44,8 @@ const serviceSource = read('commons/services/SettingsService.ets');
 // 提取实际方法（按类方法4空格结束行），不复制/重写 load/save 分支。
 const loadMethod = serviceSource.match(/^  static async load\(\): Promise<AppSettings> \{[\s\S]*?^  \}/m)?.[0];
 const saveMethod = serviceSource.match(/^  static async save\(settings: AppSettings\): Promise<void> \{[\s\S]*?^  \}/m)?.[0];
-assert.ok(loadMethod && saveMethod, 'must extract actual SettingsService load/save methods');
+const flushMethod = serviceSource.match(/^  static async flushNow\(\): Promise<void> \{[\s\S]*?^  \}/m)?.[0];
+assert.ok(loadMethod && saveMethod && flushMethod, 'must extract actual SettingsService load/save/flushNow methods');
 const serviceHarness = `
 const KEY_SETTINGS = 'app_settings_json';
 export class MemorySettingsStore {
@@ -55,13 +56,25 @@ export class MemorySettingsStore {
 }
 export class SettingsService {
   static store = null;
+  // 用例会直接改写 store 原文来模拟「另一个写者」：屏蔽进程内缓存，保证 load 读盘。
+  static get cache() { return null; }
+  static set cache(_v) {}
   static syncRawProviderGate() {} // unrelated file cleanup boundary, no routing behavior
   // 测速快照分片与本闸门无关（闸门验的是路由规则的读写语义）：
   // 桩掉这两个新入口，别让「分片」把规则读写的结论搅进来。
   static async loadNodeSortSnapshot() { return ''; }
   static async routeSnapshotWrite() {}
 ${loadMethod}
-${saveMethod}
+${saveMethod.replace('static async save(', 'private static async saveDeferred(')}
+  // 闸门不模拟 300ms 防抖窗口：save() 立即 flushNow，落盘计数才可断言。
+  static scheduleFlush() {}
+  static async save(settings) {
+    await SettingsService.saveDeferred(settings);
+    await SettingsService.flushNow();
+  }
+${flushMethod}
+  static writeChain = Promise.resolve();
+${serviceSource.match(/^  static async patchSettings\(mutator: SettingsMutator\): Promise<void> \{[\s\S]*?^  \}/m)?.[0] ?? 'static async patchSettings() { throw new Error("missing"); }'}
 }
 `;
 const latencyTestUrlStub = [

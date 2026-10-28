@@ -13,7 +13,7 @@ function fixture() {
   h.platform.fs.unlinkSync = path => { h.removed.push(path); if (path.endsWith('hyper_adrules_ads.mrs')) h.ruleReady = false; };
   h.downloads = 0; h.downloadOK = true; h.downloadGate = null; h.reloads = 0; h.restarts = 0; h.configs = [];
   h.platform.SettingsService.load = async () => ({ ...h.settings });
-  h.platform.ProfileStore = { currentId: () => 'fixture-profile' };
+  h.platform.ProfileRepository = { currentId: () => 'fixture-profile' };
   h.orch.appliedProfileId = 'fixture-profile';
   h.platform.ensurePrivateDir = () => {};
   h.platform.privateFs.writePrivate = (_path, text) => h.configs.push(JSON.parse(text));

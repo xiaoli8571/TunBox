@@ -40,6 +40,7 @@
  * 任务被外部取消/暂停时由 BackgroundTaskWatch → detach() 止损。
  */
 import { notificationManager } from '@kit.NotificationKit';
+import { UnifiedScheduler } from './UnifiedScheduler';
 import { AppLogger } from '../utils/AppLogger';
 import { TunBoxNotifier } from './TunBoxNotifier';
 
@@ -145,7 +146,7 @@ export class TaskProgressUpdater {
     // 应用自有常驻通知与长时任务通知重复（用户实锤「两个通知消息」），接管即撤
     TunBoxNotifier.cancel().catch((): void => {});
     TaskProgressUpdater.push();
-    TaskProgressUpdater.timer = setInterval((): void => {
+    TaskProgressUpdater.timer = UnifiedScheduler.every((): void => {
       TaskProgressUpdater.push();
     }, UPDATE_INTERVAL_MS);
     AppLogger.info(TAG, `progress heartbeat attached (taskNotificationId=${notificationId} type=${kind})`);
@@ -154,7 +155,7 @@ export class TaskProgressUpdater {
   /** 释放 / 断开 / 任务取消或被暂停时调用（幂等；两种长时任务类型都安全）。 */
   static detach(): void {
     if (TaskProgressUpdater.timer >= 0) {
-      clearInterval(TaskProgressUpdater.timer);
+      UnifiedScheduler.clear(TaskProgressUpdater.timer);
       TaskProgressUpdater.timer = -1;
     }
     TaskProgressUpdater.taskNotificationId = -1;

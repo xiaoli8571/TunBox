@@ -25,7 +25,8 @@ const ets = path.join(here, '..', 'entry', 'src', 'main', 'ets');
 const read = (rel) => fs.readFileSync(path.join(ets, rel), 'utf8').replace(/\r\n/g, '\n');
 
 const backup = read('commons/services/BackupRestoreService.ets');
-const home = read('pages/HomePage.ets');
+// 2026-10-27：备份 UI 从 HomePage 迁到独立 BackupPage（设置 → 关于与隐私入口）。
+const home = read('pages/BackupPage.ets');
 
 let passed = 0;
 const failures = [];
@@ -52,18 +53,18 @@ ok(/file\.profiles\s*=\s*BackupRestoreService\.collectProfiles\(/.test(exportFn)
   '导出必须采集 profiles（内核节点来源）');
 ok(/file\.subscriptionSecrets\s*=\s*await\s+BackupRestoreService\.collectSubscriptionSecrets\(/.test(exportFn),
   '导出必须采集订阅 header 凭据');
-ok(/file\.currentProfileId\s*=\s*ProfileStore\.isReady\(\)\s*\?\s*ProfileStore\.currentId\(\)/.test(exportFn),
+ok(/file\.currentProfileId\s*=\s*ProfileRepository\.isReady\(\)\s*\?\s*ProfileRepository\.currentId\(\)/.test(exportFn),
   '导出必须记录 current profile');
-ok(/ProfileStore\.read\(s\.id\)/.test(backup) && /CredentialStore\.subscriptionCredential\(/.test(backup),
-  '采集实现必须真读 ProfileStore / CredentialStore');
+ok(/ProfileRepository\.read\(s\.id\)/.test(backup) && /CredentialStore\.subscriptionCredential\(/.test(backup),
+  '采集实现必须真读 ProfileRepository / CredentialStore');
 ok(/await\s+BackupRestoreService\.exportJsonWithSettings\(/.test(home),
-  'HomePage 导出必须 await 异步导出');
+  'BackupPage 导出必须 await 异步导出');
 
 // 3. 导入必须写回 profile / current / 凭据，并给旧备份补拉
 ok(/restoreProfiles\(parsed, subIds, restoredSubs\)/.test(backup),
   '导入必须调用 restoreProfiles 写回 profile 原文与 current');
-ok(/ProfileStore\.write\(id, yaml\)/.test(backup), 'restoreProfiles 必须写入 profiles/<id>.yaml');
-ok(/await ProfileStore\.setCurrent\(current\)/.test(backup), 'restoreProfiles 必须切回 current profile');
+ok(/ProfileRepository\.write\(id, yaml\)/.test(backup), 'restoreProfiles 必须写入 profiles/<id>.yaml');
+ok(/await ProfileRepository\.setCurrent\(current\)/.test(backup), 'restoreProfiles 必须切回 current profile');
 ok(/CredentialStore\.canonicalize\(\[\], sources, true\)/.test(backup),
   'restoreProfiles 必须把订阅 header 凭据补进 Asset');
 ok(/needRefresh\.push\(s\.id\)/.test(backup) && /await svc\.refreshSubscription\(id\)/.test(backup),

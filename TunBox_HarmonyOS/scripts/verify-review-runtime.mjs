@@ -47,7 +47,7 @@ const {ProfileConfigMerger:M}=load('commons/flclash/ProfileConfigMerger.ets','Pr
 load('commons/subscription/UriNodeParser.ets','UriNodeParser');
 load('commons/subscription/BodyDispatch.ets','BodyDispatch,BodyKind');
 const {SubConverter}=load('commons/flclash/SubConverter.ets','SubConverter');
-const {ProfileStore:P}=load('commons/flclash/ProfileStore.ets','ProfileStore');
+const {ProfileRepository:P}=load('commons/flclash/ProfileRepository.ets','ProfileRepository');
 P.attachConverter(text=>SubConverter.convert(text).proxiesYaml);
 P.attachPreparer(async text=>prepare(text));
 const files=new Map(); P.write=(id,text)=>{files.set(id,text);return true;};
@@ -122,7 +122,7 @@ await test('an old batch cannot clear a new batch testing mark',async()=>{
   assert.equal(V.stateFor('same'),LatencyState.TESTING);second.cancel();await second.wait();
 });
 await test('same profile with changed bytes triggers reload',async()=>{
-  const h=harness();h.platform.ProfileStore={currentId:()=> 's',exists:()=>true,revisionOf:()=> 'new'};
+  const h=harness();h.platform.ProfileRepository={currentId:()=> 's',exists:()=>true,revisionOf:()=> 'new'};
   h.orch.appliedProfileId='s';h.orch.appliedProfileRevision='old';let reloads=0;
   h.orch.applyRulesChanged=async()=>{reloads++;return 'hot';};
   assert.equal(await h.orch.ensureProfileApplied('refresh'),true);assert.equal(reloads,1);h.stop();

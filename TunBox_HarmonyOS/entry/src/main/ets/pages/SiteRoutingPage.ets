@@ -4,6 +4,7 @@ import { Ui } from '../theme/UiTokens';
 import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { SettingsService } from '../commons/services/SettingsService';
+import { AppSettings } from '../commons/models/AppSettings';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SiteRoutingPolicy } from '../commons/services/SiteRoutingPolicy';
 
@@ -192,16 +193,27 @@ struct SiteRoutingPage {
         message: '三份名单同时保存。立即应用通过热更新规则生效；失败时保留当前连接，不自动重连。仅保存则下次连接或规则重新加载时生效。',
         buttons: [{ text: '取消', color: $r('app.color.ui_text_secondary') }, { text: '仅保存', color: $r('app.color.ui_text_blue') }, { text: '保存并应用', color: $r('app.color.ui_text_blue') }] });
       if (result.index === 0) { return; }
-      const settings = await SettingsService.load();
-      if (JSON.stringify(settings.forceProxySites) !== JSON.stringify(this.originalProxy)
-        || JSON.stringify(settings.forceDirectSites) !== JSON.stringify(this.originalDirect)
-        || JSON.stringify(settings.forceBlockSites) !== JSON.stringify(this.originalBlock)) {
+      // 字段级写入（patchSettings）：只覆盖本页三份名单。旧写法 `load() → 改字段 → save(整份)`
+      // 会让「load 与 save 之间别的写者」（设置页改节点、订阅刷新改 preferredNode*）被本页快照
+      // 整份盖掉 —— F2 类静默数据丢失。并发三向比较也搬进写锁内：mutator 返回 false ⇒ 不写盘。
+      let conflict = false;
+      let proxyMode = '';
+      await SettingsService.patchSettings((current: AppSettings): boolean => {
+        proxyMode = current.proxyMode;
+        if (JSON.stringify(current.forceProxySites) !== JSON.stringify(this.originalProxy)
+          || JSON.stringify(current.forceDirectSites) !== JSON.stringify(this.originalDirect)
+          || JSON.stringify(current.forceBlockSites) !== JSON.stringify(this.originalBlock)) {
+          conflict = true;
+          return false;
+        }
+        current.forceProxySites = this.proxy.slice();
+        current.forceDirectSites = this.direct.slice();
+        current.forceBlockSites = this.block.slice();
+        return true;
+      });
+      if (conflict) {
         this.toast('网站规则已被其他页面修改，请返回重新打开后编辑'); return;
       }
-      settings.forceProxySites = this.proxy.slice();
-      settings.forceDirectSites = this.direct.slice();
-      settings.forceBlockSites = this.block.slice();
-      await SettingsService.save(settings);
       this.originalProxy = this.proxy.slice();
       this.originalDirect = this.direct.slice();
       this.originalBlock = this.block.slice();
@@ -218,7 +230,7 @@ struct SiteRoutingPage {
             : outcome === 'pending' ? '已保存，另一规则更新进行中，请稍后重试立即应用。' : '已保存，下次连接生效。';
         } catch (e) { this.notice = '配置已保存，但立即应用失败；请检查配置后重试。'; }
       }
-      if (settings.proxyMode === 'global') { this.notice += ' 当前全局模式，请切回智能规则模式使用网站规则。'; }
+      if (proxyMode === 'global') { this.notice += ' 当前全局模式，请切回智能规则模式使用网站规则。'; }
       this.toast(this.notice);
     } catch (e) { this.toast('保存未完成，请重试'); }
     finally { this.busy = false; }

@@ -45,6 +45,8 @@
  * 守护承担；本文件只负责隧道数据面与其内部自愈。
  */
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
+import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
+import { ReconnectReason } from '../commons/services/ConnectionEvents';
 import { common } from '@kit.AbilityKit';
 import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
 import type Want from '@ohos.app.ability.Want';
@@ -918,7 +920,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.scheduleTunnelRebuild('mtu-change');
     } else if (previous === NetTypes.NONE || previous !== netType) {
       this.activeMtu = nextMtu;
-      this.scheduleCoreRecovery('network-changed');
+      this.scheduleCoreRecovery(ReconnectReason.NETWORK_CHANGED);
     }
   }
 
@@ -1073,7 +1075,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     this.stopCoreMonitor();
     this.startLeaseTimer();
     this.coreDeathStrikes = 0;
-    this.coreMonitorTimer = setInterval((): void => {
+    this.coreMonitorTimer = UnifiedScheduler.every((): void => {
       if (this.connection === null || this.recoveryRunning || this.rebuilding || !this.networkAvailable) {
         return;
       }
@@ -1095,7 +1097,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
         this.coreDeathStrikes = 0;
         // 内核已死：保持 TUN（Kill Switch），进入恢复编排。
         this.writeStatus('recovering', false, 'core-not-alive');
-        this.scheduleCoreRecovery('core-not-alive');
+        this.scheduleCoreRecovery(ReconnectReason.CORE_NOT_ALIVE);
       }).catch((e: Object): void => {
         // 探针异常（原生调用失败）不是"内核已死"的证据，只告警不升级。
         AppLogger.warn(TAG, `core liveness probe failed: ${AppLogger.errText(e)}`);
@@ -1105,7 +1107,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
 
   private stopCoreMonitor(): void {
     if (this.coreMonitorTimer >= 0) {
-      clearInterval(this.coreMonitorTimer);
+      UnifiedScheduler.clear(this.coreMonitorTimer);
       this.coreMonitorTimer = -1;
     }
   }
@@ -1127,7 +1129,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private startLeaseTimer(): void {
     this.stopLeaseTimer();
     this.touchLivenessLease(Date.now());
-    this.leaseTimer = setInterval((): void => {
+    this.leaseTimer = UnifiedScheduler.every((): void => {
       if (this.cleanupPromise !== null) {
         return;
       }
@@ -1144,7 +1146,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
 
   private stopLeaseTimer(): void {
     if (this.leaseTimer >= 0) {
-      clearInterval(this.leaseTimer);
+      UnifiedScheduler.clear(this.leaseTimer);
       this.leaseTimer = -1;
     }
   }
@@ -1162,7 +1164,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   }
 
   /** 有界指数退避恢复，只重启 Core，保持 VPN/TUN 与 Kill Switch 路由不被拆除。 */
-  private scheduleCoreRecovery(reason: string): void {
+  private scheduleCoreRecovery(reason: ReconnectReason): void {
     if (this.recoveryRunning || this.recoveryTimer >= 0 || this.rebuilding || this.recoveryAttempts >= MAX_CORE_RECOVERY_ATTEMPTS
       || this.connection === null || !this.networkAvailable) {
       return;
@@ -1241,7 +1243,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
             this.recoveryAttempts = 0;
             this.scheduleTunnelRebuild('core-recovery-exhausted');
           } else {
-            this.scheduleCoreRecovery(reason + '-retry');
+            this.scheduleCoreRecovery(ReconnectReason.RETRY);
           }
         }
       }

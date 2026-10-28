@@ -158,6 +158,11 @@ export default class EntryAbility extends UIAbility {
   }
 
   onBackground(): void {
+    // 设置采用「内存 → 合并 → 防抖落盘」（2026-10-27 写放大整治）：
+    // 进后台是最后一个可靠的刷盘点，必须强制落盘，否则防抖窗口内的改动会丢。
+    SettingsService.flushNow().catch((e: Error): void => {
+      AppLogger.warn(TAG, `settings flush on background failed: ${e.message}`);
+    });
     // 进后台时若隧道确实活着，补一次驻留凭证：UiGuardian.registered 是进程级静态
     // 布尔，进程重启后必然为 false，只有 HomePage 存在时才会被重新 engage ——
     // 卡片/快捷方式路径拉起的会话没有页面，这里兜住最后一环。
@@ -332,6 +337,9 @@ export default class EntryAbility extends UIAbility {
 
   onDestroy(): void {
     AppLogger.info(TAG, 'onDestroy: UI ability released; preserve active VPN runtime artifacts');
+    SettingsService.flushNow().catch((e: Error): void => {
+      AppLogger.warn(TAG, `settings flush on destroy failed: ${e.message}`);
+    });
     // UI Ability 被系统回收不代表用户主动停止 VPN。运行配置、Extension 状态和恢复工件
     // 由 VpnExtensionAbility 在确认会话终止后统一清理，避免破坏仍在后台运行的隧道及其恢复链。
   }

@@ -36,6 +36,7 @@
  *    速率/运行时长继续由应用自有常驻通知（TunBoxNotifier）承载。
  */
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
+import { UnifiedScheduler } from './UnifiedScheduler';
 // `WantAgent` 是模块的**具名类型导出**（不是 wantAgent 命名空间的成员），
 // 必须与命名空间一起具名导入 —— 与 TunBoxNotifier.ets 的既有写法一致。
 import { wantAgent, WantAgent } from '@kit.AbilityKit';
@@ -296,7 +297,7 @@ export class UiGuardian {
     UiGuardian.watchdogContext = context;
     UiGuardian.sessionCheck = sessionCheck;
     if (UiGuardian.watchdogTimer >= 0 || UiGuardian.autoEngageSuppressed) { return; }
-    UiGuardian.watchdogTimer = setInterval((): void => {
+    UiGuardian.watchdogTimer = UnifiedScheduler.every((): void => {
       UiGuardian.checkBackgroundTask().catch((e: Error): void => {
         AppLogger.warn(TAG, `background task check failed: ${AppLogger.errText(e)}`);
       });
@@ -310,7 +311,7 @@ export class UiGuardian {
   private static stopWatchdog(): void {
     UiGuardian.watchdogCheckId++;
     UiGuardian.watchdogBusy = false;
-    if (UiGuardian.watchdogTimer >= 0) { clearInterval(UiGuardian.watchdogTimer); }
+    if (UiGuardian.watchdogTimer >= 0) { UnifiedScheduler.clear(UiGuardian.watchdogTimer); }
     UiGuardian.watchdogTimer = -1;
     UiGuardian.watchdogContext = null;
     UiGuardian.sessionCheck = null;

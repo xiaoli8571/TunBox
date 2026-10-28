@@ -208,6 +208,122 @@ export class RuntimeConfigResult {
   hostsCount: number = 0;
   /** 本次使用的决策（两种 mode 应完全一致）。 */
   options: RuntimeConfigOptions = new RuntimeConfigOptions();
+  /**
+   * 最终 YAML 里 PROXY 组**真正排第一**的成员名（2026-10-27）。
+   * 用户选中的节点可能被 validNodes 过滤，或被订阅原文覆盖层换掉；钉选必须用
+   * 这个名字，否则 PUT /proxies 400 → 「节点选择未生效」。
+   */
+  effectiveNodeName: string = '';
+  /**
+   * 规则实际指向的策略组名（2026-10-27 二次修）。
+   * 原文接管时它是机场自己起的名字（如 `吹雪云`），**不是** `PROXY`；钉选兜底
+   * 要靠它去内核 `/proxies` 里找真实成员。空串 = YAML 里没有可用的策略组。
+   */
+  ruleGroupName: string = '';
+}
+
+/** proxy-groups 里一个组的解析结果（成员名已还原 YAML 转义）。 */
+class YamlGroupInfo {
+  name: string = '';
+  type: string = '';
+  members: string[] = [];
+}
+
+/**
+ * 一次连接的**唯一目标描述**（2026-10-27 架构收口）。
+ *
+ * 旧架构同时维护三套状态：TunBox 节点列表 / `settings.preferredNode*` / 最终 YAML 里的
+ * 真实 Group 结构 —— 三者会漂移（真机现场：UI 显示「香港移联01」、内核实际走
+ * 「新加坡01aws」，最后报「节点选择未生效」）。现在统一收敛成这一个对象，
+ * `source` 明确说明名字是怎么来的，谁都不能再自己"猜"一个节点名：
+ *   - `user`   ：用户明确选择，且**在真实主组里严格存在**（可直接 SET）
+ *   - `kernel` ：内核 `/proxies` 里该组当前的 `now`（store-selected 持久化，唯一真源）
+ *   - `yaml`   ：从最终 YAML 解析得出（含地区自愈 / 组内首个叶子节点）
+ */
+/**
+ * 出口来源（2026-10-27 架构收口：字符串枚举化）。
+ *
+ * 只允许这几种来源，新增来源必须同时在本枚举与验证脚本里登记：
+ * UI/恢复/排查都靠它判断「这个节点名是谁定的、能不能信」。
+ */
+export enum ConnectionTargetSource {
+  /** 从最终 YAML 解析得出（含地区自愈 / 组内首个叶子）。 */
+  YAML = 'yaml',
+  /** 内核 `/proxies` 里该组当前的 `now`（store-selected 持久化，唯一真源）。 */
+  KERNEL = 'kernel',
+  /** 用户明确选择，且在真实主组里严格存在。 */
+  USER = 'user',
+  /** 内核智能选点（mihomo-smart）给出的出口。 */
+  AUTO = 'auto',
+  /** 进程重启后从持久化会话恢复出来的出口。 */
+  RESTORE = 'restore',
+  /** 以上都拿不到时的兜底叶子。 */
+  FALLBACK = 'fallback'
+}
+
+export class ConnectionTarget {
+  /** 真实策略组名（规则指向的 select 组，不是硬编码的 PROXY）。 */
+  groupName: string = '';
+  /** 该组里真实存在、可作为出口的节点名。 */
+  nodeName: string = '';
+  /** 出口来源（枚举；不再允许随手传字符串）。 */
+  source: ConnectionTargetSource = ConnectionTargetSource.YAML;
+  /**
+   * 确认该出口时生效的 profile id（2026-10-27 强化）。
+   * 用途：切订阅后可直接判定「这份出口属于旧 profile」，恢复/重连/排查不必猜。
+   */
+  profileId: string = '';
+  /** 确认该出口的时间戳（ms）。用于日志时序与「多久没重新确认过」。 */
+  selectedAt: number = 0;
+  /**
+   * 确认该出口时 ProfileStore 的 revision（2026-10-27）。
+   * 与 `profileId` 配合可判断「这份出口是否还属于当前配置版本」。
+   * 取值与 `ProfileRepository.revisionOf()` 同源（内容指纹字符串）。
+   */
+  profileRevision: string = '';
+  /**
+   * 产生该出口的连接代数（2026-10-27）。
+   * 旧代数的写回（迟到的 /proxies 回报、恢复回调）必须被丢弃，
+   * 不能覆盖新一代已经确认的出口。
+   */
+  generation: number = 0;
+
+  constructor(groupName: string = '', nodeName: string = '',
+    source: ConnectionTargetSource = ConnectionTargetSource.YAML,
+    profileId: string = '', selectedAt: number = 0,
+    profileRevision: string = '', generation: number = 0) {
+    this.groupName = groupName;
+    this.nodeName = nodeName;
+    this.source = source;
+    this.profileId = profileId;
+    this.selectedAt = selectedAt;
+    this.profileRevision = profileRevision;
+    this.generation = generation;
+  }
+
+  /** 是否属于指定 profile；profileId 为空（历史数据）时视为「不确定」。 */
+  belongsTo(profileId: string): boolean {
+    if (this.profileId.length === 0 || profileId.length === 0) { return false; }
+    return this.profileId === profileId;
+  }
+
+  /** 是否与指定 profile 的指定 revision 一致（两者都已知才算一致）。 */
+  matchesRevision(profileId: string, revision: string): boolean {
+    return this.belongsTo(profileId) && this.profileRevision.length > 0
+      && this.profileRevision === revision;
+  }
+
+  /** 是否是比 `generation` 更新的出口（用于丢弃迟到写回）。 */
+  isNewerThan(generation: number): boolean {
+    return this.generation > generation;
+  }
+
+  /** 展示用：`组名 → 节点名`；缺组名时只给节点名。 */
+  label(): string {
+    if (this.groupName.length === 0) { return this.nodeName; }
+    if (this.nodeName.length === 0) { return this.groupName; }
+    return `${this.groupName} → ${this.nodeName}`;
+  }
 }
 
 /**
@@ -397,12 +513,12 @@ export class RuntimeConfigBuilder {
 
     // ── FlClash 同构：订阅原文接管 proxies / proxy-groups / rules / dns ──────
     // overlay（上面生成的 yaml）只保留运行期参数（端口 / secret / tun / mode 等），
-    // 原文段整体替换进来；原文 dns.enable=true 时整段 dns 用原文。
+    // 原文代理/规则段整体替换；DNS 覆写开启时保留应用 DNS，关闭时采用订阅 DNS。
     // 有原文时合并失败必须拒绝，不能把内部占位节点当作用户的有效配置。
     let finalYaml = yaml;
     if (profile.profileYaml.trim().length > 0) {
       const merged = ProfileConfigMerger.merge(yaml, profile.profileYaml,
-        profile.settings.dnsOverrideEnabled !== false);
+        profile.settings.dnsOverrideEnabled === false);
       if (merged.ok) {
         finalYaml = merged.yaml;
         AppLogger.info(TAG, `profile merged: mode=${mode} applied=${merged.applied} `
@@ -453,10 +569,331 @@ export class RuntimeConfigBuilder {
     result.tunEnabled = tunEnabled;
     result.hostsCount = Object.keys(hosts).length;
     result.options = options;
+    // ── 钉选目标解析（2026-10-27 二次修，真机复现后定案）───────────────────
+    // 旧实现把主组写死成字符串 PROXY：订阅原文接管后，规则指向
+    // 的组名是机场自己起的（本次真机为 `吹雪云`），取不到 → 退回生成器的
+    // lastEffectiveNodeName（**旧订阅残留名** `新加坡01aws`）→ 钉选必然失败 →
+    // 「节点选择未生效」。而且这份 YAML 里的节点名是 `"\U0001F1ED..."` 转义写法，
+    // 不还原转义就永远和内核对不上。这里改为一律从**最终 YAML** 解析：
+    //   ① 组名 = 规则真正指向的 select 组（兜底 proxy-groups 首组）；
+    //   ② 节点 = 用户所选节点若在该组/该配置里存在就用它，否则按「去 emoji 归一化 /
+    //      地区关键词」自愈到组内同名地区的真实节点，再否则取组内首个叶子节点。
+    const resolvedPin: ConnectionTarget = RuntimeConfigBuilder.resolvePinTarget(
+      finalYaml, options.selectedNodeName);
+    result.ruleGroupName = resolvedPin.groupName;
+    // provider-only 订阅的组在文本里只有内部占位 outbound（__tunbox_overlay__），
+    // 真实节点由 `use: provider` 在运行时注入 —— 这个占位符绝不能当钉选目标。
+    const fromGenerator: string = ClashConfigGenerator.lastEffectiveNodeName.startsWith('__')
+      ? '' : ClashConfigGenerator.lastEffectiveNodeName;
+    result.effectiveNodeName = resolvedPin.nodeName.length > 0
+      ? resolvedPin.nodeName
+      : (fromGenerator.length > 0 ? fromGenerator : options.selectedNodeName);
     AppLogger.info(TAG, `runtime config built: mode=${mode} bytes=${finalYaml.length} `
       + `hosts=${result.hostsCount} useSmart=${options.useSmart} `
       + `ruleProviderReady=${options.ruleProviderReady} useGeoip=${options.useGeoip} `
-      + `ipv6=${ipv6Enabled} node="${options.selectedNodeName}"`);
+      + `ipv6=${ipv6Enabled} node="${options.selectedNodeName}" `
+      + `group="${result.ruleGroupName}" effective="${result.effectiveNodeName}"`);
     return result;
+  }
+
+  // ── 钉选目标解析（2026-10-27 二次修）─────────────────────────────────────
+
+  /**
+   * 解析最终 YAML，得出「该钉哪个组的哪个节点」。
+   *
+   * 三条事实必须一起处理，缺一条就会退回「节点选择未生效」：
+   *   ① 组名不一定是 `PROXY` —— 原文接管后是机场自己起的名字，只能从 rules 反查；
+   *   ② 用户所选节点名可能是**换机场前的旧名字**（`新加坡01aws` vs `新加坡•移联01`），
+   *      直接 PUT 必 400，必须按地区关键词自愈；
+   *   ③ YAML 里的名字是 `"\U0001F1F8..."` 转义写法，必须还原成内核里的真实字符串，
+   *      否则拿去和 `/proxies` 比对永远不相等。
+   */
+  static resolvePinTarget(yaml: string, preferredName: string): ConnectionTarget {
+    const out = new ConnectionTarget();
+    const groups: YamlGroupInfo[] = RuntimeConfigBuilder.parseProxyGroups(yaml);
+    const rules: string[] = RuntimeConfigBuilder.parseRuleTargets(yaml);
+    const proxies: string[] = RuntimeConfigBuilder.parseProxyNames(yaml);
+    const groupNames: Set<string> = new Set<string>();
+    for (const g of groups) { groupNames.add(g.name); }
+
+    // ① 规则指向的 select 组（真正的用户可见选择组）；找不到就退首个组。
+    for (const tgt of rules) {
+      const g: YamlGroupInfo | null = RuntimeConfigBuilder.findGroup(groups, tgt);
+      if (g !== null && g.type === 'select') { out.groupName = g.name; break; }
+    }
+    if (out.groupName.length === 0) {
+      for (const tgt of rules) {
+        const g: YamlGroupInfo | null = RuntimeConfigBuilder.findGroup(groups, tgt);
+        if (g !== null) { out.groupName = g.name; break; }
+      }
+    }
+    if (out.groupName.length === 0 && groups.length > 0) { out.groupName = groups[0].name; }
+    const ruleGroup: YamlGroupInfo | null = out.groupName.length > 0
+      ? RuntimeConfigBuilder.findGroup(groups, out.groupName) : null;
+    const members: string[] = ruleGroup !== null ? ruleGroup.members : [];
+
+    // ②③ 依次尝试：**规则组直连成员优先**（订阅里常有 PROXY/GLOBAL/自动选择/故障转移
+    // 多个分组，只有直连成员能被 SET 到），再退到全量 proxies：
+    // 精确命中 → 归一化命中 → 地区关键词命中 → 组内首个叶子节点 → 任意叶子节点。
+    const preferred: string = preferredName.startsWith('__') ? '' : preferredName.trim();
+    out.nodeName = RuntimeConfigBuilder.pickExisting(members, groupNames, preferred, true);
+    if (out.nodeName.length === 0) {
+      out.nodeName = RuntimeConfigBuilder.pickExisting(proxies, groupNames, preferred, true);
+    }
+    if (out.nodeName.length === 0) {
+      // 组里第一个**真节点**（跳过策略组与「剩余流量/到期」信息条目）。
+      for (const m of members) {
+        if (RuntimeConfigBuilder.isInfoOrGroup(m, groupNames)) { continue; }
+        out.nodeName = m;
+        break;
+      }
+    }
+    if (out.nodeName.length === 0) {
+      for (const p of proxies) {
+        if (RuntimeConfigBuilder.isInfoOrGroup(p, groupNames)) { continue; }
+        out.nodeName = p;
+        break;
+      }
+    }
+    // 来源标注：与用户所选**逐字节相同**才算 user；地区自愈/组内首叶子都算 yaml。
+    out.source = (out.nodeName.length > 0 && out.nodeName === preferred)
+      ? ConnectionTargetSource.USER : ConnectionTargetSource.YAML;
+    return out;
+  }
+
+  /** 在候选名集合里找用户意图对应的真实节点（精确 / 归一化 / 地区关键词三级）。 */
+  private static pickExisting(pool: string[], groupNames: Set<string>, preferred: string,
+    leafOnly: boolean): string {
+    if (pool.length === 0 || preferred.length === 0) { return ''; }
+    for (const name of pool) {
+      if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
+      if (name === preferred) { return name; }
+    }
+    const wantKey: string = RuntimeConfigBuilder.nodeKey(preferred);
+    if (wantKey.length === 0) { return ''; }
+    for (const name of pool) {
+      if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
+      if (RuntimeConfigBuilder.nodeKey(name) === wantKey) { return name; }
+    }
+    // 地区关键词：`新加坡01aws` → 新加坡 ；`hy2台湾1` → 台湾
+    const runs: string[] = RuntimeConfigBuilder.cjkRuns(preferred);
+    for (const region of runs) {
+      for (const name of pool) {
+        if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
+        if (RuntimeConfigBuilder.nodeKey(name).indexOf(region) >= 0) { return name; }
+      }
+    }
+    return '';
+  }
+
+  private static isInfoOrGroup(name: string, groupNames: Set<string>): boolean {
+    if (name.length === 0 || name.startsWith('__')) { return true; }
+    if (groupNames.has(name)) { return true; }
+    return name.indexOf('剩余') >= 0 || name.indexOf('到期') >= 0;
+  }
+
+  /** 去 emoji / 分隔符 / 大小写差异后的比较键（只保留 ASCII 字母数字与 CJK）。 */
+  static nodeKey(raw: string): string {
+    let out: string = '';
+    for (let i = 0; i < raw.length; i++) {
+      const c: number = raw.charCodeAt(i);
+      const isDigit: boolean = c >= 0x30 && c <= 0x39;
+      const isUpper: boolean = c >= 0x41 && c <= 0x5A;
+      const isLower: boolean = c >= 0x61 && c <= 0x7A;
+      const isCjk: boolean = (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF);
+      if (isDigit || isCjk) { out += raw.charAt(i); continue; }
+      if (isUpper) { out += String.fromCharCode(c + 32); continue; }
+      if (isLower) { out += raw.charAt(i); }
+    }
+    return out;
+  }
+
+  /** 抽出 2 字及以上的中文串（地区关键词），长的优先。 */
+  private static cjkRuns(raw: string): string[] {
+    const runs: string[] = [];
+    let cur: string = '';
+    for (let i = 0; i < raw.length; i++) {
+      const c: number = raw.charCodeAt(i);
+      const isCjk: boolean = (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF);
+      if (isCjk) { cur += raw.charAt(i); continue; }
+      if (cur.length >= 2) { runs.push(cur); }
+      cur = '';
+    }
+    if (cur.length >= 2) { runs.push(cur); }
+    runs.sort((a: string, b: string): number => b.length - a.length);
+    return runs;
+  }
+
+  private static findGroup(groups: YamlGroupInfo[], name: string): YamlGroupInfo | null {
+    for (const g of groups) {
+      if (g.name === name) { return g; }
+    }
+    return null;
+  }
+
+  /** 解析 `proxy-groups:` 段：组名、类型、成员（名字已还原转义）。 */
+  static parseProxyGroups(yaml: string): YamlGroupInfo[] {
+    const out: YamlGroupInfo[] = [];
+    const lines: string[] = RuntimeConfigBuilder.splitYamlLines(yaml);
+    let inSection: boolean = false;
+    let collecting: boolean = false;
+    let cur: YamlGroupInfo | null = null;
+    for (const raw of lines) {
+      const t: string = raw.trim();
+      if (!inSection) {
+        if (t === 'proxy-groups:' && raw.length === t.length) { inSection = true; }
+        continue;
+      }
+      if (t.length === 0) { continue; }
+      if (raw.charAt(0) !== ' ' && raw.charAt(0) !== '\t' && raw.charAt(0) !== '-') { break; }
+      if (t.startsWith('- ')) {
+        if (collecting && cur !== null) {
+          cur.members.push(RuntimeConfigBuilder.unquoteYaml(t.substring(2).trim()));
+          continue;
+        }
+        cur = new YamlGroupInfo();
+        out.push(cur);
+        const rest: string = t.substring(2);
+        if (rest.startsWith('name:')) {
+          cur.name = RuntimeConfigBuilder.unquoteYaml(rest.substring(5).trim());
+        }
+        continue;
+      }
+      if (cur === null) { continue; }
+      if (t === 'proxies:') { collecting = true; continue; }
+      if (t.startsWith('name:')) {
+        cur.name = RuntimeConfigBuilder.unquoteYaml(t.substring(5).trim());
+        collecting = false;
+        continue;
+      }
+      if (t.startsWith('type:')) {
+        cur.type = RuntimeConfigBuilder.decodeYamlEscapes(t.substring(5).trim());
+        collecting = false;
+        continue;
+      }
+      collecting = false;
+    }
+    return out;
+  }
+
+  /** 解析顶层 `proxies:` 段里的节点名（已还原转义）。 */
+  static parseProxyNames(yaml: string): string[] {
+    const out: string[] = [];
+    const lines: string[] = RuntimeConfigBuilder.splitYamlLines(yaml);
+    let inSection: boolean = false;
+    for (const raw of lines) {
+      const t: string = raw.trim();
+      if (!inSection) {
+        if (t === 'proxies:' && raw.length === t.length) { inSection = true; }
+        continue;
+      }
+      if (t.length === 0) { continue; }
+      if (raw.charAt(0) !== ' ' && raw.charAt(0) !== '\t') { break; }
+      if (t.startsWith('- name:')) {
+        out.push(RuntimeConfigBuilder.unquoteYaml(t.substring(7).trim()));
+        continue;
+      }
+      if (t.startsWith('name:')) {
+        out.push(RuntimeConfigBuilder.unquoteYaml(t.substring(5).trim()));
+      }
+    }
+    return out;
+  }
+
+  /** 解析 `rules:` 段里每条规则的**目标**（最后一段），并还原转义。 */
+  static parseRuleTargets(yaml: string): string[] {
+    const out: string[] = [];
+    const lines: string[] = RuntimeConfigBuilder.splitYamlLines(yaml);
+    let inSection: boolean = false;
+    for (const raw of lines) {
+      const t: string = raw.trim();
+      if (!inSection) {
+        if (t === 'rules:' && raw.length === t.length) { inSection = true; }
+        continue;
+      }
+      if (t.length === 0) { continue; }
+      if (raw.charAt(0) !== ' ' && raw.charAt(0) !== '\t' && raw.charAt(0) !== '-') { break; }
+      if (!t.startsWith('- ')) { continue; }
+      const body: string = RuntimeConfigBuilder.decodeYamlEscapes(t.substring(2).trim());
+      const parts: string[] = body.split(',');
+      if (parts.length < 2) { continue; }
+      const target: string = RuntimeConfigBuilder.unquoteYaml(parts[parts.length - 1].trim());
+      if (target.length > 0) { out.push(target); }
+    }
+    return out;
+  }
+
+  /** 还原 YAML 双引号标量转义：`\U0001F1F8` `\uXXXX` `\xXX` `\"` `\\` `\n` `\t`。 */
+  static decodeYamlEscapes(s: string): string {
+    if (s.indexOf('\\') < 0) { return s; }
+    let out: string = '';
+    let i: number = 0;
+    while (i < s.length) {
+      const c: string = s.charAt(i);
+      if (c !== '\\' || i + 1 >= s.length) { out += c; i++; continue; }
+      const n: string = s.charAt(i + 1);
+      if (n === 'U' && i + 9 < s.length) {
+        const cp: number = RuntimeConfigBuilder.hexValue(s.substring(i + 2, i + 10));
+        if (cp >= 0) { out += RuntimeConfigBuilder.codePointToString(cp); i += 10; continue; }
+      }
+      if (n === 'u' && i + 5 < s.length) {
+        const cp: number = RuntimeConfigBuilder.hexValue(s.substring(i + 2, i + 6));
+        if (cp >= 0) { out += String.fromCharCode(cp); i += 6; continue; }
+      }
+      if (n === 'x' && i + 3 < s.length) {
+        const cp: number = RuntimeConfigBuilder.hexValue(s.substring(i + 2, i + 4));
+        if (cp >= 0) { out += String.fromCharCode(cp); i += 4; continue; }
+      }
+      if (n === 'n') { out += '\n'; i += 2; continue; }
+      if (n === 't') { out += '\t'; i += 2; continue; }
+      if (n === 'r') { out += '\r'; i += 2; continue; }
+      out += n; // \" \\ \/ 等一律还原成字符本身
+      i += 2;
+    }
+    return out;
+  }
+
+  private static codePointToString(cp: number): string {
+    if (cp <= 0xFFFF) { return String.fromCharCode(cp); }
+    const v: number = cp - 0x10000;
+    return String.fromCharCode(0xD800 + (v >> 10)) + String.fromCharCode(0xDC00 + (v & 0x3FF));
+  }
+
+  /** 严格十六进制解析：任何非 hex 字符都返回 -1（ArkTS 下不依赖 isNaN）。 */
+  private static hexValue(s: string): number {
+    let v: number = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c: number = s.charCodeAt(i);
+      let d: number = -1;
+      if (c >= 0x30 && c <= 0x39) { d = c - 0x30; }
+      else if (c >= 0x41 && c <= 0x46) { d = c - 0x37; }
+      else if (c >= 0x61 && c <= 0x66) { d = c - 0x57; }
+      if (d < 0) { return -1; }
+      v = v * 16 + d;
+    }
+    return v;
+  }
+
+  /**
+   * 行切分（**去 CRLF**）。真机 `mihomo_config.yaml` 是 CRLF 行尾（实测 1062 行
+   * 1062 个 `\r`）；旧实现用 `raw.length === t.length` 判「顶层键」，在 CRLF 下永远
+   * 不成立 → `firstProxyMember` 恒返回空 → 钉选退回生成器旧名字 →「节点选择未生效」。
+   */
+  private static splitYamlLines(yaml: string): string[] {
+    const parts: string[] = yaml.split('\n');
+    const out: string[] = [];
+    for (const p of parts) {
+      out.push(p.length > 0 && p.charCodeAt(p.length - 1) === 0x0D
+        ? p.substring(0, p.length - 1) : p);
+    }
+    return out;
+  }
+
+  private static unquoteYaml(raw: string): string {
+    let s: string = raw;
+    if (s.length >= 2 && s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') {
+      s = s.substring(1, s.length - 1);
+    }
+    return RuntimeConfigBuilder.decodeYamlEscapes(s);
   }
 }

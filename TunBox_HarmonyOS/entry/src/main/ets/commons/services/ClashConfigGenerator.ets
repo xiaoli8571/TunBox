@@ -150,6 +150,13 @@ export class ClashConfigGenerator {
 
   /** 最近一次生成的丢弃账本（UI/诊断可读取，即使调用方忽略返回值也不丢信息） */
   static lastDropStats: ProxyDropStats = new ProxyDropStats();
+  /**
+   * 最近一次生成里 **PROXY 组真正排第一的节点名**（2026-10-27）。
+   * 调用方必须用它去 PUT /proxies：用户选中的节点可能因缺凭据/非法字段被
+   * validNodes 过滤掉，此时生成器会回落 validNodes[0]，旧代码仍拿原节点名
+   * 钉选 → 400「节点选择未生效」。
+   */
+  static lastEffectiveNodeName: string = '';
   /** 最近一次生成的「订阅/覆盖层规则跳过」计数（策略目标或 provider 未声明的行） */
   static lastSkippedUserRules: number = 0;
   /** 最近一次生成的「双轨 provider」账本（开关关闭时 enabled=false 且 emitted=0） */
@@ -265,13 +272,9 @@ export class ClashConfigGenerator {
     // `find-process-mode: off` 与 `find-process-mode: "off"` 内核都接受）。
     lines.push('find-process-mode: "off"');
     lines.push('');
-    // ── DNS：设置页「DNS 接管」开关（默认开，2026-10-27 恢复）──
-    // 开（默认）：`dns:` 整段由 pushDnsSection 产出 + `tun.dns-hijack: any:53`，
-    // VpnExtensionAbility 把 VpnConfig.dnsAddresses 指向 TUN 内 sentinel —— 三处同源。
-    // 关：只写 `dns: { enable: false }`、不写 dns-hijack，扩展也不下发 dnsAddresses
-    // ⇒ 系统沿用物理网络 DNS，TunBox 完全不碰解析（无常驻 DNS 劫持、无 fake-ip）。
-    // 唯一真源是 YAML 的 dns.enable 行：扩展 readTunFlagsFromConfig 读回它，
-    // 所以设置页 → YAML → 扩展 的闭环不可能出现「内核不跑 DNS 却仍劫持 53」的黑洞。
+    // DNS 默认块始终启用。dnsOverrideEnabled 只决定 RuntimeConfigBuilder
+    // 是否允许显式启用的订阅 DNS 替代本块；缺失/禁用时仍用本块。
+    // TUN 的 any:53 与扩展 sentinel 不受覆写开关关闭影响。
     // 强制拦截站点：DNS 层 REJECT 预匹配（nameserver-policy）与后面路由层兜底
     // 共用同一份规范化结果 —— 只算一次，避免两处各自 normalize 出不同集合。
     const blockSites = ClashConfigGenerator.normalizeDomains(settings.forceBlockSites);
@@ -328,14 +331,9 @@ export class ClashConfigGenerator {
     // headless 测速模式: tun.enable=false, 内核只开 mixed/API 端口, 不建隧道不碰 VPN 权限
     lines.push('  enable: ' + (tunEnabled ? 'true' : 'false'));
     lines.push('  stack: mips');  // mihomo v1.19.33 自研用户态栈(mipstack 已编入 libgojni.so), fd 注入路径与 gvisor 同构
-    // DNS 接管(TUN 层): 目标端口 53 的 DNS 请求劫持进内核解析。
-    // 与 `dns.enable` 严格同开：设置页「DNS 接管」关闭时这里也**不写** dns-hijack，
-    // 否则查询被劫持进一个没启用 DNS 的内核 ⇒ 整机解析黑洞。
-    // 设备侧 VpnConfig.dnsAddresses 由扩展读同一份 YAML 的 dns.enable 行决定 —— 三处同源。
-    if (settings.dnsOverrideEnabled !== false) {
-      lines.push('  dns-hijack:');
-      lines.push('    - any:53');
-    }
+    // DNS 恒接入 TUN。覆写开关只决定 DNS 配置来源；订阅禁用/缺失时回退默认块。
+    lines.push('  dns-hijack:');
+    lines.push('    - any:53');
     lines.push('  auto-route: false');   // 路由由 VpnExtensionAbility 安装（默认路由 = 系统级 Kill Switch）
     lines.push('  auto-detect-interface: false');
     // 说明：strict-route 依赖 nftables/iptables，OHOS gvisor+fd 注入沙箱不可用，
@@ -549,6 +547,7 @@ export class ClashConfigGenerator {
       AppLogger.info(TAG, `raw passthrough: ${ClashConfigGenerator.rawPassthroughCount}/${staticNodes.length} node(s) emitted from subscription body verbatim`);
     }
     const groupSelected: ProxyNode = validNodes.includes(selectedNode) ? selectedNode : validNodes[0];
+    ClashConfigGenerator.lastEffectiveNodeName = groupSelected.name;
     // ── YAML 覆盖层自定义 proxy-groups 聚合 ──────────────────────────────
     // 覆盖层里用户手写的 proxy-groups（如「落地选择」）此前被 validateYamlOverride
     // 连同整个覆盖层一起丢弃，订阅里引用它们的规则全部被 isValidUserRuleLine 判
@@ -1131,12 +1130,6 @@ export class ClashConfigGenerator {
   private static pushDnsSection(lines: string[], settings: AppSettings, dnsPort: number,
     useGeoip: boolean, ipv6Enabled: boolean, blockSites: string[],
     subDnsUpstreams: SubDnsUpstreamPolicy[] = [], subDnsPolicies: string[][] = []): void {
-    // 开关关闭：只留一个「内核不跑 DNS」的事实，其余键一个都不写。
-    if (settings.dnsOverrideEnabled === false) {
-      lines.push('dns:');
-      lines.push('  enable: false');
-      return;
-    }
     lines.push('dns:');
     lines.push('  enable: true');
     lines.push(`  listen: 127.0.0.1:${dnsPort}`);

@@ -160,7 +160,7 @@ const FILES = [
       // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退改走规范解析层
       '../subscription/UriNodeParser': './UriNodeParser.ts',
       // 2026-10-22（FlClash 同构）：订阅原文落成 profile 文件
-      '../flclash/ProfileStore': './ProfileStore.ts',
+      '../flclash/ProfileRepository': './ProfileStore.ts',
       '../../core/CoreBridge': './stubs.ts',
       '../flclash/SubConverter': './SubConverter.ts',
       '../flclash/CoreCatalogService': './stubs.ts',
@@ -223,7 +223,7 @@ const FILES = [
   // 内核目录解析（零 import，纯函数）
   { src: 'commons/flclash/CoreCatalog.ets', out: 'CoreCatalog.ts', map: {} },
   {
-    src: 'commons/flclash/ProfileStore.ets', out: 'ProfileStore.ts', map: {
+    src: 'commons/flclash/ProfileRepository.ets', out: 'ProfileStore.ts', map: {
       '@kit.ArkData': './stubs.ts',
       '@kit.CoreFileKit': './stubs.ts',
       '@kit.ArkTS': './stubs.ts',

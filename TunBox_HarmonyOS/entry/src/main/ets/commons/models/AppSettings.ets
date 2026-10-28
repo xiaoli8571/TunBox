@@ -84,12 +84,16 @@ export class AppSettingsJson {
   preferredNodeSubscriptionId: string = '';
   /** 偏好节点的名字快照：订阅重解析按位置重排 id 时用于重锚（冷启动不丢手动选择） */
   preferredNodeName: string = '';
+  /** 每个订阅各自记住的手动选择节点（JSON：订阅 id → 节点名），见 AppSettings 同名字段 */
+  preferredNodeNamesBySubscription: string = '';
   autoUpdateSubscription: boolean = true;
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default' 订阅默认顺序 / 'auto' 按最近测速结果 / 'manual' 用户手动固定顺序 */
   nodeSortMode: string = 'default';
+  /** 订阅页节点列表排序：'delay' 延迟优先（默认）/ 'default' 订阅原始顺序 */
+  nodeListSortMode: string = 'delay';
   /** 最近一次测速快照（JSON: NodeSortSnapshot），无测速数据为空串 */
   nodeSortSnapshot: string = '';
   /** 各订阅代理组当前策略选择（JSON 对象：稳定组键 -> 成员名）；旧配置缺失时为空串。 */
@@ -192,17 +196,10 @@ export class AppSettingsJson {
    */
   ipv6Enabled: boolean = true;
   /**
-   * DNS 接管开关（设置页「DNS 接管」，默认 **true**）。
-   *
-   * true（默认，与 0.4.3～0.6.8 行为一致）：
-   *   `dns.enable: true` + `tun.dns-hijack: any:53` + VpnConfig.dnsAddresses 指向 TUN 的
-   *   sentinel（172.19.0.2）三处同开 —— 全设备 DNS 进内核，走 DoT 加密上游 + fake-ip。
-   * false：生成 `dns: { enable: false }`、**不写** `tun.dns-hijack`，扩展也**不下发**
-   *   dnsAddresses —— 系统沿用物理网络的 DNS，TunBox 完全不碰解析。
-   *
-   * 三处必须由「同一份 YAML 的 dns.enable 行」驱动（扩展 readTunFlagsFromConfig 读回），
-   * 禁止在别处再存一份状态：否则出现「内核不跑 DNS 却仍劫持 53」⇒ 整机解析黑洞
-   * （2026-10-21 前的老实现踩过：TunFlags.dnsOverride 默认 true 而内核没接管）。
+   * DNS 配置覆写开关（默认 true），只控制 DNS 配置来源，不关闭 TUN DNS 接管。
+   * true：采用应用生成的默认 DNS；false：优先采用显式启用的订阅 DNS。
+   * 订阅 DNS 缺失或禁用时仍回退应用默认配置。最终 dns.enable、tun.dns-hijack
+   * 与扩展下发的 TUN sentinel 始终保持同步，确保全设备 DNS 经内核处理。
    */
   dnsOverrideEnabled: boolean = true;
   /**
@@ -263,16 +260,44 @@ export class AppSettings {
   /** 强制拦截网站（DNS 层 REJECT 预匹配，详见 AppSettingsJson.forceBlockSites 注释） */
   forceBlockSites: string[] = [];
   preferredNodeId: string = '';
+  /**
+   * ⚠ 语义契约（2026-10-27 架构收口，勿再当"当前状态"用）：
+   * `preferredNode*` 三兄弟只是**用户偏好缓存** —— 记住"用户上次选了哪个"，
+   * 用于节点列表打勾、未连接时的展示、以及**校验通过后**的初始选择提示。
+   *
+   * 「当前是什么节点」的唯一真源是内核 `/proxies` 里主出口组的 `now`
+   * （`profile.store-selected: true` 已持久化到 cache.db），运行时由
+   * `ConnectionOrchestrator.lastConnectionTarget`（类型 `ConnectionTarget`）承载。
+   *
+   * 禁止的写法（真机事故 2026-10-27：UI 显示香港移联01、内核实际走新加坡01aws）：
+   *   - 直接拿 preferredNodeName 当连接目标去 `PUT /proxies/<组>`；
+   *   - 已连接时拿它渲染"当前连接节点"（必须读 ConnectionTarget）；
+   *   - 跨订阅沿用旧名字而不先在内核主组成员里校验。
+   */
   preferredNodeSubscriptionId: string = '';
   /** 偏好节点名字快照（重锚用），与 AppSettingsJson.preferredNodeName 对应 */
   preferredNodeName: string = '';
   autoUpdateSubscription: boolean = true;
+  /**
+   * 每个订阅**各自**记住的手动选择节点（JSON：订阅 id → 节点名）。
+   *
+   * 为什么不复用 preferredNodeId：那是「当前生效的一份偏好」，切订阅后按作用域
+   * 判无效（跨订阅不许猜），于是切回去时会掉到该订阅的第一个节点 —— 用户看到
+   * 的就是「切回吹雪云随机选了一个节点」。这里按订阅分槽记住名字，切回时还原。
+   * 只存名字不存 id：解析表按位置生成 id（`<subId>-mN`），刷新后会漂移。
+   */
+  preferredNodeNamesBySubscription: string = '';
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
   /** 代理模式：rule = 规则 / global = 全局 / direct = 直连（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
   nodeSortMode: string = 'default';
+  /**
+   * 订阅页节点列表排序：'delay'=延迟优先（默认，保持既有行为）/ 'default'=订阅原始顺序。
+   * 与 nodeSortMode 相互独立：后者是节点选择页的三态排序，这里只控制订阅页展示。
+   */
+  nodeListSortMode: string = 'delay';
   /** 最近一次测速快照序列化（NodeSortSnapshot JSON），无则空串。随设置一起落盘，
    *  使测速排序结果在退出页面/重启应用后仍然保持，直到用户重新测速才覆盖。 */
   nodeSortSnapshot: string = '';
@@ -371,11 +396,13 @@ export class AppSettings {
     j.preferredNodeId = this.preferredNodeId;
     j.preferredNodeSubscriptionId = this.preferredNodeSubscriptionId;
     j.preferredNodeName = this.preferredNodeName;
+    j.preferredNodeNamesBySubscription = this.preferredNodeNamesBySubscription;
     j.autoUpdateSubscription = this.autoUpdateSubscription;
     j.selectedSubscriptionId = this.selectedSubscriptionId;
     j.testLatencyUrl = this.testLatencyUrl;
     j.proxyMode = this.proxyMode;
     j.nodeSortMode = this.nodeSortMode;
+    j.nodeListSortMode = this.nodeListSortMode;
     j.nodeSortSnapshot = this.nodeSortSnapshot;
     j.proxyGroupSelections = this.proxyGroupSelections;
     j.autoReconnectOnNetworkChange = this.autoReconnectOnNetworkChange;
@@ -402,6 +429,81 @@ export class AppSettings {
     j.assetSource = this.assetSource;
     j.quotaAlertMarks = this.quotaAlertMarks;
     return j;
+  }
+
+  /**
+   * 解析「每个订阅各自记住的节点名」映射（订阅 id → 节点名）。
+   *
+   * 损坏 JSON / 非对象 / 非字符串值一律**跳过**而不是抛：这份映射只用于「切回订阅
+   * 时还原用户上次的选择」，读坏了最多回到旧行为（该订阅第一个节点），绝不能让
+   * 一个坏字段把设置加载整单打成「需重新确认」。
+   */
+  static parsePreferredNodeNames(text: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    const raw: string = typeof text === 'string' ? text.trim() : '';
+    if (raw.length === 0) {
+      return out;
+    }
+    try {
+      const parsed = JSON.parse(raw) as Record<string, Object>;
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return out;
+      }
+      const keys: string[] = Object.keys(parsed);
+      for (const key of keys) {
+        const value = parsed[key];
+        if (key.length > 0 && typeof value === 'string' && value.length > 0) {
+          out[key] = value as string;
+        }
+      }
+    } catch (_) {
+      return {};
+    }
+    return out;
+  }
+
+  /** 某订阅记住的节点名；没有记录返回空串。 */
+  static rememberedPreferredNodeName(text: string, subscriptionId: string): string {
+    if (subscriptionId.length === 0) {
+      return '';
+    }
+    const map = AppSettings.parsePreferredNodeNames(text);
+    const name = map[subscriptionId];
+    return typeof name === 'string' ? name : '';
+  }
+
+  /** 记住某订阅当前选中的节点名，返回**新的** JSON 串（调用方负责写回设置）。 */
+  static rememberPreferredNodeName(text: string, subscriptionId: string, nodeName: string): string {
+    if (subscriptionId.length === 0 || nodeName.length === 0) {
+      return text;
+    }
+    const map = AppSettings.parsePreferredNodeNames(text);
+    map[subscriptionId] = nodeName;
+    return JSON.stringify(map);
+  }
+
+  /** 忘掉某订阅记住的节点名；带 nodeName 时只删「仍是它」的那条，避免误删后换的。 */
+  static forgetPreferredNodeName(text: string, subscriptionId: string, nodeName: string): string {
+    if (subscriptionId.length === 0) {
+      return text;
+    }
+    const map = AppSettings.parsePreferredNodeNames(text);
+    const currentValue = map[subscriptionId];
+    const current: string = typeof currentValue === 'string' ? currentValue : '';
+    if (current.length === 0) {
+      return text;
+    }
+    if (nodeName.length > 0 && current !== nodeName) {
+      return text;
+    }
+    const next: Record<string, string> = {};
+    const keys: string[] = Object.keys(map);
+    for (const key of keys) {
+      if (key !== subscriptionId) {
+        next[key] = map[key];
+      }
+    }
+    return JSON.stringify(next);
   }
 
   /**
@@ -487,6 +589,8 @@ export class AppSettings {
     s.preferredNodeSubscriptionId = typeof j.preferredNodeSubscriptionId === 'string'
       ? j.preferredNodeSubscriptionId : '';
     s.preferredNodeName = typeof j.preferredNodeName === 'string' ? j.preferredNodeName : '';
+    s.preferredNodeNamesBySubscription = typeof j.preferredNodeNamesBySubscription === 'string'
+      ? j.preferredNodeNamesBySubscription : '';
     s.autoUpdateSubscription = typeof j.autoUpdateSubscription === 'boolean' ? j.autoUpdateSubscription : true;
     s.selectedSubscriptionId = typeof j.selectedSubscriptionId === 'string' ? j.selectedSubscriptionId : '';
     // 测速地址：**只做「历史 http 默认值 → https」的单向升级**（C3）。
@@ -507,6 +611,7 @@ export class AppSettings {
     const parsedMode: string = j.proxyMode;
     s.proxyMode = parsedMode === 'global' ? 'global' : 'rule';
     s.nodeSortMode = NodeSortModes.normalize(j.nodeSortMode);
+    s.nodeListSortMode = j.nodeListSortMode === 'default' ? 'default' : 'delay';
     s.nodeSortSnapshot = typeof j.nodeSortSnapshot === 'string' ? j.nodeSortSnapshot : '';
     s.proxyGroupSelections = typeof j.proxyGroupSelections === 'string' ? j.proxyGroupSelections : '';
     // 旧版本配置缺字段 → 取默认值；非法值 → 回落/夹取（加载不炸、保存幂等）
@@ -555,9 +660,8 @@ export class AppSettings {
     // IPv6 双栈：缺字段取默认 true（升级上来的老配置默认开启），
     // 只有显式 false 才关闭 —— 与「默认开」的产品口径一致。
     s.ipv6Enabled = j.ipv6Enabled === false ? false : true;
-    // DNS 接管开关：缺字段取 **true**（与 0.4.3～0.6.8 的恒接管行为一致，升级用户无感），
-    // 显式 false 才关闭。关闭后生成器写 `dns: { enable: false }` 且不写 dns-hijack，
-    // 扩展读同一行决定是否下发 dnsAddresses —— 三处同源，不存在中间态。
+    // DNS 配置覆写缺字段默认开启；显式 false 优先使用已启用的订阅 DNS。
+    // 两种来源都保留 DNS 与 TUN 劫持，订阅 DNS 不可用时回退应用默认块。
     s.dnsOverrideEnabled = j.dnsOverrideEnabled === false ? false : true;
     // 2026-10-23 用户口径：配额提醒恒开（设置页已去掉这个开关，默认就是开）。
     // 旧配置里存过 false 的也一律置 true —— 否则升级后「开关没了却也不提醒」，

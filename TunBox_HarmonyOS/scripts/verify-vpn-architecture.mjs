@@ -239,11 +239,11 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   // tun.inet6-address 仍不声明：v6 地址是通过 VpnConfig.addresses 注入已有 fd 的 TUN，
   // 不是让内核自建 TUN，声明了反而会与注入 fd 冲突。
   notHas('gen.no.inet6-address', genSrc, 'inet6-address');
-  // DNS 恒接管（2026-10-21 产品定案：设置页开关删除）：整段 dns 无条件产出。
+  // DNS 始终经 TUN 接管；覆写开关仅影响配置来源。
   has('gen.dns.always-emitted', genSrc,
     'ClashConfigGenerator.pushDnsSection(lines, settings, dnsPort, useGeoip, ipv6Enabled, blockSites,');
-  has('gen.dns.enable-false-branch', genSrc, "lines.push('  enable: false')");
-  ok('gen.dns.override-setting', genSrc.includes('dnsOverrideEnabled'));
+  notHas('gen.dns.no-disable-branch', genSrc, "lines.push('  enable: false')");
+  has('gen.dns.always-enabled', genSrc, "lines.push('  enable: true')");
   has('gen.keepalive-idle', genSrc, 'keep-alive-idle:');
   has('gen.keepalive-interval', genSrc, 'keep-alive-interval:');
   has('gen.udp-timeout', genSrc, 'udp-timeout:');
@@ -272,7 +272,7 @@ const genSrc = readFileSync(join(svcDir, 'ClashConfigGenerator.ets'), 'utf8');
   has('gen.dns.proxy-server-nameserver', genSrc, 'proxy-server-nameserver:');
   // dns-hijack 必须恒开（内核 DNS 恒启用）：任何条件包裹都会重现「设备指过来但内核没接管」。
   has('gen.dns.hijack-any53', genSrc, "lines.push('    - any:53')");
-  has('gen.dns.hijack-gate', genSrc, 'dnsOverrideEnabled');
+  notHas('gen.dns.hijack-independent-of-override', genSrc, 'if (settings.dnsOverrideEnabled) {');
   // C22：mihomo RawConfig.Profile 的正确键名是 `store-selected`
   // （`store-selections` 是错的 —— 内核不认这个键，配置里的「记住选中节点」不生效）
   has('gen.profile.store-selected', genSrc, 'store-selected: true');
@@ -334,6 +334,28 @@ const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets
 }
 
 const orchSrc = readFileSync(join(svcDir, 'ConnectionOrchestrator.ets'), 'utf8');
+
+// 2026-10-27：状态写入收敛到 setState()（单入口 + 事件推送），
+// 门禁同时接受两种写法，避免「实现改了、门禁还在找旧字面量」的假失败。
+function firstConnectedIdx(src) {
+  const forms = ['this.state = ConnState.CONNECTED;', 'this.setState(ConnState.CONNECTED);'];
+  let best = -1;
+  for (const f of forms) {
+    const i = src.indexOf(f);
+    if (i >= 0 && (best < 0 || i < best)) { best = i; }
+  }
+  return best;
+}
+
+function lastConnectedIdx(src) {
+  const forms = ['this.state = ConnState.CONNECTED;', 'this.setState(ConnState.CONNECTED);'];
+  let best = -1;
+  for (const f of forms) {
+    const i = src.lastIndexOf(f);
+    if (i > best) { best = i; }
+  }
+  return best;
+}
 const builderSrc = readFileSync(join(etsRoot, 'commons', 'config', 'RuntimeConfigBuilder.ets'), 'utf8');
 const pageSrc = readFileSync(join(etsRoot, 'pages', 'NodeSelectionPage.ets'), 'utf8');
 const subsSrc = readFileSync(join(svcDir, 'SubscriptionService.ets'), 'utf8');
@@ -746,7 +768,7 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   // 所以「隧道已起后再对 doh.pub 裸发查询」这个洞仍然被堵住。
   const refreshIdx = builderSrc.indexOf('DoHResolver.refreshStale()');
   const buildCallIdx = orchSrc.indexOf('RuntimeConfigBuilder.buildRuntimeConfig(');
-  const connectedIdx = orchSrc.lastIndexOf('this.state = ConnState.CONNECTED;');
+  const connectedIdx = lastConnectedIdx(orchSrc);
   ok('dns.doh-refresh-pre-tunnel', refreshIdx > 0 && buildCallIdx > 0 && connectedIdx > 0
     && buildCallIdx < connectedIdx);
 
@@ -791,11 +813,11 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
     orchSrc, 'this.writeStartParamsFile(stagedConfigPath, appRouting.mode, appRouting.needsReview, packagesJson);');
   has('config.coldstart-promote', orchSrc, 'this.acceptStagedConfig(stagedConfigPath, configPath, preparedConfig);');
   has('config.coldstart-promote-atomic', orchSrc, 'fs.renameSync(tmp, target);');
-  has('config.coldstart-promote-after-connected', orchSrc,
-    'this.state = ConnState.CONNECTED;');
+  ok('config.coldstart-promote-after-connected', firstConnectedIdx(orchSrc) >= 0,
+    'missing: 置 CONNECTED 的语句（this.state = … 或 this.setState(…)）');
   ok('config.coldstart-promote-order',
-    orchSrc.indexOf('this.state = ConnState.CONNECTED;') >= 0
-      && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') > orchSrc.indexOf('this.state = ConnState.CONNECTED;')
+    firstConnectedIdx(orchSrc) >= 0
+      && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') > firstConnectedIdx(orchSrc)
       && orchSrc.indexOf('this.acceptStagedConfig(stagedConfigPath') < orchSrc.indexOf('this.snapshotLastGoodConfig(preparedConfig);'));
   // 等价兜底仍保留（内核拒载时回滚到最后一份能连上的配置）
   has('config.lastgood-snapshot', orchSrc, 'this.snapshotLastGoodConfig(preparedConfig);');

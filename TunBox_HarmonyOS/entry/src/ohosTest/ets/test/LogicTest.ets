@@ -612,6 +612,31 @@ export default function logicTest() {
       expect(def.nodeSortSnapshot).assertEqual('');
     });
 
+    it('preferred_node_memory_is_scoped_per_subscription', 0, () => {
+      // 用户场景：吹雪云选新加坡01 → 飞鸟云选日本01 → 切回吹雪云应还原新加坡01
+      let text = '';
+      text = AppSettings.rememberPreferredNodeName(text, 'sub-a', '新加坡01');
+      text = AppSettings.rememberPreferredNodeName(text, 'sub-b', '日本01');
+      expect(AppSettings.rememberedPreferredNodeName(text, 'sub-a')).assertEqual('新加坡01');
+      expect(AppSettings.rememberedPreferredNodeName(text, 'sub-b')).assertEqual('日本01');
+      // 序列化往返（等同落盘后冷启动）不丢
+      const s = new AppSettings();
+      s.preferredNodeNamesBySubscription = text;
+      const round = AppSettings.fromJson(JSON.parse(JSON.stringify(s.toJson())) as AppSettingsJson);
+      expect(AppSettings.rememberedPreferredNodeName(round.preferredNodeNamesBySubscription, 'sub-a'))
+        .assertEqual('新加坡01');
+      // 删除某订阅的记住节点：只清该槽，别家不动
+      const after = AppSettings.forgetPreferredNodeName(text, 'sub-a', '新加坡01');
+      expect(AppSettings.rememberedPreferredNodeName(after, 'sub-a')).assertEqual('');
+      expect(AppSettings.rememberedPreferredNodeName(after, 'sub-b')).assertEqual('日本01');
+      // 名字对不上（该订阅后来换了节点）时不误删
+      expect(AppSettings.forgetPreferredNodeName(text, 'sub-a', '别的节点')).assertEqual(text);
+      // 损坏 JSON / 非对象 / 空值一律安全回落，不把坏数据带进连接路径
+      expect(AppSettings.rememberedPreferredNodeName('{bad', 'sub-a')).assertEqual('');
+      expect(JSON.stringify(AppSettings.parsePreferredNodeNames('[1,2]'))).assertEqual('{}');
+      expect(AppSettings.rememberedPreferredNodeName(text, '')).assertEqual('');
+    });
+
     it('node_protocol_type_mapping_includes_unknown_and_reality', 0, () => {
       // proxyType 优先
       expect(NodeProtocolPolicy.resolve('vless', '', '', '').label).assertEqual('VLESS');

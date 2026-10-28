@@ -13,6 +13,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { TunBoxColors, TunBoxGeometry, TunBoxPing } from '../theme/TunBoxTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
+import { SubscriptionSummary } from '../commons/utils/SubscriptionSummary';
 import { SubscriptionService, DIRECT_GROUP_ID } from '../commons/services/SubscriptionService';
 import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
 import { ProxyNode } from '../commons/models/ProxyNode';
@@ -20,10 +21,10 @@ import { NodeUsability } from '../commons/subscription/NodeUsability';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
-import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { ConnState, ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { ClashApiService } from '../commons/services/ClashApiService';
 import { AppLogger } from '../commons/utils/AppLogger';
-import { ProfileStore } from '../commons/flclash/ProfileStore';
+import { ProfileRepository } from '../commons/flclash/ProfileRepository';
 import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
 import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
@@ -39,6 +40,12 @@ import {
 } from '../commons/services/ConcurrentRefresh';
 
 const TAG = 'SubscriptionPage';
+/** 悬浮主按钮（⋮）：直径 / 展开项直径 / 项间距 / 默认边距 / 顶部留白 */
+const FAB_SIZE: number = 44;
+const FAB_ITEM_SIZE: number = 40;
+const FAB_ITEM_GAP: number = 8;
+const FAB_EDGE: number = 16;
+const FAB_TOP_CLEARANCE: number = 6;
 
 /** “+”导入三选一弹窗（扫描 / URL / 文件），对齐 HTML import-overlay */
 @CustomDialog
@@ -363,6 +370,26 @@ export struct SubscriptionPage {
   @StorageLink('smart_model_seq') @Watch('onSmartModelSeq') smartModelSeq: number = 0;
   /** 节点排布列数（1=单列 2=双列），用户在订阅分组展开区手动切换，选择持久化 */
   @State nodeColumns: number = 1;
+  /** 订阅页节点列表排序：'delay' 延迟优先（默认）/ 'default' 订阅原始顺序 */
+  @State nodeListSortMode: string = 'delay';
+  /** 右下角悬浮菜单：展开态 / 主按钮位置（vp，页面绝对坐标） */
+  @State fabExpanded: boolean = false;
+  @State fabX: number = 0;
+  @State fabY: number = 0;
+  @State fabDragging: boolean = false;
+  /** 展开方向：上方空间不足时改为向下展开（拖到屏幕顶部也不会把菜单画到屏幕外） */
+  @State fabMenuBelow: boolean = false;
+  private fabStartX: number = 0;
+  private fabStartY: number = 0;
+  private fabMoved: boolean = false;
+  private fabPositionReady: boolean = false;
+  /** 用户是否亲手摆过位置（拖过 / 读到过落盘坐标）。false 时每次布局都贴右下角默认位，
+   *  避免首帧 onAreaChange 拿到的是未稳定高度，把「默认右下」冻结在半屏。 */
+  private fabUserPositioned: boolean = false;
+  private savedFabX: number = -1;
+  private savedFabY: number = -1;
+  private pageWidth: number = 0;
+  private pageHeight: number = 0;
   @State latencyTick: number = 0;
   @State isAdding: boolean = false;
   @State isRefreshing: boolean = false;
@@ -481,16 +508,47 @@ export struct SubscriptionPage {
     await this.service.init(ctx);
     this.settings = await SettingsService.load();
     // 当前 Profile 是唯一真源（FlClash currentProfileId）；旧偏好只作回落。
-    const currentProfile = ProfileStore.currentId();
+    const currentProfile = ProfileRepository.currentId();
     this.activeSubId = currentProfile.length > 0
       ? currentProfile : this.settings.preferredNodeSubscriptionId;
-    // 作用域化：旧偏好指向其他订阅时不算「已选」（findNode 全局搜会拿错）
-    const scopedPreferred = this.service.preferredNodeInCurrentProfile(this.settings.preferredNodeId);
+    // 冷启动/从子页返回：当前订阅自己的上次选择优先于「全局偏好」里别的订阅的节点。
+    await this.restoreRememberedNode(this.activeSubId);
+    // 作用域化：旧偏好指向其他订阅时不算「已选」。
+    // 2026-10-27：改用 name+id 双锚解析 —— 连接自愈可能只保留 name，
+    // 只按 id 找会让「已连接节点」的复选框变空（真机复现）。
+    const scopedPreferred = this.service.resolveUserPreference(
+      this.settings.preferredNodeId, this.settings.preferredNodeName);
     this.activeNodeId = scopedPreferred !== null ? scopedPreferred.id : '';
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     // 只查模型是否已就位（本地文件判断，不播种、不下载、不联网）
     this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();
     this.nodeColumns = await SettingsService.loadNodeColumns();
+    // 订阅页节点排序（默认延迟优先，保持既有行为）
+    this.nodeListSortMode = this.settings.nodeListSortMode === 'default' ? 'default' : 'delay';
+    // 右下角悬浮菜单上次拖到的位置（-1/-1 = 从未拖过，用默认右下角）
+    try {
+      const pos: number[] = await SettingsService.loadSubscriptionFabPosition();
+      if (pos.length >= 2 && pos[0] >= 0 && pos[1] >= 0) {
+        this.savedFabX = pos[0];
+        this.savedFabY = pos[1];
+        this.fabUserPositioned = true;
+        if (this.pageWidth > 0 && this.pageHeight > 0) {
+          this.fabX = pos[0];
+          this.fabY = pos[1];
+          this.fabPositionReady = true;
+          this.clampFabPosition();
+        } else {
+          // 页面尺寸还没量到：先记住，等 onAreaChange 首次回调时用（否则已被
+          // applyDefaultFabPosition 设成默认位，savedFab 永远没有机会生效）。
+          this.fabPositionReady = false;
+          setTimeout((): void => {
+            this.applyDefaultFabPosition();
+          }, 0);
+        }
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `load fab position failed: ${AppLogger.errText(e)}`);
+    }
     this.reload();
     this.refreshDisplayNode();
     if (!this.latencyBound) {
@@ -530,7 +588,7 @@ export struct SubscriptionPage {
     // 顶部「当前使用订阅组」就跳到别的机场（真机两次实锤：oc2 节点/飞鸟云顶栏）。
     const node = this.service.findNode(this.activeNodeId);
     if (node === null && !this.activeNodeId.startsWith('core:')) {
-      const current = ProfileStore.currentId();
+      const current = ProfileRepository.currentId();
       const scoped = this.service.nodesOf(current)
         .find((n: ProxyNode): boolean => !NodeUsability.isInfoEntry(n.name));
       if (scoped !== undefined) {
@@ -556,9 +614,164 @@ export struct SubscriptionPage {
   }
 
   /**
+   * 节点列表排序切换：延迟优先 ↔ 订阅原始顺序。
+   *
+   * 只改展示顺序，不动节点选择、也不重跑测速；写 AppSettings.nodeListSortMode
+   * 后 `nodesSortedByLatency()` 立即按新口径返回，@State 变化触发列表重排。
+   */
+  private async toggleNodeListSortMode(): Promise<void> {
+    const next: string = this.nodeListSortMode === 'delay' ? 'default' : 'delay';
+    this.nodeListSortMode = next;
+    this.settings.nodeListSortMode = next;
+    try {
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.nodeListSortMode = next;
+      });
+    } catch (e) {
+      AppLogger.warn(TAG, `save node list sort mode failed: ${AppLogger.errText(e)}`);
+    }
+    // latencyTick 参与 ForEach 键，切回延迟优先后立即按已落库的测速结论重排。
+    this.latencyTick = this.latencyTick + 1;
+    this.showToast(next === 'delay' ? '节点排序：延迟优先' : '节点排序：默认顺序');
+  }
+
+  /** 悬浮主按钮默认位置：右上角（用户 2026-10-27 指定），可随意拖动 */
+  private applyDefaultFabPosition(): void {
+    if (this.pageWidth <= 0 || this.pageHeight <= 0) {
+      return;
+    }
+    this.fabPositionReady = true;
+    // 用户摆过：恢复到落盘坐标；没摆过：**每次布局**都贴右上角默认位，
+    // 这样首帧测量值不稳定（拿到过小的 pageHeight）也不会把按钮钉在屏幕中间。
+    if (this.fabUserPositioned && this.savedFabX >= 0 && this.savedFabY >= 0) {
+      this.fabX = this.savedFabX;
+      this.fabY = this.savedFabY;
+      this.clampFabPosition();
+      return;
+    }
+    this.fabX = this.pageWidth - FAB_SIZE - FAB_EDGE;
+    this.fabY = FAB_TOP_CLEARANCE;
+    this.clampFabPosition();
+  }
+
+  /** 把主按钮限制在页面内（留边距、向上不侵入导航栏、向下避开底部悬浮栏） */
+  private clampFabPosition(): void {
+    if (this.pageWidth <= 0 || this.pageHeight <= 0) {
+      return;
+    }
+    const minX: number = 8;
+    const maxX: number = Math.max(minX, this.pageWidth - FAB_SIZE - 8);
+    // 可以拖到顶部（默认就在右上角），只保证不越出页面/不被底部悬浮栏盖住。
+    const minY: number = FAB_TOP_CLEARANCE;
+    const maxY: number = Math.max(minY, this.pageHeight - FAB_SIZE - TunBoxGeometry.dockClearance);
+    this.fabX = Math.min(Math.max(this.fabX, minX), maxX);
+    this.fabY = Math.min(Math.max(this.fabY, minY), maxY);
+  }
+
+  private onFabDragStart(): void {
+    this.fabStartX = this.fabX;
+    this.fabStartY = this.fabY;
+    this.fabMoved = false;
+    this.fabDragging = true;
+    // 拖动时先收起菜单：避免 4 个入口跟着手指飞、也避免拖完还悬在半空。
+    this.fabExpanded = false;
+  }
+
+  private onFabDragUpdate(event: GestureEvent): void {
+    this.fabX = this.fabStartX + event.offsetX;
+    this.fabY = this.fabStartY + event.offsetY;
+    if (Math.abs(event.offsetX) > 6 || Math.abs(event.offsetY) > 6) {
+      this.fabMoved = true;
+      this.fabUserPositioned = true;
+    }
+    this.clampFabPosition();
+  }
+
+  private onFabDragEnd(): void {
+    this.fabDragging = false;
+    this.clampFabPosition();
+    this.savedFabX = this.fabX;
+    this.savedFabY = this.fabY;
+    this.fabUserPositioned = true;
+    SettingsService.saveSubscriptionFabPosition(this.fabX, this.fabY).catch((): void => {});
+    // 拖动结束后 click 可能还会补发一次：留一个短窗口把它吃掉，避免拖完顺手展开。
+    if (this.fabMoved) {
+      setTimeout((): void => {
+        this.fabMoved = false;
+      }, 250);
+    }
+  }
+
+  /** 展开菜单里的圆形入口（slot=1 距主按钮最近；上方不足时自动改为向下排列） */
+  @Builder
+  FabActionItem(icon: Resource, label: string, slot: number, action: () => void) {
+    Stack({ alignContent: Alignment.Center }) {
+      Image(icon).width(20).height(20).fillColor(TunBoxColors.textPrimary)
+    }
+    .width(FAB_ITEM_SIZE)
+    .height(FAB_ITEM_SIZE)
+    .borderRadius(FAB_ITEM_SIZE / 2)
+    .backgroundColor(TunBoxColors.surfaceCard)
+    .border({ width: 1, color: TunBoxColors.cardBorder })
+    .shadow({ radius: 10, color: TunBoxColors.toastShadow, offsetX: 0, offsetY: 3 })
+    .position({
+      x: this.fabX + (FAB_SIZE - FAB_ITEM_SIZE) / 2,
+      y: this.fabMenuBelow
+        ? this.fabY + FAB_SIZE + FAB_ITEM_GAP + (slot - 1) * (FAB_ITEM_SIZE + FAB_ITEM_GAP)
+        : this.fabY - slot * (FAB_ITEM_SIZE + FAB_ITEM_GAP)
+    })
+    .zIndex(41)
+    .accessibilityText(label)
+    .onClick(() => {
+      this.fabExpanded = false;
+      action();
+    })
+  }
+
+  /**
    * 节点卡片（文档 §3.2 节点网格）：两行信息列 —— 名称行（Radio 单选 + 名称）+
    * 协议行（协议标签 + 延迟文本）。单列/双列均由 GridRow 控宽，卡片自身 100% 填充。
    */
+  /**
+   * 当前选中节点的**名称**（复选框/边框高亮用）。
+   *
+   * ## 为什么渲染层按名称而不是 id（2026-10-27 真机实锤）
+   *
+   * 连接后 `coreNodesUsable()` 为真，列表数据源从「App 解析节点」切到「内核影子节点」
+   * （id = `core:<name>`）。解析节点的 id 与影子节点 id 不同，只比 id 会让复选框
+   * 变空 —— 而内核实际仍走这个节点，正是用户报的「没勾选却连着它」。
+   * 名称是跨数据源唯一的稳定标识，因此渲染层只比名称。
+   */
+  private activeNodeName(): string {
+    // ① 连接期间：**只认 ConnectionTarget**（与主页/顶部同一真源）。
+    //    2026-10-28 用户报障：只点订阅名（不点节点）时，restoreRememberedNode 把偏好
+    //    写成了新订阅的节点，而内核/ConnectionTarget 还在旧订阅节点上 —— 本页按偏好
+    //    画勾，主页按真源显示，两处互相矛盾。连接期间真源优先，偏好只在未连接时代表意图。
+    const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+    if (orch.state === ConnState.CONNECTED || orch.state === ConnState.CONNECTING) {
+      const live = orch.getCurrentConnectionTarget();
+      if (live !== null && live.nodeName.length > 0) {
+        return live.nodeName;
+      }
+    }
+    if (this.activeNodeId.length > 0) {
+      const n = this.service.findNode(this.activeNodeId);
+      if (n !== null) {
+        return n.name;
+      }
+      if (this.activeNodeId.startsWith('core:')) {
+        return this.activeNodeId.substring('core:'.length);
+      }
+    }
+    // 解析表还没加载/ id 被清空时，偏好名称仍是用户意图的稳定锚。
+    return this.settings.preferredNodeName;
+  }
+
+  private isActiveNode(node: ProxyNode): boolean {
+    const name = this.activeNodeName();
+    return name.length > 0 && node.name === name;
+  }
+
   @Builder
   nodeCard(node: ProxyNode) {
     Column({ space: 8 }) {
@@ -568,12 +781,12 @@ export struct SubscriptionPage {
           Circle({ width: 16, height: 16 })
             .fill(this.nodeSelectMode
               ? (this.isNodeSelected(node.id) ? TunBoxColors.primary : Color.Transparent)
-              : (node.id === this.activeNodeId ? TunBoxColors.primary : Color.Transparent))
+              : (this.isActiveNode(node) ? TunBoxColors.primary : Color.Transparent))
             .stroke(this.nodeSelectMode
               ? (this.isNodeSelected(node.id) ? TunBoxColors.primary : TunBoxColors.textMuted)
-              : (node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.textMuted))
+              : (this.isActiveNode(node) ? TunBoxColors.primary : TunBoxColors.textMuted))
             .strokeWidth(1.6)
-          if (this.nodeSelectMode ? this.isNodeSelected(node.id) : node.id === this.activeNodeId) {
+          if (this.nodeSelectMode ? this.isNodeSelected(node.id) : this.isActiveNode(node)) {
             Circle({ width: 5, height: 5 }).fill(TunBoxColors.textOnPrimary)
           }
         }.width(16).height(16)
@@ -605,8 +818,8 @@ export struct SubscriptionPage {
     .borderRadius(16)
     .backgroundColor(TunBoxColors.surfaceCard)
     .border({
-      width: node.id === this.activeNodeId ? 1.5 : 1,
-      color: node.id === this.activeNodeId ? TunBoxColors.primary : TunBoxColors.cardBorder
+      width: this.isActiveNode(node) ? 1.5 : 1,
+      color: this.isActiveNode(node) ? TunBoxColors.primary : TunBoxColors.cardBorder
     })
     .onClick(() => this.onNodeCardTap(node))
     // 长按进入批量多选（2026-10-20）：先勾上被长按的这个节点
@@ -656,6 +869,51 @@ export struct SubscriptionPage {
   }
 
   /**
+   * 还原「目标订阅上次手动选中的节点」到当前偏好。
+   *
+   * 全局偏好只有一份（preferredNodeId/Name/SubscriptionId），切订阅后它指向别家
+   * 节点时按作用域判无效，于是回落到该订阅第一个可用节点 —— 用户看到的就是
+   * 「切回吹雪云随机选了一个节点」。这里在 profile 真正切过去之前，把该订阅自己
+   * 记住的节点名写回偏好，后续 ensureProfileApplied（自动模式完整重连）与
+   * displayNodeName（顶部/首页展示）都会拿到正确目标。
+   *
+   * 记住的节点已下架/改名 → 什么都不做，保持旧行为（回落第一个可用节点）。
+   */
+  private async restoreRememberedNode(subId: string): Promise<void> {
+    if (subId.length === 0) {
+      return;
+    }
+    const saved: AppSettings = await SettingsService.load();
+    const remembered: string = AppSettings.rememberedPreferredNodeName(
+      saved.preferredNodeNamesBySubscription, subId);
+    if (remembered.length === 0) {
+      return;
+    }
+    const node = this.service.nodes.find((n: ProxyNode): boolean =>
+      n.subscriptionId === subId && n.name === remembered && !NodeUsability.isInfoEntry(n.name));
+    if (node === undefined) {
+      return;
+    }
+    this.activeNodeId = node.id;
+    this.activeSubId = subId;
+    if (this.settings.preferredNodeId === node.id
+      && this.settings.preferredNodeName === node.name
+      && this.settings.preferredNodeSubscriptionId === subId) {
+      return; // 已经是它，不重复写盘
+    }
+    this.settings.preferredNodeId = node.id;
+    this.settings.preferredNodeName = node.name;
+    this.settings.preferredNodeSubscriptionId = subId;
+    // 字段级写：只改偏好三件套，别把别的写者刚落的字段盖回旧值。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.preferredNodeId = node.id;
+      s.preferredNodeName = node.name;
+      s.preferredNodeSubscriptionId = subId;
+    });
+    AppLogger.info(TAG, `restored remembered node for sub=${subId}: ${node.name} (${node.id})`);
+  }
+
+  /**
    * 订阅头部点击（FlClash 语义）：**切换当前 Profile** + 展开。
    *
    * 同一时刻只有一份 profile 生效（FlClash 的 currentProfileId），切换后按
@@ -675,13 +933,13 @@ export struct SubscriptionPage {
     // FlClash 语义：切 profile 的前提是这份 profile **已经有内容**（原文落盘）。
     // 没落盘就切过去，内核拿不到基底会退回「全部订阅合并」的旧配置，
     // 于是这个订阅里全是别人的节点（真机实锤：飞鸟云刷新超时后出现另外三个订阅的节点）。
-    if (!ProfileStore.exists(id)) {
+    if (!ProfileRepository.exists(id)) {
       // 没有原文：先自动拉一次（FlClash `checkAndUpdateAndCopy` 同语义），
       // 拉不到就不切 —— 绝不能带着空基底切过去。
       this.showToast('该订阅还没有内容，正在刷新…');
       const refreshed = await this.service.refreshSubscription(id);
       this.reload();
-      if (!ProfileStore.exists(id)) {
+      if (!ProfileRepository.exists(id)) {
         this.showToast(refreshed.status === SubscriptionRefreshStatus.OK
           ? '刷新成功但没有解析出可用节点'
           : '刷新失败，请开启代理再次刷新');
@@ -696,15 +954,19 @@ export struct SubscriptionPage {
     }
     this.activatedId = id;
     this.activatedAt = now;
-    const previous = ProfileStore.currentId();
+    const previous = ProfileRepository.currentId();
     if (previous !== id) {
-      await ProfileStore.setCurrent(id);
+      await ProfileRepository.setCurrent(id);
       this.activeSubId = id;
       this.coreNodes = [];
       this.coreNodesProfileId = '';
       this.syncCandidateCount();
       this.latencyTick = this.latencyTick + 1;
     }
+    // 切订阅：先还原该订阅**上次手动选的节点**，再让编排器应用配置。
+    // 否则全局偏好还停在上一家订阅的节点上，按跨订阅作用域判无效后
+    // 会掉到新订阅的第一个节点（用户感知「切回来随机选了一个」）。
+    await this.restoreRememberedNode(id);
     try {
       await ConnectionOrchestrator.instance().ensureProfileApplied('subscription-page');
     } catch (e) {
@@ -754,7 +1016,7 @@ export struct SubscriptionPage {
    */
   private useProfileAndToggle(id: string): void {
     this.toggleOpen(id);
-    if (ProfileStore.currentId() === id) {
+    if (ProfileRepository.currentId() === id) {
       return;
     }
     this.activateProfile(id).catch((e: Object): void => {
@@ -781,7 +1043,7 @@ export struct SubscriptionPage {
   /**
    * 刷新「当前连接节点」显示值。
    *
-   * 取值**完全委托** `orchestrator.displayNodeName()` —— 与主页启动按钮调用的是
+   * 取值**完全委托** `orchestrator.getCurrentNodeName()` —— 与主页启动按钮调用的是
    * 同一个方法、同一套顺序，因此两处显示的必然是同一个节点（2026-10-25 用户要求：
    * 接口完全一致）。
    *
@@ -790,8 +1052,8 @@ export struct SubscriptionPage {
    * 卡片仍显示未选择」就是这么来的。现在不再看连接状态。
    */
   private refreshDisplayNode(): void {
-    this.currentNodeName = ConnectionOrchestrator.instance().displayNodeName(
-      this.settings.preferredNodeId, this.settings.autoSelectMode);
+    // 统一读取口（2026-10-27）：不再传偏好参数，真源在内核侧。
+    this.currentNodeName = ConnectionOrchestrator.instance().getCurrentNodeName();
   }
 
   /**
@@ -803,7 +1065,7 @@ export struct SubscriptionPage {
    * 否则会出现「卡片 24、候选 22」这种自相矛盾的数字。
    */
   private coreNodesUsable(): boolean {
-    const current = ProfileStore.currentId();
+    const current = ProfileRepository.currentId();
     if (current.length === 0 || this.coreNodes.length === 0) {
       return false;
     }
@@ -817,7 +1079,7 @@ export struct SubscriptionPage {
   private totalNodes(): number {
     // FlClash 同构：只有当前 Profile 生效 ⇒ 候选数就是**当前订阅**的节点数。
     // 绝不跨订阅求和（旧实现会回落到「所有订阅节点相加」，切换中出现怪数字）。
-    const current = ProfileStore.currentId();
+    const current = ProfileRepository.currentId();
     if (current.length === 0) {
       return 0;
     }
@@ -830,7 +1092,7 @@ export struct SubscriptionPage {
   /**
    * 「几个候选」的**可渲染副本**。
    *
-   * totalNodes() 内部读的是 this.coreNodes / ProfileStore 这类非直接依赖，
+   * totalNodes() 内部读的是 this.coreNodes / ProfileRepository 这类非直接依赖，
    * ArkUI 的定向刷新不会把「方法内部读取的状态」登记成依赖 —— 表现就是
    * 概览卡的「24 节点」已刷新、智能优选卡的「0 个候选」还停在首帧
    * （2026-10-23 真机：24 节点 vs 0 候选同屏并存）。
@@ -842,7 +1104,7 @@ export struct SubscriptionPage {
 
   /** 单个订阅卡片的节点数：当前 profile 用内核目录，其它用解析表。 */
   private nodeCountOf(sub: Subscription): number {
-    if (sub.id === ProfileStore.currentId() && this.coreNodesUsable()) {
+    if (sub.id === ProfileRepository.currentId() && this.coreNodesUsable()) {
       return this.coreNodes.length;
     }
     // 【2026-10-22 · FlClash 同构】节点数取**原文 proxies 条目数**
@@ -893,9 +1155,13 @@ export struct SubscriptionPage {
     // 上一份订阅的节点（用户实锤：吹雪云卡片里显示 oc2 的节点）。
     // 三重一致才用内核目录：内核里生效的 profile == 当前 profile == 这张卡片。
     // 任何一处不一致都回落该订阅自己的解析表 —— 宁可显示旧数据，也绝不把别人的节点画进来。
-    const source: ProxyNode[] = (subId === ProfileStore.currentId() && this.coreNodesUsable())
+    const source: ProxyNode[] = (subId === ProfileRepository.currentId() && this.coreNodesUsable())
       ? this.coreNodes : this.service.nodesOf(subId);
     const arr: ProxyNode[] = source.slice();
+    // 排序口径由「节点排序」按钮决定：delay=延迟优先（默认）/ default=订阅原始顺序。
+    if (this.nodeListSortMode !== 'delay') {
+      return arr;
+    }
     return CoreNodeBridge.sortByDelay(arr, (name: string): number | null => {
       return LatencyStoreBridge.latencyFor(name);
     });
@@ -917,7 +1183,7 @@ export struct SubscriptionPage {
       this.syncCandidateCount();
       this.latencyTick = this.latencyTick + 1;
       AppLogger.info(TAG, `core catalog nodes=${this.coreNodes.length} `
-        + `applied=${this.coreNodesProfileId} current=${ProfileStore.currentId()}`);
+        + `applied=${this.coreNodesProfileId} current=${ProfileRepository.currentId()}`);
     }).catch((e: Object): void => {
       AppLogger.warn(TAG, `core catalog refresh failed: ${AppLogger.errText(e)}`);
     });
@@ -940,8 +1206,21 @@ export struct SubscriptionPage {
     if (node.subscriptionId.length > 0) {
       this.settings.preferredNodeSubscriptionId = node.subscriptionId;
       this.settings.selectedSubscriptionId = node.subscriptionId;
+      // 按订阅分槽记住这次手动选择：切走再切回来要还原这个节点，而不是掉到第一个。
+      this.settings.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+        this.settings.preferredNodeNamesBySubscription, node.subscriptionId, node.name);
     }
-    await SettingsService.save(this.settings);
+    // 字段级写：整单 save 会把别的写者刚落的字段盖回旧值（审计 F2）。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.preferredNodeId = node.id;
+      s.preferredNodeName = node.name;
+      if (node.subscriptionId.length > 0) {
+        s.preferredNodeSubscriptionId = node.subscriptionId;
+        s.selectedSubscriptionId = node.subscriptionId;
+        s.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+          s.preferredNodeNamesBySubscription, node.subscriptionId, node.name);
+      }
+    });
     // 选完立即刷新顶部「当前连接节点」，不等重连完成、也不依赖下次进页面。
     this.refreshDisplayNode();
     // 已连接时完整重连让新节点即时生效；未连接时仅保存选择。
@@ -966,7 +1245,7 @@ export struct SubscriptionPage {
       return;
     }
     // 重连目标必须属于当前订阅：跨订阅旧偏好在这里只会让重连钉错节点
-    let target: ProxyNode | null = await this.service.resolvePreferredNode();
+    let target: ProxyNode | null = await this.service.resolvePreferenceHint();
     if (target === null) {
       target = this.service.fallbackConnectionNode();
     }
@@ -975,7 +1254,10 @@ export struct SubscriptionPage {
       return;
     }
     this.settings.autoSelectMode = AutoSelectModes.AUTO;
-    await SettingsService.save(this.settings);
+    // 字段级写：只改 autoSelectMode，不覆盖连接路径刚写入的偏好/快照。
+    await SettingsService.patchSettings((s: AppSettings): void => {
+      s.autoSelectMode = AutoSelectModes.AUTO;
+    });
     this.autoSelectMode = AutoSelectModes.AUTO;
     // 模式已变：卡片应立刻显示「♻️ 自动选择」，与主页按钮同步。
     this.refreshDisplayNode();
@@ -1430,6 +1712,7 @@ export struct SubscriptionPage {
     }
     let removedCount = 0;
     let activeRemoved = false;
+    const activeNode = this.service.findNode(this.activeNodeId);
     for (const id of ids) {
       if (this.activeNodeId === id) {
         activeRemoved = true;
@@ -1443,7 +1726,21 @@ export struct SubscriptionPage {
       this.settings.preferredNodeId = '';
       this.settings.preferredNodeSubscriptionId = '';
       this.settings.preferredNodeName = '';
-      await SettingsService.save(this.settings);
+      // 该订阅记住的正是被删掉的这个节点：一并忘掉，切回时不再尝试还原。
+      if (activeNode !== null) {
+        this.settings.preferredNodeNamesBySubscription = AppSettings.forgetPreferredNodeName(
+          this.settings.preferredNodeNamesBySubscription, activeNode.subscriptionId, activeNode.name);
+      }
+      const forgotten = activeNode;
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.preferredNodeId = '';
+        s.preferredNodeSubscriptionId = '';
+        s.preferredNodeName = '';
+        if (forgotten !== null) {
+          s.preferredNodeNamesBySubscription = AppSettings.forgetPreferredNodeName(
+            s.preferredNodeNamesBySubscription, forgotten.subscriptionId, forgotten.name);
+        }
+      });
       this.activeNodeId = '';
       this.activeSubId = '';
     }
@@ -1471,7 +1768,21 @@ export struct SubscriptionPage {
       this.settings.preferredNodeId = '';
       this.settings.preferredNodeSubscriptionId = '';
       this.settings.preferredNodeName = '';
-      await SettingsService.save(this.settings);
+      // 该订阅记住的正是被删掉的这个节点：一并忘掉，切回时不再尝试还原。
+      if (node !== null) {
+        this.settings.preferredNodeNamesBySubscription = AppSettings.forgetPreferredNodeName(
+          this.settings.preferredNodeNamesBySubscription, node.subscriptionId, node.name);
+      }
+      const forgottenNode = node;
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.preferredNodeId = '';
+        s.preferredNodeSubscriptionId = '';
+        s.preferredNodeName = '';
+        if (forgottenNode !== null) {
+          s.preferredNodeNamesBySubscription = AppSettings.forgetPreferredNodeName(
+            s.preferredNodeNamesBySubscription, forgottenNode.subscriptionId, forgottenNode.name);
+        }
+      });
       this.activeNodeId = '';
       this.activeSubId = '';
     }
@@ -1520,27 +1831,11 @@ export struct SubscriptionPage {
   }
 
   private formatUpdateTime(ts: number): string {
-    if (ts <= 0) {
-      return '未更新';
-    }
-    const diff = Date.now() - ts;
-    const minutes = Math.floor(diff / 60000);
-    if (minutes < 1) {
-      return '刚刚';
-    }
-    if (minutes < 60) {
-      return `${minutes}分钟前`;
-    }
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) {
-      return `${hours}小时前`;
-    }
-    const days = Math.floor(hours / 24);
-    if (days < 7) {
-      return `${days}天前`;
-    }
-    const d = new Date(ts);
-    return `${d.getMonth() + 1}/${d.getDate()}`;
+    return SubscriptionSummary.updateTime(ts);
+  }
+
+  private trafficSummaryOf(sub: Subscription): string {
+    return SubscriptionSummary.traffic(sub.uploadBytes, sub.downloadBytes, sub.totalBytes);
   }
 
   build() {
@@ -1553,47 +1848,10 @@ export struct SubscriptionPage {
       Column() {
         Scroll() {
           Column() {
-            // ── 顶部导航（页签页，无返回；右侧保留全部既有入口） ──
-            TopNavBar({ title: '订阅与节点' }) {
-              Row({ space: 8 }) {
-                // 单列/双列节点排布切换
-                Stack({ alignContent: Alignment.Center }) {
-                  Image($r('app.media.ic_apps')).width(20).height(20)
-                    .fillColor(TunBoxColors.textPrimary)
-                }
-                .width(36).height(36)
-                .borderRadius(TunBoxGeometry.pillRadius)
-                .backgroundColor(TunBoxColors.chipBg)
-                .accessibilityText('切换单列双列排布')
-                .onClick(() => { this.toggleNodeColumns(); })
-                // 刷新全部
-                Stack({ alignContent: Alignment.Center }) {
-                  if (this.isRefreshing) {
-                    LoadingProgress().width(18).height(18).color(TunBoxColors.primary)
-                  } else {
-                    Image($r('app.media.ic_refresh')).width(20).height(20)
-                      .fillColor(TunBoxColors.textPrimary)
-                      .rotate({ angle: this.spinTick * 360 })
-                      .animation({ duration: 650, curve: Curve.EaseInOut })
-                  }
-                }
-                .width(36).height(36)
-                .borderRadius(TunBoxGeometry.pillRadius)
-                .backgroundColor(TunBoxColors.chipBg)
-                .accessibilityText('刷新全部订阅')
-                .onClick(() => { this.refreshAll(); })
-                // “+”添加订阅
-                Stack({ alignContent: Alignment.Center }) {
-                  Image($r('app.media.ic_plus')).width(20).height(20)
-                    .fillColor(TunBoxColors.primary)
-                }
-                .width(36).height(36)
-                .borderRadius(TunBoxGeometry.pillRadius)
-                .backgroundColor(TunBoxColors.primaryLight)
-                .accessibilityText('添加订阅')
-                .onClick(() => { this.importDialog.open(); })
-              }.alignItems(VerticalAlign.Center)
-            }
+            // ── 顶部导航（页签页，无返回）──
+            // 2026-10-27 用户要求：标题「订阅与节点」改为「订阅」；原来的三个右侧入口
+            // （单双列 / 刷新 / 添加）已合并进右下角可拖动的悬浮菜单（见 build() 末尾）。
+            TopNavBar({ title: '订阅' })
 
             // 顶部提示不再放在这里（2026-10-18）：它曾是 Scroll 内容里的条件 Text，
             // 每次「正在测速…/✓ 测速完成/刷新完成」出现时都把下面的订阅卡整体下推一行。
@@ -1725,7 +1983,7 @@ export struct SubscriptionPage {
                           .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
                           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                           .layoutWeight(1)
-                        if (sub.id === ProfileStore.currentId()) {
+                        if (sub.id === ProfileRepository.currentId()) {
                           Text('使用中')
                             .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.success)
                             .padding({ left: 6, right: 6, top: 1, bottom: 1 })
@@ -1753,7 +2011,7 @@ export struct SubscriptionPage {
                             .borderWidth(1)
                             .borderColor(TunBoxColors.danger)
                         }
-                        Text(`${this.nodeCountOf(sub)} 个节点 · 更新于 ${this.formatUpdateTime(sub.lastFetchedAt)}`)
+                        Text(`${this.nodeCountOf(sub)}节点 · ${this.formatUpdateTime(sub.lastFetchedAt)} · ${this.trafficSummaryOf(sub)}`)
                           .fontSize(11).fontColor(TunBoxColors.textMuted)
                           .layoutWeight(1)
                           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -1858,7 +2116,7 @@ export struct SubscriptionPage {
                           GridCol() {
                             this.nodeCard(node)
                           }
-                        }, (node: ProxyNode) => `${node.id}|${node.id === this.activeNodeId ? 1 : 0}`)
+                        }, (node: ProxyNode) => `${node.id}|${this.isActiveNode(node) ? 1 : 0}`)
                       }
                       .width('100%')
                     }
@@ -1873,11 +2131,11 @@ export struct SubscriptionPage {
                 .borderRadius(TunBoxGeometry.cardRadius)
                 .backgroundColor(TunBoxColors.surfaceCard)
                 .border({
-                  width: sub.id === ProfileStore.currentId() ? 1.5 : 1,
-                  color: sub.id === ProfileStore.currentId() ? TunBoxColors.primary : TunBoxColors.cardBorder
+                  width: sub.id === ProfileRepository.currentId() ? 1.5 : 1,
+                  color: sub.id === ProfileRepository.currentId() ? TunBoxColors.primary : TunBoxColors.cardBorder
                 })
                 .clip(true)
-              }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.nodeCountOf(sub)}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === ProfileStore.currentId() ? 1 : 0}|${this.activeNodeId}`)
+              }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.nodeCountOf(sub)}|${sub.lastFetchedAt}|${this.isOpen(sub.id) ? 1 : 0}|${sub.id === ProfileRepository.currentId() ? 1 : 0}|${this.activeNodeId}`)
 
               if (this.subs.length === 0) {
                 Column({ space: 10 }) {
@@ -1984,7 +2242,88 @@ export struct SubscriptionPage {
         .shadow({ radius: 14, color: TunBoxColors.toastShadow, offsetX: 0, offsetY: 4 })
         .zIndex(30)
       }
+
+      // ── 右下角悬浮菜单（2026-10-27 用户要求）──
+      //
+      // 原顶栏 3 个入口 + 新增「节点排序」共 4 个，统一收进这个可拖动的主按钮：
+      // 默认收起；点一下向上展开 4 个圆形按钮，再点收起。位置用 PanGesture 拖动，
+      // 松手落盘（SettingsService.saveSubscriptionFabPosition），下次进入还原。
+      // 主按钮默认**透明**（不压内容），只在展开时给一个浅色胶囊提示当前态。
+      if (this.fabExpanded) {
+        this.FabActionItem($r('app.media.ic_swap'),
+          this.nodeListSortMode === 'delay' ? '切换为默认顺序' : '切换为延迟优先',
+          4, (): void => {
+            this.toggleNodeListSortMode();
+          })
+        this.FabActionItem($r('app.media.ic_apps'), '切换单列双列排布',
+          3, (): void => {
+            this.toggleNodeColumns();
+          })
+        this.FabActionItem($r('app.media.ic_refresh'), '刷新全部订阅',
+          2, (): void => {
+            this.refreshAll();
+          })
+        this.FabActionItem($r('app.media.ic_plus'), '添加订阅',
+          1, (): void => {
+            this.importDialog.open();
+          })
+      }
+      Stack({ alignContent: Alignment.Center }) {
+        // 用户指定：收起时用「⋮」菜单图标；展开时换成关闭图标，避免同图标两种含义。
+        Image(this.fabExpanded ? $r('app.media.ic_close') : $r('app.media.ic_menu_dots'))
+          .width(this.fabExpanded ? 18 : 20)
+          .height(this.fabExpanded ? 18 : 20)
+          .fillColor(this.fabExpanded ? TunBoxColors.primary : TunBoxColors.textPrimary)
+          .animation({ duration: 160, curve: Curve.EaseOut })
+      }
+      .width(FAB_SIZE)
+      .height(FAB_SIZE)
+      .borderRadius(FAB_SIZE / 2)
+      .backgroundColor(this.fabExpanded ? TunBoxColors.primaryLight : Color.Transparent)
+      .border({
+        width: this.fabExpanded ? 1 : 0,
+        color: TunBoxColors.cardBorder
+      })
+      .shadow({
+        radius: this.fabExpanded ? 14 : 0,
+        color: TunBoxColors.toastShadow,
+        offsetX: 0,
+        offsetY: 4
+      })
+      .opacity(this.fabPositionReady ? (this.fabDragging ? 0.85 : 1) : 0)
+      .position({ x: this.fabX, y: this.fabY })
+      .zIndex(45)
+      .accessibilityText(this.fabExpanded ? '收起订阅操作菜单' : '展开订阅操作菜单')
+      .onClick(() => {
+        // 刚拖动过的手势不再当成点击（否则拖完会顺手展开/收起）
+        if (this.fabMoved) {
+          this.fabMoved = false;
+          return;
+        }
+        this.fabMenuBelow = this.fabY - (FAB_ITEM_SIZE + FAB_ITEM_GAP) * 4 < TunBoxGeometry.navHeight;
+        this.fabExpanded = !this.fabExpanded;
+      })
+      .gesture(
+        PanGesture({ fingers: 1, distance: 6 })
+          .onActionStart((): void => this.onFabDragStart())
+          .onActionUpdate((event: GestureEvent): void => this.onFabDragUpdate(event))
+          .onActionEnd((): void => this.onFabDragEnd())
+          .onActionCancel((): void => {
+            this.fabDragging = false;
+            this.clampFabPosition();
+          })
+      )
     }
     .width('100%').height('100%')
+    .onAreaChange((_oldArea: Area, newArea: Area): void => {
+      const w: number = Number(newArea.width);
+      const h: number = Number(newArea.height);
+      if (w <= 0 || h <= 0) {
+        return;
+      }
+      this.pageWidth = w;
+      this.pageHeight = h;
+      this.applyDefaultFabPosition();
+    })
   }
 }

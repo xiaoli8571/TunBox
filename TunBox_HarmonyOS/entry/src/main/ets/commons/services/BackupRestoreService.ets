@@ -13,7 +13,7 @@ import { ProxyGroup, ProxyGroupJson } from '../models/ProxyGroup';
 import { SettingsService } from './SettingsService';
 import { SubscriptionService, SubscriptionJson, ProxyNodeJson } from './SubscriptionService';
 import { CredentialStore, SubscriptionCredentialSource } from './CredentialStore';
-import { ProfileStore } from '../flclash/ProfileStore';
+import { ProfileRepository } from '../flclash/ProfileRepository';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'BackupRestore';
@@ -99,21 +99,21 @@ export class BackupRestoreService {
     file.settings = settings.toJson();
     file.profiles = BackupRestoreService.collectProfiles(svc);
     file.subscriptionSecrets = await BackupRestoreService.collectSubscriptionSecrets(svc);
-    file.currentProfileId = ProfileStore.isReady() ? ProfileStore.currentId() : '';
+    file.currentProfileId = ProfileRepository.isReady() ? ProfileRepository.currentId() : '';
     return JSON.stringify(file, null, 2);
   }
 
   /** 收集每份订阅的配置原文（内核真正的节点来源，含节点密码）。 */
   private static collectProfiles(svc: SubscriptionService): ProfileBackupEntry[] {
     const out: ProfileBackupEntry[] = [];
-    if (!ProfileStore.isReady()) {
+    if (!ProfileRepository.isReady()) {
       return out;
     }
     for (const s of svc.subscriptions) {
-      if (!ProfileStore.exists(s.id)) {
+      if (!ProfileRepository.exists(s.id)) {
         continue;
       }
-      const yaml = ProfileStore.read(s.id);
+      const yaml = ProfileRepository.read(s.id);
       if (yaml.length === 0) {
         continue;
       }
@@ -308,7 +308,7 @@ export class BackupRestoreService {
    */
   private static async restoreProfiles(parsed: BackupFile, subIds: Set<string>,
     subs: Subscription[]): Promise<number> {
-    if (!ProfileStore.isReady()) {
+    if (!ProfileRepository.isReady()) {
       return 0;
     }
     let restored = 0;
@@ -325,24 +325,24 @@ export class BackupRestoreService {
         if (yaml.length > 8 * 1024 * 1024) {
           continue;
         }
-        if (ProfileStore.write(id, yaml)) {
+        if (ProfileRepository.write(id, yaml)) {
           restored++;
         }
       }
     }
     // current profile：优先备份里的那个，失效则退回第一个「启用且有原文」的订阅。
     let current = typeof parsed.currentProfileId === 'string' ? parsed.currentProfileId : '';
-    if (current.length === 0 || !ProfileStore.exists(current)) {
+    if (current.length === 0 || !ProfileRepository.exists(current)) {
       current = '';
       for (const s of subs) {
-        if (s.enabled && ProfileStore.exists(s.id)) {
+        if (s.enabled && ProfileRepository.exists(s.id)) {
           current = s.id;
           break;
         }
       }
     }
     if (current.length > 0) {
-      await ProfileStore.setCurrent(current);
+      await ProfileRepository.setCurrent(current);
     }
     // 订阅 header 值落在 Asset（preferences 里永远是空的），重装后只能从备份补。
     const sources: SubscriptionCredentialSource[] = [];

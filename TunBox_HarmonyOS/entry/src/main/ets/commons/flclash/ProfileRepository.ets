@@ -1,5 +1,12 @@
 /**
- * Profile 存储（订阅原文 = 一份 Profile 文件）
+ * Profile **Repository**（订阅原文 = 一份 Profile 文件）
+ *
+ * ⚠ 定位说明（2026-10-27 架构收口）：本类**不是**文件读写工具，而是配置仓库 ——
+ * 它拥有「当前用哪份 profile」「校验后落盘」「revision 版本」「可用性判定」这些领域决策，
+ * 全仓 122 处引用都依赖它做事实判定（`currentId` / `exists` / `revisionOf`）。
+ *
+ * 新代码请通过同文件导出的 `ProfileRepository` 别名引用，读代码的人一眼能看出它是仓库；
+ * 历史 `ProfileRepository` 引用保留（纯改名会污染 diff，收益为零）。
  *
  * 来源：FlClash `lib/models/profile.dart` + `lib/core/controller.dart:101-127`
  *      （`Profile.file` / `saveFile` / `validateProfile`）。
@@ -31,7 +38,7 @@ import { AppLogger } from '../utils/AppLogger';
 import { ProfileConfigMerger } from './ProfileConfigMerger';
 import { BodyDispatch } from '../subscription/BodyDispatch';
 
-const TAG = 'ProfileStore';
+const TAG = 'ProfileRepository';
 const PREF_NAME = 'tunbox_profiles';
 const KEY_STATE = 'profile_state';
 const DIR_NAME = 'profiles';
@@ -51,7 +58,7 @@ export class ProfileValidationResult {
 /** 可注入的转换器（SubConverter 的薄接口，避免本文件依赖其实现细节）。 */
 export type ProfileTextConverter = (text: string) => string;
 
-export class ProfileStore {
+export class ProfileRepository {
   private static store: preferences.Preferences | null = null;
   private static dirPath: string = '';
   private static currentProfileId: string = '';
@@ -61,20 +68,20 @@ export class ProfileStore {
   private static preparer: ((text: string) => Promise<string>) | null = null;
 
   static attachPreparer(preparer: (text: string) => Promise<string>): void {
-    ProfileStore.preparer = preparer;
+    ProfileRepository.preparer = preparer;
   }
 
   static async prepare(text: string): Promise<string> {
-    if (ProfileStore.preparer === null) {
+    if (ProfileRepository.preparer === null) {
       throw new Error('订阅校验器尚未初始化');
     }
-    const key = ProfileStore.fingerprint(text);
-    const cached = ProfileStore.preparedCache.get(key);
+    const key = ProfileRepository.fingerprint(text);
+    const cached = ProfileRepository.preparedCache.get(key);
     if (cached !== undefined) { return cached; }
-    const prepared = await ProfileStore.preparer(text);
-    if (ProfileStore.preparedCache.size >= 8) { ProfileStore.preparedCache.clear(); }
-    ProfileStore.preparedCache.set(key, prepared);
-    ProfileStore.preparedCache.set(ProfileStore.fingerprint(prepared), prepared);
+    const prepared = await ProfileRepository.preparer(text);
+    if (ProfileRepository.preparedCache.size >= 8) { ProfileRepository.preparedCache.clear(); }
+    ProfileRepository.preparedCache.set(key, prepared);
+    ProfileRepository.preparedCache.set(ProfileRepository.fingerprint(prepared), prepared);
     return prepared;
   }
 
@@ -90,33 +97,33 @@ export class ProfileStore {
   }
 
   static revisionOf(id: string): string {
-    return id.length === 0 ? '' : ProfileStore.fingerprint(ProfileStore.read(id));
+    return id.length === 0 ? '' : ProfileRepository.fingerprint(ProfileRepository.read(id));
   }
 
   /** 注入 convertProxies 实现（由 SubConverter 接入；未注入时只走 YAML 校验）。 */
   static attachConverter(converter: ProfileTextConverter | null): void {
-    ProfileStore.converter = converter;
+    ProfileRepository.converter = converter;
   }
 
   static async init(context: Context): Promise<void> {
-    if (ProfileStore.loaded) {
+    if (ProfileRepository.loaded) {
       return;
     }
-    ProfileStore.dirPath = `${context.filesDir}/${DIR_NAME}`;
-    ProfileStore.ensureDir(ProfileStore.dirPath);
-    ProfileStore.store = await preferences.getPreferences(context, PREF_NAME);
-    const raw = await ProfileStore.store.get(KEY_STATE, '{}') as string;
+    ProfileRepository.dirPath = `${context.filesDir}/${DIR_NAME}`;
+    ProfileRepository.ensureDir(ProfileRepository.dirPath);
+    ProfileRepository.store = await preferences.getPreferences(context, PREF_NAME);
+    const raw = await ProfileRepository.store.get(KEY_STATE, '{}') as string;
     try {
       const obj = JSON.parse(raw) as Record<string, Object>;
       const current = obj['current'];
       if (typeof current === 'string') {
-        ProfileStore.currentProfileId = current;
+        ProfileRepository.currentProfileId = current;
       }
     } catch (e) {
       AppLogger.warn(TAG, 'invalid profile state ignored');
     }
-    ProfileStore.loaded = true;
-    AppLogger.info(TAG, `profiles dir ready: ${ProfileStore.dirPath} current=${ProfileStore.currentProfileId}`);
+    ProfileRepository.loaded = true;
+    AppLogger.info(TAG, `profiles dir ready: ${ProfileRepository.dirPath} current=${ProfileRepository.currentProfileId}`);
   }
 
   /** 确保目录存在（应用私有目录，权限由系统沙箱保证）。 */
@@ -129,15 +136,15 @@ export class ProfileStore {
   }
 
   static isReady(): boolean {
-    return ProfileStore.loaded;
+    return ProfileRepository.loaded;
   }
 
   static dir(): string {
-    return ProfileStore.dirPath;
+    return ProfileRepository.dirPath;
   }
 
   static pathOf(id: string): string {
-    return `${ProfileStore.dirPath}/${ProfileStore.safeId(id)}.yaml`;
+    return `${ProfileRepository.dirPath}/${ProfileRepository.safeId(id)}.yaml`;
   }
 
   /** 订阅 id 里可能有路径分隔符/冒号：落盘文件名只允许 `[A-Za-z0-9_-]`。 */
@@ -168,7 +175,7 @@ export class ProfileStore {
       return false;
     }
     try {
-      const stat = fs.statSync(ProfileStore.pathOf(id));
+      const stat = fs.statSync(ProfileRepository.pathOf(id));
       return stat.size > 0;
     } catch (e) {
       return false;
@@ -177,10 +184,10 @@ export class ProfileStore {
 
   /** 读原文；不存在/读取失败返回空串（调用方按「无 profile」处理）。 */
   static read(id: string): string {
-    if (!ProfileStore.exists(id)) {
+    if (!ProfileRepository.exists(id)) {
       return '';
     }
-    const path = ProfileStore.pathOf(id);
+    const path = ProfileRepository.pathOf(id);
     let file: fs.File | null = null;
     try {
       const stat = fs.statSync(path);
@@ -191,7 +198,7 @@ export class ProfileStore {
       file = fs.openSync(path, fs.OpenMode.READ_ONLY);
       const buf = new ArrayBuffer(stat.size);
       const read = fs.readSync(file.fd, buf);
-      return ProfileStore.decode(buf, read);
+      return ProfileRepository.decode(buf, read);
     } catch (e) {
       AppLogger.warn(TAG, `read profile failed: ${AppLogger.errText(e)}`);
       return '';
@@ -216,8 +223,8 @@ export class ProfileStore {
     if (id.length === 0) {
       return false;
     }
-    ProfileStore.ensureDir(ProfileStore.dirPath);
-    const target = ProfileStore.pathOf(id);
+    ProfileRepository.ensureDir(ProfileRepository.dirPath);
+    const target = ProfileRepository.pathOf(id);
     const tmp = `${target}.tmp`;
     let file: fs.File | null = null;
     try {
@@ -247,7 +254,7 @@ export class ProfileStore {
   }
 
   static remove(id: string): void {
-    const path = ProfileStore.pathOf(id);
+    const path = ProfileRepository.pathOf(id);
     try {
       fs.unlinkSync(path);
     } catch (e) {
@@ -256,22 +263,22 @@ export class ProfileStore {
   }
 
   static currentId(): string {
-    return ProfileStore.currentProfileId;
+    return ProfileRepository.currentProfileId;
   }
 
   static async setCurrent(id: string): Promise<void> {
-    ProfileStore.currentProfileId = id;
-    await ProfileStore.persistState();
+    ProfileRepository.currentProfileId = id;
+    await ProfileRepository.persistState();
   }
 
   private static async persistState(): Promise<void> {
-    if (ProfileStore.store === null) {
+    if (ProfileRepository.store === null) {
       return;
     }
-    const state: Record<string, string> = { 'current': ProfileStore.currentProfileId };
+    const state: Record<string, string> = { 'current': ProfileRepository.currentProfileId };
     try {
-      await ProfileStore.store.put(KEY_STATE, JSON.stringify(state));
-      await ProfileStore.store.flush();
+      await ProfileRepository.store.put(KEY_STATE, JSON.stringify(state));
+      await ProfileRepository.store.flush();
     } catch (e) {
       AppLogger.warn(TAG, `persist profile state failed: ${AppLogger.errText(e)}`);
     }
@@ -292,17 +299,17 @@ export class ProfileStore {
       // Decode a wrapped YAML document before trying the URI converter.
       let candidate = BodyDispatch.classify(text).body;
       if (!ProfileConfigMerger.isKernelLoadableConfig(candidate)) {
-        if (ProfileStore.converter === null) {
+        if (ProfileRepository.converter === null) {
           out.message = '请提供 Clash 配置或有效节点链接';
           return out;
         }
-        candidate = ProfileStore.converter(candidate);
+        candidate = ProfileRepository.converter(candidate);
         out.converted = true;
       }
       // Native YAML resolves aliases in the complete document and validates
       // outbound/group references without starting a core or fetching providers.
-      const prepared = await ProfileStore.prepare(candidate);
-      if (prepared.length === 0 || !ProfileStore.write(id, prepared)) {
+      const prepared = await ProfileRepository.prepare(candidate);
+      if (prepared.length === 0 || !ProfileRepository.write(id, prepared)) {
         out.message = '订阅保存失败，已保留旧配置';
         return out;
       }
@@ -315,3 +322,9 @@ export class ProfileStore {
     }
   }
 }
+
+/**
+ * 向后兼容别名：旧代码里的 `ProfileStore` 指向同一个配置仓库。
+ * 新代码一律用 `ProfileRepository`（命名即契约：它是仓库，不是文件工具）。
+ */
+export const ProfileStore = ProfileRepository;

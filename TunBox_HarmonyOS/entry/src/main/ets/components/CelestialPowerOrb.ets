@@ -33,6 +33,7 @@
  * 不对圆形组件挂 .shadow/.linearGradient（按矩形盒渲染会透出方框）。
  */
 import { curves } from '@kit.ArkUI';
+import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { vibrator } from '@kit.SensorServiceKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
 import { ThemeService } from '../theme/ThemeService';
@@ -345,7 +346,7 @@ export struct CelestialPowerOrb {
     if (this.ticker >= 0) {
       return;
     }
-    this.ticker = setInterval((): void => {
+    this.ticker = UnifiedScheduler.every((): void => {
       this.spinDeg += this.isConnected ? SPIN_ACTIVE : SPIN_IDLE;
       if (this.spinDeg >= 360) {
         this.spinDeg -= 360;
@@ -356,7 +357,7 @@ export struct CelestialPowerOrb {
 
   private stopTicker(): void {
     if (this.ticker >= 0) {
-      clearInterval(this.ticker);
+      UnifiedScheduler.clear(this.ticker);
       this.ticker = -1;
     }
   }

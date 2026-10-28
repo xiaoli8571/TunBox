@@ -267,10 +267,13 @@ function queryMap(query) {
 }
 
 function splitAuthority(authority) {
+  // 2026-10-27：userinfo **可省略** —— 真解析层（UriNodeParser.splitAuthority）早就按这个口径
+  // 实现（hysteria v1 的口令常在 query 的 auth/auth_str，转换器生成的 trojan/anytls 也可能
+  // 无凭据段）。oracle 这里若仍要求 `@`，就会把「解析层接受、结构合法」的链接误判成
+  // 结构不合法（hysteria1.txt 第 2 条一直是这条假红的唯一来源）。
   const at = authority.lastIndexOf('@');
-  if (at < 0) return null;
-  const userInfo = authority.slice(0, at);
-  const hostPart = authority.slice(at + 1);
+  const userInfo = at < 0 ? '' : authority.slice(0, at);
+  const hostPart = at < 0 ? authority : authority.slice(at + 1);
   if (hostPart.startsWith('[')) {
     const close = hostPart.indexOf(']');
     if (close < 0 || hostPart[close + 1] !== ':') return null;

@@ -31,8 +31,10 @@ const ASSET_SECRET_KEY = 'api_secret';
 const KEY_SNAPSHOT = 'connection_snapshot_json';
 const KEY_DOH_PINS = 'doh_pins_json';
 const KEY_ROUTING_SNAPSHOT = 'app_routing_snapshot_json';
-const KEY_SUBSCRIPTION_FAB_X = 'subscription_fab_x';
-const KEY_SUBSCRIPTION_FAB_Y = 'subscription_fab_y';
+// 2026-10-27：悬浮菜单启用。旧键（subscription_fab_x/y）是历史实验残留，
+// 可能存着半屏坐标；换 v2 键让首次升级落到「右下角默认位」，之后拖过才恢复。
+const KEY_SUBSCRIPTION_FAB_X = 'subscription_fab_v2_x';
+const KEY_SUBSCRIPTION_FAB_Y = 'subscription_fab_v2_y';
 /** 订阅页节点排布列数（1=单列 2=双列），用户手动切换后持久化 */
 const KEY_NODE_COLUMNS = 'node_columns';
 
@@ -82,11 +84,13 @@ export class AppRoutingSnapshot {
  * 设置的**字段级写入**入口：mutator 拿到的是「刚从盘上读出来的最新设置」，
  * 在它上面改，改完立刻落盘。
  *
- * 为什么不能直接 `save(settings)`：那个 API 收的是**调用方自己那份内存副本**，
- * 而内存副本可能是几分钟前 load 出来的 —— 两个写者各持一份陈旧副本时，
- * 后写者会把先写者的字段整片盖回旧值（审计 F2）。
+ * 返回值语义（2026-10-27 补）：
+ *  · `void` / `true`  ⇒ 正常写盘；
+ *  · 显式 `false`    ⇒ **本次不写**（mutator 判定「没什么可写」或「并发冲突，放弃」）。
+ *   没有这个出口，页面级的并发三向比较只能「先 load 预检、再 patch 写」—— 预检与写入
+ *   之间又有窗口，且冲突时仍白发一次整份写（把别人刚写的字段按同值重写一遍）。
  */
-export type SettingsMutator = (settings: AppSettings) => void;
+export type SettingsMutator = (settings: AppSettings) => boolean | void;
 
 /** 测速结论分片里的单条记录（只有测速路径拥有的字段） */
 class NodeSortLatencyEntry {
@@ -123,6 +127,16 @@ class NodeSortShards {
 
 export class SettingsService {
   private static store: preferences.Preferences | null = null;
+  /**
+   * 进程内设置缓存（2026-10-27 写放大整治）：
+   * 读走缓存、写走「内存 → 合并 → 防抖落盘」，避免"每个动作都读盘 + 每个动作都 flush"。
+   * 不变量：`cache` 永远等于「最新意图」，`pending` 是尚未落盘的那一份。
+   */
+  private static cache: AppSettings | null = null;
+  private static pending: AppSettings | null = null;
+  private static flushTimer: number = -1;
+  /** 防抖窗口：UI 连点/批量开关只落一次盘；进后台/退出前由 flushNow 强制刷。 */
+  private static readonly FLUSH_DELAY_MS: number = 300;
   /** 本进程内「双轨 provider」开关的上一次生效值：用于识别开关变化并同步落盘仓闸门 */
   private static lastRawProviderFlag: boolean = false;
 
@@ -130,12 +144,26 @@ export class SettingsService {
     SettingsService.store = await preferences.getPreferences(context, PREF_NAME);
   }
 
+  /** 同步读缓存（仅 UI 展示用；未经 init 时返回 null，调用方必须回退）。 */
+  static peek(): AppSettings | null {
+    const c = SettingsService.cache;
+    return c === null ? null : AppSettings.fromJson(c.toJson());
+  }
+
   static async load(): Promise<AppSettings> {
     if (SettingsService.store === null) {
       throw new Error('设置服务尚未初始化，已拒绝使用默认应用分流');
     }
+    const cached = SettingsService.cache;
+    if (cached !== null) {
+      const settings = AppSettings.fromJson(cached.toJson());
+      settings.nodeSortSnapshot = await SettingsService.loadNodeSortSnapshot();
+      SettingsService.syncRawProviderGate(settings.useRawProviderConfig);
+      return settings;
+    }
     const raw = await SettingsService.store.get(KEY_SETTINGS, '') as string;
     if (raw.length === 0) {
+      SettingsService.cache = new AppSettings();
       return new AppSettings();
     }
     try {
@@ -151,12 +179,16 @@ export class SettingsService {
       // 双轨开关是全局闸门：任何一次加载都把持久化值同步给落盘仓，
       // 持久化为关闭 → 顺带清掉历史落盘原文（含进程被杀后残留）。
       SettingsService.syncRawProviderGate(settings.useRawProviderConfig);
+      const cacheable = AppSettings.fromJson(settings.toJson());
+      cacheable.nodeSortSnapshot = '';
+      SettingsService.cache = cacheable;
       return settings;
     } catch (e) {
       // 损坏数据不等同首次安装：保持需要确认，禁止退回 all 自动接管。
       const invalid = new AppSettings();
       invalid.appRoutingMode = '';
       invalid.appRoutingNeedsReview = true;
+      SettingsService.cache = AppSettings.fromJson(invalid.toJson());
       return invalid;
     }
   }
@@ -173,8 +205,10 @@ export class SettingsService {
     // 真源 —— 整单覆盖会把另一个写者的分片盖回旧值（审计 F2 的根因）。
     const stored = normalized.toJson();
     stored.nodeSortSnapshot = '';
-    await SettingsService.store.put(KEY_SETTINGS, JSON.stringify(stored));
-    await SettingsService.store.flush();
+    // 内存即真源：先更新缓存与待落盘快照，再由防抖刷盘（同一次 tick 的多次保存合并为一次写）。
+    SettingsService.cache = AppSettings.fromJson(stored);
+    SettingsService.pending = AppSettings.fromJson(stored);
+    SettingsService.scheduleFlush();
     SettingsService.syncRawProviderGate(normalized.useRawProviderConfig);
     // 快照按「谁拥有哪个字段」分别路由：测速结论只在新批次出现时写，
     // 记账只写**相对盘上发生变化**的节点。两者互不覆盖。
@@ -190,7 +224,12 @@ export class SettingsService {
   static async patchSettings(mutator: SettingsMutator): Promise<void> {
     const task = SettingsService.writeChain.then(async (): Promise<void> => {
       const current = await SettingsService.load();
-      mutator(current);
+      const verdict = mutator(current);
+      // 显式 false = 本次放弃写入（并发冲突 / 无变更）。绝不能退化成「写回原值」：
+      // 白发一次整份写既浪费落盘，也会把别处刚写好的字段按本进程的内存形态重写一遍。
+      if (verdict === false) {
+        return;
+      }
       await SettingsService.save(current);
     });
     SettingsService.writeChain = task.then((): void => {}, (): void => {});
@@ -199,6 +238,32 @@ export class SettingsService {
 
   /** 设置写入的串行链：避免两个写者同时读-改-写互相穿插 */
   private static writeChain: Promise<void> = Promise.resolve();
+
+  private static scheduleFlush(): void {
+    if (SettingsService.flushTimer >= 0) { return; }
+    SettingsService.flushTimer = setTimeout((): void => {
+      SettingsService.flushTimer = -1;
+      SettingsService.flushNow().catch((e: Error): void => {
+        AppLogger.warn('SettingsService', `settings flush failed: ${AppLogger.errText(e)}`);
+      });
+    }, SettingsService.FLUSH_DELAY_MS);
+  }
+
+  /**
+   * 立即落盘。关键点（进后台 / 退出 / 连接成功）必须显式调用，
+   * 保证防抖窗口内不丢用户意图。
+   */
+  static async flushNow(): Promise<void> {
+    if (SettingsService.flushTimer >= 0) {
+      clearTimeout(SettingsService.flushTimer);
+      SettingsService.flushTimer = -1;
+    }
+    const p = SettingsService.pending;
+    if (p === null || SettingsService.store === null) { return; }
+    SettingsService.pending = null;
+    await SettingsService.store.put(KEY_SETTINGS, JSON.stringify(p.toJson()));
+    await SettingsService.store.flush();
+  }
 
   /**
    * 测速快照**单独写**（字段级写入口，导出让测速路径直接调用）。
@@ -494,9 +559,16 @@ export class SettingsService {
    * 关闭时落盘原文会被删除（凭据不再需要即删干净），返回删除的文件数。
    */
   static async setUseRawProviderConfig(value: boolean): Promise<number> {
-    const settings = await SettingsService.load();
-    settings.useRawProviderConfig = value;
-    await SettingsService.save(settings);
+    // 字段级写入：只改 useRawProviderConfig 一个字段。
+    // 这里从前拿整份 load() 快照再 save(整份)，在“用户在设置页切开关”与“页面/后台同时写节点或网站规则”
+    // 相邻时会互相覆盖（审计 F2）；单一入口 + 写锁内判断才是唯一可靠的做法。
+    await SettingsService.patchSettings((current: AppSettings): boolean => {
+      if (current.useRawProviderConfig === value) {
+        return false;
+      }
+      current.useRawProviderConfig = value;
+      return true;
+    });
     const removed = RawSubscriptionStore.setEnabled(value);
     AppLogger.info(TAG, `useRawProviderConfig=${value} (raw files removed=${removed})`);
     return removed;

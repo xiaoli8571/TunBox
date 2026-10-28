@@ -235,7 +235,7 @@ ok('卡片 padding(12)', /\.padding\(12\)/.test(cardTail));
 ok('卡片 borderRadius(16)', /\.borderRadius\(16\)/.test(cardTail));
 ok('卡片 backgroundColor(surfaceCard)', /backgroundColor\(TunBoxColors\.surfaceCard\)/.test(cardTail));
 ok('选中卡片描边加粗（1.5 vs 1）',
-  /border\(\{\s*width: node\.id === this\.activeNodeId \? 1\.5 : 1,/.test(cardTail));
+  /border\(\{\s*width: (?:node\.id === this\.activeNodeId|this\.isActiveNode\(node\)) \? 1\.5 : 1,/.test(cardTail));
 // 2026-10-20 批量多选改造后：圆圈要同时表达「当前出口」（平时）与「已勾选」（选择态），
 // 点击走 onNodeCardTap（选择态=勾选 / 平时=选中出口），长按改为进入批量选择态。
 ok('选中态圆圈填充 primary（含批量勾选态）',

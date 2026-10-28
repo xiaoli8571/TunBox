@@ -1,14 +1,14 @@
 /**
  * HomePage —— TunBox 主页（严格对齐《TunBox-UI重构笔记》§3.1 首页）
- * 布局：TopNavBar(TunBox + rightSlot 备份/主题) → 天体轨域启动按钮(CelestialPowerOrb 320/280/200，
+ * 布局：TopNavBar(TunBox + 主题按钮；备份入口已迁到设置页) → 天体轨域启动按钮(CelestialPowerOrb 320/280/200，
  *      2026-10-17 用户按 stitch 设计稿重构，原 StatusRing 三层同心环下架；按钮内含当前节点名)
  *      → 代理模式三段按钮(规则/全局/直连，启动按钮下方) → 实时速率与流量卡(RateChart，含公网 IP) → 错误条
  * 2026-10-17：规则模式卡片下架，三项迁入 SettingsPage（用户 batch-2）。
  * 后端：复用 ConnectionOrchestrator / SubscriptionService / SettingsService / LatencyController 全量逻辑（未改动）。
  */
 import { router, promptAction } from '@kit.ArkUI';
-import { picker, fileIo as fs } from '@kit.CoreFileKit';
-import { util } from '@kit.ArkTS';
+import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
+import { ConnEvent, ConnEventKind, ConnListener } from '../commons/services/ConnectionEvents';
 import { window } from '@kit.ArkUI';
 import { NexusSizes } from '../theme/NexusTokens';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
@@ -31,158 +31,12 @@ import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
 import { ProxyNode } from '../commons/models/ProxyNode';
 import { NodeSortSnapshot } from '../commons/services/NodeSortPersistence';
-import { BackupRestoreService, RestoreOutcome } from '../commons/services/BackupRestoreService';
-import { BackupCrypto } from '../commons/services/BackupCrypto';
 
 const TAG = 'HomePage';
 /** 连接卡展开时预览的活跃连接条数（全部连接走「连接管理」） */
 const CONN_PREVIEW_MAX = 5;
 /** 连接卡预览轮询周期（与 ConnectionsPage 一致） */
 const CONN_PREVIEW_POLL_MS = 2000;
-
-/** 配置备份与恢复弹窗（Nexus §9）：导出/导入订阅+自定义规则 JSON */
-@CustomDialog
-struct BackupDialog {
-  controller?: CustomDialogController;
-  @State toastMsg: string = '';
-  onExport: () => void = () => {};
-  onImport: () => void = () => {};
-  getToast: () => string = (): string => '';
-
-  aboutToAppear(): void {
-    this.toastMsg = '';
-  }
-
-  build() {
-    Column({ space: 10 }) {
-      Row({ space: 8 }) {
-        Image($r('app.media.ic_doc'))
-          .width(20).height(20)
-          .fillColor(TunBoxColors.primary)
-        Text('配置备份与恢复').fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-        Image($r('app.media.ic_close'))
-          .width(16).height(16)
-          .fillColor(TunBoxColors.textMuted)
-          .padding(6)
-          .onClick(() => {
-            if (this.controller !== undefined) {
-              this.controller.close();
-            }
-          })
-      }.width('100%')
-      Text('备份范围包括当前全部已导入的订阅、节点以及自定义规则配置。')
-        .fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
-      Column({ space: 4 }) {
-        Text('📤 导出当前配置备份').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).width('100%')
-        Text('生成包含所有订阅和规则的 .json 备份文件，便于多设备同步或留存。')
-          .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-        Button('导出备份文件 (.json)')
-          .width('100%').borderRadius(8)
-          .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(12.5)
-          .onClick(() => this.onExport())
-      }
-      .width('100%').padding(12).borderRadius(12)
-      .backgroundColor(TunBoxColors.background)
-      .borderWidth(1).borderColor(TunBoxColors.cardBorder)
-      Column({ space: 4 }) {
-        Text('📥 导入恢复配置').fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).width('100%')
-        Text('上传备份的 .json 配置文件，一键恢复所有订阅及自定义规则。')
-          .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-        Button('选择备份文件并恢复')
-          .width('100%').borderRadius(8)
-          .backgroundColor(TunBoxColors.surfaceCard).fontColor(TunBoxColors.textPrimary).fontSize(12.5)
-          .borderWidth(1.5).borderColor(TunBoxColors.cardBorder)
-          .onClick(() => this.onImport())
-      }
-      .width('100%').padding(12).borderRadius(12)
-      .backgroundColor(TunBoxColors.background)
-      .borderWidth(1).borderColor(TunBoxColors.cardBorder)
-      if (this.getToast().length > 0) {
-        Text(this.getToast())
-          .fontSize(11.5).fontWeight(FontWeight.Bold).fontColor(Color.White)
-          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .borderRadius(9999).backgroundColor(TunBoxColors.success)
-      }
-    }
-    .padding(20)
-    .borderRadius(20)
-    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
-    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
-    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
-    // 视觉交给系统材质统一接管；内容层（行卡片/输入框/按钮）样式保持不动。
-  }
-}
-
-/**
- * 备份密码输入弹窗（P0-4 收尾）：导出/导入加密备份时收集密码。
- * mode: 'export'（确认导出，可选留空=明文）| 'import'（必填密码解密，失败可重试）
- * 结果通过 onSubmit(password) 回传，取消通过 onCancel() 回传。
- */
-@CustomDialog
-struct BackupPasswordDialog {
-  controller?: CustomDialogController;
-  @State mode: string = 'export';
-  @State attemptHint: string = '';
-  @State password: string = '';
-  onSubmit: (password: string) => void = (_password: string) => {};
-  onCancel: () => void = () => {};
-
-  build() {
-    Column({ space: 12 }) {
-      Row({ space: 8 }) {
-        Image($r('app.media.ic_lock')).width(18).height(18).fillColor(TunBoxColors.primary)
-        Text(this.mode === 'export' ? '设置备份密码' : '输入备份密码')
-          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
-      }.width('100%')
-      if (this.mode === 'export') {
-        Text('使用 AES-256-GCM 加密备份。留空则导出明文；密码至少 4 个字符，遗忘后无法恢复。')
-          .fontSize(11.5).fontColor(TunBoxColors.textMuted).width('100%')
-      } else {
-        Text(this.attemptHint.length > 0 ? this.attemptHint : '此备份已加密，请输入导出时设置的密码。')
-          .fontSize(11.5).fontColor(TunBoxColors.textMuted).width('100%')
-      }
-      TextInput({ placeholder: this.mode === 'export' ? '密码（留空=明文备份）' : '备份密码', text: this.password })
-        .type(InputType.Password)
-        .width('100%').height(42).borderRadius(8)
-        .fontSize(13)
-        .onChange((value: string) => {
-          this.password = value;
-        })
-      Row({ space: 10 }) {
-        Button('取消')
-          .layoutWeight(1).height(38).borderRadius(8)
-          .backgroundColor(TunBoxColors.surfaceCard).fontColor(TunBoxColors.textMuted).fontSize(13)
-          .borderWidth(1).borderColor(TunBoxColors.cardBorder)
-          .onClick(() => {
-            if (this.controller !== undefined) {
-              this.controller.close();
-            }
-            this.onCancel();
-          })
-        Button(this.mode === 'export' ? '确认导出' : '解密恢复')
-          .layoutWeight(1).height(38).borderRadius(8)
-          .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
-          .onClick(() => {
-            if (this.mode === 'import' && this.password.length < 4) {
-              this.attemptHint = '密码至少 4 个字符，请重新输入。';
-              return;
-            }
-            const pw = this.password;
-            if (this.controller !== undefined) {
-              this.controller.close();
-            }
-            this.onSubmit(pw);
-          })
-      }.width('100%')
-    }
-    .padding(20)
-    .borderRadius(20)
-    // 沉浸光感适配（官方《组件适配沉浸光感》+《沉浸光感常见问题》）：应用级 enable
-    // 后 CustomDialog 默认 ULTRA_THICK 沉浸材质背板；材质层级位于背景色/背景模糊之下，
-    // 不透明背景色、背景模糊与自定义 shadow 都会遮挡材质（官方反模式），根容器不再设置，
-    // 视觉交给系统材质统一接管；内容层（行卡片/输入框/按钮）样式保持不动。
-  }
-}
 
 @Component
 export struct HomePage {
@@ -192,6 +46,15 @@ export struct HomePage {
    *  覆盖订阅 hydrate 等待（冷启最多 ~1.5s）与 connect 进入 CONNECTING 前的空窗；
    *  编排器状态翻转后由真实 isConnecting 接管，流程结束（含失败/无节点）即清除 */
   @State pendingStart: boolean = false;
+  /**
+   * 冷启动节点尚未就绪（订阅 hydrate / 首次刷新还没出节点）。
+   * true 时启动按钮显示「节点加载中…」，用户点了也不能直接连 —— 否则
+   * 立刻点启动会拿空/旧节点表生成配置，最后报「节点选择未生效」。
+   */
+  @State nodesLoading: boolean = true;
+  /** 用户已在加载中点了启动：节点就绪后自动补一次连接（再点一次取消） */
+  private pendingConnectAfterNodes: boolean = false;
+  private nodeWatchTimer: number = -1;
   @State errorMessage: string = '';
   @State publicIp: string = '';
   @State publicIpRefreshing: boolean = false;
@@ -218,11 +81,12 @@ export struct HomePage {
   private connPreviewTimer: number = -1;
   private connPreviewBusy: boolean = false;
 @State ratePoints: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-  @State backupToast: string = '';
   @StorageLink('theme_revision') themeRevision: number = 0;
   @StorageLink('public_ip_revision') @Watch('onPublicIpRevision') publicIpRevision: number = 0;
   @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
   private pageReady: boolean = false;
+  private bootstrapTask: Promise<void> | null = null;
+  private pageMounted: boolean = false;
   /** 宿主（MainPage）「重新展示」通知桥：替代 @Entry 页面的 onPageShow（见 TabLifecycleBridge） */
   shownBridge?: TabLifecycleBridge;
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
@@ -231,121 +95,82 @@ export struct HomePage {
   private readonly connectionListener: () => void = (): void => {
     this.applyOrchestratorState();
   };
+  /** 类型化事件订阅（2026-10-27）：速率/出口/状态都走推送，页面不再自采样。 */
+  private connEventsToken: number = -1;
+  private readonly onConnEvent: ConnListener = (e: ConnEvent): void => {
+    if (!this.pageMounted) { return; }
+    if (e.kind === ConnEventKind.TRAFFIC) {
+      // 速率曲线由事件驱动：一次采样一次，不再靠页面自己的 1s 定时器再读一遍 orchestrator
+      this.upSpeed = e.upSpeed;
+      this.downSpeed = e.downSpeed;
+      this.upTotal = e.upTotal;
+      this.downTotal = e.downTotal;
+      const speed = e.upSpeed + e.downSpeed;
+      const ratio = Math.min(1, Math.max(0, speed / (1500 * 1024)));
+      const next = this.ratePoints.slice();
+      next.push(ratio);
+      if (next.length > NexusSizes.ratePoints) {
+        next.splice(0, next.length - NexusSizes.ratePoints);
+      }
+      this.ratePoints = next;
+      AppStorage.setOrCreate('mini_conn_up', e.upSpeed);
+      AppStorage.setOrCreate('mini_conn_down', e.downSpeed);
+      return;
+    }
+    if (e.kind === ConnEventKind.EXIT) {
+      this.refreshDisplayNode();
+      return;
+    }
+    // STATE：对齐整屏状态（含守护注册、miniBar、按钮态）
+    this.applyOrchestratorState();
+  };
   private listenerBound: boolean = false;
   private connectionTimer: number = -1;
-  private backupDialog: CustomDialogController = new CustomDialogController({
-    builder: BackupDialog({
-      getToast: (): string => this.backupToast,
-      onExport: (): void => {
-        this.exportBackup();
-      },
-      onImport: (): void => {
-        this.importBackup();
-      }
-    }),
-    autoCancel: true
-  });
-  private exportPassword: string = '';
-  private exportPending: boolean = false;
-  private exportPasswordAsked: boolean = false;
-  private importPendingText: string = '';
-  private importAttempt: number = 0;
-  @State private importDialogMode: string = 'import';
-  @State private importHint: string = '';
-  private backupPasswordDialog: CustomDialogController = new CustomDialogController({
-    builder: BackupPasswordDialog({
-      mode: this.importDialogMode,
-      attemptHint: this.importHint,
-      onSubmit: (password: string): void => {
-        if (this.exportPending) {
-          this.exportPending = false;
-          this.exportPassword = password;
-          this.exportBackup();
-        } else if (this.importPendingText.length > 0) {
-          this.decryptImportedBackup(this.importPendingText, password);
-        }
-      },
-      onCancel: (): void => {
-        this.exportPending = false;
-        this.exportPassword = '';
-        this.importPendingText = '';
-      }
-    }),
-    autoCancel: true
-  });
-
-  /** 对导入文本尝试解密：成功→继续导入；失败→重开密码弹窗（最多 3 次） */
-  private decryptImportedBackup(text: string, password: string): void {
-    const dec = BackupCrypto.decrypt(text, password);
-    if (dec.ok) {
-      this.importPendingText = '';
-      this.importAttempt = 0;
-      this.finishImport(dec.text);
-      return;
+  /** 节点集变化监听（稳定引用，便于 aboutToDisappear 退订）。 */
+  private readonly nodeSetListener: (reason: string) => void = (reason: string): void => {
+    if (this.pageMounted && this.hasUsableNodes()) {
+      this.onNodesBecameReady();
     }
-    promptAction.showToast({ message: dec.message });
-    this.importAttempt += 1;
-    if (this.importAttempt >= 3) {
-      this.importAttempt = 0;
-      this.importPendingText = '';
-      return;
-    }
-    this.openImportPasswordDialog(text, `密码错误，还可尝试 ${2 - this.importAttempt} 次。`);
-  }
-
-  private openImportPasswordDialog(text: string, hint: string): void {
-    this.importPendingText = text;
-    // BackupPasswordDialog 按 exportPending 判定模式；导入前先确保非导出态
-    this.exportPending = false;
-    this.importHint = hint;
-    this.importDialogMode = 'import';
-    this.backupPasswordDialog.open();
-  }
-
-  /** 导入结果应用：恢复成功则重载设置并提示 */
-  private applyImportOutcome(outcome: RestoreOutcome): void {
-    if (outcome.ok) {
-      SettingsService.load().then((loaded: AppSettings): void => {
-        this.settings = loaded;
-        const pm: string = this.settings.proxyMode;
-    this.proxyMode = (pm === 'global' || pm === 'direct') ? pm : 'rule';
-        this.refreshDisplayNode();
-      });
-      this.backupToast = `✓ 恢复成功！已导入 ${outcome.subCount} 个订阅及自定义规则`;
-      promptAction.showToast({ message: this.backupToast });
-    } else {
-      promptAction.showToast({ message: outcome.message });
-    }
-  }
-
-  /** finishImport：解密成功后的导入入口（复用 importBackup 的恢复逻辑） */
-  private finishImport(text: string): void {
-    BackupRestoreService.importJsonText(text).then((outcome: RestoreOutcome): void => {
-      this.applyImportOutcome(outcome);
-    }).catch((): void => {
-      promptAction.showToast({ message: '导入失败，请重试' });
-    });
-  }
+  };
 
   aboutToAppear(): void {
-    // 作为主页页签内容组件（非 @Entry 页）后：页签「重新展示」由宿主经桥通知，
-    // 语义等价于原 onPageShow（从子页返回 / 切回页签时刷新）。
+    this.pageMounted = true;
+    // 连接状态监听先于磁盘初始化绑定，避免恢复 UI 的异步窗口丢失状态变化。
+    if (!this.listenerBound) {
+      this.listenerBound = true;
+      this.orchestrator.addListener(this.connectionListener);
+      this.connEventsToken = this.orchestrator.subscribeConnEvents(this.onConnEvent);
+    }
     if (this.shownBridge !== undefined) {
       this.shownBridge.setShowHandler((): void => { this.refreshForShown(); });
     }
-  }
-
-  /** 宿主通知的「重新展示」：执行原 onPageShow 的刷新 */
-  refreshForShown(): void {
     this.bootstrap();
   }
 
+  /** 宿主通知的「重新展示」：已初始化时仅刷新轻量运行态。 */
+  refreshForShown(): void {
+    if (!this.pageReady) {
+      this.bootstrap();
+      return;
+    }
+    this.applyOrchestratorState();
+    this.syncConnectionTimer();
+    if (this.connCardOpen) { this.refreshConnPreview(); }
+  }
+
   aboutToDisappear(): void {
+    this.pageMounted = false;
     this.pageReady = false;
     this.stopConnectionTimer();
+    this.stopNodeReadinessWatch();
+    SubscriptionService.offNodeSetChanged(this.nodeSetListener);
     this.stopConnPreview();
     if (this.shownBridge !== undefined) {
       this.shownBridge.setShowHandler(null);
+    }
+    if (this.connEventsToken >= 0) {
+      this.orchestrator.unsubscribeConnEvents(this.connEventsToken);
+      this.connEventsToken = -1;
     }
     if (this.listenerBound) {
       this.orchestrator.removeListener(this.connectionListener);
@@ -390,14 +215,14 @@ export struct HomePage {
       return;
     }
     this.refreshConnPreview();
-    this.connPreviewTimer = setInterval((): void => {
+    this.connPreviewTimer = UnifiedScheduler.every((): void => {
       this.refreshConnPreview();
     }, CONN_PREVIEW_POLL_MS);
   }
 
   private stopConnPreview(): void {
     if (this.connPreviewTimer >= 0) {
-      clearInterval(this.connPreviewTimer);
+      UnifiedScheduler.clear(this.connPreviewTimer);
       this.connPreviewTimer = -1;
     }
   }
@@ -485,7 +310,7 @@ export struct HomePage {
     if (this.connectionTimer >= 0) {
       return;
     }
-    this.connectionTimer = setInterval(() => {
+    this.connectionTimer = UnifiedScheduler.every(() => {
       if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
         this.connectionDuration = 0;
         this.stopConnectionTimer();
@@ -493,25 +318,13 @@ export struct HomePage {
       }
       this.connectionDuration = Math.max(0,
         Math.floor((Date.now() - this.orchestrator.startedAt) / 1000));
-      // 速率采样：滑动窗口 26 点，量程 1500KB/s
-      const speed = this.orchestrator.traffic.uploadSpeed + this.orchestrator.traffic.downloadSpeed;
-      const ratio = Math.min(1, Math.max(0, speed / (1500 * 1024)));
-      const next = this.ratePoints.slice();
-      next.push(ratio);
-      if (next.length > NexusSizes.ratePoints) {
-        next.splice(0, next.length - NexusSizes.ratePoints);
-      }
-      this.ratePoints = next;
-      this.upSpeed = this.orchestrator.traffic.uploadSpeed;
-      this.downSpeed = this.orchestrator.traffic.downloadSpeed;
-      this.upTotal = this.orchestrator.traffic.uploadBytes;
-      this.downTotal = this.orchestrator.traffic.downloadBytes;
+      // 速率/流量已由 TRAFFIC 事件推送（见 onConnEvent），这里只数秒数。
     }, 1000);
   }
 
   private stopConnectionTimer(): void {
     if (this.connectionTimer >= 0) {
-      clearInterval(this.connectionTimer);
+      UnifiedScheduler.clear(this.connectionTimer);
       this.connectionTimer = -1;
     }
   }
@@ -524,12 +337,36 @@ export struct HomePage {
     }
   }
 
-  private async bootstrap(): Promise<void> {
+  private bootstrap(): Promise<void> {
+    if (this.bootstrapTask !== null) { return this.bootstrapTask; }
+    const task: Promise<void> = this.bootstrapImpl();
+    this.bootstrapTask = task;
+    task.finally((): void => {
+      if (this.bootstrapTask === task) { this.bootstrapTask = null; }
+    }).catch((): void => {});
+    return task;
+  }
+
+  private async bootstrapImpl(): Promise<void> {
     const ctx = getContext(this) as Context;
     this.orchestrator.init(ctx);
+    if (!this.listenerBound) {
+      this.listenerBound = true;
+      this.orchestrator.addListener(this.connectionListener);
+    }
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
+    // 冷启动兜底：把当前订阅上次手动选的节点还原成生效偏好。
+    // 否则「切到别家订阅再切回来」时全局偏好仍指向别家节点，首页/连接会掉到
+    // 该订阅第一个节点（用户感知为随机选点）。
+    await this.subs.restoreRememberedNodeForCurrentProfile();
+    this.settings = await SettingsService.load();
+    // 冷启动节点就绪看门狗：未就绪时启动按钮显示「节点加载中…」，
+    // 避免用户秒点启动时拿空/旧节点表去生成配置（报「节点选择未生效」）。
+    this.startNodeReadinessWatch();
+    this.applyOrchestratorState();
+    this.pageReady = true;
     // ── 测速结论恢复：**新真源**（LatencyStore，字段级落盘）────────────
     //
     // 旧形态是「进程内 Map」+「落盘 nodeSortSnapshot」两份源，冷启动时旧快照能把
@@ -563,10 +400,7 @@ export struct HomePage {
     this.proxyMode = (pm === 'global' || pm === 'direct') ? pm : 'rule';
     // 会话接管由编排器统一校验代次；页面不得用异步读到的旧快照改写连接态。
     await this.orchestrator.restoreKilledSession(ctx);
-    if (!this.listenerBound) {
-      this.listenerBound = true;
-      this.orchestrator.addListener(this.connectionListener);
-    }
+    if (!this.pageMounted) { return; }
     if (this.publicIp.length === 0) {
       setTimeout((): void => {
         // 启动期这次查询发生在**隧道未建立**时：出口是本机宽带，弱网下容易超时。
@@ -589,6 +423,7 @@ export struct HomePage {
     // 稳定性优先：预热整体删除，首连的 DoH 等待回到连接路径内（预算已恢复 6000ms，
     // 与 0.3.3 一致）。若将来要恢复预热，必须满足：延后到首屏之后 ≥3s、worker ≤4、
     // 只预热当前订阅、且与公网 IP 查询串行。
+    if (!this.pageMounted) { return; }
     this.applyOrchestratorState();
     this.pageReady = true;
     this.syncConnectionTimer();
@@ -635,10 +470,79 @@ export struct HomePage {
     }
   }
 
+  /** 是否已经有可连接的节点集合（真实节点表或可用 profile 兜底） */
+  private hasUsableNodes(): boolean {
+    return this.subs.nodes.length > 0 || this.subs.hasUsableProfile();
+  }
+
+  /**
+   * 冷启动节点就绪看门狗：最多等 20s，期间按钮显示「节点加载中…」。
+   *
+   * 订阅 auto-refresh 是后台并行的，没有回调能直接告诉首页「节点表已填充」；
+   * 用 400ms 轮询比「等固定 2s」稳：就绪即放行，慢网也不会过早报空。
+   * 就绪时若用户已经在加载中点了启动（pendingConnectAfterNodes），自动补连一次。
+   */
+  private startNodeReadinessWatch(): void {
+    this.stopNodeReadinessWatch();
+    // 已连接：无论节点表是否为空都不该把按钮打回「节点加载中」。
+    if (this.isConnected || this.orchestrator.state === ConnState.CONNECTED) {
+      this.nodesLoading = false;
+      return;
+    }
+    if (this.hasUsableNodes()) {
+      this.nodesLoading = false;
+      return;
+    }
+    this.nodesLoading = true;
+    const deadline: number = Date.now() + 20000;
+    // 事件优先：节点集一变就放行（不再等下一次 tick）。
+    SubscriptionService.onNodeSetChanged(this.nodeSetListener);
+    this.nodeWatchTimer = UnifiedScheduler.every((): void => {
+      if (this.hasUsableNodes()) {
+        this.onNodesBecameReady();
+        return;
+      }
+      if (Date.now() >= deadline) {
+        this.nodesLoading = false;
+        this.stopNodeReadinessWatch();
+        if (this.pendingConnectAfterNodes) {
+          this.pendingConnectAfterNodes = false;
+          promptAction.showToast({ message: '节点加载超时，请到「订阅」页刷新后再连接' });
+        }
+      }
+    }, 400);
+  }
+
+  /** 节点就绪：停看门狗 + 若用户在加载中点了启动则补连一次。 */
+  private onNodesBecameReady(): void {
+    this.nodesLoading = false;
+    this.stopNodeReadinessWatch();
+    if (this.pendingConnectAfterNodes) {
+      this.pendingConnectAfterNodes = false;
+      // 让「节点加载中…」先落一帧，再进入正在连接，避免按钮文案跳变
+      setTimeout((): void => {
+        this.toggleConnection();
+      }, 0);
+    }
+  }
+
+  private stopNodeReadinessWatch(): void {
+    if (this.nodeWatchTimer >= 0) {
+      UnifiedScheduler.clear(this.nodeWatchTimer);
+      this.nodeWatchTimer = -1;
+    }
+  }
+
   private async startConnectionIfNeeded(): Promise<void> {
     // 显式用户操作（快捷方式 start）：清除长时任务抑制态
     UiGuardian.clearExternalCancelSuppression();
     if (this.isConnecting || this.isConnected || this.pendingStart) {
+      return;
+    }
+    // 冷启动快捷启动：节点未就绪时排队，就绪后由看门狗补连（不报节点未生效）。
+    if (this.nodesLoading) {
+      this.pendingConnectAfterNodes = true;
+      this.startNodeReadinessWatch();
       return;
     }
     // 乐观反馈同 toggleConnection：快捷方式路径同样不出现无响应空窗
@@ -666,7 +570,7 @@ export struct HomePage {
 
   private async selectedNode(): Promise<ProxyNode | null> {
     // 作用域化 + 重锚：切订阅后的旧偏好不再当连接目标；刷新导致 id 漂移时按名自愈
-    const preferred = await this.subs.resolvePreferredNode();
+    const preferred = await this.subs.resolvePreferenceHint();
     return preferred !== null ? preferred : this.subs.fallbackConnectionNode();
   }
 
@@ -674,8 +578,8 @@ export struct HomePage {
     // 与订阅页顶部概览卡共用同一条取值路径（orchestrator.displayNodeName），
     // 两处显示必然一致。旧实现在这里各算一套，订阅页那份按连接状态分叉 →
     // 未连接时显示「未选择」，与主页按钮不一致（2026-10-25 用户实锤）。
-    this.currentNodeName = this.orchestrator.displayNodeName(
-      this.settings.preferredNodeId, this.settings.autoSelectMode);
+    // 统一读取口（2026-10-27）：不再传偏好参数，真源在内核侧。
+    this.currentNodeName = this.orchestrator.getCurrentNodeName();
   }
 
   /** 实时速率数值与单位拆分（文档 §3.1：数值 26 Bold + 单位 13 textSecondary） */
@@ -819,6 +723,19 @@ export struct HomePage {
     if (this.isConnecting || this.pendingStart) {
       return;
     }
+    // 冷启动节点还没就绪：不让用户白点一次再吃「节点选择未生效」。
+    // 记下意图，节点就绪后自动补连；再点一次可取消。
+    if (!this.isConnected && this.nodesLoading) {
+      this.startNodeReadinessWatch();
+      if (this.pendingConnectAfterNodes) {
+        this.pendingConnectAfterNodes = false;
+        promptAction.showToast({ message: '已取消本次自动连接' });
+      } else {
+        this.pendingConnectAfterNodes = true;
+        promptAction.showToast({ message: '节点加载中，就绪后自动连接…' });
+      }
+      return;
+    }
     const context = getContext(this) as Context;
     // 乐观反馈：任何 await 之前先点亮「正在连接」—— 冷启订阅 hydrate 等待
     // （最多 ~1.5s）绝不能变成按钮无响应的空窗
@@ -896,103 +813,6 @@ export struct HomePage {
     }
   }
 
-  /** Nexus §9 导出：快照 → JSON → 可选密码加密 → 系统文件选择器另存（用户自选导出位置） */
-  private async exportBackup(): Promise<void> {
-    try {
-      // P0-4：先经密码弹窗收集可选密码（留空=明文），确认后再走文件选择器
-      if (!this.exportPasswordAsked) {
-        this.exportPasswordAsked = true;
-        this.exportPending = true;
-        this.importDialogMode = 'export';
-        this.importHint = '';
-        this.exportPassword = '';
-        this.backupPasswordDialog.open();
-        return;
-      }
-      this.exportPasswordAsked = false;
-      const password = this.exportPassword;
-      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
-      const opts = new picker.DocumentSaveOptions();
-      opts.newFileNames = [BackupRestoreService.defaultFileName()];
-      opts.fileSuffixChoices = ['JSON 备份|.json'];
-      const uris = await docPicker.save(opts);
-      if (uris.length === 0) {
-        return;
-      }
-      let json = await BackupRestoreService.exportJsonWithSettings(this.settings);
-      if (password.length >= 4) {
-        const enc = BackupCrypto.encrypt(json, password);
-        if (!enc.ok) {
-          promptAction.showToast({ message: enc.message });
-          return;
-        }
-        json = enc.text;
-      }
-      const f = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      try {
-        fs.writeSync(f.fd, json);
-      } finally {
-        fs.closeSync(f);
-      }
-      const slash = uris[0].lastIndexOf('/');
-      const savedName = slash >= 0 ? uris[0].substring(slash + 1) : '备份文件';
-      this.backupToast = '✓ 备份文件已成功导出！';
-      promptAction.showToast({ message: `备份已导出：${savedName}` });
-      AppLogger.info(TAG, `backup exported: ${uris[0]}`);
-    } catch (e) {
-      this.backupToast = '';
-      promptAction.showToast({ message: '导出备份失败，请重试' });
-      AppLogger.error(TAG, `backup export failed: ${AppLogger.errText(e)}`);
-    }
-  }
-
-  /** Nexus §9 导入：系统文件选择器挑 .json → 校验恢复 */
-  private async importBackup(): Promise<void> {
-    try {
-      const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
-      const opts = new picker.DocumentSelectOptions();
-      opts.maxSelectNumber = 1;
-      opts.fileSuffixFilters = ['.json'];
-      const uris = await docPicker.select(opts);
-      if (uris.length === 0) {
-        return;
-      }
-      const uri = uris[0];
-      const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-      let text = '';
-      try {
-        const stat = fs.statSync(file.fd);
-        if (stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
-          promptAction.showToast({ message: '文件大小需在 4MB 以内' });
-          return;
-        }
-        const buf = new ArrayBuffer(Number(stat.size));
-        let readLen = 0;
-        while (readLen < Number(stat.size)) {
-          const chunk = fs.readSync(file.fd, buf, { offset: readLen, length: Number(stat.size) - readLen });
-          if (chunk <= 0) {
-            break;
-          }
-          readLen += chunk;
-        }
-        text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, readLen));
-      } finally {
-        fs.closeSync(file);
-      }
-      // 加密备份探测与解密：TunBox-Encrypted 信封 → 密码弹窗（decryptImportedBackup 内可重试 3 次）
-      if (BackupCrypto.isEncrypted(text)) {
-        this.importAttempt = 0;
-        this.openImportPasswordDialog(text, '');
-        return;
-      }
-      const outcome = await BackupRestoreService.importJsonText(text);
-      this.applyImportOutcome(outcome);
-    } catch (e) {
-      AppLogger.warn(TAG, `backup import failed: ${AppLogger.errText(e)}`);
-      promptAction.showToast({ message: '导入失败，请重试' });
-    }
-  }
-
   /** 代理模式三段按钮（2026-10-26 用户定稿：透明按钮 + 小椭圆高亮）：
    *  整条三段按钮没有底；只有选中项带一个小胶囊（宽度=文字+左右 20vp，高 34vp），
    *  胶囊用 modeChipFill/modeChipBorder（比 primaryLight 蓝一档，用户要求「再加重一点点」）。
@@ -1029,24 +849,9 @@ export struct HomePage {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
-        // ── 1. 顶部导航（文档 §2.1，无返回）：rightSlot 承载既有「备份 / 主题切换」入口 ──
+        // ── 1. 顶部导航（文档 §2.1，无返回）：rightSlot 只保留主题切换（备份已迁到设置页） ──
         TopNavBar({ title: 'TunBox' }) {
           Row({ space: 8 }) {
-            Row() {
-              Text('备份')
-                .fontSize(12)
-                .fontWeight(FontWeight.Bold)
-                .fontColor(TunBoxColors.textPrimary)
-            }
-            .padding({ left: 11, right: 11, top: 5, bottom: 5 })
-            .borderRadius(TunBoxGeometry.pillRadius)
-            .backgroundColor(TunBoxColors.chipBg)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
-            .accessibilityText('打开配置备份与恢复')
-            .onClick(() => {
-              this.backupToast = '';
-              this.backupDialog.open();
-            })
             Button() {
               SymbolGlyph($r('sys.symbol.sun_max'))
                 .fontSize(20)
@@ -1074,8 +879,10 @@ export struct HomePage {
             Column() {
               CelestialPowerOrb({
                 isConnected: $isConnected,
-                isConnecting: this.isConnecting || this.pendingStart,
-                nodeName: this.currentNodeName,
+                // 节点加载中不算「正在连接」：标题保持「开启连接」，副标题显示加载中，
+                // 节点就绪并自动补连后才切到「正在连接」。
+                isConnecting: this.isConnecting || (this.pendingStart && !this.nodesLoading),
+                nodeName: this.nodesLoading ? '节点加载中…' : this.currentNodeName,
                 onToggle: (): void => {
                   this.toggleConnection();
                 }

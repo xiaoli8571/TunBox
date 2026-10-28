@@ -199,9 +199,17 @@ export class SubscriptionQuotaService {
     }
     // 标记持久化（新增/清理过的 marks 都要写回，即使本次无新告警 —— 清理也是变更）
     if (evaluation.marksJson !== settings.quotaAlertMarks) {
-      settings.quotaAlertMarks = evaluation.marksJson;
+      // 字段级写入：本服务只拥有 quotaAlertMarks 一个字段。旧写法 `settings.xxx = …; save(settings)`
+      // 会把 run() 开头 load 的整份快照（可能已经过期）写回磁盘，盖掉期间用户改的节点/开关（审计 F2）。
+      // 写锁内再比一次：两个进程/两次刷新并发时，后到者发现自己已不是最新判定就不覆盖。
       try {
-        await SettingsService.save(settings);
+        await SettingsService.patchSettings((current: AppSettings): boolean => {
+          if (current.quotaAlertMarks === evaluation.marksJson) {
+            return false;
+          }
+          current.quotaAlertMarks = evaluation.marksJson;
+          return true;
+        });
       } catch (e) {
         // 保存失败只影响去重（可能重复提醒一次），不影响主流程
       }

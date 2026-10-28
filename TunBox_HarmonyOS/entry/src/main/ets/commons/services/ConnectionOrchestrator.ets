@@ -10,6 +10,7 @@
  *   → 本编排器轮询 Clash API 就绪 → selectNode → CONNECTED
  */
 import { vpnExtension, http, webSocket, socket, connection } from '@kit.NetworkKit';
+import { UnifiedScheduler } from './UnifiedScheduler';
 import type Want from '@ohos.app.ability.Want';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -17,8 +18,10 @@ import { notificationManager } from '@kit.NotificationKit';
 import { util } from '@kit.ArkTS';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { coreBridge } from '../../core/CoreBridge';
-import { ClashApiService, TrafficSnapshot } from './ClashApiService';
-import { RuntimeConfigBuilder, RuntimeConfigMode, RuntimeConfigProfile } from '../config/RuntimeConfigBuilder';
+import { ClashApiService, KernelGroupSelection, TrafficSnapshot } from './ClashApiService';
+import { KernelSelectionManager } from './KernelSelectionManager';
+import { ConnectionEvents, ConnEvent, ConnListener, ReconnectReason } from './ConnectionEvents';
+import { ConnectionTarget, ConnectionTargetSource, RuntimeConfigBuilder, RuntimeConfigMode, RuntimeConfigProfile } from '../config/RuntimeConfigBuilder';
 import { ClashConfigGenerator } from './ClashConfigGenerator';
 import { ConfigValidator } from './ConfigValidator';
 import { DoHResolver } from './DoHResolver';
@@ -34,6 +37,13 @@ import {
   SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText
 } from './RuntimeFilePolicy';
 import { chmodPrivate, ensurePrivateDir, privateFs } from './PrivateFileStore';
+import { ConnState } from './connection/ConnState';
+import { ConnectionStateMachine } from './connection/ConnectionStateMachine';
+import { ConnectionAttempt, ConnectionAttemptClock } from './connection/ConnectionAttempt';
+import {
+  ReconnectAttemptOutcome, ReconnectHost, ReconnectManager, ReconnectRuntimeState, ReconnectTelemetry
+} from './connection/ReconnectManager';
+
 import { SingleFlightTestCore, TestCoreStatus } from './TestCoreFlight';
 import { NetworkStateWatcher, NetworkStateListener, NetTypes } from './NetworkStateWatcher';
 import {
@@ -51,9 +61,16 @@ import { AppDiagnostics } from '../models/PublicIpInfo';
 import { AppProxyRoute } from './AppProxyRoute';
 import { AppLogger } from '../utils/AppLogger';
 // FlClash 同构：当前 Profile 原文（配置基底）
-import { ProfileStore } from '../flclash/ProfileStore';
+import { ProfileRepository } from '../flclash/ProfileRepository';
 import { CoreCatalogService } from '../flclash/CoreCatalogService';
 import { CoreNodeBridge } from '../flclash/CoreNodeBridge';
+
+// 状态枚举已抽到零依赖叶子模块（避免 stateMachine ↔ orchestrator 循环依赖）；
+// 这里再导出，保持既有 `import { ConnState } from '.../ConnectionOrchestrator'` 不变。
+export { ConnState };
+// 重连运行态快照已随 ReconnectManager 迁到 connection/（Phase 3）；同样再导出，
+// 保证 `import { ReconnectRuntimeState } from '.../ConnectionOrchestrator'` 的调用点不改。
+export { ReconnectRuntimeState, ReconnectTelemetry };
 
 const TAG = 'ConnectionOrchestrator';
 const MIXED_PORT = 7890;
@@ -288,36 +305,6 @@ export function nextReadinessDelayMs(currentMs: number): number {
   return Math.min(currentMs * 2, READINESS_MAX_DELAY_MS);
 }
 
-export enum ConnState {
-  DISCONNECTED = 0,
-  CONNECTING = 1,
-  CONNECTED = 2,
-  DISCONNECTING = 3,
-  RECOVERING = 4
-}
-
-/** 重连运行态（只读快照，供第三轮 UI 展示） */
-export class ReconnectRuntimeState {
-  /** 是否有挂起的重连定时器 */
-  active: boolean = false;
-  /** 是否正在执行重连（单航班） */
-  connecting: boolean = false;
-  /** 已发起的重连尝试次数 */
-  attempts: number = 0;
-  /** 最大尝试次数 */
-  maxAttempts: number = 3;
-  /** 下一次重连的退避延迟（ms） */
-  pendingDelayMs: number = 0;
-  /** 触发原因（network-changed / network-restored / ...） */
-  reason: string = '';
-  /** 当前网络类型 */
-  networkType: string = 'unknown';
-  /** 网络事件代数 */
-  networkGeneration: number = 0;
-  /** 网络监听是否已订阅 */
-  watcherSubscribed: boolean = false;
-}
-
 /** 单个修复动作的执行结果（内部结构） */
 class RepairOutcome {
   text: string = '';
@@ -412,6 +399,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private lastSubs: SubscriptionService | null = null;
   private lastNode: ProxyNode | null = null;
   /**
+   * 当前出口的**单一事实源**（已拆为独立管理器，2026-10-27 架构收口）。
+   * UI/日志/快照只读它，禁止再各自用 preferredNode* 推出「当前节点」。
+   */
+  private kernelSelection: KernelSelectionManager = new KernelSelectionManager();
+  /** 内核出口轮询节拍计数（每 N 次流量轮询对齐一次内核）。 */
+  private exitPollTick: number = 0;
+  /** 后台订阅刷新互斥（连接路径不再等待它）。 */
+  private backgroundRefreshRunning: boolean = false;
+  /**
    * 本次查询是否已经为「零节点」自动拉取过一次订阅。
    *
    * 全新安装的用户进应用就点连接：订阅已添加但从未拉取成功 → nodes 为空。
@@ -466,7 +462,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /**
    * 最近一次**生成配置时**使用的 profile id（FlClash 的「已生效 profile」）。
    *
-   * 内核只有一份配置；订阅切换/刷新后若这里与 `ProfileStore.currentId()` 不一致，
+   * 内核只有一份配置；订阅切换/刷新后若这里与 `ProfileRepository.currentId()` 不一致，
    * 说明内核里还是旧订阅的节点 —— 此时`/proxies`读到的是旧集合，
    * 测速就会出现「测的是 A 订阅、界面显示 B 订阅 → 全是 --」。
    */
@@ -484,12 +480,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private lastNetType: string = '';
   /** 上一次处理过的网络事件代数（防重复处理） */
   private lastNetGeneration: number = -1;
-  private reconnectTimer: number = -1;
-  private reconnectAttempts: number = 0;
-  private reconnectReasonText: string = '';
-  private reconnectPendingDelayMs: number = 0;
-  private reconnectMaxMs: number = RECONNECT_MAX_MS;
-  private readonly reconnectMaxAttempts: number = RECONNECT_MAX_ATTEMPTS;
+  private reconnects: ReconnectManager | null = null;
+
+  /**
+   * 连接事务时钟（2026-10-27 P0）。
+   * `connectSeq` 仍管请求排队；这里管「单次连接事务是否还有效」，
+   * 每个长 await 之后统一 checkpoint，旧事务不得再写状态/设置/出口。
+   */
+  private readonly attempts: ConnectionAttemptClock = new ConnectionAttemptClock();
+  /** 最近一次用户主动断开的时间（诊断用；不影响判断，判断看 disconnectRequested）。 */
+  private lastUserDisconnectAt: number = 0;
 
   // ── 第二阶段：链路自检 → 有限自动修复 ──────────────────────────────
   private healthReport: LinkHealthReport | null = null;
@@ -582,11 +582,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   requestDisconnect(): void {
     this.invalidateStateProbeCache();
     this.disconnectRequested = true;
+    this.lastUserDisconnectAt = Date.now();
     this.connectSeq = this.connectSeq + 1;
     this.testCoreLaunchGeneration++;
-    // 用户主动断开 → 取消一切挂起的退避重连（禁止重连风暴）
-    this.reconnectAttempts = 0;
-    this.cancelReconnect('user-disconnect');
+    // 用户主动断开 → 作废进行中的连接事务（旧事务的所有 await 之后都会被拒）。
+    this.attempts.cancelCurrent();
+    // 用户主动断开 → 取消一切挂起的退避重连并复位预算（禁止重连风暴）
+    this.reconnectManager().resetAttempts();
+    this.reconnectManager().cancel('user-disconnect');
   }
 
   /**
@@ -714,7 +717,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         this.lastNodeName = snap.nodeName;
         this.lastSubs = SubscriptionService.instance();
         this.lastNode = this.lastSubs.nodes.find((node: ProxyNode): boolean => node.name === snap.nodeName) ?? null;
-        this.state = ConnState.CONNECTED;
+        this.setState(ConnState.CONNECTED);
         if (changedSession || this.monitorTimer < 0) { this.startMonitors(); }
         this.notify();
         return 'already-connected';
@@ -877,7 +880,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (!authority.connected) {
         return false;
       }
-      this.state = ConnState.CONNECTED;
+      this.setState(ConnState.CONNECTED);
     }
     if (this.restarting) {
       return false;
@@ -1109,12 +1112,26 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     try {
       const settings: AppSettings = await SettingsService.load();
       let target = node;
-      const requestedProfile = ProfileStore.currentId();
+      const requestedProfile = ProfileRepository.currentId();
       if (requestedProfile.length > 0 && requestedProfile !== this.appliedProfileId) {
+        // preferredNode* 只是**用户偏好缓存**（2026-10-27 契约，见 AppSettings 类注释）：
+        // 切订阅时要先认内核**已经生效**的出口（ConnectionTarget，来源 /proxies），
+        // 它才是「当前是什么节点」；偏好只作同订阅内的兜底提示。
+        const liveName: string = this.kernelSelection.nodeName();
+        let liveNode: ProxyNode | null = null;
+        if (liveName.length > 0) {
+          for (const n of subs.nodesOf(requestedProfile)) {
+            if (n.name === liveName) { liveNode = n; break; }
+          }
+        }
         const preferred = subs.findNode(settings.preferredNodeId);
         const fallback = subs.fallbackConnectionNode();
-        target = preferred !== null && preferred.subscriptionId === requestedProfile
-          ? preferred : (fallback !== null ? fallback : node);
+        if (liveNode !== null) {
+          target = liveNode;
+        } else {
+          target = preferred !== null && preferred.subscriptionId === requestedProfile
+            ? preferred : (fallback !== null ? fallback : node);
+        }
       }
       const ruleProviderFileReady = this.isRuleProviderReady();
       // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
@@ -1126,6 +1143,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const hotProfile = await this.hydrateAndBuildProfile(subs, settings, target.name, hotPorts, this.apiSecret,
         this.lastProxyHosts, this.lastSmartModelReady, this.lastGeoipReady, ruleProviderFileReady);
       const hotBuilt = await RuntimeConfigBuilder.buildRuntimeConfig(hotProfile, RuntimeConfigMode.TUNNEL);
+      // 与 connect 同口径：钉选必须钉最终 YAML 的 PROXY 组首成员，否则 PUT 400 →
+      // 回滚热重载（节点被 validNodes 过滤 / 原文接管时尤其常见）。
+      const hotEffectiveName: string = (hotBuilt.effectiveNodeName ?? '').length > 0
+        ? hotBuilt.effectiveNodeName : target.name;
+      const hotEffectiveNode: ProxyNode | null =
+        (hotProfile.nodes ?? []).find((n: ProxyNode): boolean => n.name === hotEffectiveName) ?? null;
+      const hotPinNode: ProxyNode = hotEffectiveNode !== null ? hotEffectiveNode : target;
       if (!this.isRuleSessionCurrent(seq, generation)) {
         return false;
       }
@@ -1157,7 +1181,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return false;
       }
       // 热重载会重置 select 组；选点确认前不能提交新的 Profile 身份或磁盘基准。
-      const pinned = target.id.startsWith('profile:') || await this.api.selectNode(target.name);
+      const pinned = (hotEffectiveName === target.name && target.id.startsWith('profile:'))
+        || await this.api.selectNode(hotEffectiveName);
       if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
       if (!pinned) {
         const restored = await this.api.reloadFromPath(rollbackPath);
@@ -1177,10 +1202,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 隧道配置已按当前节点集重写 → 登记新指纹（测速前的过期判定用）
       this.tunnelConfigFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
       this.lastRuleProviderFileReady = ruleProviderFileReady;
-      this.lastNode = target;
-      this.lastNodeName = target.name;
+      this.lastNode = hotPinNode;
+      this.lastNodeName = hotEffectiveName;
       this.snapshotLastGoodConfig(safeYaml);
-      await this.updateSessionSnapshot(generation, true, 'connected', target.name, this.startedAt);
+      await this.updateSessionSnapshot(generation, true, 'connected', hotEffectiveName, this.startedAt);
       if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
       // mode 已在本次最终 YAML 中，不额外发送一个可能迟到的异步模式更新。
       AppLogger.info(TAG, `[hot-reload] rules applied without TUN rebuild (${reason})`);
@@ -1235,7 +1260,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * @returns hot / reconnect / none；ad-unavailable=需手动下载规则集；pending=另一热更进行中
    */
   /**
-   * 确保「内核里的配置」就是 `ProfileStore.currentId()` 指向的那份。
+   * 确保「内核里的配置」就是 `ProfileRepository.currentId()` 指向的那份。
    *
    * 订阅导入/切换后必须调一次再测速：否则内核仍是旧订阅的节点，
    * `/proxies` 返回旧集合，测速结果对不上界面（用户报障：新订阅测速全是 `--`）。
@@ -1263,12 +1288,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   async ensureProfileApplied(reason: string): Promise<boolean> {
-    const current = ProfileStore.currentId();
-    if (current.length === 0 || !ProfileStore.exists(current)) {
+    const current = ProfileRepository.currentId();
+    if (current.length === 0 || !ProfileRepository.exists(current)) {
       return false;
     }
     if (this.appliedProfileId === current
-      && this.appliedProfileRevision === ProfileStore.revisionOf(current)) {
+      && this.appliedProfileRevision === ProfileRepository.revisionOf(current)) {
       return true;
     }
     if (this.state !== ConnState.CONNECTED && this.state !== ConnState.CONNECTING) {
@@ -1289,7 +1314,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 所以「手动指定节点会自动重连，自动选择却不动」成了可感知的不对称。
     // 这里对齐：自动选择模式下走同一条完整重连路径。
     // 手动模式保持热重载不变（不打断用户正在用的固定节点）。
-    if (await this.shouldFullReconnectOnProfileSwitch()) {
+    if (await this.shouldFullReconnectOnProfileSwitch(current)) {
       const switched = await this.reconnectForProfileSwitch(current, reason);
       if (switched) {
         return true;
@@ -1305,8 +1330,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return ok;
   }
 
-  /** 切换订阅时是否应该完整重连而不是热重载（当前口径：自动选择模式）。 */
-  private async shouldFullReconnectOnProfileSwitch(): Promise<boolean> {
+  /**
+   * 切换订阅时是否应该完整重连而不是热重载。
+   *
+   * 两种情况必须重连：
+   * ① 自动选择模式：用户意图是「让内核按新订阅重新优选」，热重载会沿用旧选择；
+   * ② 手动模式但**钉住的出口不属于新 profile**（2026-10-28 用户报障）：旧节点名在
+   *    新配置里不存在，内核只能自己挑一个，而 App 侧 ConnectionTarget 仍写着旧订阅的
+   *    节点 → 主页 /「当前连接节点」显示旧订阅、订阅页复选框显示新订阅（偏好被
+   *    restoreRememberedNode 改成新订阅节点），三处互相矛盾。跨 profile 的钉节点在
+   *    物理上不可能成立，必须重新拨号把出口与真源一起落到新订阅。
+   *
+   * 手动模式且出口仍属于新 profile 时保持热重载（不打断用户正在用的固定节点）。
+   */
+  private async shouldFullReconnectOnProfileSwitch(profileId: string): Promise<boolean> {
     if (this.state !== ConnState.CONNECTED) {
       return false;
     }
@@ -1316,11 +1353,37 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     try {
       const settings: AppSettings = await SettingsService.load();
-      return settings.autoSelectMode === AutoSelectModes.AUTO;
+      if (settings.autoSelectMode === AutoSelectModes.AUTO) {
+        return true;
+      }
     } catch (e) {
       // 读不到设置不能据此拆掉用户正在用的隧道。
       return false;
     }
+    return !this.exitBelongsToProfile(profileId);
+  }
+
+  /**
+   * 当前出口节点是否属于指定 profile。
+   *
+   * 名字是跨数据源唯一稳定的节点标识（内核影子节点 id 是 `core:<name>`，与解析节点 id
+   * 不同），因此按名字 + 订阅作用域判定，而不是比 id。
+   */
+  private exitBelongsToProfile(profileId: string): boolean {
+    if (profileId.length === 0) {
+      return false;
+    }
+    const target: ConnectionTarget | null = this.kernelSelection.current();
+    const name: string = target !== null && target.nodeName.length > 0
+      ? target.nodeName : this.lastNodeName;
+    if (name.length === 0) {
+      // 没有可靠出口记录：按「不属于」处理，重连一次把事实落定，别让显示层继续挂旧值。
+      return false;
+    }
+    const subs: SubscriptionService = this.lastSubs !== null
+      ? this.lastSubs : SubscriptionService.instance();
+    return subs.nodes.some((n: ProxyNode): boolean =>
+      n.subscriptionId === profileId && n.name === name);
   }
 
   /**
@@ -1335,7 +1398,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       ? this.lastSubs : SubscriptionService.instance();
     let target: ProxyNode | null = null;
     try {
-      const preferred = await subs.resolvePreferredNode();
+      const preferred = await subs.resolvePreferenceHint();
       target = preferred !== null && preferred.subscriptionId === profileId ? preferred : null;
     } catch (e) {
       target = null;
@@ -1425,12 +1488,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.netWatcher !== null) {
       this.netWatcher.stop();
     }
-    this.cancelReconnect('watch-stopped');
+    this.reconnectManager().cancel('watch-stopped');
   }
 
-  /** 退避上限可配（ms） */
+  /** 退避上限可配（ms）；重连状态归 ReconnectManager，这里只转发配置 */
   setReconnectBackoffMax(ms: number): void {
-    this.reconnectMaxMs = ms > 0 ? ms : RECONNECT_MAX_MS;
+    this.reconnectManager().setMaxDelay(ms > 0 ? ms : RECONNECT_MAX_MS);
   }
 
   /**
@@ -1448,7 +1511,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.lastNetType = netType;
       AppLogger.info(TAG, `[reconnect] net change gen=${generation} ${prev.length === 0 ? '(init)' : prev} -> ${netType}`);
       if (netType === NetTypes.NONE) {
-        this.cancelReconnect('network-lost');
+        this.reconnectManager().cancel('network-lost');
         AppLogger.info(TAG, '[reconnect] network lost; wait for recovery (no reconnect)');
         return;
       }
@@ -1464,7 +1527,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return;
       }
       const restored = prev === NetTypes.NONE;
-      this.requestReconnect(restored ? 'network-restored' : 'network-changed');
+      this.reconnectManager().request(restored ? ReconnectReason.NETWORK_RESTORED
+        : ReconnectReason.NETWORK_CHANGED);
     } catch (e) {
       AppLogger.warn(TAG, `[reconnect] listener error: ${AppLogger.errText(e)}`);
     }
@@ -1475,118 +1539,72 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       || t === NetTypes.CELLULAR || t === NetTypes.ETHERNET;
   }
 
-  /** 请求一次（可能退避延后的）重连；单航班：已有挂起定时器则合并 */
-  private requestReconnect(reason: string): void {
-    this.evaluateIntentThenSchedule(reason).catch((e: Object): void => {
-      AppLogger.warn(TAG, `reconnect scheduling failed: ${AppLogger.errText(e)}`);
-    });
+  /**
+   * 重连管理器（Phase 3）：重连的**全部状态**（定时器 / 尝试计数 / 退避预算 / 原因）
+   * 都归 `ReconnectManager` 所有。编排器这里只做一次装配，并提供只读能力。
+   *
+   * 为什么用「懒装配 + 宿主回调」而不是把字段留在本类：
+   *   ① 宿主能力（意图、代数、单航班、网络）全是编排器的私有状态，用箭头闭包注入
+   *      可以避免为此新增一批 public getter（对外 API 表面最小）；
+   *   ② 管理器在第一次需要时才创建，避免字段初始化阶段就依赖 `this` 的其它字段。
+   */
+  private reconnectManager(): ReconnectManager {
+    let manager = this.reconnects;
+    if (manager === null) {
+      const host = new ReconnectHost();
+      host.wantsConnected = (): Promise<boolean> => this.isUserIntentConnected();
+      host.userDisconnected = (): boolean => this.disconnectRequested;
+      host.networkDown = (): boolean => this.lastNetType === NetTypes.NONE;
+      host.connectInFlight = (): boolean => this.state === ConnState.CONNECTING;
+      host.hasEndpoint = (): boolean => this.lastSubs !== null && this.lastNodeName.length > 0;
+      host.sessionGeneration = (): number => this.connectSeq;
+      host.networkType = (): string => this.currentNetworkType();
+      host.networkGeneration = (): number => this.networkGeneration();
+      host.watcherSubscribed = (): boolean => this.isNetworkWatcherSubscribed();
+      host.runAttempt = (reason: string): Promise<ReconnectAttemptOutcome> =>
+        this.runReconnectAttempt(reason);
+      host.onChanged = (): void => {
+        this.notify();
+      };
+      host.onGiveUp = (message: string): void => {
+        this.lastError = message;
+        this.notify();
+      };
+      manager = new ReconnectManager(host, RECONNECT_BASE_MS, RECONNECT_MAX_MS,
+        RECONNECT_MAX_ATTEMPTS);
+      this.reconnects = manager;
+    }
+    return manager;
   }
 
-  private async evaluateIntentThenSchedule(reason: string): Promise<void> {
-    const seq = this.connectSeq;
-    if (this.disconnectRequested) {
-      AppLogger.info(TAG, `[reconnect] user-disconnected; skip (${reason})`);
-      return;
-    }
-    const intent = await this.isUserIntentConnected();
-    if (seq !== this.connectSeq || this.disconnectRequested || this.lastNetType === NetTypes.NONE) { return; }
-    if (!intent) {
-      AppLogger.info(TAG, `[reconnect] intent=disconnected; skip (${reason})`);
-      return;
-    }
-    if (this.reconnectTimer >= 0) {
-      AppLogger.info(TAG, `[reconnect] already scheduled; coalesce (${reason})`);
-      return;
-    }
-    if (this.state === ConnState.CONNECTING) {
-      AppLogger.info(TAG, `[reconnect] connect in flight; skip (${reason})`);
-      return;
-    }
-    if (this.reconnectAttempts >= this.reconnectMaxAttempts) {
-      AppLogger.warn(TAG, `[reconnect] max attempts(${this.reconnectMaxAttempts}) reached; give up (${reason})`);
-      this.lastError = '网络切换后自动重连多次失败，已停止自动重试';
-      this.notify();
-      return;
-    }
-    const attempt = this.reconnectAttempts;
-    let delay = this.reconnectMaxMs;
-    const scaled = RECONNECT_BASE_MS * Math.pow(2, attempt);
-    if (scaled < delay) {
-      delay = scaled;
-    }
-    this.reconnectAttempts = this.reconnectAttempts + 1;
-    this.reconnectReasonText = reason;
-    this.reconnectPendingDelayMs = delay;
-    AppLogger.info(TAG, `[reconnect] schedule attempt ${this.reconnectAttempts}/${this.reconnectMaxAttempts} in ${delay}ms (${reason})`);
-    this.notify();
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = -1;
-      this.reconnectPendingDelayMs = 0;
-      this.runScheduledReconnect(reason).catch((e: Object): void => {
-        AppLogger.warn(TAG, `scheduled reconnect failed: ${AppLogger.errText(e)}`);
-      });
-    }, delay);
-  }
-
-  private async runScheduledReconnect(reason: string): Promise<void> {
-    const seq = this.connectSeq;
-    if (this.disconnectRequested) {
-      AppLogger.info(TAG, '[reconnect] cancelled by user disconnect before attempt');
-      this.reconnectAttempts = 0;
-      this.notify();
-      return;
-    }
+  /**
+   * 真正执行一次重连尝试（由 `ReconnectManager` 在退避到点后调用）。
+   *
+   * 这里只做编排器才能做的事：取上一次端点、找节点、`connect()`，以及**代数判定**
+   * （`connectSeq` 变了 ⇒ 本次尝试已被新事务取代，旧链路必须停，绝不排重试）。
+   */
+  private async runReconnectAttempt(reason: string): Promise<ReconnectAttemptOutcome> {
     const subs = this.lastSubs;
     if (subs === null || this.lastNodeName.length === 0) {
       AppLogger.warn(TAG, '[reconnect] no previous endpoint; abort');
-      return;
-    }
-    const intent = await this.isUserIntentConnected();
-    if (seq !== this.connectSeq || this.disconnectRequested || this.lastNetType === NetTypes.NONE) { return; }
-    if (!intent) {
-      AppLogger.info(TAG, '[reconnect] intent disconnected; abort');
-      this.reconnectAttempts = 0;
-      return;
-    }
-    if (this.state === ConnState.CONNECTING) {
-      AppLogger.info(TAG, '[reconnect] connect in flight; abort'); // 单航班
-      return;
+      return ReconnectAttemptOutcome.SUPERSEDED;
     }
     const node = this.findNodeByName(subs, this.lastNodeName);
     if (node === null) {
       AppLogger.warn(TAG, '[reconnect] node not found; abort');
-      return;
+      return ReconnectAttemptOutcome.FAILED;
     }
-    AppLogger.info(TAG, `[reconnect] attempt ${this.reconnectAttempts}/${this.reconnectMaxAttempts} (${reason})`);
     const attemptSeq = this.connectSeq + 1;
     const ok = await this.connect(node, subs);
+    if (attemptSeq !== this.connectSeq) {
+      // 期间又开了新事务（用户手动连接 / 切订阅）⇒ 本次尝试的结论无效。
+      return ReconnectAttemptOutcome.SUPERSEDED;
+    }
     if (ok) {
-      AppLogger.info(TAG, `[reconnect] success (${reason})`);
-      this.reconnectAttempts = 0;
-      this.cancelReconnect('reconnected');
-      return;
+      return ReconnectAttemptOutcome.SUCCESS;
     }
-    AppLogger.warn(TAG, `[reconnect] attempt failed (${reason})`);
-    if (attemptSeq !== this.connectSeq) { return; }
-    if (this.disconnectRequested) {
-      this.reconnectAttempts = 0;
-      return;
-    }
-    if (this.reconnectAttempts < this.reconnectMaxAttempts) {
-      this.requestReconnect(reason + '-retry');
-    } else {
-      this.lastError = '网络切换后自动重连失败（已达最大尝试次数）';
-      this.notify();
-    }
-  }
-
-  private cancelReconnect(reason: string): void {
-    if (this.reconnectTimer >= 0) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = -1;
-      this.reconnectPendingDelayMs = 0;
-      AppLogger.info(TAG, `[reconnect] timer cancelled (${reason})`);
-    }
+    return this.disconnectRequested ? ReconnectAttemptOutcome.SUPERSEDED
+      : ReconnectAttemptOutcome.FAILED;
   }
 
   /** 用户连接意图（进程内状态优先，否则读持久化快照） */
@@ -1623,19 +1641,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.netWatcher !== null && this.netWatcher.isSubscribed();
   }
 
-  /** 重连运行态快照 */
+  /** 重连运行态快照（重连状态全部归 ReconnectManager） */
   reconnectState(): ReconnectRuntimeState {
-    const r = new ReconnectRuntimeState();
-    r.active = this.reconnectTimer >= 0;
-    r.connecting = this.state === ConnState.CONNECTING;
-    r.attempts = this.reconnectAttempts;
-    r.maxAttempts = this.reconnectMaxAttempts;
-    r.pendingDelayMs = this.reconnectPendingDelayMs;
-    r.reason = this.reconnectReasonText;
-    r.networkType = this.currentNetworkType();
-    r.networkGeneration = this.networkGeneration();
-    r.watcherSubscribed = this.isNetworkWatcherSubscribed();
-    return r;
+    return this.reconnectManager().snapshot(this.state === ConnState.CONNECTING);
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -1883,7 +1891,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // 3 次，每次都要手动恢复）。这里改为交给既有退避重连：用户意图仍为
         // "连接"时按指数退避重试，只有 intent=disconnected 或重试耗尽才放弃。
         if (this.disconnectRequested) {
-          this.state = ConnState.DISCONNECTED;
+          this.setState(ConnState.DISCONNECTED);
           if (this.lastError.length === 0) {
             this.lastError = '内核已死，链路自检与有限修复未能恢复，已停止自动重试';
           }
@@ -1896,9 +1904,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (this.lastError.length === 0) {
           this.lastError = '内核已被系统回收，正在自动重连…';
         }
-        this.state = ConnState.RECOVERING;
+        this.setState(ConnState.RECOVERING);
         this.notify();
-        this.requestReconnect('core-killed-by-system');
+        this.reconnectManager().request(ReconnectReason.CORE_KILLED_BY_SYSTEM);
         return;
       }
       // 自检被关闭：退回既有有界恢复策略（最多 2 次）
@@ -1911,7 +1919,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           return;
         }
       }
-      this.state = ConnState.DISCONNECTED;
+      this.setState(ConnState.DISCONNECTED);
       this.lastError = '内核异常退出，自动恢复失败，请手动重连';
       this.notify();
     } finally {
@@ -2129,8 +2137,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     this.failoverRunning = true;
     try {
-      this.reconnectAttempts = 0;
-      this.cancelReconnect('failover-switch');
+      this.reconnectManager().resetAttempts();
+      this.reconnectManager().cancel('failover-switch');
       const ok = await this.connect(node, subs);
       AppLogger.info(TAG, `[failover] switch to ${next.name} result=${ok}`);
       return ok;
@@ -2159,22 +2167,103 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 展示用「当前连接节点」名称 —— **主页启动按钮与订阅页顶部概览卡共用这一个方法**，
    * 两处显示必然是同一节点（2026-10-25 用户要求：接口完全一致，不许各写一套）。
    *
-   * 取值顺序（沿用主页既有的 refreshDisplayNode 语义，不新增分支）：
+   * 取值顺序（2026-10-27 架构收口：**内核真源优先**）：
    *   ① 自动模式且 smart 模型就位 → 「♻️ 自动选择」（出口由内核挑，名字不固定）
-   *   ② preferredNodeId 在当前订阅内命中 → 该节点名（用户手动选点走这条）
-   *   ③ fallbackConnectionNode() → 当前订阅第一个可用真实节点 / 「订阅默认出口」
-   *   ④ '' → 当前订阅确实没有可用节点，由调用方给可行动文案
+   *   ② `KernelSelectionManager` 记录的当前出口（本次/上次真实出口，连接期间由 refreshExitFromKernel
+   *      持续与内核对齐）→ 用它。**这是唯一有资格代表"当前节点"的来源。**
+   *   ③ preferredNodeId 在当前订阅内命中 → 该节点名（偏好缓存：仅未连接且无出口时）
+   *   ④ fallbackConnectionNode() → 当前订阅第一个可用真实节点
+   *   ⑤ '' → 当前订阅确实没有可用节点，由调用方给可行动文案
    *
-   * 关键：这里**不看连接状态、也不查内核 /proxies**。用户选的是哪个节点，与此刻
-   * 是否连上无关；旧订阅页实现按 `state === CONNECTED` 分叉、未连接固定回「未选择」，
-   * 真机上「手动选了吹雪云节点仍显示未选择」就是它造成的。
+   * 为什么 ② 不再限定 `state === CONNECTED`：用户在内核里换了出口（通知栏/组内自动
+   * 切换/另一个入口），而偏好没同步时，只有内核真源能反映事实。旧实现以连接状态分叉
+   * 或只读偏好，才会出现「UI 香港、实际新加坡」。
    */
+  /** 订阅连接事件（状态/流量/出口）。返回 token，页面 aboutToDisappear 时退订。 */
+  subscribeConnEvents(listener: ConnListener): number {
+    return ConnectionEvents.subscribe(listener);
+  }
+
+  unsubscribeConnEvents(token: number): void {
+    ConnectionEvents.unsubscribe(token);
+  }
+
+  /**
+   * 状态写入的**唯一入口**（2026-10-27）：赋值 + 变化时推送事件。
+   *
+   * 直接写 `this.state = X` 会让订阅方收不到变化，退化成轮询 ——
+   * 因此所有转换必须走这里（门禁 pc9 会检查）。
+   */
+  private setState(next: ConnState): void {
+    if (this.state === next) { return; }
+    if (!this.stateTransitionAllowed(next)) { return; }
+    this.state = next;
+    // 双通道：① 既有 listeners（HomePage 等）② 新事件总线（带载荷，供后续去轮询）
+    this.notify();
+    ConnectionEvents.emit(ConnEvent.state(next, this.startedAt));
+  }
+
+  /**
+   * 状态迁移门禁（与 `setState` 分开只为让「赋值 + 推送」保持单入口且可读）。
+   *
+   * ① 用户主动断开后的「复活屏障」：迟到的网络/恢复回调不得把状态推回连接态；
+   * ② 合法迁移动表：表外迁移直接拒绝并记录（不再允许任何代码随手赋值）。
+   */
+  private stateTransitionAllowed(next: ConnState): boolean {
+    if (this.disconnectRequested && ConnectionStateMachine.blockedByUserDisconnect(true, next)) {
+      AppLogger.warn(TAG, `state transition blocked after user disconnect: `
+        + `${this.state} -> ${next}`);
+      return false;
+    }
+    const violation: string | null = ConnectionStateMachine.explain(this.state, next);
+    if (violation !== null) {
+      AppLogger.warn(TAG, `${violation}（已拒绝；当前=${this.state}）`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * 「当前出口节点名」的统一读取口（2026-10-27，P1 命名收口）。
+   *
+   * 与旧的 `displayNodeName(preferredNodeId, autoSelectMode)` 的差别：
+   * 调用方**不再传偏好相关参数** —— 偏好只是缓存，由本方法内部按优先级降级，
+   * 接口本身就不给"用偏好决定当前节点"留口子。
+   */
+  getCurrentNodeName(): string {
+    const s: AppSettings | null = SettingsService.peek();
+    const autoMode: string = s !== null ? s.autoSelectMode : '';
+    const preferredId: string = s !== null ? s.preferredNodeId : '';
+    return this.displayNodeName(preferredId, autoMode);
+  }
+
+  /** 当前连接目标（组 + 节点 + 来源）；未确认过返回 null。 */
+  getCurrentConnectionTarget(): ConnectionTarget | null {
+    return this.kernelSelection.current();
+  }
+
+  /** @deprecated 用 getCurrentNodeName()；保留只为兼容既有调用点。 */
   displayNodeName(preferredNodeId: string, autoSelectMode: string): string {
     if (autoSelectMode === AutoSelectModes.AUTO && this.ensureSmartModelReady()) {
       return ClashConfigGenerator.SMART_GROUP_NAME;
     }
+    // ① 已连接：**只认内核真源**（连接期间由 refreshExitFromKernel 与 /proxies 对齐）。
+    //    「界面显示香港、实际走新加坡」从显示层消失的关键一步（2026-10-27 架构收口）：
+    //    已连接时 preferredNode* 无权决定「当前是什么节点」。
+    //
+    // ② 未连接：**必须读用户意图**（偏好缓存）。原因：内核出口只有在连接/切换发生时
+    //    才会更新；用户刚在节点页手选了一个节点、还没连接时，内核里仍是上一个出口。
+    //    2026-10-27 真机回归：这里不看状态一律先读内核，导致「手选节点后，主页按钮和
+    //    订阅页顶部仍显示上次那个节点，连接后才变」——本函数因此按状态分流。
     const svc = SubscriptionService.instance();
-    const preferred = svc.preferredNodeInCurrentProfile(preferredNodeId);
+    const liveName: string = this.kernelSelection.nodeName();
+    if (this.state === ConnState.CONNECTED && liveName.length > 0
+      && svc.nodeByNameCurrent(liveName) !== null) {
+      return liveName;
+    }
+    const peeked = SettingsService.peek();
+    const preferredName: string = peeked !== null ? peeked.preferredNodeName : '';
+    const preferred = svc.resolveUserPreference(preferredNodeId, preferredName);
     if (preferred !== null) {
       return preferred.name;
     }
@@ -2183,6 +2272,40 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return fallback.name;
     }
     return '';
+  }
+
+  /**
+   * 用内核真源刷新「当前出口」（2026-10-27，显示层不再依赖偏好）。
+   *
+   * 连接期间周期调用：用户在内核里换了出口（通知栏/组内自动切换/其它入口），
+   * 或自动模式优选到了别的节点，这里把当前出口与偏好缓存一起对齐；
+   * UI 下一次渲染（`displayNodeName`）读到的就是事实，而不是旧偏好。
+   */
+  async refreshExitFromKernel(): Promise<void> {
+    if (this.state !== ConnState.CONNECTED || this.api === null) {
+      return;
+    }
+    try {
+      const changed: ConnectionTarget | null =
+        await this.kernelSelection.syncFromKernel(this.api, this.kernelSelection.groupName(),
+          ProfileRepository.currentId());
+      if (changed === null) { return; }
+      this.lastNodeName = changed.nodeName;
+      AppLogger.info(TAG, `exit changed on kernel: ${changed.label()}`);
+      ConnectionEvents.emit(ConnEvent.exit(changed.groupName, changed.nodeName));
+      await this.selfHealPreferredNode(changed.nodeName, [], '');
+    } catch (e) {
+      AppLogger.warn(TAG, `refresh exit from kernel failed: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  /**
+   * 「出口组 → 当前节点」的统一展示值（2026-10-27 架构收口）。
+   * 例如 `吹雪云 → 🇭🇰香港•移联01`；尚未成功连接过则返回空串，由调用方回退到
+   * preferredNode* 推导的「上次选择」。主页若要显示"组"，只读这一个方法。
+   */
+  connectionTargetLabel(): string {
+    return this.kernelSelection.label();
   }
 
   /**
@@ -2891,8 +3014,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 不一致就重建（配置按当前节点集重新生成），再谈探活。
       const staleConfig: boolean = this.testCoreNodeFingerprint.length > 0
         && (this.testCoreNodeFingerprint !== SubscriptionService.nodeSetFingerprint(subs.nodes)
-          || this.appliedProfileId !== ProfileStore.currentId()
-          || this.appliedProfileRevision !== ProfileStore.revisionOf(ProfileStore.currentId()));
+          || this.appliedProfileId !== ProfileRepository.currentId()
+          || this.appliedProfileRevision !== ProfileRepository.revisionOf(ProfileRepository.currentId()));
       if (staleConfig) {
         AppLogger.info(TAG, 'test core config is stale (node set changed); rebuilding test core');
         await this.stopTestCore();
@@ -3169,6 +3292,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         abilityName: 'VpnExtensionAbility',
         parameters: launchParams
       };
+      // 扩展是**独立进程**，它读的是磁盘上的设置：拉起前强制刷一次，避免防抖窗口未落盘。
+      await SettingsService.flushNow();
       await vpnExtension.startVpnExtensionAbility(want);
       if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       this.invalidateStateProbeCache();
@@ -3330,7 +3455,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return;
     }
     if (this.tunnelConfigFingerprint === SubscriptionService.nodeSetFingerprint(subs.nodes)
-      && this.appliedProfileRevision === ProfileStore.revisionOf(ProfileStore.currentId())) {
+      && this.appliedProfileRevision === ProfileRepository.revisionOf(ProfileRepository.currentId())) {
       return;
     }
     AppLogger.info(TAG, 'tunnel config is stale (node set changed); hot reloading');
@@ -3480,6 +3605,42 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 测速/连接都找不到节点（真机 2026-10-20：34/34 秒败）。
    * 收敛到一处之后，「配置里没有节点」这件事只可能来自这一处。
    */
+  /**
+   * 后台刷新订阅（**不阻塞连接**，2026-10-27）。
+   *
+   * 为什么必须后台：冷启动点连接时若节点表尚未就绪，旧实现会串行刷新全部订阅并 await，
+   * 死订阅还要吃满 3 次重试 —— 实测把「立即连接」拖到 11~12s，而等 2s 再点只要 0.7s。
+   * 现在连接只用现成节点（或 profile 原文接管）先连上，刷新在后台跑，失败的订阅
+   * 记入待补拉，由连接成功后的 self-heal 补。
+   */
+  private refreshSubscriptionsInBackground(subs: SubscriptionService): void {
+    if (this.backgroundRefreshRunning) { return; }
+    this.backgroundRefreshRunning = true;
+    const run = async (): Promise<void> => {
+      // 串行：并发写订阅仓会互相打断（凭据规范化较重），这里要的是不阻塞而非更快。
+      for (const s of subs.subscriptions) {
+        try {
+          const r: SubscriptionRefreshResult = await subs.refreshSubscription(s.id);
+          if (r.status !== SubscriptionRefreshStatus.OK
+            && r.status !== SubscriptionRefreshStatus.NOT_MODIFIED) {
+            AppLogger.warn(TAG, `background refresh ${s.name}: ${r.status} ${r.message}`);
+            if (r.status === SubscriptionRefreshStatus.NETWORK_ERROR) {
+              subs.markNetworkFetchFailure(s.id);
+            }
+          }
+        } catch (e) {
+          AppLogger.warn(TAG, `background refresh ${s.name} failed: ${AppLogger.errText(e)}`);
+        }
+      }
+    };
+    run().then((): void => {
+      this.backgroundRefreshRunning = false;
+    }, (e: Error): void => {
+      this.backgroundRefreshRunning = false;
+      AppLogger.warn(TAG, `background refresh chain failed: ${AppLogger.errText(e)}`);
+    });
+  }
+
   private async hydrateAndBuildProfile(subs: SubscriptionService, settings: AppSettings,
     selectedNodeName: string, ports: RuntimePorts, secret: string,
     proxyHosts: Record<string, string>, smartModelReady: boolean,
@@ -3517,20 +3678,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // ── FlClash 同构：当前 Profile 的订阅原文（配置基底）───────────────────
     // 当前 profile 未设置时回落第一个启用订阅的 id（旧数据：升级后第一次连接也能用）。
     // 原文缺失（未迁移/写盘失败）→ 空串 → builder 保持旧的 overlay 全量生成。
-    let profileId = ProfileStore.currentId();
-    if (profileId.length === 0 || !ProfileStore.exists(profileId)) {
+    let profileId = ProfileRepository.currentId();
+    if (profileId.length === 0 || !ProfileRepository.exists(profileId)) {
       // 回落顺序：当前 profile 失效 → 第一个**已落盘**的启用订阅（有 profile 文件才能当基底）
       for (const candidate of subs.subscriptions) {
-        if (candidate.enabled && ProfileStore.exists(candidate.id)) {
+        if (candidate.enabled && ProfileRepository.exists(candidate.id)) {
           profileId = candidate.id;
           break;
         }
       }
     }
     if (profileId.length > 0) {
-      const sourceYaml = ProfileStore.read(profileId);
-      this.pendingProfileRevision = ProfileStore.fingerprint(sourceYaml);
-      profile.profileYaml = sourceYaml.length > 0 ? await ProfileStore.prepare(sourceYaml) : '';
+      const sourceYaml = ProfileRepository.read(profileId);
+      this.pendingProfileRevision = ProfileRepository.fingerprint(sourceYaml);
+      profile.profileYaml = sourceYaml.length > 0 ? await ProfileRepository.prepare(sourceYaml) : '';
       if (profile.profileYaml.length === 0) {
         // 文件读不出来（被删/写盘中断）：**不要**把它当配置基底，也不要把
         // applied 记成它 —— 否则界面会认为内核里是这份 profile，
@@ -3541,7 +3702,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     this.pendingProfileId = profileId;
     AppLogger.info(TAG, `profile base: id=${profileId.length > 0 ? profileId : '<none>'} `
-      + `bytes=${profile.profileYaml.length} exists=${profileId.length > 0 ? ProfileStore.exists(profileId) : false}`);
+      + `bytes=${profile.profileYaml.length} exists=${profileId.length > 0 ? ProfileRepository.exists(profileId) : false}`);
     return profile;
   }
 
@@ -3618,9 +3779,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 先登记意图再等待任何异步读取，用户停止可以使排队请求立即失效。
     this.disconnectRequested = false;
     const seq = ++this.connectSeq;
+    // 连接事务：带上「这次连的是哪份配置的哪个版本」。之后每个长 await 后
+    // 都用 attempt.checkpoint() 判断是否还该继续（旧事务不得再写任何状态）。
+    const startProfileId: string = ProfileRepository.currentId();
+    const attempt: ConnectionAttempt = this.attempts.begin(startProfileId,
+      ProfileRepository.revisionOf(startProfileId), 'connect');
     const task = this.lifecycleWrites.then((): Promise<boolean> => {
       if (seq !== this.connectSeq || this.disconnectRequested) { return Promise.resolve(false); }
-      return this.connectExclusive(node, subs, seq);
+      return this.connectExclusive(node, subs, seq, attempt);
     });
     this.lifecycleWrites = task.then((): void => {}, (): void => {});
     const connected = await task;
@@ -3639,7 +3805,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return false;
   }
 
-  private async connectExclusive(node: ProxyNode, subs: SubscriptionService, seq: number): Promise<boolean> {
+  private async connectExclusive(node: ProxyNode, subs: SubscriptionService, seq: number,
+    attempt: ConnectionAttempt): Promise<boolean> {
     this.failedConnectSeq = -1;
     // 策略拒绝不是网络故障：在任何状态变化/拆隧道/修复与故障切换前退出。
     let settings: AppSettings;
@@ -3684,7 +3851,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `subs hydration wait failed: ${AppLogger.errText(e)}`);
       }
     }
-    if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
+    if (!attempt.checkpoint(this.attempts.currentGeneration())
+      || seq !== this.connectSeq || this.disconnectRequested) { return false; }
 
     // ── 硬门禁：一个节点都没有时，绝不拉起 VPN 扩展 ─────────────────────────
     // 全新安装的典型路径：订阅已添加但尚未拉取成功 → subs.nodes 为空。
@@ -3697,9 +3865,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 不进入 CONNECTING、不写配置、不拉起扩展、不占用 20s。
     if (subs.nodes.length === 0 && !subs.hasUsableProfile()) {
       await this.autoRefreshForZeroNodes(subs);
-      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
+      if (!attempt.checkpoint(this.attempts.currentGeneration())
+        || seq !== this.connectSeq || this.disconnectRequested) { return false; }
       if (subs.nodes.length === 0 && !subs.hasUsableProfile()) {
-        this.state = ConnState.DISCONNECTED;
+        this.setState(ConnState.DISCONNECTED);
         this.lastError = '没有可用节点：请先到「订阅」页添加订阅并点击刷新，等节点列表出现后再连接';
         this.notify();
         AppLogger.warn(TAG, 'connect refused: zero nodes available '
@@ -3709,7 +3878,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
 
     const stateBeforeConnect: ConnState = this.state;
-    this.state = ConnState.CONNECTING;
+    this.setState(ConnState.CONNECTING);
     this.lastError = '';
     this.lastSubs = subs;
     this.lastNodeName = node.name;
@@ -3757,8 +3926,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // FlClash 同构（2026-10-22）：节点来自内核 `/proxies`（影子节点 `core:<name>`）时，
       // 配置由订阅原文决定，App 侧不需要「能序列化成 YAML」——名字在内核里就是有效节点。
       // 旧判据会把影子节点判成无效并回落到 subs.nodes[0]（真机实测：点了香港Z09、连的是 hy2台湾）。
+      // 【2026-10-27 冷启动 12s 定案】凭据引导在后台跑（冷启动 +980ms 才就绪），而这里
+      // 的有效性判据依赖 `proxyYamlLine()` —— 凭据没回填时它对每个节点都返回空串，
+      // 于是「刚点连接」被误判成「没有任何有效节点」，接着串行刷新订阅（死订阅还要
+      // 重试 3×700ms），实测把立即连接拖到 11~12s；等 2s 再点则只要 0.7s。
+      // 修法：先在**这里**等凭据就绪（幂等，后面的 hydrateAndBuildProfile 再调是 no-op），
+      // 再做有效性判定。代价 0：这笔等待本来就在连接路径上，只是提前了。
+      await subs.ensureCredentials();
+      const profileExists: boolean = ProfileRepository.exists(ProfileRepository.currentId());
       const isValidNode = (n: ProxyNode): boolean =>
-        CoreNodeBridge.isShadow(n) || n.id.startsWith('profile:') || ClashConfigGenerator.proxyYamlLine(n).length > 0;
+        CoreNodeBridge.isShadow(n) || n.id.startsWith('profile:')
+          || ClashConfigGenerator.proxyYamlLine(n).length > 0
+          // 原文接管（FlClash 同构）时 nodes 由 profile 原文决定，App 侧能否序列化
+          // 与「能否连上」无关 —— 拿序列化能力判有效性会制造假阴性。
+          || profileExists;
       let target: ProxyNode = node;
       if (!isValidNode(target)) {
         const firstValid = subs.nodes.find((n) => isValidNode(n)) ?? null;
@@ -3766,43 +3947,26 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           target = firstValid;
           AppLogger.warn(TAG, `preferred node invalid; fall back to ${target.name}`);
         } else {
-          AppLogger.warn(TAG, 'no valid node config; auto-refreshing subscriptions');
-          // 【2026-10-24 限时】连接路径内的自动刷新必须有总预算：蜂窝下面板超时/530
-          // 每条要吃满传输层重试（真机取证：4 个订阅串行 60s，用户全程卡在「连接中」）。
-          // 15s 预算内刷多少算多少，到点用现有节点继续；刷不出来的留给连接成功后的
-          // self-heal 补拉（markNetworkFetchFailure 机制不变）。
-          const refreshDeadline = Date.now() + 15000;
-          for (const s of subs.subscriptions) {
-            if (Date.now() >= refreshDeadline) {
-              AppLogger.warn(TAG, 'connect-time auto-refresh budget exhausted; continuing with current nodes');
-              break;
-            }
-            try {
-              // 单条硬帽 12s：refreshSubscription 的传输层重试链最坏 45s，
-              // race 放弃后该条刷新仍在后台自行落地（写锁保证安全），连接不再等它
-              const refreshResult = await Promise.race([
-                subs.refreshSubscription(s.id),
-                new Promise<SubscriptionRefreshResult>((_, reject) => {
-                  setTimeout(() => reject(new Error('connect-time refresh budget (12s) exceeded')), 12000);
-                })
-              ]);
-              if (refreshResult.status !== SubscriptionRefreshStatus.OK
-                && refreshResult.status !== SubscriptionRefreshStatus.NOT_MODIFIED) {
-                AppLogger.warn(TAG,
-                  `auto refresh ${s.name} failed: ${refreshResult.status} ${refreshResult.message}`);
-                if (refreshResult.status === SubscriptionRefreshStatus.NETWORK_ERROR) {
-                  // P0-2 订阅自救：这里仍直连（隧道未建立），网络性失败记入待补拉，
-                  // 连接成功后的 self-heal 会自动重试一次
-                  subs.markNetworkFetchFailure(s.id);
-                }
-              }
-            } catch (e) {
-              AppLogger.warn(TAG, `auto refresh ${s.name} failed: ${AppLogger.errText(e)}`);
-            }
+          AppLogger.warn(TAG, 'no valid node config; refreshing subscriptions in background');
+          // 【2026-10-27】连接路径**绝不等待**订阅刷新：实测死订阅的 3 次重试就能把
+          // 「立即连接」拖到 11~12s，而用户等 2s 再点只要 0.7s —— 差别全在这里。
+          // 现在只做两件事：① 后台串行刷新（不 await，成功后自愈）；② 最多等 1200ms
+          // 拿现成节点，超时就继续（配置由 profile 原文接管，不依赖订阅刷新）。
+          this.refreshSubscriptionsInBackground(subs);
+          const waitDeadline = Date.now() + 1200;
+          let retry: ProxyNode | null = subs.nodes.find((n) => isValidNode(n)) ?? null;
+          while (retry === null && Date.now() < waitDeadline) {
+            await new Promise<void>((resolve) => setTimeout((): void => resolve(), 120));
+            retry = subs.nodes.find((n) => isValidNode(n)) ?? null;
           }
-          const retry = subs.nodes.find((n) => isValidNode(n)) ?? null;
           if (retry === null) {
-            throw new Error('订阅节点配置无效：请到「订阅」页点击「全部刷新」，确认节点已成功导入后再连接');
+            // 仍然没有可序列化节点：只要 profile 原文在，目标节点依旧有效（见上面注释）。
+            if (profileExists) {
+              AppLogger.warn(TAG, 'still no serializable node; continuing with profile takeover');
+              retry = target;
+            } else {
+              throw new Error('订阅节点配置无效：请到「订阅」页点击「全部刷新」，确认节点已成功导入后再连接');
+            }
           }
           target = retry;
         }
@@ -4000,7 +4164,42 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const tunnelProfile = await this.hydrateAndBuildProfile(subs, settings, target.name, tunnelPorts, this.apiSecret,
         proxyHosts, smartReady, geoipReady, ruleProviderFileReady);
       const built = await RuntimeConfigBuilder.buildRuntimeConfig(tunnelProfile, RuntimeConfigMode.TUNNEL);
+      // 配置构建含 DoH 刷新/合并/校验，是连接中最长的一步之一：用户可能已停止，
+      // 或订阅已被刷新（revision 变了）—— 旧事务不得把旧配置推到内核上。
+      if (!attempt.checkpoint(this.attempts.currentGeneration())
+        || seq !== this.connectSeq || this.disconnectRequested) { return false; }
       const yaml = built.yaml;
+      // ── 冷启动「节点选择未生效」根治（2026-10-27 用户报障）───────────────
+      // `target` 来自 App 侧节点表（可能是上次落盘的旧名字），而最终 YAML 的
+      // PROXY 组由「validNodes 过滤 + 订阅原文接管」决定，未必包含它。旧代码仍拿
+      // `target.name` 去 PUT /proxies → 必然 400 → 整个连接失败，用户只能手动重新
+      // 测速/刷新后再连一次。这里改用构建结果里的 `effectiveNodeName`（最终 YAML
+      // PROXY 组首成员）钉选，并把偏好自愈成它，下一次冷启动不再踩同一个旧名字。
+      const effectiveName: string = (built.effectiveNodeName ?? '').length > 0
+        ? built.effectiveNodeName : target.name;
+      const effectiveNode: ProxyNode | null =
+        (tunnelProfile.nodes ?? []).find((n: ProxyNode): boolean => n.name === effectiveName) ?? null;
+      const pinNode: ProxyNode = effectiveNode !== null ? effectiveNode : target;
+      if (effectiveName !== target.name) {
+        AppLogger.warn(TAG, `pin target "${target.name}" missing from final PROXY group; `
+          + `pinning "${effectiveName}" instead`);
+        this.lastNode = pinNode;
+        this.lastNodeName = effectiveName;
+        try {
+          await SettingsService.patchSettings((p: AppSettings): void => {
+            p.preferredNodeId = effectiveNode !== null ? effectiveNode.id : '';
+            p.preferredNodeName = effectiveName;
+            p.preferredNodeSubscriptionId = effectiveNode !== null
+              ? effectiveNode.subscriptionId : target.subscriptionId;
+            p.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+              p.preferredNodeNamesBySubscription,
+              effectiveNode !== null ? effectiveNode.subscriptionId : target.subscriptionId,
+              effectiveName);
+          });
+        } catch (e) {
+          AppLogger.warn(TAG, `self-heal preferred node failed: ${AppLogger.errText(e)}`);
+        }
+      }
       if (settings.autoSelectMode === AutoSelectModes.AUTO && !built.options.useSmart) {
         AppLogger.info(TAG, 'auto mode but Model.bin not ready; using app-side selection '
           + '(smart group disabled this session; downloading in background)');
@@ -4077,7 +4276,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 可能永不 resolve —— 加 15s 竞速超时, 保证 UI 不会无限转圈。
       const launchFloorTs = Date.now();
       await Promise.race([
-        vpnExtension.startVpnExtensionAbility(want),
+        (async (): Promise<void> => {
+          await SettingsService.flushNow();
+          await vpnExtension.startVpnExtensionAbility(want);
+        })(),
         new Promise<void>((resolve, reject) => {
           setTimeout(() => {
             reject(new Error('VPN 扩展拉起超时（15s）：系统授权弹窗未完成或扩展无法启动，请重试'));
@@ -4102,7 +4304,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         this.clearStartError();
         const retryFloorTs = Date.now();
         await Promise.race([
-          vpnExtension.startVpnExtensionAbility(want),
+          (async (): Promise<void> => {
+          await SettingsService.flushNow();
+          await vpnExtension.startVpnExtensionAbility(want);
+        })(),
           new Promise<void>((resolve, reject) => {
             setTimeout(() => {
               reject(new Error('VPN 扩展重试拉起超时（15s）'));
@@ -4150,7 +4355,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             this.writeStartParamsFile(stagedConfigPath, appRouting.mode, appRouting.needsReview, packagesJson);
             this.clearStartError();
             await Promise.race([
-              vpnExtension.startVpnExtensionAbility(want),
+              (async (): Promise<void> => {
+          await SettingsService.flushNow();
+          await vpnExtension.startVpnExtensionAbility(want);
+        })(),
               new Promise<void>((resolve, reject) => {
                 setTimeout(() => {
                   reject(new Error('VPN 扩展重试拉起超时（15s）'));
@@ -4247,25 +4455,196 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // 生成器写的是带引号形式（`- name: "♻️ 自动选择"`）；旧检查不带引号永远匹配
         // 不上 → 自动模式一直在钉选用户手动节点（2026-10-25 真机实证「没有去优选」）。
         && yaml.includes(`name: "${ClashConfigGenerator.SMART_GROUP_NAME}"`);
-      const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : target.name;
+      const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : effectiveName;
       // A provider-only profile can start with its own default group policy.
       // Explicit user picks must be confirmed through the actual group graph.
-      const pinned = target.id.startsWith('profile:') ? true : await this.api.selectNode(pinTargetName);
+      // 只有「目标本来就是 profile 伪节点且没有被改名」时才跳过钉选。
+      // 钉选阶段硬预算（2026-10-27 二次修）：任何一条兜底路径都不得把用户按在
+      // 「正在连接」上爬几分钟。实测旧实现这里会空转 134s。
+      const pinT0: number = Date.now();
+      // 钉选阶段开始前再过一道事务门禁：用户可能刚刚停止/切了节点。
+      if (!attempt.checkpoint(this.attempts.currentGeneration())
+        || seq !== this.connectSeq || this.disconnectRequested) { return false; }
+      const PIN_PHASE_BUDGET_MS: number = 12000;
+      // ── 内核优先（2026-10-27 架构收口，用户报障定案）────────────────────
+      // `profile.store-selected: true` 已开、设备 cache.db 也在 ⇒ 内核**本来就把每个
+      // 组的当前选择持久化了**。旧实现却每次冷启动拿 `settings.preferredNodeName`
+      // 去覆盖它：换机场后那个名字属于旧订阅（真机 `新加坡01aws`）→ 覆盖必然失败 →
+      // 134s 空转 →「节点选择未生效」。现在按 FlClash 口径，优先级：
+      //   ① 用户偏好**严格命中**主组叶子成员 → 钉它（保留用户意图）；
+      //   ② 主组 `now` 是合法叶子 → **直接采用，不 PUT**（这就是上次的真实出口）；
+      //   ③ 都不成立 → 才走 resolvePinTarget（地区自愈）/ 内核叶子兜底。
+      const kernelSel: KernelGroupSelection | null =
+        await this.api.readKernelSelection(built.ruleGroupName);
+      let userPickValid: boolean = false;
+      if (kernelSel !== null && !pinSmartGroup) {
+        for (const leaf of kernelSel.leafMembers) {
+          if (leaf === target.name) { userPickValid = true; break; }
+        }
+      }
+      let finalNodeName: string = effectiveName;
+      let fallbackNode: ProxyNode | null = null;
+      let pinned: boolean = false;
+      if (userPickValid) {
+        pinned = await this.api.selectNode(target.name);
+        if (pinned) { finalNodeName = target.name; }
+      }
+      let adoptedByKernel: boolean = false;
+      if (!pinned && kernelSel !== null && !pinSmartGroup && kernelSel.nowIsLeaf) {
+        // 内核已持有合法出口 ⇒ 本次不写内核，直接认它（从此不再有「显示 vs 实际」漂移）。
+        pinned = true;
+        adoptedByKernel = true;
+        finalNodeName = kernelSel.now;
+        AppLogger.info(TAG, `pin adopted kernel selection: group="${kernelSel.group}" `
+          + `now="${kernelSel.now}" (skipped PUT)`);
+      }
+      if (!pinned && (effectiveName === target.name && target.id.startsWith('profile:'))) {
+        pinned = true;
+      }
+      if (!pinned && pinTargetName.length > 0) {
+        pinned = await this.api.selectNode(pinTargetName);
+      }
+      if (adoptedByKernel) {
+        // 内核真源与偏好不一致时必须回写偏好，否则下次冷启动还会拿旧名字去试。
+        await this.selfHealPreferredNode(finalNodeName, tunnelProfile.nodes ?? [],
+          target.subscriptionId);
+      }
+      // provider-only 订阅：文本里的组只有内部占位符，真实成员由内核 `use: provider`
+      // 运行时注入，文本无法预知。此时按当前订阅的节点表逐个试钉（只限同一订阅，
+      // 绝不跨订阅猜），成功即自愈偏好。
+      const candidates: ProxyNode[] = target.subscriptionId.length > 0
+        ? subs.nodesOf(target.subscriptionId) : tunnelProfile.nodes;
+      if (!pinned && candidates.length > 0) {
+        let attempted: number = 0;
+        for (const cand of candidates) {
+          if (attempted >= 8 || Date.now() - pinT0 >= PIN_PHASE_BUDGET_MS) { break; }
+          if (cand.name.length === 0 || cand.name === pinTargetName
+            || cand.name.startsWith('__') || cand.id.startsWith('profile:')
+            || cand.server.length === 0
+            || cand.name.includes('剩余') || cand.name.includes('到期')) {
+            continue;
+          }
+          attempted++;
+          if (await this.api.selectNode(cand.name)) {
+            pinned = true;
+            finalNodeName = cand.name;
+            fallbackNode = cand;
+            break;
+          }
+        }
+        if (pinned && fallbackNode !== null) {
+          AppLogger.warn(TAG, `pin "${pinTargetName}" failed; auto-pinned "${finalNodeName}" `
+            + `from current subscription instead`);
+          this.lastNode = fallbackNode;
+          this.lastNodeName = finalNodeName;
+          try {
+            await SettingsService.patchSettings((p: AppSettings): void => {
+              p.preferredNodeId = fallbackNode !== null ? fallbackNode.id : '';
+              p.preferredNodeName = finalNodeName;
+              p.preferredNodeSubscriptionId = fallbackNode !== null
+                ? fallbackNode.subscriptionId : target.subscriptionId;
+              p.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+                p.preferredNodeNamesBySubscription,
+                fallbackNode !== null ? fallbackNode.subscriptionId : target.subscriptionId,
+                finalNodeName);
+            });
+          } catch (e) {
+            AppLogger.warn(TAG, `self-heal fallback node failed: ${AppLogger.errText(e)}`);
+          }
+        }
+      }
+      if (!pinned && Date.now() - pinT0 < PIN_PHASE_BUDGET_MS) {
+        AppLogger.warn(TAG, `pin failed for ${pinTargetName}; retrying before fail-fast`);
+        const retryDelays: number[] = [500, 1000, 1500];
+        for (const delayMs of retryDelays) {
+          if (Date.now() - pinT0 >= PIN_PHASE_BUDGET_MS) { break; }
+          await new Promise<void>((resolve) => setTimeout((): void => resolve(), delayMs));
+          if (await this.api.selectNode(pinTargetName)) {
+            pinned = true;
+            break;
+          }
+        }
+      }
+
+      if (!pinned && Date.now() - pinT0 < PIN_PHASE_BUDGET_MS) {
+        // ── 冷启动竞态容错（2026-10-27 二次修，真机实测 21:08:52→21:10:37）──────
+        // 旧实现拿 **App 侧节点表**逐个试钉：换机场/机场改名后那份表全是**旧订阅的
+        // 名字**，每个候选还要吃满 3s 收敛窗口 —— 实测 47 个候选 ≈ 134s 静默空转，
+        // 用户看到的就是「一直正在连接」，最后才报「节点选择未生效」。
+        // 现在只走两条快路，整段受 PIN_PHASE_BUDGET_MS 约束，且逐次可追：
+        //   ① 最终 YAML 认定的节点（buildRuntimeConfig 已按地区关键词自愈过）；
+        //   ② 内核 /proxies 里该策略组真实存在的第一个叶子节点（唯一事实源）。
+        const yamlFirst: string = built.effectiveNodeName ?? '';
+        if (yamlFirst.length > 0 && yamlFirst !== pinTargetName
+          && Date.now() - pinT0 < PIN_PHASE_BUDGET_MS) {
+          if (await this.api.selectNode(yamlFirst)) {
+            pinned = true;
+            finalNodeName = yamlFirst;
+            AppLogger.warn(TAG, `pin fallback: yaml-first "${yamlFirst}" accepted`);
+          }
+        }
+        if (!pinned && Date.now() - pinT0 < PIN_PHASE_BUDGET_MS) {
+          const kernelPick: string | null = await this.api.selectLeafFromKernelGroup(built.ruleGroupName);
+          if (kernelPick !== null) {
+            pinned = true;
+            finalNodeName = kernelPick;
+            AppLogger.warn(TAG, `pin fallback: kernel pick "${kernelPick}" accepted`);
+          }
+        }
+        if (pinned) {
+          // 落到的节点与用户偏好不一致时必须自愈偏好，否则下次冷启动再踩同一个死名字。
+          await this.selfHealPreferredNode(finalNodeName, tunnelProfile.nodes ?? [],
+            target.subscriptionId);
+        } else {
+          AppLogger.warn(TAG, `pin fallback exhausted in ${Date.now() - pinT0}ms `
+            + `(node="${pinTargetName}" group="${built.ruleGroupName}")`);
+        }
+      }
+
       if (!pinned) {
-        // ⚠ 2026-10-24 审计勘误：上方 4043-4049 的「只 warn、不抛错（0.3.3 口径）」注释
-        // 已过时 —— 后续真机取证（见 4035-4038：连上了但代理不生效/公网 IP 查不到）
-        // 把口径改为 fail-fast，并由 verify-connect-stability 的 b9.no-fake-success 契约
-        // 守护（选点未生效必须阻止 CONNECTED）。瞬态的首个 PUT 400/超时由
-        // ClashApiService.selectNode 内的一次重试吸收，走到这里的就是真钉不上。
-        throw new Error(`节点选择未生效：${pinTargetName}，未将本次连接标记为成功`);
+        // 最后一道闸（唯一判定点）：链路其实已经可用时**绝不能**判失败。
+        // 重新问一次内核 —— 只要放弃钉选的这段时间里内核已落到某个叶子节点，
+        // 就认它并把偏好回写成内核真相；否则才 fail-fast（b9.no-fake-success 契约）。
+        const recheck: KernelGroupSelection | null =
+          await this.api.readKernelSelection(built.ruleGroupName);
+        if (recheck !== null && recheck.nowIsLeaf) {
+          pinned = true;
+          adoptedByKernel = true;
+          finalNodeName = recheck.now;
+          AppLogger.warn(TAG, `pin "${pinTargetName}" gave up but kernel already routes via `
+            + `"${recheck.now}" (group="${recheck.group}"); adopting it`);
+          await this.selfHealPreferredNode(finalNodeName, tunnelProfile.nodes ?? [],
+            target.subscriptionId);
+        } else {
+          AppLogger.error(TAG, `pin failed for "${pinTargetName}" `
+            + `(group="${built.ruleGroupName}" elapsed=${Date.now() - pinT0}ms)`);
+          throw new Error(`节点选择未生效：${pinTargetName}，未将本次连接标记为成功`);
+        }
       }
 
-      if (seq !== this.connectSeq) {
+      // ── 单一事实源：本次连接目标（组 + 节点 + 来源）──────────────────────
+      // 之后 UI/日志/快照一律读它，不再各自维护「显示节点」与「连接节点」两套状态。
+      // 2026-10-27：节点名来自内核回读收敛（finalNodeName），来源用枚举，
+      // 并带上 profileRevision + generation —— 迟到的旧事务写回可被直接丢弃。
+      const chosenSource: ConnectionTargetSource = adoptedByKernel
+        ? ConnectionTargetSource.KERNEL
+        : (finalNodeName === target.name ? ConnectionTargetSource.USER : ConnectionTargetSource.YAML);
+      this.kernelSelection.set(new ConnectionTarget(built.ruleGroupName, finalNodeName,
+        chosenSource, attempt.profileId, Date.now(),
+        this.pendingProfileRevision, attempt.generation));
+      ConnectionEvents.emit(ConnEvent.exit(built.ruleGroupName, finalNodeName));
+      AppLogger.info(TAG, `connection target: ${this.kernelSelection.label()} `
+        + `source=${chosenSource} ${attempt.label()}`);
+
+      // 提交前的最后一道事务门禁：任何旧事务/用户停止都在这里出局。
+      if (!attempt.checkpoint(this.attempts.currentGeneration()) || seq !== this.connectSeq
+        || this.disconnectRequested) {
         await this.disconnectInternal(intentGeneration);
-        return false; // 已被更新的连接请求取代
+        return false; // 已被更新的连接请求/用户停止取代
       }
 
-      this.state = ConnState.CONNECTED;
+      this.setState(ConnState.CONNECTED);
+      attempt.complete();
       this.startedAt = Date.now();
       this.recoveryAttempts = 0;
       this.startMonitors();
@@ -4277,8 +4656,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 本次配置已被内核接受并真的连上 → 留作 last-good，供未来拒载时回滚。
       this.snapshotLastGoodConfig(preparedConfig);
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
-      this.reconnectAttempts = 0;
-      this.cancelReconnect('connected');
+      this.reconnectManager().resetAttempts();
+      this.reconnectManager().cancel('connected');
       this.notify();
       AppLogger.info(TAG, `connect timing: prep=${tPrep}ms prelaunch=${tPrelaunch}ms`
         + ` launch=${tLaunch}ms ready=${tReady}ms pinned=${Date.now() - connectT0}ms`
@@ -4286,12 +4665,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 连接快照升格为 connected：同代写入。期间若用户已推进新代次（又点了
       // 断开或连接）则放弃写入 —— 绝不用旧结果覆盖更新的用户意图。
       const committed = await this.updateSessionSnapshot(intentGeneration, true, 'connected',
-        target.name, this.startedAt);
+        finalNodeName, this.startedAt);
       if (!committed) {
         AppLogger.warn(TAG, 'session generation moved on during connect; snapshot not overwritten');
       }
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
-      await this.recordNodeSuccess(target.name);
+      await this.recordNodeSuccess(finalNodeName);
       if (seq !== this.connectSeq || this.disconnectRequested) {
         await this.disconnectInternal(intentGeneration);
         return false;
@@ -4305,7 +4684,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // —— 两条通知重复（用户实锤），这里只清掉可能残留的旧 id-1001
       TunBoxNotifier.cancel().catch((): void => {});
       this.notify();
-      AppLogger.info(TAG, `connected to node ${target.name}`);
+      AppLogger.info(TAG, `connected to node ${finalNodeName}`);
       // 隧道就绪：把 **App 自身** 的 HTTP 请求导到本地 mixed 端口。
       // 否则出口 IP 查询（api64.ipify.org）与 geo/规则集/模型下载（GitHub 镜像）
       // 都从物理网卡直连 —— 国内即表现为「节点能测速、出口 IP 获取失败、
@@ -4328,7 +4707,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `connect rollback failed: ${AppLogger.errText(cleanupError)}`);
       }
       if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
-      this.state = ConnState.DISCONNECTED;
+      this.setState(ConnState.DISCONNECTED);
       this.startedAt = 0;
       this.ipv6Active = false;
       this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
@@ -4351,6 +4730,47 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       this.failedConnectSeq = seq;
       return false;
+    }
+  }
+
+  /**
+   * 把「这次实际钉上的节点」写回偏好，避免下次冷启动继续拿旧名字撞墙
+   * （2026-10-27 二次修：换机场后 preferredNodeName 是旧订阅的 `新加坡01aws`，
+   *  最终 YAML 里只有 `🇸🇬新加坡•移联01` —— 不自愈就会永久复现「节点选择未生效」）。
+   */
+  private async selfHealPreferredNode(nodeName: string, nodes: ProxyNode[],
+    fallbackSubId: string): Promise<void> {
+    let matched: ProxyNode | null = null;
+    for (const n of nodes) {
+      if (n.name === nodeName) { matched = n; break; }
+    }
+    if (matched === null) {
+      // 节点表没带全（例如内核回报了别的订阅里的出口）时按名再查一次。
+      // 先按「当前 profile」作用域查找，避免把别家订阅的同名节点当成本次偏好。
+      const svc = SubscriptionService.instance();
+      const scoped = svc.resolveUserPreference('', nodeName);
+      matched = scoped !== null ? scoped : svc.nodeByNameCurrent(nodeName);
+    }
+    this.lastNode = matched;
+    this.lastNodeName = nodeName;
+    const subId: string = matched !== null ? matched.subscriptionId : fallbackSubId;
+    try {
+      await SettingsService.patchSettings((p: AppSettings): void => {
+        // 2026-10-27 真机回归修复：matched=null 时**不得清空 preferredNodeId**。
+        // id 只是快速索引，名称才是跨刷新稳定锚；清空 id 会让节点页的
+        // 「已选」复选框变空，而内核实际仍走该节点（用户看到的就是“没勾选却连着它”）。
+        if (matched !== null) {
+          p.preferredNodeId = matched.id;
+        }
+        p.preferredNodeName = nodeName;
+        if (subId.length > 0) {
+          p.preferredNodeSubscriptionId = subId;
+          p.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+            p.preferredNodeNamesBySubscription, subId, nodeName);
+        }
+      });
+    } catch (e) {
+      AppLogger.warn(TAG, `self-heal preferred node failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -4407,10 +4827,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 2026-10-20 自动断开整改：修复期重连（repairReconnect）里的"断开"只是
     // 重建隧道的一步，不该把 UI 落成"已断开"——那会让用户以为掉线，卡片也会在
     // 重连窗口里闪断。修复全程保持 RECOVERING。
-    this.state = this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTING;
-    this.notify();
+    // 2026-10-27：改走 setState（唯一写入口），否则订阅方收不到事件，UI 会滞后。
+    this.setState(this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTING);
     await this.disconnectInternal();
-    this.state = this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTED;
+    this.setState(this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTED);
     this.startedAt = 0;
     this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
     this.api.resetTrafficBaseline();
@@ -5206,13 +5626,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private startMonitors(): void {
     this.stopMonitors();
     const generation = this.monitorGeneration;
-    this.monitorTimer = setInterval(() => {
+    this.monitorTimer = UnifiedScheduler.every(() => {
       this.pollRuntimeLiveness(generation).catch((e: Error): void => {
         AppLogger.warn(TAG, `liveness probe failed: ${AppLogger.errText(e)}`);
       });
     }, CORE_LIVENESS_POLL_MS);
     this.trafficPollRunning = false;
-    this.trafficTimer = setInterval(() => {
+    this.trafficTimer = UnifiedScheduler.every(() => {
       if (this.trafficPollRunning || this.state !== ConnState.CONNECTED) {
         return;
       }
@@ -5221,7 +5641,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.api.traffic().then((t: TrafficSnapshot) => {
         if (!this.isCurrentMonitor(generation, seq)) { return; }
         this.traffic = t;
+        ConnectionEvents.emit(ConnEvent.traffic(t.uploadSpeed, t.downloadSpeed,
+          t.uploadBytes, t.downloadBytes));
         if (this.state === ConnState.CONNECTED) {
+          this.exitPollTick++;
+          if (this.exitPollTick % 5 === 0) {
+            this.refreshExitFromKernel().catch((e: Error): void => {
+              AppLogger.warn(TAG, `exit poll failed: ${AppLogger.errText(e)}`);
+            });
+          }
           TaskProgressUpdater.updateLive(
             this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
             // 2026-10-19：实况通知单行宽度有限，速率串用紧凑写法（去掉多余空格），
@@ -5313,7 +5741,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           return;
         }
         this.resetCoreDeathConfirmation();
-        this.state = ConnState.RECOVERING;
+        this.setState(ConnState.RECOVERING);
         this.notify();
         AppLogger.warn(TAG, 'terminal black hole confirmed: lease fresh but core dead '
           + 'and extension recovery exhausted; escalating to full reconnect');
@@ -5340,7 +5768,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return;
       }
       this.resetCoreDeathConfirmation();
-      this.state = ConnState.RECOVERING;
+      this.setState(ConnState.RECOVERING);
       this.notify();
       AppLogger.warn(TAG, 'runtime unresponsive: lease and authenticated controller '
         + `failed ${CORE_DEATH_CONFIRMATIONS} spaced checks; escalating to health self-check`);
@@ -5366,11 +5794,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.livenessPollRunning = false;
     this.resetCoreDeathConfirmation();
     if (this.monitorTimer >= 0) {
-      clearInterval(this.monitorTimer);
+      UnifiedScheduler.clear(this.monitorTimer);
       this.monitorTimer = -1;
     }
     if (this.trafficTimer >= 0) {
-      clearInterval(this.trafficTimer);
+      UnifiedScheduler.clear(this.trafficTimer);
       this.trafficTimer = -1;
     }
     this.trafficPollRunning = false;

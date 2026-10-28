@@ -112,7 +112,7 @@ function runOnce() {
   const out = `${r.stdout || ''}\n${r.stderr || ''}`;
   const arktsErrors = out
     .split('\n')
-    .filter((l) => /ArkTS Compiler Error|ERROR: 10605\d+|arkts-no-|Failed :entry:default@CompileArkTS|CompileArkTS.*error/i.test(l));
+    .filter((l) => /ArkTS Compiler Error|ERROR: 10605\d+|ERROR: ArkTS|Failed :entry:default@CompileArkTS|CompileArkTS.*error/i.test(l));
   const buildOk = /BUILD SUCCESSFUL/.test(out);
   return { out, arktsErrors, buildOk };
 }

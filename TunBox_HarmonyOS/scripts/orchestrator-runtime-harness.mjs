@@ -69,10 +69,112 @@ export function harness() {
     setTimeout(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay, once: true }); return id; },
     clearTimeout(id) { timers.delete(id); },
     ClashApiService: Api, ConnectionSnapshot: class {},
+    // 2026-10-27：状态枚举/事务/状态机已抽成独立模块，沙箱里必须提供等价替身，
+    // 否则字段初始化（new ConnectionAttemptClock()）与 setState 门禁会 ReferenceError。
+    // 数值必须与 entry/src/main/ets/commons/services/connection/ConnState.ets 一致。
+    ConnState: { DISCONNECTED: 0, CONNECTING: 1, CONNECTED: 2, DISCONNECTING: 3,
+      RECOVERING: 4, RECONNECTING: 5, ERROR: 6 },
+    ConnectionStateMachine: {
+      explain() { return null; },
+      canTransition() { return true; },
+      blockedByUserDisconnect() { return false; },
+      interruptible() { return true; }
+    },
+    ConnectionTargetSource: { YAML: 'yaml', KERNEL: 'kernel', USER: 'user',
+      AUTO: 'auto', RESTORE: 'restore', FALLBACK: 'fallback' },
+    ConnectionTarget: class ConnectionTarget {
+      constructor(groupName = '', nodeName = '', source = 'yaml', profileId = '',
+        selectedAt = 0, profileRevision = '', generation = 0) {
+        this.groupName = groupName; this.nodeName = nodeName; this.source = source;
+        this.profileId = profileId; this.selectedAt = selectedAt;
+        this.profileRevision = profileRevision; this.generation = generation;
+      }
+      belongsTo(id) { return this.profileId.length > 0 && this.profileId === id; }
+      label() { return this.groupName.length === 0 ? this.nodeName : this.groupName + ' → ' + this.nodeName; }
+    },
+    ConnectionAttemptClock: class ConnectionAttemptClock {
+      constructor() { this.gen = 1; }
+      begin(profileId, profileRevision, reason) {
+        const generation = this.gen++;
+        return {
+          id: generation, generation, profileId, profileRevision, reason,
+          startedAt: 0, cancelled: false,
+          cancel() { this.cancelled = true; },
+          complete() {}, fail() {},
+          isCancelled() { return this.cancelled; },
+          isActive() { return !this.cancelled; },
+          checkpoint() { return !this.cancelled; },
+          sameProfile(id, rev) { return this.profileId === id && this.profileRevision === rev; },
+          getOutcome() { return 0; },
+          label() { return 'attempt#' + this.id + ' gen=' + this.generation; }
+        };
+      }
+      currentGeneration() { return this.gen; }
+      currentAttempt() { return null; }
+      superseded() { return false; }
+      cancelCurrent() { this.gen++; }
+    },
+    // 2026-10-27 拆分后的新边界：执行器沙箱里必须是可用的替身，
+    // 否则 new ConnectionOrchestrator() 字段初始化就会 ReferenceError。
+    KernelSelectionManager: class KernelSelectionManager {
+      current() { return null; }
+      nodeName() { return ''; }
+      groupName() { return ''; }
+      label() { return ''; }
+      set() {}
+      clear() {}
+      async read() { return null; }
+      async pickLeaf() { return null; }
+      async syncFromKernel() { return null; }
+    },
+    ConnectionEvents: {
+      subscribe() { return 1; }, unsubscribe() {}, emit() {}, count() { return 0; }
+    },
+    ConnEvent: class ConnEvent {
+      constructor(kind) { this.kind = kind; this.state = 0; this.startedAt = 0;
+        this.groupName = ''; this.nodeName = ''; this.upSpeed = 0; this.downSpeed = 0;
+        this.upTotal = 0; this.downTotal = 0; }
+      static state(next, startedAt) { const e = new ConnEvent(0); e.state = next; e.startedAt = startedAt; return e; }
+      static exit(g, n) { const e = new ConnEvent(2); e.groupName = g; e.nodeName = n; return e; }
+      static traffic(a, b, c, d) { const e = new ConnEvent(1); e.upSpeed = a; e.downSpeed = b; e.upTotal = c; e.downTotal = d; return e; }
+    },
+    ReconnectReason: {
+      NETWORK_RESTORED: 'network-restored', NETWORK_CHANGED: 'network-changed',
+      CORE_KILLED_BY_SYSTEM: 'core-killed-by-system', CORE_NOT_ALIVE: 'core-not-alive',
+      RETRY: 'retry', USER_REQUEST: 'user-request'
+    },
+    // UnifiedScheduler 必须是**真的会排程**的替身：假定时器表里不注册任务，
+    // h.tick() 就永远不会触发存活探针（表现为 coreDeathStrikes 恒为 0）。
+    UnifiedScheduler: {
+      every(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
+      clear(id) { timers.delete(id); },
+      count() { return timers.size; }
+    },
+    ReconnectPolicy: {
+      delayMs(attempt, baseMs, maxMs) {
+        const n = attempt < 1 ? 1 : attempt;
+        const scaled = baseMs * Math.pow(2, n - 1);
+        return scaled < maxMs ? scaled : maxMs;
+      },
+      exhausted(attempts, maxAttempts) { return attempts >= maxAttempts; },
+      describeBackoff(attempts, maxAttempts, delayMs) {
+        return delayMs !== null && delayMs > 0
+          ? 'attempt ' + attempts + '/' + maxAttempts + ' in ' + delayMs + 'ms'
+          : 'attempt ' + attempts + '/' + maxAttempts;
+      }
+    },
     SettingsService: {
       async init() {}, async loadSnapshot() { return { ...h.snapshot }; },
       async saveSnapshot(s) { h.writes++; h.snapshot = { ...s }; },
       async getApiSecret() { return h.storedSecret; }
+    },
+    // 2026-10-27：connect() 现在用 ProfileRepository 给事务打上 profile+revision，
+    // 沙箱里必须有替身（不能读真实磁盘）。
+    ProfileRepository: {
+      currentId() { return 'fixture-profile'; },
+      revisionOf() { return 'fixture-revision'; },
+      fingerprint(text) { return 'fp-' + String(text).length; },
+      read() { return ''; }
     },
     SubscriptionService: { instance: () => subs, onNodeSetChanged() {} },
     NetworkStateWatcher: class {
@@ -101,6 +203,12 @@ export function harness() {
   Object.assign(context, load('commons/services/TunnelAuthority.ets',
     '({ resolveAuthority, parseExtensionStatus, deriveUiPhase })', context));
   Object.assign(context, load('commons/services/RuntimeFilePolicy.ets', '({ heartbeatAgeFromText })', context));
+  // Phase 3（2026-10-28）：退避策略与重连链路已独立成模块，门禁必须跑**真实**实现。
+  // 用桩会让「用户断开后旧定时器不得复活」「作废尝试不得排重试」这类断言失去意义。
+  Object.assign(context, load('commons/services/ReconnectPolicy.ets', '({ ReconnectPolicy })', context));
+  Object.assign(context, load('commons/services/connection/ReconnectManager.ets',
+    '({ ReconnectManager, ReconnectHost, ReconnectAttemptOutcome, ReconnectRuntimeState, ReconnectTelemetry })',
+    context));
   const { ConnectionOrchestrator, ConnState } = load('commons/services/ConnectionOrchestrator.ets',
     '({ ConnectionOrchestrator, ConnState })', context);
   const orch = new ConnectionOrchestrator(); orch.init({ cacheDir: '/sandbox' });

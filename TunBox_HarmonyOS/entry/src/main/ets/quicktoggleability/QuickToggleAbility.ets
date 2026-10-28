@@ -27,6 +27,7 @@
  * 重复点击/在途请求：单航班 + 末次意图合并，绝不吞点击，也不重复拉起。
  */
 import { UIAbility, AbilityConstant, Want } from '@kit.AbilityKit';
+import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { window } from '@kit.ArkUI';
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -402,14 +403,14 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
 
   private armGuardianPoll(): void {
     this.clearGuardianTimer();
-    this.guardianTimer = setInterval((): void => {
+    this.guardianTimer = UnifiedScheduler.every((): void => {
       this.checkSessionAlive();
     }, GUARDIAN_POLL_MS);
   }
 
   private clearGuardianTimer(): void {
     if (this.guardianTimer >= 0) {
-      clearInterval(this.guardianTimer);
+      UnifiedScheduler.clear(this.guardianTimer);
       this.guardianTimer = -1;
     }
   }

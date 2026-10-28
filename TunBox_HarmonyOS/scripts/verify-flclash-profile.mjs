@@ -135,6 +135,26 @@ const r3 = ProfileConfigMerger.merge(overlay, profileNoDns);
 ok(/223\.5\.5\.5/.test(r3.yaml), 'overlay dns 保留');
 ok(!/doh\.example/.test(r3.yaml), '没有凭空出现的原文 dns');
 
+console.log('[DNS regression] override precedence, fallback, inline map and comments');
+const overrideOn = ProfileConfigMerger.merge(overlay, profileWithDns, false);
+ok(overrideOn.ok && overrideOn.yaml.includes('223.5.5.5') && !overrideOn.yaml.includes('doh.example'),
+  '覆写开启：应用 DNS 优先于已启用的订阅 DNS');
+for (const dns of ['dns:\n  enable: false\n', 'dns: {}\n', 'dns:\n  nameserver: [1.1.1.1]\n',
+  'dns:\n  nameserver-policy:\n    enable: true\n']) {
+  const merged = ProfileConfigMerger.merge(overlay, profile + dns, true);
+  ok(merged.ok && merged.yaml.includes('223.5.5.5'), '订阅禁用/缺失 enable/嵌套 enable：回退应用 DNS');
+}
+for (const dns of [
+  'dns: # enabled DNS\n  enable: true # retain subscription\n  nameserver: [1.1.1.1]\n',
+  'dns: {enable: true, nameserver: [1.1.1.1], nameserver-policy: {"a,b.test": "https://doh.example/dns-query"}}\n',
+  "dns:\n    'enable': true\n    nameserver: [1.1.1.1]\n"
+]) {
+  const merged = ProfileConfigMerger.merge(overlay, profile + dns, true);
+  ok(merged.ok && merged.yaml.includes('1.1.1.1') && !merged.yaml.includes('223.5.5.5'),
+    '带注释/行内映射/非标准缩进：保留已启用订阅 DNS');
+  ok((merged.yaml.match(/^dns:/gm) || []).length === 1, 'DNS 仅一个顶层段');
+}
+
 console.log('[4] 原文 proxy-providers 段搬入');
 const profileProvider = `proxies: []
 proxy-groups:
