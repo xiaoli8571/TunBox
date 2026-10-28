@@ -2,7 +2,7 @@
  * HomePage —— TunBox 主页（严格对齐《TunBox-UI重构笔记》§3.1 首页）
  * 布局：TopNavBar(TunBox + 主题按钮；备份入口已迁到设置页) → 天体轨域启动按钮(CelestialPowerOrb 320/280/200，
  *      2026-10-17 用户按 stitch 设计稿重构，原 StatusRing 三层同心环下架；按钮内含当前节点名)
- *      → 代理模式三段按钮(规则/全局/直连，启动按钮下方) → 实时速率与流量卡(RateChart，含公网 IP) → 错误条
+ *      → 公网 IP(启动按钮正下方) → 代理模式三段按钮(规则/全局/直连) → 订阅区块 → 错误条
  * 2026-10-17：规则模式卡片下架，三项迁入 SettingsPage（用户 batch-2）。
  * 后端：复用 ConnectionOrchestrator / SubscriptionService / SettingsService / LatencyController 全量逻辑（未改动）。
  */
@@ -10,14 +10,13 @@ import { router, promptAction } from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { ConnEvent, ConnEventKind, ConnListener } from '../commons/services/ConnectionEvents';
 import { window } from '@kit.ArkUI';
-import { NexusSizes } from '../theme/NexusTokens';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { CelestialPowerOrb } from '../components/CelestialPowerOrb';
-import { RateChart } from '../components/RateChart';
+import { SubscriptionSection } from '../components/SubscriptionSection';
+import { TrafficStatsStore } from '../commons/services/TrafficStatsStore';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
-import { ConnectionEntry } from '../commons/services/ClashApiService';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { SettingsService } from '../commons/services/SettingsService';
 import { PublicIpService } from '../commons/services/PublicIpService';
@@ -33,13 +32,14 @@ import { ProxyNode } from '../commons/models/ProxyNode';
 import { NodeSortSnapshot } from '../commons/services/NodeSortPersistence';
 
 const TAG = 'HomePage';
-/** 连接卡展开时预览的活跃连接条数（全部连接走「连接管理」） */
-const CONN_PREVIEW_MAX = 5;
-/** 连接卡预览轮询周期（与 ConnectionsPage 一致） */
-const CONN_PREVIEW_POLL_MS = 2000;
 
 @Component
 export struct HomePage {
+  /**
+   * 节点切换版本号：主页订阅区块选完节点后自增，用来**立刻**刷新启动按钮内的节点名
+   * （2026-10-28 用户报障：选完节点要等启动后才更新）。
+   */
+  @StorageLink('node_switch_revision') @Watch('onNodeSwitched') nodeSwitchRevision: number = 0;
   @State isConnected: boolean = false;
   @State isConnecting: boolean = false;
   /** 乐观反馈（2026-10-17 用户反馈「点启动 1 秒多按钮才动」）：点击瞬间点亮「正在连接」，
@@ -68,19 +68,7 @@ export struct HomePage {
   @State currentNodeName: string = '';
   @State showDiagnostics: boolean = false;
   @State diagData: AppDiagnostics | null = null;
-  @State upSpeed: number = 0;
-  @State downSpeed: number = 0;
-  @State upTotal: number = 0;
-  @State downTotal: number = 0;
-  @State connectionDuration: number = 0;
   @State proxyMode: string = 'rule';
-  @State private connCardOpen: boolean = false;
-  /** 连接卡预览：活跃连接前 5 条（按流量降序，全部连接走「连接管理」） */
-  @State private connPreview: ConnectionEntry[] = [];
-  @State private connPreviewReachable: boolean = true;
-  private connPreviewTimer: number = -1;
-  private connPreviewBusy: boolean = false;
-@State ratePoints: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   @StorageLink('theme_revision') themeRevision: number = 0;
   @StorageLink('public_ip_revision') @Watch('onPublicIpRevision') publicIpRevision: number = 0;
   @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
@@ -100,19 +88,8 @@ export struct HomePage {
   private readonly onConnEvent: ConnListener = (e: ConnEvent): void => {
     if (!this.pageMounted) { return; }
     if (e.kind === ConnEventKind.TRAFFIC) {
-      // 速率曲线由事件驱动：一次采样一次，不再靠页面自己的 1s 定时器再读一遍 orchestrator
-      this.upSpeed = e.upSpeed;
-      this.downSpeed = e.downSpeed;
-      this.upTotal = e.upTotal;
-      this.downTotal = e.downTotal;
-      const speed = e.upSpeed + e.downSpeed;
-      const ratio = Math.min(1, Math.max(0, speed / (1500 * 1024)));
-      const next = this.ratePoints.slice();
-      next.push(ratio);
-      if (next.length > NexusSizes.ratePoints) {
-        next.splice(0, next.length - NexusSizes.ratePoints);
-      }
-      this.ratePoints = next;
+      // 速率/流量展示已全部迁到「数据」页（2026-10-28 用户要求：主页不再放信息卡）。
+      // 这里只保留服务卡片（miniBar）消费的两个 AppStorage 速率信号。
       AppStorage.setOrCreate('mini_conn_up', e.upSpeed);
       AppStorage.setOrCreate('mini_conn_down', e.downSpeed);
       return;
@@ -125,7 +102,6 @@ export struct HomePage {
     this.applyOrchestratorState();
   };
   private listenerBound: boolean = false;
-  private connectionTimer: number = -1;
   /** 节点集变化监听（稳定引用，便于 aboutToDisappear 退订）。 */
   private readonly nodeSetListener: (reason: string) => void = (reason: string): void => {
     if (this.pageMounted && this.hasUsableNodes()) {
@@ -154,17 +130,13 @@ export struct HomePage {
       return;
     }
     this.applyOrchestratorState();
-    this.syncConnectionTimer();
-    if (this.connCardOpen) { this.refreshConnPreview(); }
   }
 
   aboutToDisappear(): void {
     this.pageMounted = false;
     this.pageReady = false;
-    this.stopConnectionTimer();
     this.stopNodeReadinessWatch();
     SubscriptionService.offNodeSetChanged(this.nodeSetListener);
-    this.stopConnPreview();
     if (this.shownBridge !== undefined) {
       this.shownBridge.setShowHandler(null);
     }
@@ -182,74 +154,6 @@ export struct HomePage {
     return this.subs.nodes.map((n: ProxyNode): string => n.name);
   }
 
-  /** 连接卡展开期间的 2s 轮询：活跃连接前 5 条（对齐 ConnectionsPage 排序口径） */
-  private async refreshConnPreview(): Promise<void> {
-    if (this.connPreviewBusy) {
-      return;
-    }
-    this.connPreviewBusy = true;
-    try {
-      if (!this.isConnected) {
-        this.connPreview = [];
-        this.connPreviewReachable = true;
-        return;
-      }
-      const list = await this.orchestrator.api.listConnections(this.knownNodeNames());
-      if (list === null) {
-        this.connPreviewReachable = false;
-        return;
-      }
-      this.connPreviewReachable = true;
-      list.sort((a: ConnectionEntry, b: ConnectionEntry): number =>
-        (b.download + b.upload) - (a.download + a.upload));
-      this.connPreview = list.slice(0, CONN_PREVIEW_MAX);
-    } catch (e) {
-      AppLogger.warn('HomePage', `conn preview failed: ${AppLogger.errText(e)}`);
-    } finally {
-      this.connPreviewBusy = false;
-    }
-  }
-
-  private startConnPreview(): void {
-    if (this.connPreviewTimer >= 0) {
-      return;
-    }
-    this.refreshConnPreview();
-    this.connPreviewTimer = UnifiedScheduler.every((): void => {
-      this.refreshConnPreview();
-    }, CONN_PREVIEW_POLL_MS);
-  }
-
-  private stopConnPreview(): void {
-    if (this.connPreviewTimer >= 0) {
-      UnifiedScheduler.clear(this.connPreviewTimer);
-      this.connPreviewTimer = -1;
-    }
-  }
-
-  private toggleConnCard(): void {
-    this.connCardOpen = !this.connCardOpen;
-    if (this.connCardOpen) {
-      this.startConnPreview();
-    } else {
-      this.stopConnPreview();
-    }
-  }
-
-  private formatConnBytes(total: number): string {
-    if (total < 1024) {
-      return `${Math.round(total)} B`;
-    }
-    const kb = total / 1024;
-    if (kb < 1024) {
-      return `${kb.toFixed(1)} KB`;
-    }
-    const mb = kb / 1024;
-    if (mb < 1024) {
-      return `${mb.toFixed(1)} MB`;
-    }
-    return `${(mb / 1024).toFixed(2)} GB`;
-  }
 
   private applyOrchestratorState(): void {
     const wasConnected: boolean = this.isConnected;
@@ -286,47 +190,15 @@ export struct HomePage {
     AppStorage.setOrCreate('mini_conn_connecting', this.isConnecting);
     AppStorage.setOrCreate('mini_conn_node', this.orchestrator.currentNodeName());
     this.errorMessage = this.orchestrator.lastError;
-    this.upSpeed = this.orchestrator.traffic.uploadSpeed;
-    this.downSpeed = this.orchestrator.traffic.downloadSpeed;
-    this.upTotal = this.orchestrator.traffic.uploadBytes;
-    this.downTotal = this.orchestrator.traffic.downloadBytes;
-    if (!this.isConnected) {
-      this.ratePoints = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    }
-    if (this.pageReady) {
-      this.syncConnectionTimer();
-    }
     this.refreshDisplayNode();
   }
 
-  private syncConnectionTimer(): void {
-    if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
-      this.connectionDuration = 0;
-      this.stopConnectionTimer();
+  /** 订阅区块切换节点后刷新按钮内节点名（无需等连接） */
+  onNodeSwitched(): void {
+    if (this.nodeSwitchRevision <= 0) {
       return;
     }
-    this.connectionDuration = Math.max(0,
-      Math.floor((Date.now() - this.orchestrator.startedAt) / 1000));
-    if (this.connectionTimer >= 0) {
-      return;
-    }
-    this.connectionTimer = UnifiedScheduler.every(() => {
-      if (this.orchestrator.state !== ConnState.CONNECTED || this.orchestrator.startedAt <= 0) {
-        this.connectionDuration = 0;
-        this.stopConnectionTimer();
-        return;
-      }
-      this.connectionDuration = Math.max(0,
-        Math.floor((Date.now() - this.orchestrator.startedAt) / 1000));
-      // 速率/流量已由 TRAFFIC 事件推送（见 onConnEvent），这里只数秒数。
-    }, 1000);
-  }
-
-  private stopConnectionTimer(): void {
-    if (this.connectionTimer >= 0) {
-      UnifiedScheduler.clear(this.connectionTimer);
-      this.connectionTimer = -1;
-    }
+    this.refreshDisplayNode();
   }
 
   private async toggleTheme(): Promise<void> {
@@ -355,6 +227,9 @@ export struct HomePage {
       this.orchestrator.addListener(this.connectionListener);
     }
     await SettingsService.init(ctx);
+    // 数据页流量记账：App 级每秒 tick（不依赖「数据」页是否被打开）
+    await TrafficStatsStore.init(ctx);
+    TrafficStatsStore.startAccounting();
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
     // 冷启动兜底：把当前订阅上次手动选的节点还原成生效偏好。
@@ -426,7 +301,6 @@ export struct HomePage {
     if (!this.pageMounted) { return; }
     this.applyOrchestratorState();
     this.pageReady = true;
-    this.syncConnectionTimer();
     this.consumeVpnRequest();
   }
 
@@ -507,7 +381,7 @@ export struct HomePage {
         this.stopNodeReadinessWatch();
         if (this.pendingConnectAfterNodes) {
           this.pendingConnectAfterNodes = false;
-          promptAction.showToast({ message: '节点加载超时，请到「订阅」页刷新后再连接' });
+          promptAction.showToast({ message: '节点加载超时，请到主页「订阅」里刷新后再连接' });
         }
       }
     }, 400);
@@ -554,7 +428,7 @@ export struct HomePage {
       }
       const node = await this.selectedNode();
       if (node === null) {
-        promptAction.showToast({ message: '暂无可用节点，请先在「订阅」页添加并刷新' });
+        promptAction.showToast({ message: '暂无可用节点，请先在主页「订阅」里添加并刷新' });
         return;
       }
       const ok = await this.orchestrator.connect(node, this.subs);
@@ -582,48 +456,6 @@ export struct HomePage {
     this.currentNodeName = this.orchestrator.getCurrentNodeName();
   }
 
-  /** 实时速率数值与单位拆分（文档 §3.1：数值 26 Bold + 单位 13 textSecondary） */
-  private realtimeRateParts(): string[] {
-    if (!this.isConnected) {
-      return ['0.0', 'KB/s'];
-    }
-    return this.formatSpeedValue(this.upSpeed + this.downSpeed).split(' ');
-  }
-
-  private formatSpeedValue(bytesPerSecond: number): string {
-    if (bytesPerSecond < 1024) {
-      return `${Math.round(bytesPerSecond)} B/s`;
-    }
-    const kb = bytesPerSecond / 1024;
-    if (kb < 1024) {
-      return `${kb.toFixed(1)} KB/s`;
-    }
-    return `${(kb / 1024).toFixed(1)} MB/s`;
-  }
-
-  private formatTotalMB(): string {
-    const total = this.upTotal + this.downTotal;
-    if (total < 1024) {
-      return `${Math.round(total)} B`;
-    }
-    const kb = total / 1024;
-    if (kb < 1024) {
-      return `${kb.toFixed(1)} KB`;
-    }
-    const mb = kb / 1024;
-    if (mb < 1024) {
-      return `${mb.toFixed(1)} MB`;
-    }
-    return `${(mb / 1024).toFixed(2)} GB`;
-  }
-
-  private formatDuration(): string {
-    const s = Math.max(0, Math.floor(this.connectionDuration));
-    const hh = `0${Math.floor(s / 3600)}`.slice(-2);
-    const mm = `0${Math.floor((s % 3600) / 60)}`.slice(-2);
-    const ss = `0${s % 60}`.slice(-2);
-    return this.connectionDuration > 0 ? `${hh}:${mm}:${ss}` : '--:--:--';
-  }
 
   private refreshDiagnostics(): void {
     this.orchestrator.diagnostics().then((d: AppDiagnostics) => {
@@ -754,7 +586,7 @@ export struct HomePage {
       }
       if (node === null) {
         await FormStateSync.publish(context, FormStateSync.noNode());
-        promptAction.showToast({ message: '暂无可用节点，请先在「订阅」页添加并刷新' });
+        promptAction.showToast({ message: '暂无可用节点，请先在主页「订阅」里添加并刷新' });
         return;
       }
       await FormStateSync.publish(context, FormStateSync.connecting(node.name));
@@ -874,8 +706,7 @@ export struct HomePage {
             // 2026-10-19 用户要求「启动按钮缩小一点，下面整体往上挪一行」：
             // 按钮本体已在 TunBoxTokens 等比缩到 87.5%（省 40vp），
             // 这里再把上下内边距 8/4 收成 0 —— 合计上移约 52vp（≈ 一行内容）。
-            // 首页下方（模式按钮 / 速率卡 / 连接卡）因此整体上提，连接卡不再被
-            // 底部 Dock 遮挡。
+            // 首页下方（公网 IP / 模式按钮 / 订阅区块）因此整体上提。
             Column() {
               CelestialPowerOrb({
                 isConnected: $isConnected,
@@ -883,6 +714,8 @@ export struct HomePage {
                 // 节点就绪并自动补连后才切到「正在连接」。
                 isConnecting: this.isConnecting || (this.pendingStart && !this.nodesLoading),
                 nodeName: this.nodesLoading ? '节点加载中…' : this.currentNodeName,
+                // 出口 IP 现在画在按钮内部沿底部弧线（2026-10-28 用户要求）；未连接不显示
+                ipText: this.isConnected ? this.publicIp : '',
                 onToggle: (): void => {
                   this.toggleConnection();
                 }
@@ -900,231 +733,10 @@ export struct HomePage {
             }
             .width('100%')
 
-            // ── 3. 实时速率与流量卡片（文档 §3.1 第 4 节）──
-            Column({ space: 12 }) {
-              // 2026-10-19：公网 IP 已移到下方「连接」卡片的中线位置（用户要求），
-              // 本卡恢复两列：左「实时速率」+ 右「流量消耗 / 连接时长」。
-              // 防溢出：两列等权 layoutWeight(1)，任何列都不能靠内容撑大自己；
-              // 每个 Text 再叠 maxLines(1)+省略号，窄屏下只会截断、绝不越界。
-              Row() {
-                // ── 左 1/2：实时速率 ──
-                Column({ space: 4 }) {
-                  Text('实时速率')
-                    .fontSize(12)
-                    .fontColor(TunBoxColors.textMuted)
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .width('100%')
-                  Row() {
-                    Text(this.realtimeRateParts()[0])
-                      .fontSize(26)
-                      .fontWeight(FontWeight.Bold)
-                      .fontColor(TunBoxColors.textPrimary)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(` ${this.realtimeRateParts()[1]}`)
-                      .fontSize(13)
-                      .fontColor(TunBoxColors.textSecondary)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }
-                  .width('100%')
-                  .alignItems(VerticalAlign.Bottom)
-                }
-                .layoutWeight(1)
-                .alignItems(HorizontalAlign.Start)
-
-                // ── 右 1/2：流量消耗 + 连接时长（子项等权，可压缩）──
-                Row({ space: 8 }) {
-                  Column({ space: 4 }) {
-                    Text('流量消耗')
-                      .fontSize(12)
-                      .fontColor(TunBoxColors.textMuted)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(this.formatTotalMB())
-                      .fontSize(14)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor(TunBoxColors.textPrimary)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }
-                  .layoutWeight(1)
-                  .alignItems(HorizontalAlign.End)
-                  Column({ space: 4 }) {
-                    Text('连接时长')
-                      .fontSize(12)
-                      .fontColor(TunBoxColors.textMuted)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(this.formatDuration())
-                      .fontSize(14)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor(TunBoxColors.textPrimary)
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }
-                  .layoutWeight(1)
-                  .alignItems(HorizontalAlign.End)
-                }
-                .layoutWeight(1)
-                .alignItems(VerticalAlign.Top)
-              }.width('100%').alignItems(VerticalAlign.Top)
-
-              // 速率曲线容器（48 高，2026-10-17 用户要求去掉凹槽框，曲线直接坐在卡片上）
-              Stack({ alignContent: Alignment.BottomStart }) {
-                RateChart({ points: this.ratePoints, isConnected: this.isConnected })
-                Text(`↓ ${this.formatSpeedValue(this.upSpeed)}`)
-                  .fontSize(11)
-                  .fontColor(TunBoxColors.textSecondary)
-                  .margin({ left: 10, bottom: 6 })
-                  // 防溢出：曲线区已 clip，这里再加单行+省略号约束
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-              }
+            // ── 订阅区块（2026-10-28：订阅从独立页签迁到主页，对齐 ClashPlus「内联 profiles」）──
+            // 点订阅卡 → 全屏覆盖展开节点列表（bindContentCover），选完节点自动返回。
+            SubscriptionSection()
               .width('100%')
-              .height(48)
-              .clip(true)
-
-            }
-            .width('100%')
-            .padding(TunBoxGeometry.cardPaddingLarge)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
-            // 2026-10-19 用户硬性要求：卡片信息任何情况下都不得超出卡片边界。
-            // 上面已用「等权列 + 省略号 + 自适应字号」保证不产生溢出；这里再加
-            // clip 作为最后一道视觉保险，即使极端字号/系统字体放大也只会被卡片
-            // 圆角裁掉，绝不会画到卡片外面。
-            .clip(true)
-
-
-            // ── 连接卡（2026-10-17 自速率卡下移为独立卡：可收起/展开显示连接信息）──
-            Column({ space: 10 }) {
-              // 2026-10-19 用户要求：公网 IP 放在连接卡**左侧**，紧跟「连接」之后
-              // （既不是独立成行——那会撑高卡片把下面内容下移；也不是绝对居中）。
-              //
-              // 布局：连接 ●  |  公网 IP：x.x.x.x  |  ← 剩余空间  |  ›
-              //   · IP 用 layoutWeight(1) 占据「连接」与箭头之间的全部剩余空间，
-              //     左对齐紧随其后，不新增行 ⇒ 卡片高度不变。
-              //   · maxLines(1)+省略号：IP 再长也只在自己的剩余宽度内截断，
-              //     绝不会把右侧箭头挤出卡片。
-              Row({ space: 8 }) {
-                Text('连接')
-                  .fontSize(15)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor(TunBoxColors.textPrimary)
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                Circle({ width: 6, height: 6 })
-                  .fill(this.isConnecting ? TunBoxColors.primary
-                    : (this.isConnected ? TunBoxColors.success : TunBoxColors.textMuted))
-                if (this.isConnected) {
-                  Text(this.publicIpRefreshing ? '公网 IP：获取中…'
-                    : (this.publicIp.length > 0
-                      ? `公网 IP：${this.publicIp}`
-                      : (this.publicIpError.length > 0 ? this.publicIpError : '公网 IP：--')))
-                    .fontSize(12)
-                    .fontColor(this.publicIpRefreshing ? TunBoxColors.textMuted
-                      : (this.publicIp.length > 0 ? TunBoxColors.textSecondary : TunBoxColors.danger))
-                    .fontFamily('monospace')
-                    .maxLines(1)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .textAlign(TextAlign.Start)
-                    .layoutWeight(1)
-                    // 左侧留一点间距，与「●」分开
-                    .margin({ left: 2 })
-                    .onClick(() => {
-                      if (!this.publicIpRefreshing) {
-                        this.refreshPublicIp('user-retry');
-                      }
-                    })
-                } else {
-                  Blank()
-                }
-                Image($r('app.media.ic_arrow_right'))
-                  .width(14).height(14)
-                  .fillColor(TunBoxColors.textMuted)
-                  .rotate({ angle: this.connCardOpen ? 90 : 0 })
-                  .animation({ duration: 250, curve: Curve.EaseInOut })
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Center)
-              .onClick(() => { this.toggleConnCard(); })
-
-              if (this.connCardOpen) {
-                Column({ space: 8 }) {
-                  // 活跃连接前 5 条（要看全部走下方「连接管理」）
-                  if (this.connPreview.length === 0) {
-                    Text(this.isConnected
-                      ? (this.connPreviewReachable ? '暂无活跃连接' : '内核无响应，稍后自动重试')
-                      : '连接后显示活跃连接')
-                      .fontSize(12)
-                      .fontColor(TunBoxColors.textMuted)
-                      .width('100%')
-                      .maxLines(2)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  } else {
-                    ForEach(this.connPreview, (item: ConnectionEntry) => {
-                      Row({ space: 8 }) {
-                        Text(item.port > 0 ? `${item.host}:${item.port}` : item.host)
-                          .fontSize(12)
-                          .fontColor(TunBoxColors.textPrimary)
-                          .maxLines(1)
-                          .textOverflow({ overflow: TextOverflow.Ellipsis })
-                          .layoutWeight(1)
-                        Text(item.outbound.length > 0 ? item.outbound
-                          : (item.rule.length > 0 ? item.rule : item.network))
-                          .fontSize(10)
-                          .fontColor(TunBoxColors.textMuted)
-                          .maxLines(1)
-                          .textOverflow({ overflow: TextOverflow.Ellipsis })
-                          // 2026-10-19 防溢出：原为固定 constraintSize(maxWidth:130)，
-                          // 不参与权重分配；改为 layoutWeight 让三列按可用宽度等分，
-                          // 任何窄屏下都不会撑破卡片（内容超长由省略号截断）。
-                          .layoutWeight(1)
-                        Text(this.formatConnBytes(item.download + item.upload))
-                          .fontSize(11)
-                          .fontColor(TunBoxColors.textSecondary)
-                          .fontFamily('monospace')
-                          .maxLines(1)
-                          .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      }
-                      .width('100%')
-                      .alignItems(VerticalAlign.Center)
-                    }, (item: ConnectionEntry) => item.id)
-                  }
-                  Row() {
-                    Blank()
-                    Row({ space: 2 }) {
-                      Text('连接管理')
-                        .fontSize(12)
-                        .fontWeight(FontWeight.Bold)
-                        .fontColor(TunBoxColors.primary)
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      Image($r('app.media.ic_arrow_right'))
-                        .width(12).height(12)
-                        .fillColor(TunBoxColors.primary)
-                    }
-                    .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-                    .borderRadius(TunBoxGeometry.pillRadius)
-                    .backgroundColor(TunBoxColors.primaryLight)
-                    .onClick(() => {
-                      router.pushUrl({ url: 'pages/ConnectionsPage' });
-                    })
-                  }.width('100%')
-                }
-                .width('100%')
-              }
-            }
-            .width('100%')
-            .padding(TunBoxGeometry.cardPadding)
-            .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
-            // 同上：连接卡（含展开后的活跃连接列表）也做视觉裁剪兜底
-            .clip(true)
 
             // ── 错误条（既有功能，令牌化）：点击打开诊断面板 ──
             if (this.errorMessage.length > 0) {

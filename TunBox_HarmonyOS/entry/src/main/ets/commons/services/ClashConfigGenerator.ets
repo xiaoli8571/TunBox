@@ -432,8 +432,8 @@ export class ClashConfigGenerator {
       // 错误文案必须带丢弃数量与原因，否则用户只看到「没有可用的节点配置」而无从下手。
       throw new Error(`没有可用的节点配置：${dropStats.summary()}。`
         + (dropStats.missingCredential > 0
-          ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到「订阅」页刷新订阅后重连。'
-          : '请到「订阅」页刷新订阅后重连。'));
+          ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到主页「订阅」里刷新后重连。'
+          : '请到主页「订阅」里刷新后重连。'));
     }
     // 全局代理名唯一化 —— **必须在写 proxies 之前**完成，因为：
     //   proxies[i].name、proxy-groups 的 proxies 成员、PROXY 组的内容全部按名字引用，

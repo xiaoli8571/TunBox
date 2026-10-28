@@ -156,7 +156,7 @@ export class PublicIpService {
     const t0 = Date.now();
     const req = http.createHttp();
     try {
-      const resp = await req.request('http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,isp', {
+      const resp = await req.request('http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,isp,as,timezone', {
         method: http.RequestMethod.GET,
         connectTimeout: CONNECT_TIMEOUT_MS,
         readTimeout: READ_TIMEOUT_MS,
@@ -205,6 +205,9 @@ export class PublicIpService {
       result.info.countryCode = typeof json['countryCode'] === 'string' ? json['countryCode'] as string : '';
       result.info.city = typeof json['city'] === 'string' ? json['city'] as string : '';
       result.info.isp = typeof json['isp'] === 'string' ? json['isp'] as string : '';
+      // 数据页「出口 IP」卡片需要 ASN 与时区（对齐 ClashPlus _IpInfoContent 的四行信息）
+      result.info.asn = typeof json['as'] === 'string' ? json['as'] as string : '';
+      result.info.timezone = typeof json['timezone'] === 'string' ? json['timezone'] as string : '';
       result.info.queryTime = Date.now();
       result.outcome = IpQueryOutcome.OK;
       PublicIpService.log(trigger, result, '');

@@ -57,7 +57,7 @@ export class OrchestratorHealthProbes implements LinkHealthProbes {
   probeSubscription(): Promise<ProbeOutcome> {
     if (!this.view.hasSubscriptions() || this.view.subsNodeCount() === 0) {
       return Promise.resolve(ProbeOutcome.fail('未加载订阅或订阅内无节点',
-        '请到「订阅」页刷新订阅', 'refresh-subscription'));
+        '请到主页「订阅」里刷新', 'refresh-subscription'));
     }
     return Promise.resolve(ProbeOutcome.pass(
       '订阅含 ' + this.view.subsNodeCount() + ' 个节点', '' + this.view.subsNodeCount()));

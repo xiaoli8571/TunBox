@@ -58,6 +58,12 @@ const BALL1 = OrbLayout.BALL1;
 const BALL2 = OrbLayout.BALL2;
 /** 呼吸周期（秒），对齐旧 StatusRing 的 1.4s 交替呼吸 */
 const BREATH_SEC = 1.4;
+/** 2026-10-28 用户要求「启动按钮缩小一圈」：整体视觉缩到 0.9，外层占位同步收窄 */
+const ORB_SCALE = 0.9;
+/** 弧形 IP 文字：半径（相对盘心）与底弧角度范围（度，屏幕坐标系 y 向下） */
+const ARC_IP_FONT = 11;
+const ARC_IP_START_DEG = 130;
+const ARC_IP_END_DEG = 50;
 
 @Component
 export struct CelestialPowerOrb {
@@ -65,6 +71,11 @@ export struct CelestialPowerOrb {
   @Prop isConnecting: boolean = false;
   /** 当前节点名：显示在启动按钮内部（空则显示占位，同旧 StatusRing 行为） */
   @Prop nodeName: string = '';
+  /**
+   * 出口公网 IP（2026-10-28 用户要求：放进启动按钮内部，沿底部半圆弧形显示；
+   * 未连接时不显示任何东西）。
+   */
+  @Prop ipText: string = '';
   @StorageLink('theme_revision') @Watch('onThemeChanged') themeRevision: number = 0;
   onToggle: () => void = () => {};
 
@@ -82,6 +93,62 @@ export struct CelestialPowerOrb {
   private readonly trackSize: number = TunBoxGeometry.orbTrack;
   private readonly arcRingSize: number = TunBoxGeometry.orbArcRing;
   private readonly discSize: number = TunBoxGeometry.orbDisc;
+
+  /**
+   * 弧形 IP 文字的分字几何：把 IP 逐字符摆到盘心下方半圆弧上。
+   * 角度从 152° 走到 28°（经过 90°＝正下方），每字按切向旋转，读起来像贴在弧上。
+   */
+  private ipChars(): string[] {
+    const text: string = this.ipText;
+    const out: string[] = [];
+    for (let i = 0; i < text.length; i++) {
+      out.push(text.charAt(i));
+    }
+    return out;
+  }
+
+  /** 第 i 个字符的角度（度） */
+  private arcAngleDeg(i: number, n: number): number {
+    if (n <= 1) {
+      return 90;
+    }
+    return ARC_IP_START_DEG - (ARC_IP_START_DEG - ARC_IP_END_DEG) * i / (n - 1);
+  }
+
+  /** 弧半径：落在玻璃盘外缘与轨道环之间，避免压住盘内的标题/节点名 */
+  private arcRadius(): number {
+    return this.discSize / 2 + (this.trackSize - this.discSize) / 4;
+  }
+
+  private arcPosX(i: number, n: number): number {
+    const deg: number = this.arcAngleDeg(i, n);
+    const rad: number = deg * Math.PI / 180;
+    return this.glowSize / 2 + this.arcRadius() * Math.cos(rad) - ARC_IP_FONT / 2;
+  }
+
+  private arcPosY(i: number, n: number): number {
+    const deg: number = this.arcAngleDeg(i, n);
+    const rad: number = deg * Math.PI / 180;
+    return this.glowSize / 2 + this.arcRadius() * Math.sin(rad) - ARC_IP_FONT;
+  }
+
+  /** 逐字符沿底部半圆排列的出口 IP（未连接 / 无 IP 时不渲染） */
+  @Builder
+  ArcIpText() {
+    Stack() {
+      ForEach(this.ipChars(), (ch: string, idx: number) => {
+        Text(ch)
+          .fontSize(ARC_IP_FONT)
+          .fontFamily('monospace')
+          .fontColor(TunBoxColors.textSecondary)
+          .rotate({ angle: this.arcAngleDeg(idx, this.ipChars().length) - 90 })
+          .position({ x: this.arcPosX(idx, this.ipChars().length), y: this.arcPosY(idx, this.ipChars().length) })
+      }, (ch: string, idx: number) => `${idx}:${ch}`)
+    }
+    .width(this.glowSize)
+    .height(this.glowSize)
+    .hitTestBehavior(HitTestMode.None)
+  }
 
   aboutToDisappear(): void {
     this.stopTicker();
@@ -465,13 +532,21 @@ export struct CelestialPowerOrb {
         }
         .alignItems(HorizontalAlign.Center)
         .offset({ y: 4 })
+
+        // 出口 IP：沿底部半圆弧形显示（2026-10-28 用户要求；未连接不显示）
+        if (this.isConnected && this.ipText.length > 0) {
+          this.ArcIpText()
+        }
       }
       .width(this.glowSize)
       .height(this.glowSize)
-      .scale({ x: this.pressed ? 0.95 : 1.0, y: this.pressed ? 0.95 : 1.0 })
+      .scale({
+        x: ORB_SCALE * (this.pressed ? 0.95 : 1.0),
+        y: ORB_SCALE * (this.pressed ? 0.95 : 1.0)
+      })
     }
-    .width(this.glowSize)
-    .height(this.glowSize)
+    .width(this.glowSize * ORB_SCALE)
+    .height(this.glowSize * ORB_SCALE)
     .accessibilityText(this.isConnected ? '断开连接' : '开启连接')
     .onVisibleAreaChange([0.05, 0.95], (isVisible: boolean) => {
       this.onVisible(isVisible);

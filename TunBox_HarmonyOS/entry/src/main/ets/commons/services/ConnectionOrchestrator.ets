@@ -3866,7 +3866,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         || seq !== this.connectSeq || this.disconnectRequested) { return false; }
       if (subs.nodes.length === 0 && !subs.hasUsableProfile()) {
         this.setState(ConnState.DISCONNECTED);
-        this.lastError = '没有可用节点：请先到「订阅」页添加订阅并点击刷新，等节点列表出现后再连接';
+        this.lastError = '没有可用节点：请先到主页「订阅」里添加订阅并点击刷新，等节点列表出现后再连接';
         this.notify();
         AppLogger.warn(TAG, 'connect refused: zero nodes available '
           + '(subscription empty or never fetched); VPN extension NOT launched');
@@ -3962,7 +3962,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
               AppLogger.warn(TAG, 'still no serializable node; continuing with profile takeover');
               retry = target;
             } else {
-              throw new Error('订阅节点配置无效：请到「订阅」页点击「全部刷新」，确认节点已成功导入后再连接');
+              throw new Error('订阅节点配置无效：请到主页「订阅」里点击刷新，确认节点已成功导入后再连接');
             }
           }
           target = retry;

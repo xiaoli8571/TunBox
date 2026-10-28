@@ -296,6 +296,40 @@ export class ClashApiService {
     return false;
   }
 
+  /**
+   * 内核内存占用（GET /memory，mihomo 实验端点，返回 `inuse` 字节数）。
+   *
+   * 数据页「内存占用」卡片的数据源（对齐 ClashPlus `CoreController::getMemory`：
+   * 该值由内核 FFI 直接给，鸿蒙侧等价物就是这条 REST 端点）。
+   * 端点不可用 / 未连接 / 内核版本不带该路由时返回 -1，由 UI 显示「--」而不是 0。
+   */
+  async fetchMemoryInuse(): Promise<number> {
+    const req = http.createHttp();
+    try {
+      const resp = await req.request(`${this.baseUrl()}/memory`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 1500,
+        readTimeout: 1500,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) {
+        return -1;
+      }
+      const body: string = typeof resp.result === 'string' ? resp.result as string : '';
+      if (body.length === 0) {
+        return -1;
+      }
+      const json: Record<string, Object> = JSON.parse(body) as Record<string, Object>;
+      const inuse: Object | undefined = json['inuse'];
+      return typeof inuse === 'number' ? inuse as number : -1;
+    } catch (e) {
+      return -1;
+    } finally {
+      req.destroy();
+    }
+  }
+
   /** 健康探测（对应 MihomoApiHealthProbe）：GET /version */
   async healthProbe(): Promise<boolean> {
     const req = http.createHttp();

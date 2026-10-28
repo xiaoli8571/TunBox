@@ -8,6 +8,13 @@ export class PublicIpInfo {
   countryCode: string = '';
   city: string = '';
   isp: string = '';
+  /**
+   * ASN 与运营商合并串（ip-api 的 `as` 字段，形如 `AS15169 Google LLC`）。
+   * 数据页「出口 IP」卡片对齐 ClashPlus `_IpInfoContent` 的 ASN 行。
+   */
+  asn: string = '';
+  /** 出口所在时区（ip-api `timezone`，形如 `Asia/Tokyo`）——对齐 Plus 的时区行 */
+  timezone: string = '';
   queryTime: number = 0;
 
   static empty(): PublicIpInfo {

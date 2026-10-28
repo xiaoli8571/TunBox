@@ -388,3 +388,23 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 - 主动断开约 2.0s 完成，VPN 扩展进程退出，UI/流量/时长/VPN 图标全部复位。
 - 未连接状态测速：headless test core 就绪，7/7 measured、timeout=0、failed=0，页面显示 58–265ms，无失败分类/超时数量横幅。
 - 仍未完成：8 小时锁屏存活、耗电对照、音频保活、网络切换矩阵。证据见本地审计目录 DEVICE-531R-VERIFICATION.md。
+
+## 2026-10-28：按 ClashPlus 改造——订阅迁主页、页签 1 改为数据页
+
+- 依据 ClashPlus 1.2.7 静态逆向（Dart AOT / Blutter）落地三项：主页内联订阅、数据页四卡、订阅管理独立页。逆向证据与映射表见 `docs/CLASHPLUS_ALIGN_2026-10-28.md`。
+- 新增 `components/SubscriptionSection.ets`：主页订阅卡列表 + 节点展开选点；展开动画逐值对齐 Plus `_ProfileNodeOverlayState`（340ms/`cubic-bezier(0.645,0.045,0.355,1)` 正向、300ms/`cubic-bezier(0.215,0.61,0.355,1)` 反向、高度揭示 `h=内容高×t` + `clip`、内容透明度 `clamp(t/0.6,0,1)`、整块 `clamp(0.65t+0.35,0,1)`），由 `UIContext.createAnimator` 逐帧驱动。
+- 新增 `pages/StatsPage.ets` 接管页签 1「数据」：速率双曲线卡（峰值/平均/本次连接/累计总量）、内存占用 + 运行时间双卡、出口 IP 卡（国旗/国家/城市/ISP/ASN/时区）、连通性卡（默认 google.com/github.com，TCP443 或 HTTP(S) 经本机代理，左滑删除）。
+- 新增 `commons/services/TrafficStatsStore.ets`：累计/按日（`lifetime_traffic_up/down`、`daily_traffic_by_ymd_v1`，键名与 Plus 同义）+ 每月清零日 1–28；**记账由 App 级每秒 tick 驱动**（HomePage.bootstrap 启动），不依赖「数据」页是否被打开。
+- 新增 `commons/services/ConnectivityProbe.ets`；`PublicIpInfo`/`PublicIpService` 补 ASN 与 timezone；`ClashApiService` 新增 `fetchMemoryInuse()`（`GET /memory`）。
+- `SubscriptionPage` 退化为「订阅管理」推入页（`navTitle`/`showBack`），新增 `pages/SubscriptionManagePage.ets` 承载；服务卡片 `targetPage=SubscriptionPage` 深链改折算为「主页 + 打开订阅管理页」（EntryAbility 同步调整）。
+- 底栏页签 1 文案「数据」、图标改 `ic_network`；主页两条「暂无可用节点」提示文案改为指向主页「订阅」。
+- 验证：`clean assembleHap` BUILD SUCCESSFUL；`scripts/verify-ui-resource-bindings.mjs` PASS（未新增 media 资源）。
+
+### 2026-10-28 追加（第二轮用户验收意见）
+
+- 主页卡片全删（速率/连接），公网 IP 移入启动按钮内沿底部弧线显示；订阅区块成为主页主体。
+- 订阅展开改为**全屏覆盖**（`bindContentCover`）：卡片当表头 + 仅订阅自带分组 chips + 节点列表，选点自动退出；分组切换 bug（@Builder 值参数不响应）已修。
+- 订阅卡片：流量进度条、到期文案、测速/刷新/设置三按钮（40×40）、当前订阅蓝框。
+- 订阅管理页（`SubscriptionPage` / `SubscriptionManagePage`）删除，增删改全部并入主页「+」菜单式弹窗（二维码/URL/文件/转换）；`main_pages.json` 与 EntryAbility 深链同步收口；只接受 Clash 订阅，单节点链接拒绝。
+- 设置页：连接管理/测速地址/GeoIP 资产/订阅转换四项删除；新增「网络与数据」分类（IPv6 / DNS 覆写 / Smart 选点模型）。
+- 底部 dock 渐隐底删除。

@@ -171,12 +171,12 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
   // 内核配置解析失败(带 code=-1 走这里)：给出可行动的指引，而不是原始 Go 报错。
   if (rawMessage.indexOf('has unset fields') >= 0) {
     return '内核拒绝了订阅中的节点配置（存在缺少 password/uuid 等必填凭据的节点，'
-      + '5.5.5 起此类节点会在生成配置前被隔离并计数）。请到「订阅」页刷新订阅；'
+      + '5.5.5 起此类节点会在生成配置前被隔离并计数）。请到主页「订阅」里刷新；'
       + '若仍失败，请删除日志中提示的节点。原始错误: ' + rawMessage;
   }
   if (rawMessage.indexOf('control characters are not allowed') >= 0) {
     return '内核拒绝了配置文件（文本含非法控制字符）。5.5.5 已修复蜂窝网络下扩展进程'
-      + '改写 MTU 时损坏配置文件的根因；如仍出现，请到「订阅」页刷新订阅后重连。原始错误: '
+      + '改写 MTU 时损坏配置文件的根因；如仍出现，请到主页「订阅」里刷新后重连。原始错误: '
       + rawMessage;
   }
   if (rawMessage.indexOf('应用分流参数缺失或冲突') >= 0) {
@@ -188,7 +188,7 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
   // 这条必须排在"内核启动超时"之前判定 —— 否则会被上面的联网下载分支吃掉，
   // 又把用户引到"等 10 秒再点一次"（订阅是空的，重试必然同样失败）。
   if (rawMessage.indexOf('没有可用节点') >= 0) {
-    return '还没有可用节点，本次没有启动 VPN。请到「订阅」页确认订阅已添加，'
+    return '还没有可用节点，本次没有启动 VPN。请到主页「订阅」里确认订阅已添加，'
       + '点击「刷新」并等节点列表出现后，再回首页点连接。原始错误: ' + rawMessage;
   }
   // 内核启动期联网下载阻塞（rule-provider / MMDB 本地文件缺失）：5.5.7 起生成配置时

@@ -250,8 +250,13 @@ export default class EntryAbility extends UIAbility {
       return;
     }
     let index = -1;
-    if (target.endsWith('SubscriptionPage')) {
-      index = 1;
+    /**
+     * 2026-10-28：订阅已从页签迁到主页（页签 1 现在是「数据」页），
+     * 因此 SubscriptionPage 深链不再能折算成页签 1 —— 改为「主页 + 打开订阅管理页」。
+     */
+    // 2026-10-28：订阅管理页已并入主页订阅区块，深链只切到主页（页签 0）。
+    if (target.endsWith('SubscriptionPage') || target.endsWith('SubscriptionSection')) {
+      index = 0;
     }
     if (index < 0) {
       return;

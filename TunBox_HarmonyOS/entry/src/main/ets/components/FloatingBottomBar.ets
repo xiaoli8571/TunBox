@@ -74,7 +74,7 @@ export struct FloatingBottomBar {
 
   private tabs: DockTab[] = [
     { id: 0, title: '主页', icon: $r('app.media.ic_dashboard') },
-    { id: 1, title: '订阅', icon: $r('app.media.ic_nodes') },
+    { id: 1, title: '数据', icon: $r('app.media.ic_network') },
     { id: 2, title: '设置', icon: $r('app.media.ic_settings') }
   ];
 
