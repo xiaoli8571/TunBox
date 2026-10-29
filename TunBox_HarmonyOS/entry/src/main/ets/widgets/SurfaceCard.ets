@@ -12,8 +12,8 @@ export struct SurfaceCard {
   @Prop radius: number = 22;
   @Prop paddingV: number = 16;
   @Prop paddingH: number = 16;
-  @Prop bgColor: ResourceColor = Ui.surface;
-  @Prop edgeColor: ResourceColor = Ui.glassEdge;
+  @Prop bgColor: ResourceColor = Ui.surface(-1);
+  @Prop edgeColor: ResourceColor = Ui.glassEdge(-1);
   @BuilderParam content: () => void = this.empty;
 
   @Builder

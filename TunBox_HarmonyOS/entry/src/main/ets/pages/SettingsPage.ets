@@ -25,7 +25,7 @@ import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { common } from '@kit.AbilityKit';
 import { privacyManager } from '@kit.AppGalleryKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
-import { ThemeService, AppThemeMode } from '../theme/ThemeService';
+import { ThemeService, AppThemeMode, AppBgTheme, BgThemeColors } from '../theme/ThemeService';
 import { TopNavBar } from '../components/TopNavBar';
 import { AppInfo } from '../commons/utils/AppInfo';
 import { SettingsService } from '../commons/services/SettingsService';
@@ -47,6 +47,11 @@ import { picker, fileIo as fs } from '@kit.CoreFileKit';
  * 开/关「自动重连」。退避上限的进程内记忆与设置 UI 一并移除。
  */
 /** 内容列最大宽度（与原 UiTokens.pageMaxWidth 取值一致，平板/折叠屏防过宽） */
+
+/** 浅色背景配色选项（顺序即设置页展示顺序；默认排最前） */
+const BG_THEME_OPTIONS: AppBgTheme[] = [
+  AppBgTheme.DEFAULT, AppBgTheme.MINT, AppBgTheme.HOMEBREW, AppBgTheme.NOCTIS
+];
 
 function formatGeoSize(bytes: number): string {
   if (bytes <= 0) {
@@ -86,6 +91,8 @@ export struct SettingsView {
    * SYSTEM = 跟随系统（默认）；LIGHT / DARK = 用户固定。
    */
   @StorageLink('theme_mode') themeMode: AppThemeMode = AppThemeMode.SYSTEM;
+  /** 浅色背景配色（2026-10-28 用户要求）：StorageLink 镜像 ThemeService，改完立即全 App 重绘 */
+  @StorageLink('bg_theme') bgTheme: AppBgTheme = AppBgTheme.DEFAULT;
   // ── 关于与隐私 ──
   @State privacyUrl: string = '';
   /** 顶栏标题（app.string.settings_title 的本地化取值；TopNavBar.title 为 string 型） */
@@ -358,7 +365,7 @@ export struct SettingsView {
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       Column().width('100%').height('100%')
-        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
@@ -387,8 +394,8 @@ export struct SettingsView {
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
             .onClick(() => router.pushUrl({ url: 'pages/AppRoutingPage' }))
 
             // ── 网站分流：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
@@ -411,8 +418,8 @@ export struct SettingsView {
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
             .onClick(() => router.pushUrl({ url: 'pages/SiteRoutingPage' }))
 
             // ── 广告拦截规则：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
@@ -435,8 +442,8 @@ export struct SettingsView {
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
             .onClick(() => { this.openRulesPage(); })
 
             // ── 网络与数据（2026-10-28 用户口径：IPv6 / DNS 覆写 / Smart 选点模型
@@ -454,7 +461,7 @@ export struct SettingsView {
               Text('IPv6 也走代理；关闭则纯 IPv4。改动会自动重连。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
 
-              Divider().color(TunBoxColors.cardBorder)
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
 
               Row() {
                 Text('DNS 覆写')
@@ -466,9 +473,9 @@ export struct SettingsView {
               Text('开启后使用 TunBox 配置的加密上游（DoT）；关闭后优先保留订阅 DNS。改动会自动重连。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
 
-              Divider().color(TunBoxColors.cardBorder)
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
 
-              Divider().color(TunBoxColors.cardBorder)
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
 
               // Smart 选点模型（原「数据与规则」里的 model 资产，2026-10-28 并入本分类）
               Row({ space: 8 }) {
@@ -499,8 +506,8 @@ export struct SettingsView {
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
             // ── 关于与隐私 ──
             Column({ space: 12 }) {
@@ -511,7 +518,7 @@ export struct SettingsView {
                 Text(AppInfo.version())
                   .fontSize(13).fontColor(TunBoxColors.textSecondary)
               }.width('100%')
-              Divider().color(TunBoxColors.cardBorder)
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               // 2026-10-23 用户口径：主题跟随系统放在「版本」和「隐私政策」中间
               Row() {
                 Text('主题跟随系统')
@@ -522,7 +529,13 @@ export struct SettingsView {
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('关闭后由主页太阳按钮手动切换深浅色。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              Divider().color(TunBoxColors.cardBorder)
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
+              // 2026-10-28 用户要求：浅色模式下背景色可选 Mint / Homebrew / Noctis Hibernus
+              // （深色只有一套夜间配色，故深色下这组选择器隐藏而不是置灰 —— 置灰会让人以为选不了是 bug）
+              if (!this.isDarkNow()) {
+                this.BgThemePicker()
+                Divider().color(TunBoxColors.cardBorder(this.themeRevision))
+              }
               // 2026-10-27：主页右上角「备份」迁到这里（关于与隐私卡内），功能不变。
               Row() {
                 Text('配置备份与恢复')
@@ -537,7 +550,7 @@ export struct SettingsView {
               })
               Text('导出/导入订阅、节点与自定义规则；支持 AES-256 加密备份。')
                 .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
-              Divider().color(TunBoxColors.cardBorder)
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               Row() {
                 Text($r('app.string.settings_privacy_policy_row'))
                   .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
@@ -550,8 +563,8 @@ export struct SettingsView {
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
             // 页签页底部为悬浮 Dock 预留（契约：≥ TunBoxGeometry.dockClearance）
             Blank().height(TunBoxGeometry.dockClearance)
@@ -579,6 +592,79 @@ export struct SettingsView {
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
+  }
+
+  /** 当前是否深色（每次读 ThemeService，跟着 theme_revision 重算） */
+  private isDarkNow(): boolean {
+    return ThemeService.isDark();
+  }
+
+  private bgThemeLabel(t: AppBgTheme): string {
+    if (t === AppBgTheme.MINT) {
+      return 'Mint';
+    }
+    if (t === AppBgTheme.HOMEBREW) {
+      return 'Homebrew';
+    }
+    if (t === AppBgTheme.NOCTIS) {
+      return 'Noctis';
+    }
+    return '默认';
+  }
+
+  private bgThemeSwatch(t: AppBgTheme): BgThemeColors {
+    return ThemeService.previewBgColors(t);
+  }
+
+  /**
+   * 背景配色选择器（2026-10-28 用户要求）。
+   * 每个选项直接用该配色自己的渐变做预览块 —— 选之前就能看到结果，不靠名字猜。
+   */
+  @Builder
+  BgThemePicker() {
+    Column({ space: 10 }) {
+      Row() {
+        Text('浅色背景')
+          .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+        Text(this.bgThemeLabel(this.bgTheme))
+          .fontSize(12).fontColor(TunBoxColors.textSecondary)
+      }.width('100%').alignItems(VerticalAlign.Center)
+      Row({ space: 10 }) {
+        ForEach(BG_THEME_OPTIONS, (item: AppBgTheme) => {
+          Column({ space: 6 }) {
+            Row()
+              .width('100%').height(44)
+              .borderRadius(12)
+              .linearGradient({
+                angle: 160,
+                colors: [[this.bgThemeSwatch(item).start, 0.0], [this.bgThemeSwatch(item).end, 1.0]]
+              })
+              .border({
+                width: this.bgTheme === item ? 2 : 1,
+                color: this.bgTheme === item ? TunBoxColors.primary : TunBoxColors.cardBorder(this.themeRevision)
+              })
+            Text(this.bgThemeLabel(item))
+              .fontSize(11)
+              .fontColor(this.bgTheme === item ? TunBoxColors.primary : TunBoxColors.textSecondary)
+              .fontWeight(this.bgTheme === item ? FontWeight.Medium : FontWeight.Regular)
+          }
+          .layoutWeight(1)
+          .onClick((): void => {
+            if (this.bgTheme === item) {
+              return;
+            }
+            ThemeService.setBgTheme(item).then((): void => {
+              promptAction.showToast({ message: `背景已切换为 ${this.bgThemeLabel(item)}` });
+            }).catch((): void => {
+              promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+            });
+          })
+        }, (item: AppBgTheme) => item)
+      }.width('100%')
+      Text('只影响浅色模式：页面背景、卡片与输入框会一起换成同色系；文字与品牌色不变。深色模式固定一套夜间配色。')
+        .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+    }
+    .width('100%')
   }
 
 }

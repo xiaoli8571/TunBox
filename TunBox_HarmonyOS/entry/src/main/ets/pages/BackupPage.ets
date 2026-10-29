@@ -25,6 +25,8 @@ const TAG = 'BackupPage';
 @CustomDialog
 struct BackupPasswordDialog {
   controller?: CustomDialogController;
+  /** 仅供配色 token 登记重绘依赖（2026-10-28 真机取证：themeRevision 必须在 build 表达式里被读到） */
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State mode: string = 'export';
   @State attemptHint: string = '';
   @State password: string = '';
@@ -55,8 +57,8 @@ struct BackupPasswordDialog {
       Row({ space: 10 }) {
         Button('取消')
           .layoutWeight(1).height(38).borderRadius(8)
-          .backgroundColor(TunBoxColors.surfaceCard).fontColor(TunBoxColors.textMuted).fontSize(13)
-          .borderWidth(1).borderColor(TunBoxColors.cardBorder)
+          .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision)).fontColor(TunBoxColors.textMuted).fontSize(13)
+          .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -286,21 +288,21 @@ struct BackupPage {
       Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
       Button(buttonLabel)
         .width('100%').borderRadius(8).fontSize(12.5)
-        .backgroundColor(primary ? TunBoxColors.primary : TunBoxColors.surfaceCard)
+        .backgroundColor(primary ? TunBoxColors.primary : TunBoxColors.surfaceCard(this.themeRevision))
         .fontColor(primary ? Color.White : TunBoxColors.textPrimary)
         .borderWidth(primary ? 0 : 1.5)
-        .borderColor(TunBoxColors.cardBorder)
+        .borderColor(TunBoxColors.cardBorder(this.themeRevision))
         .onClick(action)
     }
     .width('100%').padding(12).borderRadius(12)
-    .backgroundColor(TunBoxColors.background)
-    .borderWidth(1).borderColor(TunBoxColors.cardBorder)
+    .backgroundColor(TunBoxColors.background(this.themeRevision))
+    .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
   }
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       Column().width('100%').height('100%')
-        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
@@ -318,8 +320,8 @@ struct BackupPage {
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
             this.BackupCard('📤 导出当前配置备份',
               '生成包含所有订阅和规则的 .json 备份文件，便于多设备同步或留存。',

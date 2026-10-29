@@ -104,6 +104,64 @@ export const preferences = {
 
 stageLatencyCore();
 
+/**
+ * Node 的 strip-only 类型擦除不支持 enum（ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX）。
+ *
+ * ThemeService 里只有 AppThemeMode / AppBgTheme 两个「成员均为字符串字面量」的枚举，
+ * 这里等价改写成 const 对象（取值/比较语义完全一致）。
+ * 遇到非 KEY = '字面量' 形式的成员直接抛错 —— 宁可闸门红，不得静默改写语义。
+ */
+function enumsToConsts(src, fileLabel) {
+  return src.replace(/export enum (\w+)\s*\{([^}]*)\}/g, (_whole, name, body) => {
+    const fields = [];
+    for (const raw of body.split(',')) {
+      const line = raw.trim();
+      if (line.length === 0) { continue; }
+      const m = /^(\w+)\s*=\s*'([^']*)'$/.exec(line);
+      if (m === null) {
+        throw new Error(`${fileLabel}: 沙箱无法等价改写枚举成员「${line}」（仅支持 KEY = '字面量'）`);
+      }
+      fields.push(`${m[1]}: '${m[2]}'`);
+    }
+    return `export const ${name} = { ${fields.join(', ')} };`;
+  });
+}
+
+/**
+ * 暂存 theme/ThemeService（UiTokens 的表面色派生依赖，2026-10-28 新增）。
+ *
+ * 为什么需要：「浅色背景配色」要求卡片/输入框等表面色跟着背景派生，派生逻辑在
+ * ThemeService.bgColors()/isDark()/currentBgTheme()，于是 `Ui.surface*` 从静态资源
+ * 变成了调用 ThemeService 的方法 —— UiTokens 多了一条真实模块依赖。
+ * 只暂存 UiTokens 会报 ERR_MODULE_NOT_FOUND，所以连同依赖一起忠实暂存并打 @kit 桩。
+ */
+function stageThemeService() {
+  const src = enumsToConsts(readFileSync(join(appRoot, 'entry', 'src', 'main', 'ets', 'theme', 'ThemeService.ets'), 'utf8')
+    .replace(/from '@kit\.AbilityKit'/g, "from './fakeAbilityKit.ts'")
+    .replace(/from '@kit\.ArkData'/g, "from './fakeArkData.ts'")
+    .replace(/from '@kit\.ArkUI'/g, "from './fakeArkUI.ts'"), 'theme/ThemeService.ets');
+  writeFileSync(join(sandbox, 'ThemeService.ts'), src, 'utf8');
+  // 仅需模块加载期可求值的成员：ColorMode 枚举常量（静态字段初始值用到）。
+  writeFileSync(join(sandbox, 'fakeAbilityKit.ts'), `
+export const common = {};
+export const ConfigurationConstant = {
+  ColorMode: { COLOR_MODE_NOT_SET: -1, COLOR_MODE_DARK: 0, COLOR_MODE_LIGHT: 1 }
+};
+`, 'utf8');
+  writeFileSync(join(sandbox, 'fakeArkUI.ts'), `
+export const window = {};
+`, 'utf8');
+}
+
+// ArkUI 全局在 Node 下不存在 → 打桩（$r 取颜色标签，AppStorage 供 ThemeService 读写）
+globalThis.$r = (name) => 'R:' + name;
+const __appStore = new Map();
+globalThis.AppStorage = {
+  get: (k) => __appStore.get(k),
+  setOrCreate: (k, v) => { __appStore.set(k, v); },
+  set: (k, v) => { __appStore.set(k, v); }
+};
+
 const checks = [];
 function check(label, ok) {
   checks.push([label, !!ok]);
@@ -245,6 +303,8 @@ try {
       // 指向它自己 —— 不能一股脑重写成 LatencyState（那会让主题拿不到 describe）。
       .replace(/from '\.\.\/commons\/services\/LatencyState'/g, "from './LatencyState.ts'")
       .replace(/from '\.\.\/commons\/latency\/LatencyStore'/g, "from './LatencyStore.ts'")
+      // 表面色令牌改成随配色派生的方法后，UiTokens 多了 ThemeService 依赖（扁平沙箱）。
+      .replace(/from '\.\/ThemeService'/g, "from './ThemeService.ts'")
       .replace(/^import .*@ohos.*$/gm, '');
     const prelude = [
       'type ResourceColor = string;',
@@ -252,6 +312,7 @@ try {
       '',
     ].join('\n');
     writeFileSync(join(sandbox, 'UiTokens.ts'), prelude + uiSrc, 'utf8');
+    stageThemeService();
     const { LatencyStyle } = await import(pathToFileURL(join(sandbox, 'UiTokens.ts')).href);
 
     const now = 1_000_000;

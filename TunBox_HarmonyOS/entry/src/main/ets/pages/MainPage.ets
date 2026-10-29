@@ -152,7 +152,7 @@ struct MainPage {
     }
     .width('100%')
     .height('100%')
-    .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+    .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
     // 根渐变铺进状态栏/手势条安全区：切页动画期间不再露出窗口白底（2026-10-17 修「顶部/底栏闪浅白」）
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }

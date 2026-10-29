@@ -68,6 +68,13 @@ export const FLCLASH_DELAY_USE_TCP_TRANSPORT: boolean = true;
  * 语义：≤ 基线（32）时按目标数一波发完；超过基线后一路抬到「目标数」，
  * 但不超过上限（64）。即 24 → 24（一波）、40 → 40（一波）、80 → 64（2 波）、
  * 600 → 64（10 波，原来 32 并发时是 19 波）。
+ *
+ * ⚠ 2026-10-29 真机 A/B（飞鸟云 58/59 节点批，同一台机、同一 URL）：
+ *   自适应 conc=59 → measured=18 timeout=16 failed=23 cancelled=2
+ *   封顶 conc=32   → measured=14 timeout=21 failed=22 cancelled=1
+ *   ⇒ 「高并发制造假失败」在本机型上**不成立**，封顶反而更差。
+ *   那一屏「拨号失败/超时」是机场里真的有这么多死节点，不是抢资源。
+ *   所以这里保持自适应，别再为了"减少失败"去压低并发（先做 A/B 再改）。
  */
 export function flclashDelayConcurrency(total: number): number {
   if (total <= 0) {

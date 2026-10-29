@@ -109,3 +109,13 @@ kernel/
 # ---- 大体积归档二进制不入库（GitHub 100MB 硬限；2026-10-25 推送被拒后清理）----
 _archive/**/*.exe
 _archive/**/*.7z
+
+# AGC 服务账号私钥（含 private_key，绝不入库）
+agc-sa-private.json
+agc-apiclient-*.json
+# AGC 客户端配置文件（含 client_secret / api_key，绝不入库）
+agconnect-services.json
+
+# Agent 真机取证截图（大体积二进制，不入库）
+.pi-captures/
+**/.pi-captures/

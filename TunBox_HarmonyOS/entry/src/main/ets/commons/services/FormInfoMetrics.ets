@@ -104,7 +104,7 @@ export class FormInfoMetrics {
         connectTimeout: REQUEST_TIMEOUT_MS,
         readTimeout: REQUEST_TIMEOUT_MS,
         usingCache: false,
-        usingProxy: AppProxyRoute.activePort() > 0
+        usingProxy: AppProxyRoute.isReady()
       });
       let body = '';
       if (typeof response.result === 'string') {

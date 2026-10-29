@@ -58,7 +58,7 @@ export struct SubscriptionCard {
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
             .fontColor(Ui.primary)
-            .backgroundColor(Ui.surfaceMuted)
+            .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .borderRadius(10)
             .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .onClick(() => this.onRefresh(this.subId()))
@@ -66,7 +66,7 @@ export struct SubscriptionCard {
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
             .fontColor(Ui.textSecondary)
-            .backgroundColor(Ui.surfaceMuted)
+            .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .borderRadius(10)
             .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .onClick(() => this.onEdit(this.subId()))
@@ -74,7 +74,7 @@ export struct SubscriptionCard {
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
             .fontColor(Ui.error)
-            .backgroundColor(Ui.surfaceMuted)
+            .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .borderRadius(10)
             .padding({ left: 12, right: 12, top: 6, bottom: 6 })
             .onClick(() => this.onDelete(this.subId()))
@@ -84,9 +84,9 @@ export struct SubscriptionCard {
       .width('100%')
       .padding(16)
       .borderRadius(18)
-      .backgroundColor(Ui.surface)
+      .backgroundColor(Ui.surface(this.themeRevision))
       .borderWidth(this.active ? 1.5 : 1)
-      .borderColor(this.active ? Ui.primary : Ui.glassEdge)
+      .borderColor(this.active ? Ui.primary : Ui.glassEdge(this.themeRevision))
     }
   }
 }

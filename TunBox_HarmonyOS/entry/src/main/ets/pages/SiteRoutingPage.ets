@@ -13,6 +13,8 @@ class SitePageParams { kind: string = 'proxy'; }
 @CustomDialog
 struct SiteInputDialog {
   controller?: CustomDialogController;
+  /** 仅供配色 token 登记重绘依赖（2026-10-28 真机取证） */
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State text: string = '';
   onAdd: (text: string) => boolean = () => false;
 
@@ -43,7 +45,7 @@ struct SiteInputDialog {
       Text('每行一个纯域名，例如 example.com。无需 https://，不要填写路径、端口或通配符；规则包含其子域名。')
         .fontSize(12).fontColor(Ui.textSecondary)
       TextArea({ text: this.text, placeholder: 'example.com\nexample.org' }).height(170).maxLength(131072)
-        .backgroundColor(Ui.inputBackground).fontColor(Ui.textPrimary).onChange((value: string) => { this.text = value; })
+        .backgroundColor(Ui.inputBackground(this.themeRevision)).fontColor(Ui.textPrimary).onChange((value: string) => { this.text = value; })
       // 输入即识别：全部行都是合法域名时按钮立刻变实心蓝，不合法行就地标红。
       if (this.text.trim().length > 0) {
         Text(this.errorText().length > 0 ? this.errorText() : this.previewText())
@@ -52,7 +54,7 @@ struct SiteInputDialog {
           .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
       }
       Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong).fontColor(Ui.textPrimary)
+        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong(this.themeRevision)).fontColor(Ui.textPrimary)
           .onClick(() => this.controller?.close())
         Button('添加到当前名单').layoutWeight(2)
           .backgroundColor(this.canAdd() ? TunBoxColors.primary : Ui.buttonDisabled)
@@ -282,7 +284,7 @@ struct SiteRoutingPage {
     .layoutWeight(1)
     .justifyContent(FlexAlign.Center)
     .borderRadius(8)
-    .backgroundColor(this.kind === kind ? TunBoxColors.surfaceCard : Color.Transparent)
+    .backgroundColor(this.kind === kind ? TunBoxColors.surfaceCard(this.themeRevision) : Color.Transparent)
     .onClick(() => this.switchKind(kind))
   }
 
@@ -297,7 +299,7 @@ struct SiteRoutingPage {
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       // 底层背景列（文档 §1：系统全局底色，深浅色经 TunBoxColors 解析；不再用渐变/玻璃底）
-      Column().width('100%').height('100%').linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+      Column().width('100%').height('100%').linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
         // 顶部导航（文档 §2.1）：返回接既有 back()（含未保存草稿确认），rightSlot 承载既有「保存」按钮
@@ -316,7 +318,7 @@ struct SiteRoutingPage {
             this.KindTab('proxy', '强制代理')
             this.KindTab('direct', '强制直连')
             this.KindTab('block', '强制拦截')
-          }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft)
+          }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft(this.themeRevision))
             .alignSelf(ItemAlign.Center)
             .enabled(this.ready && !this.busy)
           // 既有说明卡（文案与判定不变；视觉换成描边卡配方，去掉玻璃/模糊/backgroundEffect/阴影）
@@ -331,8 +333,8 @@ struct SiteRoutingPage {
             Text('勾选仅用于批量操作，不是启用开关。网站规则位于广告 / 自定义规则之后；网站名单之间重叠时直连优先。')
               .fontSize(11).fontColor(TunBoxColors.textMuted)
           }.width('100%').padding(16).alignItems(HorizontalAlign.Start).borderRadius(TunBoxGeometry.cardRadiusSmall)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
           // 既有搜索框（过滤逻辑不变；视觉改令牌配方：高 42 / surfaceCard / 圆角 14 / 描边 / 前置 ic_search）
           Row({ space: 8 }) {
             Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMuted)
@@ -341,8 +343,8 @@ struct SiteRoutingPage {
               .backgroundColor(Color.Transparent).padding(0).height('100%').layoutWeight(1)
               .onChange((value: string) => { this.query = value; this.rebuild(); })
           }.width('100%').height(42).padding({ left: 12, right: 12 })
-            .backgroundColor(TunBoxColors.surfaceCard).borderRadius(TunBoxGeometry.controlRadius)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision)).borderRadius(TunBoxGeometry.controlRadius)
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
           // 既有过滤行（切换逻辑不变；'▾' 文字符号去掉）
           Row() {
             Text(this.selectedOnly ? `已勾选 ${this.selected.length}` : `当前名单 ${this.current().length}`).fontSize(13)
@@ -379,8 +381,8 @@ struct SiteRoutingPage {
                   }.type(ButtonType.Normal).backgroundColor(Color.Transparent)
                     .onClick(() => this.remove([domain]))
                 }.padding(14).width('100%').borderRadius(18)
-                  .backgroundColor(TunBoxColors.surfaceCard)
-                  .border({ width: 1, color: TunBoxColors.cardBorder })
+                  .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+                  .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               }
             }, (domain: string) => `${domain}:${this.selected.includes(domain)}`)
             if (this.visible.length === 0) {
@@ -421,8 +423,8 @@ struct SiteRoutingPage {
           }.width('100%').enabled(this.ready && !this.busy)
         }.width('100%').padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 10, bottom: 24
-        }).backgroundColor(TunBoxColors.surfaceCard)
-          .border({ width: { top: 1 }, color: TunBoxColors.cardBorder })
+        }).backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+          .border({ width: { top: 1 }, color: TunBoxColors.cardBorder(this.themeRevision) })
           .width('100%')
       }.width('100%').height('100%')
     }.width('100%').height('100%')

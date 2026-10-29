@@ -305,13 +305,13 @@ export struct RulesView {
     if (policy === 'DIRECT') {
       return TunBoxColors.successLight;
     }
-    return TunBoxColors.chipBg;
+    return TunBoxColors.chipBg(this.themeRevision);
   }
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       Column().width('100%').height('100%')
-        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
         // ── 顶栏（doc §3.6：页签页无返回；既有「保存」入口放 rightSlot 扩展槽）──
@@ -339,7 +339,7 @@ export struct RulesView {
                     .selectedColor(TunBoxColors.primary)
                     .onChange((value: boolean) => { this.rulesEnabled = value; })
                 }.width('100%').alignItems(VerticalAlign.Center)
-                Divider().strokeWidth(1).color(TunBoxColors.cardBorder)
+                Divider().strokeWidth(1).color(TunBoxColors.cardBorder(this.themeRevision))
                 Row() {
                   Column({ space: 2 }) {
                     Row({ space: 6 }) {
@@ -363,9 +363,9 @@ export struct RulesView {
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
-              .backgroundColor(TunBoxColors.surfaceCard)
+              .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
               .borderRadius(TunBoxGeometry.cardRadius)
-              .border({ width: 1, color: TunBoxColors.cardBorder })
+              .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               // ── 卡片 2：自定义域名与 IP 规则（doc §3.6：等宽代码编辑器 + 模版注入）──
               Column({ space: 10 }) {
                 Row() {
@@ -392,12 +392,12 @@ export struct RulesView {
                   .fontSize(12).fontFamily('monospace').lineHeight(20)
                   .fontColor(TunBoxColors.codeText)
                   .placeholderColor(TunBoxColors.textMuted)
-                  .backgroundColor(TunBoxColors.codeBg)
+                  .backgroundColor(TunBoxColors.codeBg(this.themeRevision))
                   .borderRadius(14)
                   .padding(12)
                   .border({
                     width: 1,
-                    color: this.ruleErrors.length > 0 ? TunBoxColors.danger : TunBoxColors.codeBorder
+                    color: this.ruleErrors.length > 0 ? TunBoxColors.danger : TunBoxColors.codeBorder(this.themeRevision)
                   })
                 if (this.ruleErrors.length > 0) {
                   Column({ space: 4 }) {
@@ -421,9 +421,9 @@ export struct RulesView {
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
-              .backgroundColor(TunBoxColors.surfaceCard)
+              .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
               .borderRadius(TunBoxGeometry.cardRadius)
-              .border({ width: 1, color: TunBoxColors.cardBorder })
+              .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               // ── 卡片 3：规则命中快速调试（doc §3.6：沙盒模拟）──
               Column({ space: 12 }) {
                 Row() {
@@ -438,7 +438,7 @@ export struct RulesView {
                     .fontSize(13)
                     .fontColor(TunBoxColors.textPrimary)
                     .placeholderColor(TunBoxColors.textMuted)
-                    .backgroundColor(TunBoxColors.surfaceSubtle)
+                    .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                     .borderRadius(10)
                     .padding({ left: 10, right: 10 })
                     .onChange((value: string) => {
@@ -482,15 +482,15 @@ export struct RulesView {
                   }
                   .width('100%').alignItems(VerticalAlign.Center)
                   .padding(12)
-                  .backgroundColor(TunBoxColors.surfaceSubtle)
+                  .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                   .borderRadius(12)
                 }
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
-              .backgroundColor(TunBoxColors.surfaceCard)
+              .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
               .borderRadius(TunBoxGeometry.cardRadius)
-              .border({ width: 1, color: TunBoxColors.cardBorder })
+              .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               // ── 自定义远程规则集（P1-2）：条目列表 + 新增表单，对标 iOS 六家 RULE-SET 能力 ──
               Column({ space: 10 }) {
                 Text('自定义规则集').fontSize(16).fontWeight(FontWeight.Bold)
@@ -509,25 +509,25 @@ export struct RulesView {
                     Text('删除').fontSize(12).fontColor(TunBoxColors.danger).padding(6)
                       .onClick(() => this.removeRuleSet(rs.name))
                   }.width('100%').padding(10).borderRadius(12)
-                    .backgroundColor(TunBoxColors.surfaceSubtle)
-                    .border({ width: 1, color: TunBoxColors.cardBorder })
+                    .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
+                    .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
                 }, (rs: CustomRuleSet) => rs.name)
                 TextInput({ placeholder: '名称（字母数字-_，如 my-rules）', text: this.rsName })
                   .enabled(this.rulesEnabled)
                   .onChange((value: string) => { this.rsName = value; })
                   .height(40).fontSize(13).fontColor(TunBoxColors.textPrimary)
                   .placeholderColor(TunBoxColors.textMuted)
-                  .backgroundColor(TunBoxColors.surfaceSubtle)
+                  .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                   .borderRadius(12).padding({ left: 10, right: 10 })
-                  .border({ width: 1, color: TunBoxColors.cardBorder })
+                  .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
                 TextInput({ placeholder: 'https://… 规则集 URL（yaml/text/mrs）', text: this.rsUrl })
                   .enabled(this.rulesEnabled)
                   .onChange((value: string) => { this.rsUrl = value; })
                   .height(40).fontSize(13).fontColor(TunBoxColors.textPrimary)
                   .placeholderColor(TunBoxColors.textMuted)
-                  .backgroundColor(TunBoxColors.surfaceSubtle)
+                  .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                   .borderRadius(12).padding({ left: 10, right: 10 })
-                  .border({ width: 1, color: TunBoxColors.cardBorder })
+                  .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
                 // 格式 chip 换行（Flex wrap，Row 无 flexWrap 属性）：窄屏下 chip 挤一行
                 // 会超出卡片边界，允许换行。
                 Flex({ wrap: FlexWrap.Wrap, space: { main: LengthMetrics.vp(8), cross: LengthMetrics.vp(8) } }) {
@@ -536,7 +536,7 @@ export struct RulesView {
                     Text(f).fontSize(12).padding({ left: 10, right: 10, top: 4, bottom: 4 })
                       .borderRadius(TunBoxGeometry.pillRadius)
                       .fontColor(this.rsFormat === f ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
-                      .backgroundColor(this.rsFormat === f ? TunBoxColors.primary : TunBoxColors.chipBg)
+                      .backgroundColor(this.rsFormat === f ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
                       .onClick(() => { this.rsFormat = f; })
                   }, (f: string) => f)
                 }.width('100%')
@@ -548,7 +548,7 @@ export struct RulesView {
                     Text(p).fontSize(12).padding({ left: 10, right: 10, top: 4, bottom: 4 })
                       .borderRadius(TunBoxGeometry.pillRadius)
                       .fontColor(this.rsPolicy === p ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
-                      .backgroundColor(this.rsPolicy === p ? TunBoxColors.primary : TunBoxColors.chipBg)
+                      .backgroundColor(this.rsPolicy === p ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
                       .onClick(() => { this.rsPolicy = p; })
                   }, (p: string) => p)
                 }.width('100%')
@@ -556,16 +556,16 @@ export struct RulesView {
                   .fontColor(this.rulesEnabled ? TunBoxColors.textOnPrimary : TunBoxColors.textMuted)
                   .textAlign(TextAlign.Center).width('100%').padding(10)
                   .borderRadius(TunBoxGeometry.controlRadius)
-                  .backgroundColor(this.rulesEnabled ? TunBoxColors.primary : TunBoxColors.surfaceSubtle)
+                  .backgroundColor(this.rulesEnabled ? TunBoxColors.primary : TunBoxColors.surfaceSubtle(this.themeRevision))
                   .onClick(() => this.addRuleSet())
                 Text('behavior 由格式推断：yaml/text 默认 domain，可在生成器侧自动匹配 ipcidr/classical；名称将生成 rs-<名称> 的 provider 键。')
                   .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
-              .backgroundColor(TunBoxColors.surfaceCard)
+              .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
               .borderRadius(TunBoxGeometry.cardRadius)
-              .border({ width: 1, color: TunBoxColors.cardBorder })
+              .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               // ── YAML 覆盖层（P2）：对标 Stash JS Override 的无脚本形态 ──
               Column({ space: 10 }) {
                 Text('YAML 覆盖层').fontSize(16).fontWeight(FontWeight.Bold)
@@ -579,10 +579,10 @@ export struct RulesView {
                   .fontSize(12).fontFamily('monospace').lineHeight(20)
                   .fontColor(TunBoxColors.codeText)
                   .placeholderColor(TunBoxColors.textMuted)
-                  .backgroundColor(TunBoxColors.codeBg)
+                  .backgroundColor(TunBoxColors.codeBg(this.themeRevision))
                   .borderRadius(14)
                   .padding(12)
-                  .border({ width: 1, color: TunBoxColors.codeBorder })
+                  .border({ width: 1, color: TunBoxColors.codeBorder(this.themeRevision) })
                 Text('保存').fontSize(14).fontWeight(FontWeight.Bold)
                   .fontColor(TunBoxColors.textOnPrimary)
                   .textAlign(TextAlign.Center).width('100%').padding(10)
@@ -592,9 +592,9 @@ export struct RulesView {
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
-              .backgroundColor(TunBoxColors.surfaceCard)
+              .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
               .borderRadius(TunBoxGeometry.cardRadius)
-              .border({ width: 1, color: TunBoxColors.cardBorder })
+              .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               // 页签页底部为悬浮 Dock 预留（契约：≥ TunBoxGeometry.dockClearance）
               Blank().height(TunBoxGeometry.dockClearance)
             }.width('100%')

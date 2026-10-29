@@ -219,6 +219,11 @@ export class SubscriptionFetchPolicy {
     let uaIndex = 0;
     while (uaIndex < UA_CHAIN.length) {
       const ua = customHeader ? headerValue : UA_CHAIN[uaIndex];
+      // setAppHttpProxy 成功只表示代理配置已提交，mixed-port 可能仍在启动。
+      // 先等本地端口真正响应，避免首个请求撞在内核启动窗口里。
+      if (AppProxyRoute.activePort() > 0 && !AppProxyRoute.isReady()) {
+        await AppProxyRoute.waitUntilReady(4000);
+      }
       try {
         const headers: Record<string, string> = {};
         if (customHeader && SubscriptionFetchPolicy.maySendCustomHeader(urlStr, headerName)) {
@@ -289,6 +294,11 @@ export class SubscriptionFetchPolicy {
           if (canRetry) {
             AppLogger.info(TAG, `transport failure ${transportAttempts}/${TRANSPORT_RETRY_MAX}, `
               + `retrying same UA after ${TRANSPORT_RETRY_BACKOFF_MS}ms (elapsed ${elapsed}ms)`);
+            // 直连失败时，隧道可能刚好完成启动。等待一次 mixed-port 就绪，
+            // 下一次请求会自动切换到代理；若仍未就绪则保持直连。
+            if (AppProxyRoute.activePort() > 0 && !AppProxyRoute.isReady()) {
+              await AppProxyRoute.waitUntilReady(3000);
+            }
             await SubscriptionFetchPolicy.delay(TRANSPORT_RETRY_BACKOFF_MS);
             // uaIndex 不自增 → 重试同一个 UA
             continue;
@@ -429,8 +439,8 @@ export class SubscriptionFetchPolicy {
         readTimeout: 20000,
         usingCache: false,
         // 隧道已连接时走本地 mixed 端口（被墙面板/明文拦截才能刷新），
-        // 断开时 false → 忽略残留的应用级代理配置，直连
-        usingProxy: AppProxyRoute.activePort() > 0,
+        // 断开或 mixed-port 尚未就绪时 false → 直连；就绪后才经隧道请求
+        usingProxy: AppProxyRoute.isReady(),
         expectDataType: http.HttpDataType.ARRAY_BUFFER,
         maxRedirects: 0
       });

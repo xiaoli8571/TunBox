@@ -675,7 +675,7 @@ export struct StatsPage {
         `${this.formatSpeed(this.avgDown)} / ${this.formatSpeed(this.avgUp)}`,
         TunBoxColors.textSecondary)
 
-      Divider().color(TunBoxColors.cardBorder).strokeWidth(1)
+      Divider().color(TunBoxColors.cardBorder(this.themeRevision)).strokeWidth(1)
 
       this.MetricRow($r('app.media.ic_swap'), '本次连接',
         `↓ ${this.formatBytes(this.sessionDown)}   ↑ ${this.formatBytes(this.sessionUp)}`,
@@ -695,9 +695,9 @@ export struct StatsPage {
     }
     .width('100%')
     .padding(TunBoxGeometry.cardPaddingLarge)
-    .backgroundColor(TunBoxColors.surfaceCard)
+    .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
     .borderRadius(TunBoxGeometry.cardRadius)
-    .border({ width: 1, color: TunBoxColors.cardBorder })
+    .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
     .clip(true)
   }
 
@@ -722,9 +722,9 @@ export struct StatsPage {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
       .padding(14)
-      .backgroundColor(TunBoxColors.surfaceCard)
+      .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
       .borderRadius(TunBoxGeometry.cardRadius)
-      .border({ width: 1, color: TunBoxColors.cardBorder })
+      .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
       Column({ space: 6 }) {
         Row({ space: 5 }) {
@@ -743,9 +743,9 @@ export struct StatsPage {
       .layoutWeight(1)
       .alignItems(HorizontalAlign.Start)
       .padding(14)
-      .backgroundColor(TunBoxColors.surfaceCard)
+      .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
       .borderRadius(TunBoxGeometry.cardRadius)
-      .border({ width: 1, color: TunBoxColors.cardBorder })
+      .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
     }
     .width('100%')
     .alignItems(VerticalAlign.Top)
@@ -796,9 +796,9 @@ export struct StatsPage {
     }
     .width('100%')
     .padding(TunBoxGeometry.cardPaddingLarge)
-    .backgroundColor(TunBoxColors.surfaceCard)
+    .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
     .borderRadius(TunBoxGeometry.cardRadius)
-    .border({ width: 1, color: TunBoxColors.cardBorder })
+    .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
     .clip(true)
   }
 
@@ -821,7 +821,7 @@ export struct StatsPage {
     .width('100%')
     .height(40)
     .padding({ left: 12, right: 12 })
-    .backgroundColor(TunBoxColors.surfaceSubtle)
+    .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
     .borderRadius(12)
     .alignItems(VerticalAlign.Center)
     .onClick((): void => { this.testEntry(entry); })
@@ -866,7 +866,7 @@ export struct StatsPage {
         }
         .padding({ left: 8, right: 8, top: 4, bottom: 4 })
         .borderRadius(TunBoxGeometry.pillRadius)
-        .backgroundColor(TunBoxColors.chipBg)
+        .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
         .onClick((): void => { this.addingHost = !this.addingHost; })
       }
       .width('100%')
@@ -878,7 +878,7 @@ export struct StatsPage {
             .height(36)
             .layoutWeight(1)
             .fontSize(12)
-            .backgroundColor(TunBoxColors.surfaceSubtle)
+            .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
             .borderRadius(10)
             .onChange((v: string): void => { this.hostInput = v; })
             .onSubmit((_key: EnterKeyType): void => { this.addHost(); })
@@ -918,9 +918,9 @@ export struct StatsPage {
     }
     .width('100%')
     .padding(TunBoxGeometry.cardPaddingLarge)
-    .backgroundColor(TunBoxColors.surfaceCard)
+    .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
     .borderRadius(TunBoxGeometry.cardRadius)
-    .border({ width: 1, color: TunBoxColors.cardBorder })
+    .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
     .clip(true)
   }
 

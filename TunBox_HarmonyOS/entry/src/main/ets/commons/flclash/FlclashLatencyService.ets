@@ -55,12 +55,35 @@ export class FlclashLatencySession {
   private readonly targets: DelayTarget[];
   private readonly runId: number;
   private readonly previous: Map<string, LatencyRecord>;
+  /**
+   * 本批是否被**显式取消**（用户又点了测速 / 新批抢占 / 关页面）。
+   *
+   * 为什么必须区分：收尾时「没测出结论」的节点要收回到某个状态。
+   *  - 被抢占 = 我们主动不测了 ⇒ 不能给节点盖章（沿用旧结论，没有就「未测」）；
+   *  - 没被取消却没结论 = 请求挂到守护上限（10s）才被收尾、或压根没发出去
+   *    ⇒ 这就是「问了、等到超时也没答」，应当如实显示「超时」。
+   * 旧实现两种情况一律回到 `untested`，真机表现就是 2026-10-29 用户反馈的
+   * 「测速完过一会一部分节点显示 --」（59 节点批：measured=18 timeout=16
+   * failed=23 **cancelled=2**，那 2 条正好永久停在 `--`）。
+   */
+  private explicitCancel: boolean = false;
 
   private clearOwnTesting(): void {
     for (const target of this.targets) {
       if (LatencyLiveView.isTestingOwnedBy(target.proxyName, this.runId)) {
         const old = this.previous.get(target.proxyName);
-        LatencyLiveView.setRecord(old !== undefined ? old : LatencyRecord.untested(target.proxyName));
+        if (old !== undefined) {
+          LatencyLiveView.setRecord(old);
+          continue;
+        }
+        if (this.explicitCancel) {
+          LatencyLiveView.setRecord(LatencyRecord.untested(target.proxyName));
+          continue;
+        }
+        // 非取消却无结论：请求发出后挂死到守护上限，等同超时（用户口径
+        // 2026-10-18：要么给延迟、要么给超时/失败，不要模棱两可的第三种结果）。
+        LatencyLiveView.setRecord(LatencyRecord.failed(target.proxyName, LatencyState.TIMEOUT,
+          Date.now(), LatencyChannel.CORE, LatencyProbeKind.TIMEOUT));
       }
     }
     LatencyLiveView.flushNow();
@@ -153,6 +176,8 @@ export class FlclashLatencySession {
     if (this.finished) {
       return;
     }
+    // 显式取消：收尾时未测完的节点不得盖章（新批马上会重测同一批节点）
+    this.explicitCancel = true;
     this.run.cancel();
     this.clearOwnTesting();
     this.progress.running = false;

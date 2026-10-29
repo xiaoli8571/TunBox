@@ -67,9 +67,9 @@ export struct NodeCard {
       .width('100%')
       .padding(14)
       .borderRadius(16)
-      .backgroundColor(this.selected ? Ui.selectedBackground : Ui.surface)
+      .backgroundColor(this.selected ? Ui.selectedBackground(this.themeRevision) : Ui.surface(this.themeRevision))
       .borderWidth(this.selected ? 1.5 : 1)
-      .borderColor(this.selected ? Ui.primary : Ui.glassEdge)
+      .borderColor(this.selected ? Ui.primary : Ui.glassEdge(this.themeRevision))
       .onClick(() => {
         if (this.node !== null) {
           this.onSelect(this.node);

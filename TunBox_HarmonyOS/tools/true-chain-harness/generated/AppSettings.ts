@@ -88,6 +88,15 @@ export class AppSettingsJson {
   /** 每个订阅各自记住的手动选择节点（JSON：订阅 id → 节点名），见 AppSettings 同名字段 */
   preferredNodeNamesBySubscription: string = '';
   autoUpdateSubscription: boolean = true;
+  /**
+   * 自动更新间隔（分钟，2026-10-29 用户要求可自定义）。
+   *
+   * 此前这个值根本**不存在**：编辑弹窗里的「自动更新间隔」直接 `return '360'` 硬编码，
+   * 调度器也用硬编码的 6h 阈值 ⇒ 用户看到 360 但永远改不了（也没处可存）。
+   * 现在它是真设置：弹窗可改、持久化、调度器按它算过期。
+   * 默认 360（6h）与旧行为一致，升级用户无感。
+   */
+  subscriptionUpdateIntervalMinutes: number = 360;
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
   proxyMode: string = 'rule';
@@ -279,6 +288,7 @@ export class AppSettings {
   /** 偏好节点名字快照（重锚用），与 AppSettingsJson.preferredNodeName 对应 */
   preferredNodeName: string = '';
   autoUpdateSubscription: boolean = true;
+  subscriptionUpdateIntervalMinutes: number = 360;
   /**
    * 每个订阅**各自**记住的手动选择节点（JSON：订阅 id → 节点名）。
    *
@@ -399,6 +409,7 @@ export class AppSettings {
     j.preferredNodeName = this.preferredNodeName;
     j.preferredNodeNamesBySubscription = this.preferredNodeNamesBySubscription;
     j.autoUpdateSubscription = this.autoUpdateSubscription;
+    j.subscriptionUpdateIntervalMinutes = this.subscriptionUpdateIntervalMinutes;
     j.selectedSubscriptionId = this.selectedSubscriptionId;
     j.testLatencyUrl = this.testLatencyUrl;
     j.proxyMode = this.proxyMode;
@@ -593,6 +604,9 @@ export class AppSettings {
     s.preferredNodeNamesBySubscription = typeof j.preferredNodeNamesBySubscription === 'string'
       ? j.preferredNodeNamesBySubscription : '';
     s.autoUpdateSubscription = typeof j.autoUpdateSubscription === 'boolean' ? j.autoUpdateSubscription : true;
+    // 历史存档里没这个字段 ⇒ 回推 360（6h，等同旧硬编码行为）；写成 0/负数说明存档异常，也回推。
+    s.subscriptionUpdateIntervalMinutes = typeof j.subscriptionUpdateIntervalMinutes === 'number'
+      && j.subscriptionUpdateIntervalMinutes > 0 ? j.subscriptionUpdateIntervalMinutes : 360;
     s.selectedSubscriptionId = typeof j.selectedSubscriptionId === 'string' ? j.selectedSubscriptionId : '';
     // 测速地址：**只做「历史 http 默认值 → https」的单向升级**（C3）。
     // 早期版本在这里做过**反向降级**（把用户手填的 https 改回 http）—— 那是罪魁祸首：

@@ -108,9 +108,59 @@ export const preferences = {
 `, 'utf8');
 }
 
+/**
+ * Node 的 strip-only 类型擦除不支持 enum（ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX）。
+ *
+ * ThemeService 里只有 AppThemeMode / AppBgTheme 两个「成员均为字符串字面量」的枚举，
+ * 这里等价改写成 const 对象（取值/比较语义完全一致）。
+ * 遇到非 KEY = '字面量' 形式的成员直接抛错 —— 宁可闸门红，不得静默改写语义。
+ */
+function enumsToConsts(src, fileLabel) {
+  return src.replace(/export enum (\w+)\s*\{([^}]*)\}/g, (whole, name, body) => {
+    const fields = [];
+    for (const raw of body.split(',')) {
+      const line = raw.trim();
+      if (line.length === 0) { continue; }
+      const m = /^(\w+)\s*=\s*'([^']*)'$/.exec(line);
+      if (m === null) {
+        throw new Error(`${fileLabel}: 沙箱无法等价改写枚举成员「${line}」（仅支持 KEY = '字面量'）`);
+      }
+      fields.push(`${m[1]}: '${m[2]}'`);
+    }
+    return `export const ${name} = { ${fields.join(', ')} };`;
+  });
+}
+
+/**
+ * 暂存 theme/ThemeService（UiTokens 的表面色派生依赖，2026-10-28 新增）。
+ *
+ * 为什么需要：「浅色背景配色」要求卡片/输入框等表面色跟着背景派生，派生逻辑在
+ * ThemeService.bgColors()/isDark()/currentBgTheme()，于是 `Ui.surface*` 从静态资源
+ * 变成了调用 ThemeService 的方法 —— UiTokens 多了一条真实模块依赖。
+ * 只暂存 UiTokens 会报 ERR_MODULE_NOT_FOUND，所以连同依赖一起忠实暂存并打 @kit 桩。
+ */
+function stageThemeService() {
+  const src = enumsToConsts(readFileSync(join(ets, 'theme/ThemeService.ets'), 'utf8')
+    .replace(/from '@kit\.AbilityKit'/g, "from '../fakes/fakeAbilityKit.ts'")
+    .replace(/from '@kit\.ArkData'/g, "from '../fakes/fakeArkData.ts'")
+    .replace(/from '@kit\.ArkUI'/g, "from '../fakes/fakeArkUI.ts'"), 'theme/ThemeService.ets');
+  writeFileSync(join(sandbox, 'theme', 'ThemeService.ts'), src, 'utf8');
+  // 只需模块加载期可求值的成员：ColorMode 枚举常量（静态字段初始值用到）。
+  writeFileSync(join(sandbox, 'fakes', 'fakeAbilityKit.ts'), `
+export const common = {};
+export const ConfigurationConstant = {
+  ColorMode: { COLOR_MODE_NOT_SET: -1, COLOR_MODE_DARK: 0, COLOR_MODE_LIGHT: 1 }
+};
+`, 'utf8');
+  writeFileSync(join(sandbox, 'fakes', 'fakeArkUI.ts'), `
+export const window = {};
+`, 'utf8');
+}
+
 stage('commons/services/LatencyState', 'commons/services/LatencyState');
 stage('commons/services/LatencyLiveView', 'commons/services/LatencyLiveView');
 stageLatencyCore();
+stageThemeService();
 stage('theme/UiTokens', 'theme/UiTokens');
 
 const checks = [];
@@ -131,6 +181,13 @@ const RECENT = NOW - 30 * 1000;     // 30 秒前
 
 // ArkUI 全局资源函数 $r 在 Node 下不存在 → 打成占位串（UiTokens 用它取主题色）
 globalThis.$r = (name) => name;
+// ThemeService 模块加载期要用 AppStorage（本闸门不调它，但保持可加载/可断言）
+const __appStore = new Map();
+globalThis.AppStorage = {
+  get: (k) => __appStore.get(k),
+  setOrCreate: (k, v) => { __appStore.set(k, v); },
+  set: (k, v) => { __appStore.set(k, v); }
+};
 
 try {
   const { LatencyLiveView } =

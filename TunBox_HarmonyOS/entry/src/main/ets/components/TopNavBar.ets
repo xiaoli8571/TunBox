@@ -70,7 +70,7 @@ export struct TopNavBar {
               .fillColor(TunBoxColors.textPrimary)
           }
           .type(ButtonType.Circle)
-          .backgroundColor(TunBoxColors.chipBg)
+          .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
           .width(36).height(36)
           .onClick(() => {
             const cb = this.onRightClick;

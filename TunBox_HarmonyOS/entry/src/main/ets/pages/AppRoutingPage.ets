@@ -18,6 +18,8 @@ class RoutingRow {
 @CustomDialog
 struct RoutingInputDialog {
   controller?: CustomDialogController;
+  /** 仅供配色 token 登记重绘依赖（2026-10-28 真机取证） */
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @State label: string = '';
   @State packages: string = '';
   onAdd: (packages: string, label: string) => boolean = () => false;
@@ -51,9 +53,9 @@ struct RoutingInputDialog {
       Text('每行一条，支持「名称|包名」，例如 支付宝|com.alipay.mobile.client；也可以只填鸿蒙包名。请勿使用 Android 包名代替鸿蒙包名。')
         .fontSize(12).fontColor(Ui.textSecondary)
       TextInput({ text: this.label, placeholder: '名称备注（可选，只用于单条输入）' }).maxLength(40)
-        .onChange((v: string) => { this.label = v; }).backgroundColor(Ui.inputBackground).fontColor(Ui.textPrimary)
+        .onChange((v: string) => { this.label = v; }).backgroundColor(Ui.inputBackground(this.themeRevision)).fontColor(Ui.textPrimary)
       TextArea({ text: this.packages, placeholder: '支付宝|com.alipay.mobile.client' })
-        .height(170).maxLength(65536).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground)
+        .height(170).maxLength(65536).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground(this.themeRevision))
         .onChange((v: string) => { this.packages = v; })
       // 输入即识别：合法包名全部解析成功时按钮立刻变实心蓝并可点，不合法的行就地标红。
       if (this.packages.trim().length > 0) {
@@ -63,7 +65,7 @@ struct RoutingInputDialog {
           .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
       }
       Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong).fontColor(Ui.textPrimary)
+        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong(this.themeRevision)).fontColor(Ui.textPrimary)
           .onClick(() => this.controller?.close())
         Button('添加到当前名单').layoutWeight(2)
           .backgroundColor(this.canAdd() ? TunBoxColors.primary : Ui.buttonDisabled)
@@ -405,7 +407,7 @@ struct AppRoutingPage {
       .fontWeight(this.mode === mode ? FontWeight.Bold : FontWeight.Normal)
       .fontColor(this.mode === mode ? TunBoxColors.primary : TunBoxColors.textSecondary)
       .padding({ top: 8, bottom: 8 }).layoutWeight(1).textAlign(TextAlign.Center).borderRadius(8)
-      .backgroundColor(this.mode === mode ? TunBoxColors.surfaceCard : Color.Transparent)
+      .backgroundColor(this.mode === mode ? TunBoxColors.surfaceCard(this.themeRevision) : Color.Transparent)
       .onClick(() => this.selectMode(mode))
   }
 
@@ -420,7 +422,7 @@ struct AppRoutingPage {
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       // 底层背景列（文档 §1：系统全局底色，深浅色经 TunBoxColors 解析；不再用渐变/玻璃底）
-      Column().width('100%').height('100%').linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+      Column().width('100%').height('100%').linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
         // 顶部导航（文档 §2.1）：返回接既有 back()（含未保存草稿确认），rightSlot 承载既有「保存」按钮
@@ -440,7 +442,7 @@ struct AppRoutingPage {
             this.ModeChip('all', '全部代理')
             this.ModeChip('exclude', '排除所选 (分流直连)')
             this.ModeChip('include', '仅限所选')
-          }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft)
+          }.width('92%').padding(4).borderRadius(12).backgroundColor(TunBoxColors.controlTrackSoft(this.themeRevision))
             .alignSelf(ItemAlign.Center)
             .enabled(this.ready && !this.busy)
           // 既有模式说明卡（文案与判定不变；视觉换成描边卡配方，去掉玻璃/模糊/backgroundEffect/阴影）
@@ -455,8 +457,8 @@ struct AppRoutingPage {
             Text('进入 VPN 后仍按规则 / 全局模式处理，不代表强制走代理节点。')
               .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
           }.width('100%').padding(16).borderRadius(TunBoxGeometry.cardRadiusSmall)
-            .backgroundColor(TunBoxColors.surfaceCard)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
           Text('当前 SDK 不支持读取完整安装列表。以下是常用目录与手动名单，不代表本机已安装；字形为名称标识，并非应用图标。')
             .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
           // 搜索框（文档 §3.3：高 42 / surfaceCard 底 / 圆角 14 / 描边 cardBorder / 前置 ic_search 16 textMuted；
@@ -468,8 +470,8 @@ struct AppRoutingPage {
               .backgroundColor(Color.Transparent).padding(0).height('100%').layoutWeight(1)
               .onChange((v: string) => { this.query = v; this.rebuild(); })
           }.width('100%').height(42).padding({ left: 12, right: 12 })
-            .backgroundColor(TunBoxColors.surfaceCard).borderRadius(TunBoxGeometry.controlRadius)
-            .border({ width: 1, color: TunBoxColors.cardBorder })
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision)).borderRadius(TunBoxGeometry.controlRadius)
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
           // 过滤行：左侧统计与「已选择」筛选；右侧排序 + 批量删除入口（批量删除在任何模式下都能用）
           Row({ space: 12 }) {
             Text(this.batchMode ? `已勾选 (${this.pendingDeletes.length})`
@@ -501,7 +503,7 @@ struct AppRoutingPage {
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
                       Text(row.source).fontSize(10).fontColor(TunBoxColors.textSecondary).maxLines(1)
                         .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-                        .backgroundColor(TunBoxColors.chipBg).borderRadius(4)
+                        .backgroundColor(TunBoxColors.chipBg(this.themeRevision)).borderRadius(4)
                     }.width('100%')
                     Text(row.bundleName).fontSize(11).fontColor(TunBoxColors.textMuted).maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
@@ -525,11 +527,11 @@ struct AppRoutingPage {
                       if (checked !== this.current().includes(row.bundleName)) { this.toggle(row.bundleName); }
                     })
                 }.width('100%').padding(14).borderRadius(18)
-                  .backgroundColor(TunBoxColors.surfaceCard)
+                  .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
                   .border({
                     width: 1,
                     color: this.batchMode && this.pendingDeletes.includes(row.bundleName)
-                      ? TunBoxColors.danger : TunBoxColors.cardBorder
+                      ? TunBoxColors.danger : TunBoxColors.cardBorder(this.themeRevision)
                   })
               }
             }, (row: RoutingRow) => `${row.bundleName}:${row.selected}:`
@@ -559,7 +561,7 @@ struct AppRoutingPage {
               Button(`删除所选（${this.pendingDeletes.length}）`).layoutWeight(1).height(46)
                 .fontSize(14).fontWeight(FontWeight.Bold)
                 .fontColor(this.pendingDeletes.length > 0 ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
-                .backgroundColor(this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.controlTrackSoft)
+                .backgroundColor(this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.controlTrackSoft(this.themeRevision))
                 .borderRadius(TunBoxGeometry.controlRadius)
                 .enabled(this.pendingDeletes.length > 0 && !this.busy)
                 .onClick(() => { this.deleteSelected(); })
@@ -587,8 +589,8 @@ struct AppRoutingPage {
           }.width('100%').enabled(this.ready && !this.busy && (this.batchMode || this.mode !== 'all'))
         }.width('100%').padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 10, bottom: 24
-        }).backgroundColor(TunBoxColors.surfaceCard)
-          .border({ width: { top: 1 }, color: TunBoxColors.cardBorder })
+        }).backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+          .border({ width: { top: 1 }, color: TunBoxColors.cardBorder(this.themeRevision) })
           .width('100%')
       }.width('100%').height('100%')
     }.width('100%').height('100%')

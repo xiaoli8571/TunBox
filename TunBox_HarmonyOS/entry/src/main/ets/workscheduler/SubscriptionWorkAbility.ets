@@ -20,6 +20,7 @@
 import { WorkSchedulerExtensionAbility, workScheduler } from '@kit.BackgroundTasksKit';
 import { Want } from '@kit.AbilityKit';
 import { SubscriptionUpdateScheduler } from '../commons/services/SubscriptionUpdateScheduler';
+import { SettingsService } from '../commons/services/SettingsService';
 import { AppLogger } from '../commons/utils/AppLogger';
 
 const TAG = 'SubscriptionWorkAbility';
@@ -27,16 +28,22 @@ const TAG = 'SubscriptionWorkAbility';
 export default class SubscriptionWorkAbility extends WorkSchedulerExtensionAbility {
   onWorkStart(work: workScheduler.WorkInfo): void {
     AppLogger.info(TAG, `onWorkStart: workId=${work?.workId}`);
-    const scheduler = SubscriptionUpdateScheduler.instance();
-    scheduler.ensureWorkScheduled(); // isPersisted 任务被系统恢复后闸门是进程内的，补一次幂等注册
-    scheduler.maybeRunExpiredRefresh(this.context, true)
-      .then((r): void => {
-        AppLogger.info(TAG, `work refresh done: stale=${r.stale} launched=${r.launched} `
-          + `${r.skippedReason}`);
-      })
-      .catch((e: Object): void => {
-        AppLogger.warn(TAG, `work refresh failed: ${AppLogger.errText(e)}`);
-      });
+    this.runRefresh(this.context);
+  }
+
+  private async runRefresh(context: Context): Promise<void> {
+    try {
+      // WorkScheduler runs in its own extension process; EntryAbility's async init
+      // is not shared with this process.
+      await SettingsService.init(context);
+      const scheduler = SubscriptionUpdateScheduler.instance();
+      scheduler.ensureWorkScheduled(); // isPersisted 任务被系统恢复后闸门是进程内的，补一次幂等注册
+      const r = await scheduler.maybeRunExpiredRefresh(context, true);
+      AppLogger.info(TAG, `work refresh done: stale=${r.stale} launched=${r.launched} `
+        + `${r.skippedReason}`);
+    } catch (e) {
+      AppLogger.warn(TAG, `work refresh failed: ${AppLogger.errText(e)}`);
+    }
   }
 
   onWorkStop(work: workScheduler.WorkInfo): void {

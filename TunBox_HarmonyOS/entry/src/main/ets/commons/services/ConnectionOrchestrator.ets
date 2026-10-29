@@ -4888,7 +4888,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           expectDataType: http.HttpDataType.ARRAY_BUFFER,
           connectTimeout: 15000,
           // geo/规则集/模型都托管在 GitHub：必须跟着隧道走，否则国内必失败
-          usingProxy: AppProxyRoute.activePort() > 0,
+          usingProxy: AppProxyRoute.isReady(),
+          // Model.bin 9.3MB 而且只能从 GitHub release 资产的限速前缀代理取
+          // （实测 gh-proxy 120s 只下到 5.9MB ⇒ 至少需要 ~190s），所以保留长超时；
+          // 代价是设置页会一直显示「更新中…」，由 downloadSmartModelAsset 的
+          // 并发守卫 + 手动更新提示来解释，而不是把慢但能成的下载改成必失败。
           readTimeout: what === 'Model.bin' ? 300000 : 90000,
           maxLimit: maxSize
         });
@@ -5151,6 +5155,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   /** 后台下载 LightGBM 模型到内核 home（照搬 geoip 的多镜像 + 校验模式） */
   private smartModelDownloading: boolean = false;
+
+  /** 是否有 Model.bin 下载在飞行中（设置页据此区分「正在下」与「下载失败」） */
+  isSmartModelDownloading(): boolean {
+    return this.smartModelDownloading;
+  }
 
   /** 等待型 Model.bin 下载（仅内置 rawfile 铺盘失败时的兜底路径） */
   private async downloadSmartModelAsset(source: string): Promise<boolean> {
@@ -5447,6 +5456,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (id === 'geoip') {
       ok = await this.downloadGeoipAsset(source);
     } else if (id === 'model') {
+      // 后台任务正持有下载锁时，downloadSmartModelAsset 会立刻返回 false，
+      // 旧实现把它报成「全部下载源均失败」—— 与事实相反（正在下）。
+      if (this.smartModelDownloading) {
+        return '模型正在后台下载，请稍候再看状态';
+      }
       ok = await this.downloadSmartModelAsset(source);
     } else if (id === 'ruleset') {
       ok = await this.downloadRuleProviderAsset(source);

@@ -4,24 +4,19 @@
  */
 import { LatencyRecord, LatencyState, LatencyPolicy } from '../commons/services/LatencyState';
 import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore';
+import { AppBgTheme, ThemeService } from './ThemeService';
 
 /** 随系统深浅模式自动解析的语义设计令牌。 */
 export class Ui {
   static readonly background: ResourceColor = $r('app.color.ui_background');
   static readonly backgroundRaised: ResourceColor = $r('app.color.ui_background_raised');
-  static readonly surface: ResourceColor = $r('app.color.ui_surface');
-  static readonly surfaceStrong: ResourceColor = $r('app.color.ui_surface_strong');
-  static readonly surfaceTranslucent: ResourceColor = $r('app.color.ui_surface_translucent');
   /** 主页三张信息磁贴专用底色/渐变：深色主题下更实、去白纱，避免「透白」不协调 */
   static readonly tileFill: ResourceColor = $r('app.color.ui_tile_fill');
   static readonly tileGloss: ResourceColor = $r('app.color.ui_tile_gloss');
   static readonly tileDeep: ResourceColor = $r('app.color.ui_tile_deep');
-  static readonly surfaceMuted: ResourceColor = $r('app.color.ui_surface_muted');
   static readonly glassHighlight: ResourceColor = $r('app.color.ui_glass_highlight');
   static readonly glassHighlightSoft: ResourceColor = $r('app.color.ui_glass_highlight_soft');
-  static readonly glassEdge: ResourceColor = $r('app.color.ui_glass_edge');
   static readonly glassGlow: ResourceColor = $r('app.color.ui_glass_glow');
-  static readonly inputBackground: ResourceColor = $r('app.color.ui_input_background');
   static readonly primary: ResourceColor = $r('app.color.ui_primary');
   static readonly primaryBlue: ResourceColor = $r('app.color.ui_primary_blue');
   static readonly primaryBlueFill: ResourceColor = $r('app.color.ui_primary_blue_fill');
@@ -42,7 +37,6 @@ export class Ui {
   static readonly overlay: ResourceColor = $r('app.color.ui_overlay');
   static readonly shadow: ResourceColor = $r('app.color.ui_shadow');
   static readonly navBackground: ResourceColor = $r('app.color.ui_nav_background');
-  static readonly selectedBackground: ResourceColor = $r('app.color.ui_selected_background');
   static readonly statusTint: ResourceColor = $r('app.color.ui_status_tint');
   static readonly powerGlowActive: ResourceColor = $r('app.color.ui_power_glow_active');
   static readonly powerGlowIdle: ResourceColor = $r('app.color.ui_power_glow_idle');
@@ -50,6 +44,71 @@ export class Ui {
   static readonly powerRingIdle: ResourceColor = $r('app.color.ui_power_ring_idle');
   static readonly powerInnerActive: ResourceColor = $r('app.color.ui_power_inner_active');
   static readonly powerInnerIdle: ResourceColor = $r('app.color.ui_power_inner_idle');
+
+  // ── 随浅色背景配色派生的表面色（2026-10-28 用户要求「卡片/表面要跟着背景配色走，别是死白」）──
+  //
+  // 下面七个表面类令牌从 `static readonly` 改成**带 rev 参数的方法**。原因同 TunBoxTokens：
+  // ArkUI V1 的 @StorageLink 依赖按**元素**登记，只有元素属性表达式里真的读到
+  // `this.themeRevision`，该元素才会在修订号变化时重绘（真机像素取证，`.pi-captures`）。
+  //
+  // 取值口径：深色 / 默认蓝灰配色 → 原资源值（设计与 AGC 已验收，不动）；
+  // 只有 Mint / Homebrew / Noctis 三套彩色浅色背景才用背景终点色向白混合出同色系表面色。
+
+  private static hex2(v: number): string {
+    const s = Math.round(v).toString(16);
+    return s.length === 1 ? `0${s}` : s;
+  }
+
+  /** `#RRGGBB` 向白混合：t=0 原色，t=1 纯白 */
+  private static mixToWhite(hex: string, t: number): string {
+    const r = parseInt(hex.substring(1, 3), 16);
+    const g = parseInt(hex.substring(3, 5), 16);
+    const b = parseInt(hex.substring(5, 7), 16);
+    return `#${Ui.hex2(r + (255 - r) * t)}${Ui.hex2(g + (255 - g) * t)}${Ui.hex2(b + (255 - b) * t)}`;
+  }
+
+  /** rev<0（退化调用）或深色/默认配色时走原资源值，否则从配色终点色派生 */
+  private static tinted(whiteMix: number, fallback: ResourceColor, rev: number): ResourceColor {
+    if (rev < 0 || ThemeService.isDark() || ThemeService.currentBgTheme() === AppBgTheme.DEFAULT) {
+      return fallback;
+    }
+    return Ui.mixToWhite(ThemeService.bgColors().end, whiteMix);
+  }
+
+  /** 卡片/面板底色（原 ui_surface） */
+  static surface(rev: number): ResourceColor {
+    return Ui.tinted(0.62, $r('app.color.ui_surface'), rev);
+  }
+
+  /** 强调表面（原 ui_surface_strong） */
+  static surfaceStrong(rev: number): ResourceColor {
+    return Ui.tinted(0.80, $r('app.color.ui_surface_strong'), rev);
+  }
+
+  /** 半透表面（原 ui_surface_translucent） */
+  static surfaceTranslucent(rev: number): ResourceColor {
+    return Ui.tinted(0.55, $r('app.color.ui_surface_translucent'), rev);
+  }
+
+  /** 凹槽/次级底（原 ui_surface_muted） */
+  static surfaceMuted(rev: number): ResourceColor {
+    return Ui.tinted(0.30, $r('app.color.ui_surface_muted'), rev);
+  }
+
+  /** 输入框底（原 ui_input_background） */
+  static inputBackground(rev: number): ResourceColor {
+    return Ui.tinted(0.88, $r('app.color.ui_input_background'), rev);
+  }
+
+  /** 微光描边（原 ui_glass_edge） */
+  static glassEdge(rev: number): ResourceColor {
+    return Ui.tinted(0.22, $r('app.color.ui_glass_edge'), rev);
+  }
+
+  /** 选中态底（原 ui_selected_background） */
+  static selectedBackground(rev: number): ResourceColor {
+    return Ui.tinted(0.50, $r('app.color.ui_selected_background'), rev);
+  }
 
   static readonly pagePadding: number = 20;
   static readonly cardRadius: number = 24;

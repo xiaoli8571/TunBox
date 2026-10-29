@@ -33,8 +33,31 @@ import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'SubscriptionUpdateScheduler';
 
-/** 订阅过期阈值（6 小时，对齐 Stash/Loon 推荐的 Update Interval）。 */
+/** 订阅过期阈值（6 小时，对齐 Stash/Loon 推荐的 Update Interval）。
+ *  2026-10-29：这是**默认值**。用户在「编辑订阅」里改的间隔会覆盖它，见 `staleThresholdMs()`。 */
 export const SUBSCRIPTION_STALE_MS: number = 6 * 60 * 60 * 1000;
+
+/** 允许的自定义间隔边界（分钟）：15 分钟~7 天，超出即视为非法输入，回落默认 6h */
+export const MIN_UPDATE_INTERVAL_MINUTES: number = 15;
+export const MAX_UPDATE_INTERVAL_MINUTES: number = 7 * 24 * 60;
+
+/**
+ * 把用户配置的「自动更新间隔（分钟）」换算成过期阈值（ms）。
+ *
+ * 为什么要这个函数：`SUBSCRIPTION_STALE_MS` 一直是常量，编辑弹窗里的间隔也是硬编码
+ * 字符串 —— 用户改成 30 分钟也完全没作用。现在统一从这里取，调度器与 UI 同源。
+ * 非法值（非数字 / 越界 / 0）→ 回落 6h，避免存成 0 之后「每次都判定过期」疯狂拉取。
+ */
+export function staleThresholdMs(minutes: number): number {
+  if (typeof minutes !== 'number' || !Number.isFinite(minutes)) {
+    return SUBSCRIPTION_STALE_MS;
+  }
+  const m: number = Math.floor(minutes);
+  if (m < MIN_UPDATE_INTERVAL_MINUTES || m > MAX_UPDATE_INTERVAL_MINUTES) {
+    return SUBSCRIPTION_STALE_MS;
+  }
+  return m * 60 * 1000;
+}
 
 /**
  * WorkScheduler 周期：4 小时轮询一次「是否有过期订阅」。
@@ -165,6 +188,8 @@ export class SubscriptionUpdateScheduler {
       const subs = SubscriptionService.instance();
       await subs.init(context);
     const now = Date.now();
+    // 阈值来自用户设置（2026-10-29）：以前这里是常量 6h，改设置完全不生效
+    const configuredStaleMs: number = staleThresholdMs(settings.subscriptionUpdateIntervalMinutes);
     const staleIds: string[] = [];
     let total = 0;
     let ephemeralCount = 0;
@@ -193,8 +218,8 @@ export class SubscriptionUpdateScheduler {
         ephemeralCount = ephemeralCount + 1;
       }
       const staleMs = ephemeral
-        ? Math.min(SUBSCRIPTION_STALE_MS, EPHEMERAL_SUBSCRIPTION_REFRESH_MS)
-        : SUBSCRIPTION_STALE_MS;
+        ? Math.min(configuredStaleMs, EPHEMERAL_SUBSCRIPTION_REFRESH_MS)
+        : configuredStaleMs;
       if (s.lastFetchedAt <= 0 || now - s.lastFetchedAt > staleMs) {
         staleIds.push(s.id);
       }

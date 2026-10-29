@@ -56,8 +56,11 @@ function ok(cond, label, actual) {
 }
 
 function checkTheme(src) {
-  ok(/const pageBg = dark \? '#0B1220' : '#F4F6FB';/.test(src),
-    '状态栏底色 = 页面背景色（浅 #F4F6FB / 深 #0B1220）');
+  // 2026-10-28：浅色背景支持 Mint / Homebrew / Noctis 三套配色（用户要求），
+  // 状态栏/窗口底色不再是一串写死的字面量，统一从 ThemeService.bgColors() 取（与页面渐变同源）。
+  // 这里断言的**语义不变**：状态栏底色必须就是页面背景色，只是取值方式从字面量换成了调色板。
+  ok(/const palette = ThemeService\.bgColors\(\);/.test(src) && /const pageBg = palette\.start;/.test(src),
+    '状态栏底色 = 页面背景色（取自 ThemeService.bgColors().start，浅色随配色 / 深 #0B1220）');
   ok(/statusBarColor: pageBg,/.test(src),
     '状态栏铺页面背景色（不是透明色条，避免被单独切割）');
   ok(/const contentColor = dark \? '#F5F7FF' : '#171B2A';/.test(src),
@@ -65,7 +68,7 @@ function checkTheme(src) {
   ok(/statusBarContentColor: contentColor,/.test(src),
     '状态栏图标颜色接到 window 属性');
   ok(/navigationBarColor: bottomBg,/.test(src) && /navigationBarContentColor: contentColor,?/.test(src),
-    '底部导航条同色 + 图标同口径');
+    '底部导航条同色 + 图标同口径（bottomBg = bgColors().end）');
   ok(/win\.setWindowBackgroundColor\(pageBg\);/.test(src),
     '窗口底色与页面同色（切换/首帧缝隙不露色）');
   ok(!/statusBarColor: '#00000000'/.test(src),

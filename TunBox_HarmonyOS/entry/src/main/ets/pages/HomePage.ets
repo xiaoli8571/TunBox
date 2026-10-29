@@ -65,6 +65,12 @@ export struct HomePage {
    * 详见 refreshPublicIp 的注释 —— 这是 0.4.0「取不到公网 IP」的直接修复。
    */
   private ipQuerySeq: number = 0;
+  /**
+   * 自动重连后的出口 IP 补齐定时器（2026-10-28）。
+   * 详见 schedulePublicIpRecover 的注释 —— 修「换订阅/换节点自动重连后 IP 不显示」。
+   */
+  private ipRecoverTimer: number = -1;
+  private ipRecoverTries: number = 0;
   @State currentNodeName: string = '';
   @State showDiagnostics: boolean = false;
   @State diagData: AppDiagnostics | null = null;
@@ -136,6 +142,7 @@ export struct HomePage {
     this.pageMounted = false;
     this.pageReady = false;
     this.stopNodeReadinessWatch();
+    this.stopPublicIpRecover();
     SubscriptionService.offNodeSetChanged(this.nodeSetListener);
     if (this.shownBridge !== undefined) {
       this.shownBridge.setShowHandler(null);
@@ -164,6 +171,11 @@ export struct HomePage {
     // 代次递增后，旧回调的结果会被 refreshPublicIp 直接丢弃。
     if (wasConnected !== this.isConnected) {
       this.invalidatePublicIpQueries();
+    }
+    // 自动重连（切订阅/切节点）落到 CONNECTED 后补查一次出口 IP：
+    // 重连窗口内发起的那次查询必然打在未就绪的隧道上，不补查就一直空着。
+    if (!wasConnected && this.isConnected) {
+      this.schedulePublicIpRecover();
     }
     // App 内手动连接路径的会话守护：连接成功注册 dataTransfer 连续任务（防杀），
     // 断开/失败释放。幂等，状态重复同步不会重复注册/释放。
@@ -276,13 +288,8 @@ export struct HomePage {
     // 会话接管由编排器统一校验代次；页面不得用异步读到的旧快照改写连接态。
     await this.orchestrator.restoreKilledSession(ctx);
     if (!this.pageMounted) { return; }
-    if (this.publicIp.length === 0) {
-      setTimeout((): void => {
-        // 启动期这次查询发生在**隧道未建立**时：出口是本机宽带，弱网下容易超时。
-        // 代次机制保证它晚到的失败结果不会覆盖连接后的正确结果。
-        this.refreshPublicIp('home-bootstrap').catch((): void => {});
-      }, 0);
-    }
+    // 不在冷启动阶段查询公网 IP。直连查询没有用户价值，还会与首连的 DNS/TLS
+    // 和节点握手竞争网络资源；连接成功后由 toggleConnection() 单独刷新隧道出口。
     // ── 冷启 DoH 预热：2026-10-19 **已移除**（稳定性回退）────────────────────
     //
     // 0.4.0 在这里加过一段 fire-and-forget 的 `DoHResolver.resolveMany(全部节点域名,
@@ -305,11 +312,63 @@ export struct HomePage {
   }
 
   onPublicIpRevision(): void {
-    if (!this.pageReady || this.publicIpRefreshing) {
+    if (!this.pageReady) {
       return;
     }
+    // 2026-10-28 用户报障：自动重连后启动按钮上不再显示公网 IP，必须手动断开重连才恢复。
+    // 旧实现在 publicIpRefreshing 为真时直接 return，把这次刷新意图**丢掉**；
+    // 而自动重连时正好有一次查询在飞是常态 → revision 被吞，IP 区从此空白。
+    // 现在照常发起（代次自增会作废在飞那次），失败/空结果由 schedulePublicIpRecover 兜底。
+    this.stopPublicIpRecover();
     this.publicIp = '';
     this.refreshPublicIp('node-switched', true).catch((): void => {});
+    this.schedulePublicIpRecover();
+  }
+
+  /**
+   * 重连完成后的出口 IP 补齐（2026-10-28 用户报障）。
+   *
+   * 现象：连接状态下换订阅 / 换节点会触发自动重连，重连完成后启动按钮上的公网 IP
+   * 不再显示，必须手动断开再连接才恢复。
+   *
+   * 原因链：
+   *   ① 换订阅 / 换节点会 bump public_ip_revision → 本页清空 publicIp 并立刻查询；
+   *   ② 那一刻隧道正在拆建（reconnectWithNode = disconnect → 600ms → connect），
+   *      `AppProxyRoute.isReady()` 为 false，查询只能走直连或被直接失败；
+   *   ③ 状态翻回 CONNECTED 之后**没有任何补查** → IP 区一直是空的。
+   *
+   * 现在：仅当「已连接 + IP 为空」时，按 1.2s 间隔补查，最多 5 次。
+   * 已有查询在飞时先让位（不叠请求）；拿到 IP 立即停。
+   */
+  private schedulePublicIpRecover(): void {
+    if (!this.pageMounted || !this.isConnected || this.publicIp.length > 0) {
+      return;
+    }
+    if (this.ipRecoverTimer >= 0 || this.ipRecoverTries >= 5) {
+      return;
+    }
+    this.ipRecoverTimer = setTimeout((): void => {
+      this.ipRecoverTimer = -1;
+      if (!this.pageMounted || !this.isConnected || this.publicIp.length > 0) {
+        return;
+      }
+      this.ipRecoverTries = this.ipRecoverTries + 1;
+      if (this.publicIpRefreshing) {
+        this.schedulePublicIpRecover();
+        return;
+      }
+      this.refreshPublicIp('reconnect-recover', false)
+        .then((): void => { this.schedulePublicIpRecover(); })
+        .catch((): void => { this.schedulePublicIpRecover(); });
+    }, 1200);
+  }
+
+  private stopPublicIpRecover(): void {
+    if (this.ipRecoverTimer >= 0) {
+      clearTimeout(this.ipRecoverTimer);
+      this.ipRecoverTimer = -1;
+    }
+    this.ipRecoverTries = 0;
   }
 
   onVpnRequest(): void {
@@ -677,7 +736,7 @@ export struct HomePage {
       // 底层背景列（文档骨架：纯色画布，不再用渐变/玻璃底）；
       // expandSafeArea 仅作用于背景，内容仍布局在安全区内（顶栏不被状态栏遮挡）。
       Column().width('100%').height('100%')
-        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart, 0.0], [TunBoxColors.bgGradientEnd, 1.0]] })
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {

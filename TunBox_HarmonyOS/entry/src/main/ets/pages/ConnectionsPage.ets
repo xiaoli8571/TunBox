@@ -7,7 +7,7 @@
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
-import { TunBoxMotion } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui } from '../theme/UiTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { AppLogger } from '../commons/utils/AppLogger';
@@ -184,7 +184,7 @@ struct ConnectionsPage {
   build() {
     Stack() {
       Column().width('100%').height('100%')
-        .backgroundColor(Ui.background)
+        .backgroundColor(TunBoxColors.background(this.themeRevision))
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
         // ── 顶栏（文档 §2.1 TopNavBar，右侧保留既有「关闭全部 / 刷新」入口）──
@@ -215,8 +215,8 @@ struct ConnectionsPage {
               .fontSize(12).fontColor(Ui.textSecondary)
           }
           .width('100%').padding(18).margin({ left: 18, right: 18, top: 14 })
-          .borderRadius(22).backgroundColor(Ui.surface)
-          .borderWidth(1).borderColor(Ui.glassEdge)
+          .borderRadius(22).backgroundColor(Ui.surface(this.themeRevision))
+          .borderWidth(1).borderColor(Ui.glassEdge(this.themeRevision))
           .alignItems(HorizontalAlign.Start)
           Blank().layoutWeight(1)
         } else if (this.entries.length === 0) {
@@ -226,8 +226,8 @@ struct ConnectionsPage {
               .fontSize(11).fontColor(Ui.textTertiary)
           }
           .width('100%').padding(24).margin({ left: 18, right: 18, top: 14 })
-          .borderRadius(22).backgroundColor(Ui.surface)
-          .borderWidth(1).borderColor(Ui.glassEdge)
+          .borderRadius(22).backgroundColor(Ui.surface(this.themeRevision))
+          .borderWidth(1).borderColor(Ui.glassEdge(this.themeRevision))
           Blank().layoutWeight(1)
         } else {
           List({ space: 8 }) {
@@ -240,7 +240,7 @@ struct ConnectionsPage {
                       .fontColor(entry.network === 'udp' ? Ui.warning : Ui.textBlue)
                       .padding({ left: 6, right: 6, top: 2, bottom: 2 })
                       .borderRadius(6)
-                      .backgroundColor(Ui.surfaceMuted)
+                      .backgroundColor(Ui.surfaceMuted(this.themeRevision))
                     Text(this.titleOf(entry))
                       .fontSize(13).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
                       .layoutWeight(1).maxLines(1)
@@ -273,9 +273,9 @@ struct ConnectionsPage {
                 .width('100%')
                 .padding(14)
                 .borderRadius(16)
-                .backgroundColor(Ui.surface)
+                .backgroundColor(Ui.surface(this.themeRevision))
                 .borderWidth(1)
-                .borderColor(Ui.glassEdge)
+                .borderColor(Ui.glassEdge(this.themeRevision))
               }
             }, (entry: ConnectionEntry) => entry.id)
           }.edgeEffect(EdgeEffect.Spring)

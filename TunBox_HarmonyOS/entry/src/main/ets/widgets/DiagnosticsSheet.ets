@@ -457,13 +457,13 @@ export struct DiagnosticsSheet {
           .fontColor(this.running ? Ui.textTertiary : Ui.primary)
           .padding({ left: 8, right: 8, top: 4, bottom: 4 })
           .borderRadius(10)
-          .backgroundColor(Ui.surfaceTranslucent)
+          .backgroundColor(Ui.surfaceTranslucent(this.themeRevision))
           .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
             colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
           })
           .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
           .borderWidth(1)
-          .borderColor(Ui.glassEdge)
+          .borderColor(Ui.glassEdge(this.themeRevision))
           .onClick(() => {
             if (!this.running) {
               this.runNow();
@@ -554,7 +554,7 @@ export struct DiagnosticsSheet {
           .fontColor(this.logTab === LogTab.APP ? Ui.primary : Ui.textSecondary)
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .borderRadius(10)
-          .backgroundColor(this.logTab === LogTab.APP ? Ui.selectedBackground : Color.Transparent)
+          .backgroundColor(this.logTab === LogTab.APP ? Ui.selectedBackground(this.themeRevision) : Color.Transparent)
           .borderWidth(1)
           .borderColor(this.logTab === LogTab.APP ? Ui.primary : Ui.border)
           .onClick(() => this.switchLogTab(LogTab.APP))
@@ -564,7 +564,7 @@ export struct DiagnosticsSheet {
           .fontColor(this.logTab === LogTab.CORE ? Ui.primary : Ui.textSecondary)
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .borderRadius(10)
-          .backgroundColor(this.logTab === LogTab.CORE ? Ui.selectedBackground : Color.Transparent)
+          .backgroundColor(this.logTab === LogTab.CORE ? Ui.selectedBackground(this.themeRevision) : Color.Transparent)
           .borderWidth(1)
           .borderColor(this.logTab === LogTab.CORE ? Ui.primary : Ui.border)
           .onClick(() => this.switchLogTab(LogTab.CORE))
@@ -602,7 +602,7 @@ export struct DiagnosticsSheet {
                 .fontColor(this.coreLevelFilter === lv ? Ui.primary : Ui.textTertiary)
                 .padding({ left: 6, right: 6, top: 2, bottom: 2 })
                 .borderRadius(8)
-                .backgroundColor(this.coreLevelFilter === lv ? Ui.selectedBackground : Color.Transparent)
+                .backgroundColor(this.coreLevelFilter === lv ? Ui.selectedBackground(this.themeRevision) : Color.Transparent)
                 .borderWidth(1)
                 .borderColor(this.coreLevelFilter === lv ? Ui.primary : Ui.border)
                 .onClick(() => {
@@ -619,7 +619,7 @@ export struct DiagnosticsSheet {
             .onChange((value: string) => {
               this.coreSearch = value;
             })
-            .backgroundColor(Ui.inputBackground)
+            .backgroundColor(Ui.inputBackground(this.themeRevision))
             .borderRadius(10)
           if (this.visibleCoreLines().length === 0) {
             Text(this.coreStreamState === 'open'
@@ -657,7 +657,7 @@ export struct DiagnosticsSheet {
       }
     }
     .padding(20)
-    .backgroundColor(Ui.surfaceTranslucent)
+    .backgroundColor(Ui.surfaceTranslucent(this.themeRevision))
     .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
       colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
     })
@@ -667,7 +667,7 @@ export struct DiagnosticsSheet {
       brightness: Ui.glassBrightnessSoft
     })
     .borderWidth({ top: 1 })
-    .borderColor(Ui.glassEdge)
+    .borderColor(Ui.glassEdge(this.themeRevision))
     .shadow({ radius: 32, color: Ui.shadow, offsetY: -10 })
     .borderRadius({ topLeft: 20, topRight: 20 })
   }

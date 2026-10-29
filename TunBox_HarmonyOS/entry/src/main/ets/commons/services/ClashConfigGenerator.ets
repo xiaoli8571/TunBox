@@ -720,23 +720,33 @@ export class ClashConfigGenerator {
       // 节点（无订阅归属的本地/直链节点一并保留）；池不足 2 个时退回全量，宁可
       // 跨订阅优选也不让自动模式在单订阅小池上失效。PROXY 选择组仍含全部节点，
       // 手动跨订阅选点不受影响。
+      // 【2026-10-31 修正】作用域判定必须用**该订阅的真实节点数**（validNodes 含
+      // provider 覆盖的节点）。旧实现数的是 staticNodes：订阅走 provider 接管后该
+      // 订阅在 staticNodes 里是 0 个 → 误判“池不足” → 退回跨订阅全量池，
+      // 「只在本订阅内优选」静默失效。
       const smartScopeId: string = groupSelected.subscriptionId;
-      let smartPool: ProxyNode[] = smartScopeId.length > 0
-        ? staticNodes.filter((n: ProxyNode): boolean =>
-          n.subscriptionId === smartScopeId || n.subscriptionId.length === 0)
-        : staticNodes;
-      if (smartPool.length < 2) {
-        smartPool = staticNodes;
+      let smartScopeCount = 0;
+      if (smartScopeId.length > 0) {
+        for (const n of validNodes) {
+          if (n.subscriptionId === smartScopeId) {
+            smartScopeCount = smartScopeCount + 1;
+          }
+        }
       }
+      const smartGlobalPool = smartScopeId.length === 0 || smartScopeCount < 2;
+      const smartPool: ProxyNode[] = smartGlobalPool
+        ? staticNodes
+        : staticNodes.filter((n: ProxyNode): boolean =>
+          n.subscriptionId === smartScopeId || n.subscriptionId.length === 0);
       for (const n of smartPool) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
       }
       // smart 组同样要 `use:` provider：provider 提供的节点不在静态列表里，
       // 少了这一段自动选点会看不到这些节点。
-      const scopedProviderEntries = smartScopeId.length > 0
-        ? providerPlan.entries.filter((entry: RawProviderEntry): boolean =>
-          entry.subscriptionId === smartScopeId)
-        : providerPlan.entries;
+      const scopedProviderEntries = smartGlobalPool
+        ? providerPlan.entries
+        : providerPlan.entries.filter((entry: RawProviderEntry): boolean =>
+          entry.subscriptionId === smartScopeId);
       if (scopedProviderEntries.length > 0) {
         lines.push('    use:');
         for (const entry of scopedProviderEntries) {

@@ -162,7 +162,7 @@ export class PublicIpService {
         readTimeout: READ_TIMEOUT_MS,
         usingCache: false,
         // 出口 IP 必须经由隧道查询，否则拿到的是本机物理出口（或直接失败）
-        usingProxy: AppProxyRoute.activePort() > 0
+        usingProxy: AppProxyRoute.isReady()
       });
       result.elapsedMs = Date.now() - t0;
       if (resp.responseCode !== 200) {
@@ -235,7 +235,7 @@ export class PublicIpService {
         readTimeout: READ_TIMEOUT_MS,
         usingCache: false,
         // 出口 IP 必须经由隧道查询，否则拿到的是本机物理出口（或直接失败）
-        usingProxy: AppProxyRoute.activePort() > 0
+        usingProxy: AppProxyRoute.isReady()
       });
       result.elapsedMs = Date.now() - t0;
       if (resp.responseCode !== 200) {

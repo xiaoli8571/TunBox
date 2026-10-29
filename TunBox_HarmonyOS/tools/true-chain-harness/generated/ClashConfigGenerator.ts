@@ -433,8 +433,8 @@ export class ClashConfigGenerator {
       // 错误文案必须带丢弃数量与原因，否则用户只看到「没有可用的节点配置」而无从下手。
       throw new Error(`没有可用的节点配置：${dropStats.summary()}。`
         + (dropStats.missingCredential > 0
-          ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到「订阅」页刷新订阅后重连。'
-          : '请到「订阅」页刷新订阅后重连。'));
+          ? '其中多个节点缺少 password/uuid：本机加密存储未能回填凭据，请到主页「订阅」里刷新后重连。'
+          : '请到主页「订阅」里刷新后重连。'));
     }
     // 全局代理名唯一化 —— **必须在写 proxies 之前**完成，因为：
     //   proxies[i].name、proxy-groups 的 proxies 成员、PROXY 组的内容全部按名字引用，
@@ -721,23 +721,33 @@ export class ClashConfigGenerator {
       // 节点（无订阅归属的本地/直链节点一并保留）；池不足 2 个时退回全量，宁可
       // 跨订阅优选也不让自动模式在单订阅小池上失效。PROXY 选择组仍含全部节点，
       // 手动跨订阅选点不受影响。
+      // 【2026-10-31 修正】作用域判定必须用**该订阅的真实节点数**（validNodes 含
+      // provider 覆盖的节点）。旧实现数的是 staticNodes：订阅走 provider 接管后该
+      // 订阅在 staticNodes 里是 0 个 → 误判“池不足” → 退回跨订阅全量池，
+      // 「只在本订阅内优选」静默失效。
       const smartScopeId: string = groupSelected.subscriptionId;
-      let smartPool: ProxyNode[] = smartScopeId.length > 0
-        ? staticNodes.filter((n: ProxyNode): boolean =>
-          n.subscriptionId === smartScopeId || n.subscriptionId.length === 0)
-        : staticNodes;
-      if (smartPool.length < 2) {
-        smartPool = staticNodes;
+      let smartScopeCount = 0;
+      if (smartScopeId.length > 0) {
+        for (const n of validNodes) {
+          if (n.subscriptionId === smartScopeId) {
+            smartScopeCount = smartScopeCount + 1;
+          }
+        }
       }
+      const smartGlobalPool = smartScopeId.length === 0 || smartScopeCount < 2;
+      const smartPool: ProxyNode[] = smartGlobalPool
+        ? staticNodes
+        : staticNodes.filter((n: ProxyNode): boolean =>
+          n.subscriptionId === smartScopeId || n.subscriptionId.length === 0);
       for (const n of smartPool) {
         lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
       }
       // smart 组同样要 `use:` provider：provider 提供的节点不在静态列表里，
       // 少了这一段自动选点会看不到这些节点。
-      const scopedProviderEntries = smartScopeId.length > 0
-        ? providerPlan.entries.filter((entry: RawProviderEntry): boolean =>
-          entry.subscriptionId === smartScopeId)
-        : providerPlan.entries;
+      const scopedProviderEntries = smartGlobalPool
+        ? providerPlan.entries
+        : providerPlan.entries.filter((entry: RawProviderEntry): boolean =>
+          entry.subscriptionId === smartScopeId);
       if (scopedProviderEntries.length > 0) {
         lines.push('    use:');
         for (const entry of scopedProviderEntries) {

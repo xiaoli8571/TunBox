@@ -10,7 +10,7 @@
  */
 import { router, promptAction } from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
-import { TunBoxMotion } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxMotion } from '../theme/TunBoxTokens';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
@@ -99,6 +99,8 @@ interface SubChip {
 @CustomDialog
 struct NodeBatchDeleteDialog {
   controller?: CustomDialogController;
+  /** 仅供配色 token 登记重绘依赖（2026-10-28 真机取证） */
+  @StorageLink('theme_revision') themeRevision: number = 0;
   getSummary: () => string = (): string => '';
   onConfirm: () => void = () => {};
 
@@ -109,7 +111,7 @@ struct NodeBatchDeleteDialog {
         .fontSize(13).fontColor(Ui.textSecondary)
       Row({ space: 12 }) {
         Button('取消')
-          .layoutWeight(1).backgroundColor(Ui.surfaceMuted).fontColor(Ui.textSecondary)
+          .layoutWeight(1).backgroundColor(Ui.surfaceMuted(this.themeRevision)).fontColor(Ui.textSecondary)
           .borderRadius(14)
           .borderWidth(1).borderColor(Ui.border)
           .onClick(() => {
@@ -144,6 +146,16 @@ struct NodeSelectionPage {
   @StorageLink('theme_revision') themeRevision: number = 0;
   @State nodes: NodeRow[] = [];
   @State groupRows: ProxyGroupRow[] = [];
+  /**
+   * 分组视图（按订阅筛选后）单独渲染的「♻️ 自动选择」行（0 或 1 个）。
+   *
+   * 分组视图的 List 只渲染 groupRows，**不渲染 this.nodes**（真机复现：
+   * 订阅下展开后看不到自动选择行）。所以合成行必须单独存一份给分组视图用。
+   * 空数组 = 当前不该展示（模型未就绪 / 该订阅不足 2 个节点）。
+   * 用数组而不是 `NodeRow | null`：ArkTS 禁止非空断言，build() 内也不能声明局部变量，
+   * 只能靠 ForEach 的元素类型完成收窄。
+   */
+  @State smartEntries: NodeRow[] = [];
   @State expandedGroupKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
   /** 节点搜索（P1-4）：输入即过滤本页 flat 列表（含合成行），大小写不敏感 */
@@ -414,10 +426,23 @@ struct NodeSelectionPage {
 
     // ── 内核 smart 组入口（♻️ 自动选择）───────────────────────────────
     // 该组只存在于**内核配置**里，不在订阅里，所以默认「全部节点」列表看不到它。
-    // 这里补一个合成行。所有过滤条件都必须显式处理「合成行」：
-    // 走 filterSubId 分支时无法反查 subscriptionId，直接不展示，避免归属错误。
-    if (this.smartSelectable() && this.filterSubId.length === 0) {
-      rows.unshift(this.mkSmartRow());
+    // 这里补一个合成行。所有过滤条件都必须显式处理「合成行」（isSmart）：
+    // 测速、删除、排序、多选都不能把它当真实节点。
+    this.smartEntries = [];
+    if (this.smartSelectable()) {
+      // 「全部」视图给全局入口；筛选到某个订阅时给**该订阅自己的**入口 ——
+      // 选中后重连目标取自该订阅，生成配置时 smart 池按 groupSelected 的订阅收窄，
+      // 即“只在本订阅内优先”。订阅真实节点不足 2 个时不展示（内核会退回全量池，
+      // 展示反而会让用户以为已限定在本订阅）。
+      if (this.filterSubId.length === 0) {
+        const entry = this.mkSmartRow('');
+        this.smartEntries = [entry];
+        rows.unshift(entry);
+      } else if (this.subscriptionSmartPoolSize(this.filterSubId) >= 2) {
+        const entry = this.mkSmartRow(this.filterSubId);
+        this.smartEntries = [entry];
+        rows.unshift(entry);
+      }
     }
     const groupRows: ProxyGroupRow[] = [];
     if (this.filterSubId.length > 0) {
@@ -474,6 +499,12 @@ struct NodeSelectionPage {
       }
     }
     this.nodes = smartRow !== undefined ? [smartRow].concat(ordered) : ordered;
+    // 【临时诊断】定位「订阅展开后看不到 ♻️ 自动选择」：一次打印全部门控输入。
+    // 看完日志就删（不影响功能，只为真机取证）。
+    AppLogger.info('NodeSel', `rebuildRows sub='${this.filterSubId}' smart=${this.smartView}`
+      + ` ready=${this.smartSelectable()}`
+      + ` pool=${this.subscriptionSmartPoolSize(this.filterSubId)}`
+      + ` rows=${rows.length} groups=${groupRows.length} entries=${this.smartEntries.length}`);
   }
 
   /** 节点搜索过滤（P1-4）：空串返回原列表；命中 node.name 小写包含 */
@@ -654,10 +685,12 @@ struct NodeSelectionPage {
    *
    * 它**不是真实节点**（没有 server/port），只为在列表里提供一个可选入口：
    * 选中它 = 切到自动模式，由内核按连接目标用 LightGBM 选点。
+   * `subscriptionId` 在这里被借用为**作用域标记**：空 = 全局（随当前节点），
+   * 非空 = 只在传入的订阅内优选。
    * 因此必须靠 `isSmart` 标记把它与真实节点区分开，否则会被送进测速引擎，
    * 或在下一次生成配置时被当成真实节点（它不在 `subs.nodes` 里，天然不会）。
    */
-  private mkSmartRow(): NodeRow {
+  private mkSmartRow(subscriptionId: string): NodeRow {
     const node = new ProxyNode();
     node.id = SMART_ROW_ID;
     node.name = ClashConfigGenerator.SMART_GROUP_NAME;
@@ -665,6 +698,9 @@ struct NodeSelectionPage {
     node.type = ProxyNodeType.UNKNOWN;
     node.server = '';
     node.port = 0;
+    // 作用域标记（非空 = 只在该订阅内优先）。合成行不在 subs.nodes 里，
+    // 这个字段不会被当成真实订阅归属，只在本页的 smart 分支读取。
+    node.subscriptionId = subscriptionId;
     const row: NodeRow = {
       node: node,
       countryCode: '',
@@ -672,6 +708,33 @@ struct NodeSelectionPage {
       isSmart: true
     };
     return row;
+  }
+
+  /** 该订阅可参与 smart 优选的真实节点数（<2 时内核退回全量池，不应展示入口） */
+  private subscriptionSmartPoolSize(subscriptionId: string): number {
+    let count = 0;
+    for (const n of this.subs.nodes) {
+      if (n.subscriptionId === subscriptionId) {
+        count = count + 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 合成行是否处于选中态：**作用域也必须匹配**。
+   * 所有订阅的入口共用同一个内核组名，只比名字会让每个分组里的入口同时高亮。
+   */
+  private isSmartRowSelected(row: NodeRow): boolean {
+    if (row.isSmart !== true) {
+      return false;
+    }
+    if (this.selectedName !== ClashConfigGenerator.SMART_GROUP_NAME) {
+      return false;
+    }
+    const scope: string = this.autoSelectMode === AutoSelectModes.AUTO
+      ? this.settings.preferredNodeSubscriptionId : '';
+    return row.node.subscriptionId === scope;
   }
 
 
@@ -1378,12 +1441,38 @@ struct NodeSelectionPage {
     if (node.id === SMART_ROW_ID) {
       this.settings.autoSelectMode = AutoSelectModes.AUTO;
       this.autoSelectMode = AutoSelectModes.AUTO;
-      // 字段级写：只改这一个字段
+      // 作用域：空 = 由当前/偏好节点所属订阅决定（历史行为）；非空 = 用户在该订阅下
+      // 点了「自动选择」，重连目标必须取自该订阅 —— 生成配置时 smart 池按
+      // groupSelected 的订阅收窄，才能真正做到“只在本订阅内优先”。
+      const scopeSubId: string = node.subscriptionId;
+      // 字段级写：自动模式 + 订阅作用域（空串 = 随当前节点）
       await SettingsService.patchSettings((s: AppSettings): void => {
         s.autoSelectMode = AutoSelectModes.AUTO;
+        s.preferredNodeSubscriptionId = scopeSubId;
       });
-      // 重连目标必须属于当前订阅（跨订阅旧偏好只会钉错节点），与连接路径同源
-      let target: ProxyNode | null = await this.subs.resolvePreferenceHint();
+      this.settings.preferredNodeSubscriptionId = scopeSubId;
+      let target: ProxyNode | null = null;
+      if (scopeSubId.length > 0) {
+        const inSub: ProxyNode[] = [];
+        for (const n of this.subs.nodes) {
+          if (n.subscriptionId === scopeSubId) {
+            inSub.push(n);
+          }
+        }
+        for (const n of inSub) {
+          if (n.name === this.settings.preferredNodeName) {
+            target = n;
+            break;
+          }
+        }
+        if (target === null && inSub.length > 0) {
+          target = inSub[0];
+        }
+      }
+      if (target === null) {
+        // 重连目标必须属于当前订阅（跨订阅旧偏好只会钉错节点），与连接路径同源
+        target = await this.subs.resolvePreferenceHint();
+      }
       if (target === null) {
         target = this.subs.fallbackConnectionNode();
       }
@@ -1455,7 +1544,7 @@ struct NodeSelectionPage {
     Stack() {
       Column()
         .width('100%').height('100%')
-        .backgroundColor(Ui.background)
+        .backgroundColor(TunBoxColors.background(this.themeRevision))
         // 背景延伸到状态栏/底部导航条之下, 消除底部白条
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
@@ -1471,7 +1560,7 @@ struct NodeSelectionPage {
             .justifyContent(FlexAlign.Center)
             .alignItems(VerticalAlign.Center)
             .borderRadius(18)
-            .backgroundColor(Ui.surfaceMuted)
+            .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .onClick(() => this.exitSelectMode())
             Text(`已选 ${this.selectedNodeIds.length}`)
               .fontSize(16).fontWeight(FontWeight.Bold)
@@ -1497,7 +1586,7 @@ struct NodeSelectionPage {
             .height(36)
             .padding({ left: 12, right: 12 })
             .borderRadius(18)
-            .backgroundColor(Ui.surfaceMuted)
+            .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .borderWidth(1).borderColor(Ui.border)
             .onClick(() => this.confirmDeleteSelected())
           }
@@ -1517,7 +1606,7 @@ struct NodeSelectionPage {
           .justifyContent(FlexAlign.Center)
           .alignItems(VerticalAlign.Center)
           .borderRadius(18)
-          .backgroundColor(Ui.surfaceMuted)
+          .backgroundColor(Ui.surfaceMuted(this.themeRevision))
           .onClick(() => router.back())
           Row({ space: 7 }) {
             CountryFlagIcon({
@@ -1546,7 +1635,7 @@ struct NodeSelectionPage {
             .justifyContent(FlexAlign.Center)
             .alignItems(VerticalAlign.Center)
             .borderRadius(18)
-            .backgroundColor(Ui.surfaceMuted)
+            .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .onClick(() => this.refreshNodes())
             if (this.refreshing) {
               Text(`${this.refreshDone}/${this.refreshTotal}`)
@@ -1567,7 +1656,7 @@ struct NodeSelectionPage {
             .height(36)
             .padding({ left: 10, right: 10 })
             .borderRadius(18)
-            .backgroundColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.surfaceMuted : Ui.primaryBlueFill)
+            .backgroundColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.surfaceMuted(this.themeRevision) : Ui.primaryBlueFill)
             .onClick(() => this.cycleSortMode())
             // 组测一起出结果（约 3 秒），进度条没有意义——已去掉（用户要求）。
             // 通道（内核/凭证）不可用时明确告诉用户原因。
@@ -1623,7 +1712,7 @@ struct NodeSelectionPage {
                 .fontColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primary : Ui.textSecondary)
                 .padding({ left: 14, right: 14, top: 7, bottom: 7 })
                 .borderRadius(100)
-                .backgroundColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primaryBlueFill : Ui.surfaceMuted)
+                .backgroundColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primaryBlueFill : Ui.surfaceMuted(this.themeRevision))
                 .borderWidth(1)
                 .borderColor(!this.smartView && this.filterSubId.length === 0 ? Ui.borderStrong : Ui.border)
                 .onClick(() => {
@@ -1640,7 +1729,7 @@ struct NodeSelectionPage {
                   .fontColor(this.smartView ? Ui.primary : Ui.textSecondary)
                   .padding({ left: 14, right: 14, top: 7, bottom: 7 })
                   .borderRadius(100)
-                  .backgroundColor(this.smartView ? Ui.primaryBlueFill : Ui.surfaceMuted)
+                  .backgroundColor(this.smartView ? Ui.primaryBlueFill : Ui.surfaceMuted(this.themeRevision))
                   .borderWidth(1)
                   .borderColor(this.smartView ? Ui.borderStrong : Ui.border)
                   .onClick(() => this.enterSmartView())
@@ -1652,7 +1741,7 @@ struct NodeSelectionPage {
                   .fontColor(!this.smartView && this.filterSubId === chip.id ? Ui.primary : Ui.textSecondary)
                   .padding({ left: 14, right: 14, top: 7, bottom: 7 })
                   .borderRadius(100)
-                  .backgroundColor(!this.smartView && this.filterSubId === chip.id ? Ui.primaryBlueFill : Ui.surfaceMuted)
+                  .backgroundColor(!this.smartView && this.filterSubId === chip.id ? Ui.primaryBlueFill : Ui.surfaceMuted(this.themeRevision))
                   .borderWidth(1)
                   .borderColor(!this.smartView && this.filterSubId === chip.id ? Ui.borderStrong : Ui.border)
                   .onClick(() => {
@@ -1686,9 +1775,9 @@ struct NodeSelectionPage {
         .width('100%')
         .padding({ left: 12, right: 12, top: 8, bottom: 8 })
         .borderRadius(14)
-        .backgroundColor(Ui.surface)
+        .backgroundColor(Ui.surface(this.themeRevision))
         .borderWidth(1)
-        .borderColor(Ui.glassEdge)
+        .borderColor(Ui.glassEdge(this.themeRevision))
         .margin({ left: 18, right: 18, top: 10 })
 
         // ── 节点列表 ──
@@ -1712,6 +1801,14 @@ struct NodeSelectionPage {
           .margin({ top: 120 })
         } else if (this.groupRows.length > 0) {
           List({ space: 9, scroller: this.listScroller }) {
+            // 分组视图只渲染 groupRows，所以合成行必须在这里单独铺一次（置顶）。
+            // 放在 List 顶部而不是每个组里：一个订阅通常有多个策略组，塞进组内会重复。
+            ForEach(this.smartEntries, (row: NodeRow) => {
+              ListItem() {
+                this.SmartCard(row)
+              }
+              .margin({ bottom: 2 })
+            }, (row: NodeRow) => 'smart#' + row.node.subscriptionId)
             ForEach(this.groupRows, (groupRow: ProxyGroupRow) => {
               ListItem() {
                 Column({ space: 7 }) {
@@ -1737,9 +1834,9 @@ struct NodeSelectionPage {
                   .width('100%')
                   .padding({ left: 14, right: 14, top: 12, bottom: 12 })
                   .borderRadius(18)
-                  .backgroundColor(Ui.surface)
+                  .backgroundColor(Ui.surface(this.themeRevision))
                   .borderWidth(1)
-                  .borderColor(Ui.glassEdge)
+                  .borderColor(Ui.glassEdge(this.themeRevision))
                   .onClick(() => this.toggleGroup(groupRow.group))
 
                   if (this.isGroupExpanded(groupRow.group)) {
@@ -1771,9 +1868,9 @@ struct NodeSelectionPage {
                       .width('100%')
                       .padding({ left: 14, right: 14, top: 11, bottom: 11 })
                       .borderRadius(14)
-                      .backgroundColor(Ui.surfaceMuted)
+                      .backgroundColor(Ui.surfaceMuted(this.themeRevision))
                       .borderWidth(1)
-                      .borderColor(Ui.glassEdge)
+                      .borderColor(Ui.glassEdge(this.themeRevision))
                       .onClick(() => this.selectStrategy(groupRow.group, strategy))
                     }, (strategy: ProxyGroup) => this.groupKey(groupRow.group) + '#strategy#'
                       + this.groupKey(strategy))
@@ -1803,7 +1900,7 @@ struct NodeSelectionPage {
           TextInput({ placeholder: '搜索节点名…', text: this.searchText })
             .onChange((value: string) => { this.searchText = value; })
             .height(42).fontSize(13)
-            .backgroundColor(Ui.inputBackground).borderRadius(14)
+            .backgroundColor(Ui.inputBackground(this.themeRevision)).borderRadius(14)
             .borderWidth(1).borderColor(Ui.border)
             .padding({ left: 12, right: 12 })
             .margin({ left: 18, right: 18, top: 4 })
@@ -1926,16 +2023,18 @@ struct NodeSelectionPage {
       Row({ space: 12 }) {
         Image($r('app.media.ic_radar'))
           .width(22).height(22)
-          .fillColor(row.node.name === this.selectedName ? Ui.primary : Ui.textSecondary)
+          .fillColor(this.isSmartRowSelected(row) ? Ui.primary : Ui.textSecondary)
         Column({ space: 3 }) {
           Text('自动选择')
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
-            .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
+            .fontColor(this.isSmartRowSelected(row) ? Ui.primary : Ui.textPrimary)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
-          Text('内核智能选点 · 按每条连接的目标自动择优')
+          Text(row.node.subscriptionId.length > 0
+            ? '内核智能选点 · 只在本订阅内择优'
+            : '内核智能选点 · 按每条连接的目标自动择优')
             .fontSize(11)
             .fontColor(Ui.textSecondary)
             .maxLines(1)
@@ -1952,14 +2051,14 @@ struct NodeSelectionPage {
         .width(18).height(18)
         .fillColor(Ui.primary)
         .width(24)
-        .opacity(row.node.name === this.selectedName ? 1 : 0)
+        .opacity(this.isSmartRowSelected(row) ? 1 : 0)
     }
     .width('100%')
     .padding({ left: 14, right: 6, top: 10, bottom: 10 })
     .borderRadius(16)
-    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFill : Ui.surface)
-    .borderWidth(row.node.name === this.selectedName ? 1.5 : 1)
-    .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge)
+    .backgroundColor(this.isSmartRowSelected(row) ? Ui.primaryBlueFill : Ui.surface(this.themeRevision))
+    .borderWidth(this.isSmartRowSelected(row) ? 1.5 : 1)
+    .borderColor(this.isSmartRowSelected(row) ? Ui.primary : Ui.glassEdge(this.themeRevision))
   }
 
   @Builder
@@ -2028,9 +2127,9 @@ struct NodeSelectionPage {
     .width('100%')
     .padding({ left: 14, right: 6, top: 10, bottom: 10 })
     .borderRadius(16)
-    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFill : Ui.surface)
+    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFill : Ui.surface(this.themeRevision))
     .borderWidth(row.node.name === this.selectedName ? 1.5 : 1)
-    .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge)
+    .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge(this.themeRevision))
   }
 
 }

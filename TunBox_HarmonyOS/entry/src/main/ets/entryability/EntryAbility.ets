@@ -2,7 +2,7 @@
  * 应用入口 Ability
  * 移植自 upstream: TunBox_Android/lib/main.dart + app.dart + startup/*（启动编排的 ArkTS 等价）
  */
-import { UIAbility, AbilityConstant, Want } from '@kit.AbilityKit';
+import { UIAbility, AbilityConstant, Want, Configuration } from '@kit.AbilityKit';
 import { window, display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -155,6 +155,20 @@ export default class EntryAbility extends UIAbility {
     // WorkScheduler 实际触发时机受系统调度影响，回前台立刻补一次过期检查。
     SubscriptionUpdateScheduler.instance().onForeground(this.context);
     this.scheduleSelfHeal('foreground');
+  }
+
+  /**
+   * 系统配置变化回调（2026-10-28 用户报障：跟随系统时状态栏不跟着变色）。
+   *
+   * 「跟随系统」时系统切深浅色，ArkUI 会重绘页面内容，但状态栏与导航条是我们用
+   * `setWindowSystemBarProperties` 写死的窗口级属性，系统不会替我们重刷 ——
+   * 旧实现只在 `onWindowStageCreate` 里刷一次，于是只能重启 App 才恢复。
+   * 这里在配置回调里把新配色交给 ThemeService（它会重刷系统栏并递增 theme_revision）。
+   */
+  onConfigurationUpdate(newConfig: Configuration): void {
+    ThemeService.onSystemColorModeChanged(newConfig.colorMode).catch((e: Object): void => {
+      AppLogger.warn(TAG, `theme system bar sync failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   onBackground(): void {
