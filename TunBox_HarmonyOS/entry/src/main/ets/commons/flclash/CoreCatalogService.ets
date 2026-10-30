@@ -95,7 +95,13 @@ export class CoreCatalogService {
       return CoreCatalogService.model;
     }
     CoreCatalogService.model = parsed;
-    CoreCatalogService.profileId = profileId;
+    // 空 profileId（选点后刷 now、后台测速等强制刷新）**不得**抹掉归属戳：
+    // 抹掉后 `profileIdOfSnapshot()` 返回 ''，所有 `coreCatalogFor(subId)` 判假，
+    // 「选完节点再开面板」会退化成只有本地节点（丢 now / 延迟）。保留上一次的戳即可，
+    // 这些强制刷新的调用方都在「已连上同一份 profile」的前提下执行。
+    if (profileId.length > 0) {
+      CoreCatalogService.profileId = profileId;
+    }
     CoreCatalogService.fetchedAt = now;
     CoreCatalogService.lastError = '';
     return parsed;

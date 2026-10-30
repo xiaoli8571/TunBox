@@ -127,13 +127,15 @@ const a = CoreCatalog.parse(PAYLOAD_A);
 const b = CoreCatalog.parse(PAYLOAD_B);
 
 console.log('\n== 常量与组类型判定 ==');
-check('CORE_GROUP_TYPES 恰为 5 个内核组类型', () => {
-  eq(CORE_GROUP_TYPES, ['Selector', 'URLTest', 'Fallback', 'Relay', 'LoadBalance'], 'types');
+check('CORE_GROUP_TYPES 恰为 6 个内核组类型（含 FlClash fork 的 Smart）', () => {
+  eq(CORE_GROUP_TYPES, ['Selector', 'URLTest', 'Fallback', 'Relay', 'LoadBalance', 'Smart'], 'types');
 });
 check('isGroupType 精确匹配、大小写敏感、非组类型为 false', () => {
-  eq(CORE_GROUP_TYPES.map((t) => CoreCatalog.isGroupType(t)), [true, true, true, true, true], 'all');
+  eq(CORE_GROUP_TYPES.map((t) => CoreCatalog.isGroupType(t)), [true, true, true, true, true, true], 'all');
+  // Smart 自 2026-10-30 起因真机报障「两条自动选择」被判定为组（此前漏判 → smart 组
+  // 作为伪节点混进节点列表）。大小写敏感仍必须保留。
   eq(
-    ['Shadowsocks', 'Direct', 'Compatible', 'selector', 'URLTest ', 'Smart'].map((t) => CoreCatalog.isGroupType(t)),
+    ['Shadowsocks', 'Direct', 'Compatible', 'selector', 'URLTest ', 'smart'].map((t) => CoreCatalog.isGroupType(t)),
     [false, false, false, false, false, false],
     'non-groups'
   );

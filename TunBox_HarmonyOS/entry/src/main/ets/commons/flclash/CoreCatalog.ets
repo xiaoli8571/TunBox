@@ -53,13 +53,20 @@
  *    调用方请自行按配置重排，本模块不猜。
  */
 
-/** 组类型白名单（`core/proxy.go:51-60` isProxyGroupType 的完整集合） */
+/**
+ * 组类型白名单（`core/proxy.go:51-60` isProxyGroupType + FlClash fork 的 smart 组）。
+ *
+ * **必须与 `ClashApiService.GROUP_TYPES` 保持一致**。2026-10-30 真机报障：这里漏了
+ * 'Smart'，于是 `type: smart` 的「♻️ 自动选择」组被当成**普通节点**（isGroup=false）
+ * 混进节点列表，与 App 置顶的合成入口同屏出现两条「自动选择」（上面一条无延迟值）。
+ */
 export const CORE_GROUP_TYPES: string[] = [
   'Selector',
   'URLTest',
   'Fallback',
   'Relay',
-  'LoadBalance'
+  'LoadBalance',
+  'Smart'
 ];
 
 /** 内置全局组名（reserved provider 组；hidden 判定用） */

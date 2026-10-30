@@ -457,8 +457,13 @@ struct NodeSelectionPage {
         for (const node of members.nodes) {
           memberNodes.push(this.mkNodeRow(node));
         }
+        // 「♻️ 自动选择」已由本页置顶的合成卡片（smartEntries）唯一代表。
+        // 生成配置会把它插进主选择组首位并追加组定义，若这里再当策略组渲染一遍，
+        // 展开分组后就会出现第二条「自动选择」（2026-10-30 用户报障）。按名字剔掉。
+        const strategyGroups: ProxyGroup[] = members.groups.filter(
+          (g: ProxyGroup): boolean => g.name !== ClashConfigGenerator.SMART_GROUP_NAME);
         groupRows.push({ group: group, nodes: groupNodes,
-          memberNodes: memberNodes, strategyGroups: members.groups.slice() });
+          memberNodes: memberNodes, strategyGroups: strategyGroups });
       }
     }
     this.groupRows = groupRows;
@@ -499,12 +504,6 @@ struct NodeSelectionPage {
       }
     }
     this.nodes = smartRow !== undefined ? [smartRow].concat(ordered) : ordered;
-    // 【临时诊断】定位「订阅展开后看不到 ♻️ 自动选择」：一次打印全部门控输入。
-    // 看完日志就删（不影响功能，只为真机取证）。
-    AppLogger.info('NodeSel', `rebuildRows sub='${this.filterSubId}' smart=${this.smartView}`
-      + ` ready=${this.smartSelectable()}`
-      + ` pool=${this.subscriptionSmartPoolSize(this.filterSubId)}`
-      + ` rows=${rows.length} groups=${groupRows.length} entries=${this.smartEntries.length}`);
   }
 
   /** 节点搜索过滤（P1-4）：空串返回原列表；命中 node.name 小写包含 */

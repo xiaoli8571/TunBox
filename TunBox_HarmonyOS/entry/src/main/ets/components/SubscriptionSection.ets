@@ -618,7 +618,9 @@ export struct SubscriptionSection {
       const fromCore: ProxyGroup[] = [];
       const byName: Map<string, ProxyGroup> = new Map<string, ProxyGroup>();
       for (const source of core.groups) {
-        if (source.hidden) {
+        // 「♻️ 自动选择」由面板置顶的合成入口（SmartRow）唯一代表，从内核 chips 里剔掉，
+        // 否则同一个概念会出现两个可点项（2026-10-30 用户报障）。
+        if (source.hidden || source.name === ClashConfigGenerator.SMART_GROUP_NAME) {
           continue;
         }
         const group = new ProxyGroup();
@@ -662,12 +664,25 @@ export struct SubscriptionSection {
     return this.service.groupsOf(subId);
   }
 
+  /**
+   * 拉内核快照并打上「**内核真正生效的那份订阅**」的戳。
+   *
+   * 关键：戳必须优先来自 `orch.appliedProfile()`（隧道/测速核真的按这份 profile 起来的），
+   * 不能无条件用 `ProfileRepository.currentId()`（用户刚点的期望值）。切订阅是热重载/重连
+   * 异步完成的（见 `ConnectionOrchestrator.confirmProfileApplied`），用期望值打戳会把
+   * **上一份订阅的节点**盖成新订阅的戳 → `coreCatalogFor` 误判通过 → 展开订阅 B 看到
+   * 订阅 A 的节点，重新点开才好（2026-10-30 用户报障）。
+   *
+   * 内核对不上当前选择时不刷新：快照保持旧戳，`coreCatalogFor` 判假，UI 自动退回
+   * 「本订阅本地节点」这条已经写好且绝对隔离的分支。
+   */
   private async refreshCoreCatalog(): Promise<void> {
     const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
     if (orch.state !== ConnState.CONNECTED && orch.state !== ConnState.CONNECTING) {
       return;
     }
-    const profileId = ProfileRepository.currentId();
+    const appliedId: string = orch.appliedProfile();
+    const profileId: string = appliedId.length > 0 ? appliedId : ProfileRepository.currentId();
     const model = await CoreCatalogService.refresh(orch.api, false, profileId);
     if (model !== null) {
       this.coreRevision = this.coreRevision + 1;
@@ -699,17 +714,9 @@ export struct SubscriptionSection {
     const core = CoreCatalogService.current();
     let arr: ProxyNode[];
     if (core !== null && this.panelSubId === this.currentProfileId && this.coreCatalogFor(this.panelSubId)) {
-      const source: CoreGroup | null = core.findGroup(this.selectedGroup);
-      const nodes = source !== null ? source.all.filter((node): boolean => !node.isGroup)
-        : CoreCatalogService.flattenNodes('rule');
-      arr = CoreNodeBridge.toProxyNodes(nodes, this.panelSubId);
+      arr = this.corePanelNodes(localNodes);
     } else {
-      const group: ProxyGroup | null = this.activeGroupOf(this.panelSubId);
-      if (group !== null) {
-        arr = this.service.expandProxyGroup(group);
-      } else {
-        arr = this.service.nodesOf(this.panelSubId).slice();
-      }
+      arr = this.localPanelNodes(localNodes);
     }
     if (!this.sortByDelay) {
       return arr;
@@ -717,6 +724,44 @@ export struct SubscriptionSection {
     return CoreNodeBridge.sortByDelay(arr, (name: string): number | null => {
       return LatencyStoreBridge.latencyFor(name);
     });
+  }
+
+  /**
+   * 内核快照路径的节点行。
+   *
+   * **必须**用「本订阅自己的节点名」做归属证明：内核只有一份配置，但 `selectedGroup`
+   * 只是个裸名字，而 `core.findGroup()` 是按名字**全局**查的 —— 任一处对不上就会把
+   * 其它订阅的节点盖着本订阅的戳铺出来。名字交集即归属证明；交集为空或组不存在时
+   * 一律退回本地解析结果，**绝不**回退 `flattenNodes('rule')`（那是全内核节点，是
+   * 串订阅的第二条通路）。
+   */
+  private corePanelNodes(localNodes: ProxyNode[]): ProxyNode[] {
+    const core = CoreCatalogService.current();
+    if (core === null) {
+      return this.localPanelNodes(localNodes);
+    }
+    const source: CoreGroup | null = core.findGroup(this.selectedGroup);
+    if (source === null) {
+      return this.localPanelNodes(localNodes);
+    }
+    const owned: Set<string> = new Set<string>();
+    for (const local of localNodes) {
+      owned.add(local.name);
+    }
+    const nodes = source.all.filter((node): boolean => !node.isGroup && owned.has(node.name));
+    if (nodes.length === 0) {
+      return this.localPanelNodes(localNodes);
+    }
+    return CoreNodeBridge.toProxyNodes(nodes, this.panelSubId);
+  }
+
+  /** 本地（订阅配置）路径的节点行：不经内核，天然按 subscriptionId 隔离。 */
+  private localPanelNodes(localNodes: ProxyNode[]): ProxyNode[] {
+    const group: ProxyGroup | null = this.activeGroupOf(this.panelSubId);
+    if (group !== null) {
+      return this.service.expandProxyGroup(group);
+    }
+    return localNodes.slice();
   }
 
   private protoOf(node: ProxyNode): string {
@@ -734,7 +779,17 @@ export struct SubscriptionSection {
     return TunBoxPing.recordColor(LatencyStoreBridge.recordFor(node.name), this.latencyRevision);
   }
 
+  /**
+   * 节点行是否显示为「当前选中」。
+   *
+   * **必须与 `smartSelected` 互斥**：自动选择模式下 `reconnectWithNode` 会借用本订阅内的
+   * 一个**真实节点**作重连目标，`currentNodeName` 因此等于该节点名 —— 若这里不加前置判断，
+   * 「♻️ 自动选择」和那个被借用的真实节点会**同时实心勾选**（2026-10-30 用户报障）。
+   */
   private isActiveNode(node: ProxyNode): boolean {
+    if (this.smartSelected) {
+      return false;
+    }
     return this.currentNodeName.length > 0 && node.name === this.currentNodeName;
   }
 

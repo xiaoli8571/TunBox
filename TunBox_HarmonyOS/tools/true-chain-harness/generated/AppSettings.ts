@@ -7,6 +7,7 @@
 import { NodeSortModes } from './NodeSortPersistence.ts';
 import { LatencyTestUrl } from './LatencyTestUrl.ts';
 import { AppRoutingCustomApp, AppRoutingPolicy } from './AppRoutingPolicy.ts';
+import { ImportFilePolicy } from './ImportFilePolicy.ts';
 
 /** 自动选点模式（第二阶段新增，语义同 NodeSortModes 风格） */
 export class AutoSelectModes {
@@ -650,9 +651,13 @@ export class AppSettings {
     // 上限 20 条；非法项跳过（加载不炸、保存幂等），合法性细则在生成器校验。
     s.customRuleSets = Array.isArray(j.customRuleSets)
       ? AppSettings.normalizeRuleSets(j.customRuleSets) : [];
-    // YAML 覆盖层（P2）：缺字段/非字符串回落空串；上限 8KB，合法性（顶层键白名单）
-    // 在生成器 validateYamlOverride 判定，不合法的覆盖层不追加（行为与旧版一致）。
-    s.yamlOverride = typeof j.yamlOverride === 'string' ? j.yamlOverride.slice(0, 8192) : '';
+    // YAML 覆盖层（P2）：缺字段/非字符串回落空串；合法性（顶层键白名单）在生成器
+    // validateYamlOverride 判定，不合法的覆盖层不追加（行为与旧版一致）。
+    // 上限与录入侧同源（ImportFilePolicy）。这里的裁剪是**防御性**的：正常路径下
+    // RulesPage 保存前已显式拒绝超长，只有手改/损坏的持久化数据才会走到裁剪分支，
+    // 目的是不让一份异常巨大的字段把设置对象撑爆 —— 与用户输入的「拒绝而非截断」分层。
+    s.yamlOverride = typeof j.yamlOverride === 'string'
+      ? j.yamlOverride.slice(0, ImportFilePolicy.YAML_OVERRIDE_MAX_CHARS) : '';
     // 订阅原文交给内核解析（provider 双轨）：缺字段/脏值回落 **false**（默认关 = 全内联）
     s.useRawProviderConfig = typeof j.useRawProviderConfig === 'boolean' ? j.useRawProviderConfig : false;
     // 一次性迁移（2026-10-22 21:50）：默认开的那一版在真机上出现「proxies: [] + provider 空」
