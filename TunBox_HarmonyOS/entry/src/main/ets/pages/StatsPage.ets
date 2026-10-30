@@ -15,6 +15,7 @@
 import { promptAction } from '@kit.ArkUI';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxTextColors } from '../theme/TextColors';
 import { TopNavBar } from '../components/TopNavBar';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
@@ -205,7 +206,6 @@ export struct StatsPage {
         } else {
           this.memoryText = '--';
           this.uptimeText = '--:--:--';
-          this.queryIp('stats-disconnected');
         }
       });
     }
@@ -266,7 +266,9 @@ export struct StatsPage {
     this.reloadStats();
     this.updateUptime();
     this.startTick();
-    this.queryIp('stats-bootstrap');
+    if (this.isConnected) {
+      this.queryIp('stats-bootstrap');
+    }
     this.refreshMemory();
   }
 
@@ -422,6 +424,7 @@ export struct StatsPage {
 
   private clearIpInfo(): void {
     this.ipRequestId += 1;
+    this.ipQueuedTrigger = '';
     this.ipText = '';
     this.ipCountry = '';
     this.ipFlag = '';
@@ -433,6 +436,11 @@ export struct StatsPage {
   }
 
   private async queryIp(trigger: string): Promise<void> {
+    // 数据页只显示代理出口，未连接时不能把设备自身公网 IP 误显示成出口 IP。
+    if (this.orchestrator.state !== ConnState.CONNECTED) {
+      this.clearIpInfo();
+      return;
+    }
     if (this.ipBusy) {
       this.ipQueuedTrigger = trigger;
       return;
@@ -620,7 +628,7 @@ export struct StatsPage {
     Row({ space: 6 }) {
       Image(icon).width(13).height(13).fillColor(TunBoxColors.textMuted)
       Text(label)
-        .fontSize(11).fontColor(TunBoxColors.textMuted)
+        .fontSize(11).fontColor(TunBoxTextColors.secondary)
         .maxLines(1)
       Blank()
       Text(value)
@@ -640,10 +648,10 @@ export struct StatsPage {
         Column({ space: 2 }) {
           Row({ space: 4 }) {
             Image($r('app.media.ic_chevron_down')).width(12).height(12).fillColor(TunBoxColors.primary)
-            Text('下载').fontSize(11).fontColor(TunBoxColors.textMuted)
+            Text('下载').fontSize(11).fontColor(TunBoxTextColors.secondary)
           }
           Text(this.formatSpeed(this.downSpeed))
-            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .alignItems(HorizontalAlign.Start)
@@ -654,10 +662,10 @@ export struct StatsPage {
             Image($r('app.media.ic_chevron_down'))
               .width(12).height(12).fillColor(TunBoxColors.success)
               .rotate({ angle: 180 })
-            Text('上传').fontSize(11).fontColor(TunBoxColors.textMuted)
+            Text('上传').fontSize(11).fontColor(TunBoxTextColors.secondary)
           }
           Text(this.formatSpeed(this.upSpeed))
-            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .alignItems(HorizontalAlign.Start)
@@ -670,25 +678,25 @@ export struct StatsPage {
 
       this.MetricRow($r('app.media.ic_bolt'), '峰值',
         `${this.formatSpeed(this.peakDown)} / ${this.formatSpeed(this.peakUp)}`,
-        TunBoxColors.textSecondary)
+        TunBoxTextColors.primary)
       this.MetricRow($r('app.media.ic_sort'), '平均',
         `${this.formatSpeed(this.avgDown)} / ${this.formatSpeed(this.avgUp)}`,
-        TunBoxColors.textSecondary)
+        TunBoxTextColors.primary)
 
       Divider().color(TunBoxColors.cardBorder(this.themeRevision)).strokeWidth(1)
 
       this.MetricRow($r('app.media.ic_swap'), '本次连接',
         `↓ ${this.formatBytes(this.sessionDown)}   ↑ ${this.formatBytes(this.sessionUp)}`,
-        TunBoxColors.textPrimary)
+        TunBoxTextColors.primary)
       this.MetricRow($r('app.media.ic_doc'), '累计总量',
         `↓ ${this.formatBytes(this.lifetimeDown)}   ↑ ${this.formatBytes(this.lifetimeUp)}`,
-        TunBoxColors.textPrimary)
+        TunBoxTextColors.primary)
       this.MetricRow($r('app.media.ic_globe'), '今日',
         `↓ ${this.formatBytes(this.todayDown)}   ↑ ${this.formatBytes(this.todayUp)}`,
-        TunBoxColors.textSecondary)
+        TunBoxTextColors.primary)
 
       Text(`每月 ${this.resetDay} 日 00:00 自动清零累计（点按切换 1–28 日）`)
-        .fontSize(10).fontColor(TunBoxColors.textMuted)
+        .fontSize(10).fontColor(TunBoxTextColors.muted)
         .width('100%')
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         .onClick((): void => { this.cycleResetDay(); })
@@ -709,13 +717,13 @@ export struct StatsPage {
         Row({ space: 5 }) {
           Image($r('app.media.ic_memory')).width(14).height(14).fillColor(TunBoxColors.primary)
           Text('内存占用')
-            .fontSize(12).fontColor(TunBoxColors.textMuted)
+            .fontSize(12).fontColor(TunBoxTextColors.secondary)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
         Text(this.memoryText)
-          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -730,13 +738,13 @@ export struct StatsPage {
         Row({ space: 5 }) {
           Image($r('app.media.ic_clock')).width(14).height(14).fillColor(TunBoxColors.primary)
           Text('运行时间')
-            .fontSize(12).fontColor(TunBoxColors.textMuted)
+            .fontSize(12).fontColor(TunBoxTextColors.secondary)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
         Text(this.uptimeText)
-          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -757,7 +765,7 @@ export struct StatsPage {
       Row({ space: 6 }) {
         Image($r('app.media.ic_globe')).width(14).height(14).fillColor(TunBoxColors.primary)
         Text('出口 IP')
-          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
         Blank()
         if (this.ipFlag.length > 0) {
           Text(this.ipFlag).fontSize(16).margin({ right: 6 })
@@ -767,7 +775,7 @@ export struct StatsPage {
             : (this.ipText.length > 0 ? this.ipText : '--')))
           .fontSize(12)
           .fontColor(this.ipState === 3 ? TunBoxColors.danger
-            : (this.ipState === 1 ? TunBoxColors.textMuted : TunBoxColors.textPrimary))
+            : (this.ipState === 1 ? TunBoxTextColors.muted : TunBoxTextColors.primary))
           .fontFamily('monospace')
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .onClick((): void => { this.queryIp('user-retry'); })
@@ -777,19 +785,19 @@ export struct StatsPage {
 
       if (this.ipState === 2) {
         this.MetricRow($r('app.media.ic_globe'), '国家/地区',
-          this.ipCountry.length > 0 ? this.ipCountry : '--', TunBoxColors.textSecondary)
+          this.ipCountry.length > 0 ? this.ipCountry : '--', TunBoxTextColors.primary)
         this.MetricRow($r('app.media.ic_globe'), '城市',
-          this.ipCity.length > 0 ? this.ipCity : '--', TunBoxColors.textSecondary)
+          this.ipCity.length > 0 ? this.ipCity : '--', TunBoxTextColors.primary)
         this.MetricRow($r('app.media.ic_globe'), 'ISP',
-          this.ipIsp.length > 0 ? this.ipIsp : '--', TunBoxColors.textSecondary)
+          this.ipIsp.length > 0 ? this.ipIsp : '--', TunBoxTextColors.primary)
         this.MetricRow($r('app.media.ic_globe'), 'ASN',
-          this.ipAsn.length > 0 ? this.ipAsn : '--', TunBoxColors.textSecondary)
+          this.ipAsn.length > 0 ? this.ipAsn : '--', TunBoxTextColors.primary)
         this.MetricRow($r('app.media.ic_globe'), '时区',
-          this.ipTimezone.length > 0 ? this.ipTimezone : '--', TunBoxColors.textSecondary)
+          this.ipTimezone.length > 0 ? this.ipTimezone : '--', TunBoxTextColors.primary)
       } else {
         Text(this.ipState === 3 ? '未取得出口信息（节点可能不可用，或查询被限流）'
           : (this.isConnected ? '正在通过隧道查询出口信息…' : '连接后显示出口信息'))
-          .fontSize(11).fontColor(TunBoxColors.textMuted)
+          .fontSize(11).fontColor(TunBoxTextColors.muted)
           .width('100%')
           .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
       }
@@ -808,7 +816,7 @@ export struct StatsPage {
       Circle({ width: 7, height: 7 })
         .fill(this.probeStateColor(entry.state, entry.delayMs))
       Text(entry.host)
-        .fontSize(13).fontColor(TunBoxColors.textPrimary)
+        .fontSize(13).fontColor(TunBoxTextColors.secondary)
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
       Text(entry.state === ProbeState.OK
@@ -845,7 +853,7 @@ export struct StatsPage {
       Row({ space: 8 }) {
         Image($r('app.media.ic_shield')).width(14).height(14).fillColor(TunBoxColors.primary)
         Text('连通性')
-          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
         Blank()
         Row({ space: 4 }) {
           if (this.testingAll) {
@@ -853,7 +861,7 @@ export struct StatsPage {
           } else {
             Image($r('app.media.ic_bolt')).width(13).height(13).fillColor(TunBoxColors.primary)
           }
-          Text('全部测试').fontSize(11).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.primary)
+          Text('全部测试').fontSize(11).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlue)
         }
         .padding({ left: 8, right: 8, top: 4, bottom: 4 })
         .borderRadius(TunBoxGeometry.pillRadius)
@@ -862,7 +870,7 @@ export struct StatsPage {
 
         Row({ space: 4 }) {
           Image($r('app.media.ic_plus')).width(13).height(13).fillColor(TunBoxColors.textMuted)
-          Text('添加').fontSize(11).fontColor(TunBoxColors.textMuted)
+          Text('添加').fontSize(11).fontColor(TunBoxTextColors.muted)
         }
         .padding({ left: 8, right: 8, top: 4, bottom: 4 })
         .borderRadius(TunBoxGeometry.pillRadius)
@@ -883,7 +891,7 @@ export struct StatsPage {
             .onChange((v: string): void => { this.hostInput = v; })
             .onSubmit((_key: EnterKeyType): void => { this.addHost(); })
           Text('确定')
-            .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.primary)
+            .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlue)
             .padding({ left: 10, right: 10, top: 6, bottom: 6 })
             .backgroundColor(TunBoxColors.primaryLight)
             .borderRadius(10)
@@ -908,11 +916,11 @@ export struct StatsPage {
         .edgeEffect(EdgeEffect.Spring)
       } else {
         Text('暂无目标，点「添加」输入域名')
-          .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+          .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
       }
 
       Text('TCP 直连目标 443；HTTP/HTTPS 在代理运行时经本机代理端口。点按单项重测，左滑删除。')
-        .fontSize(10).fontColor(TunBoxColors.textMuted)
+        .fontSize(10).fontColor(TunBoxTextColors.muted)
         .width('100%')
         .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
     }

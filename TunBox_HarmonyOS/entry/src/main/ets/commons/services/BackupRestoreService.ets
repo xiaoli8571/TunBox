@@ -14,6 +14,7 @@ import { SettingsService } from './SettingsService';
 import { SubscriptionService, SubscriptionJson, ProxyNodeJson } from './SubscriptionService';
 import { CredentialStore, SubscriptionCredentialSource } from './CredentialStore';
 import { ProfileRepository } from '../flclash/ProfileRepository';
+import { ImportFilePolicy } from './ImportFilePolicy';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'BackupRestore';
@@ -54,6 +55,17 @@ export class RestoreOutcome {
   message: string = '';
   subCount: number = 0;
   nodeCount: number = 0;
+}
+
+/**
+ * profile 原文写回结果。分开计数是为了**不再静默跳过**：
+ * 旧实现遇到超大 profile 直接 continue，用户只看到「恢复了 N 份」，
+ * 无从得知哪一份没回来、为什么 —— 而缺原文的订阅会直接连不上。
+ */
+export class ProfileRestoreResult {
+  restored: number = 0;
+  /** 因超过 ImportFilePolicy.YAML_MAX_BYTES 而跳过的份数 */
+  skippedOversize: number = 0;
 }
 
 export class BackupRestoreService {
@@ -252,7 +264,8 @@ export class BackupRestoreService {
     // 5.1 恢复配置原文 + 订阅 header 凭据，并把 current profile 切回去。
     //     没有这一段时：卸载重装后 profiles/*.yaml 与 Asset 里的节点密码都不存在，
     //     界面能看到节点，但内核没有节点来源 / 没有密码 → 选不了节点、连不上。
-    const profilesRestored = await BackupRestoreService.restoreProfiles(parsed, subIds, restoredSubs);
+    const profileResult = await BackupRestoreService.restoreProfiles(parsed, subIds, restoredSubs);
+    const profilesRestored = profileResult.restored;
     // 5.2 恢复后统一按订阅链接后台重拉一次：
     //     · 2.0 旧备份没有 profiles —— 不拉就永远没有内核节点来源（「刷新不出来」）；
     //     · 2.1 备份自带 profile —— 仍然重拉一次，把节点/流量/到期信息更新到最新，
@@ -298,6 +311,9 @@ export class BackupRestoreService {
     out.message = `恢复成功，已导入 ${restoredSubs.length} 个订阅` +
       (restoredNodes.length > 0 ? `/${restoredNodes.length} 个节点` : '') +
       (profilesRestored > 0 ? `、${profilesRestored} 份配置原文` : '') +
+      (profileResult.skippedOversize > 0
+        ? `；${profileResult.skippedOversize} 份配置原文超过 ${ImportFilePolicy.mib(ImportFilePolicy.YAML_MAX_BYTES)} MiB 已跳过，将改用订阅链接重新拉取`
+        : '') +
       (needRefresh.length > 0 ? `；正在后台按订阅链接更新 ${needRefresh.length} 个订阅` : '');
     return out;
   }
@@ -307,11 +323,11 @@ export class BackupRestoreService {
    * 备份里没有 profiles 段（2.0 旧备份）时返回 0，由调用方排队后台刷新。
    */
   private static async restoreProfiles(parsed: BackupFile, subIds: Set<string>,
-    subs: Subscription[]): Promise<number> {
+    subs: Subscription[]): Promise<ProfileRestoreResult> {
+    const result = new ProfileRestoreResult();
     if (!ProfileRepository.isReady()) {
-      return 0;
+      return result;
     }
-    let restored = 0;
     if (Array.isArray(parsed.profiles)) {
       for (const entry of parsed.profiles) {
         if (entry === null || typeof entry !== 'object') {
@@ -322,11 +338,17 @@ export class BackupRestoreService {
         if (id.length === 0 || yaml.length === 0 || !subIds.has(id)) {
           continue;
         }
-        if (yaml.length > 8 * 1024 * 1024) {
+        // 上限取自 ImportFilePolicy 单一来源（与 ProfileRepository.MAX_PROFILE_BYTES 同量级）。
+        // 跳过时**显式计数 + 记日志**，由调用方写进恢复文案；该订阅随后会走
+        // needRefresh 的后台重拉兜底，所以不是数据丢失，但用户有权知道。
+        if (yaml.length > ImportFilePolicy.YAML_MAX_BYTES) {
+          result.skippedOversize++;
+          AppLogger.warn(TAG, `profile ${id} skipped on restore: ${yaml.length} bytes > ` +
+            `${ImportFilePolicy.YAML_MAX_BYTES} (will re-fetch from subscription URL)`);
           continue;
         }
         if (ProfileRepository.write(id, yaml)) {
-          restored++;
+          result.restored++;
         }
       }
     }
@@ -365,6 +387,6 @@ export class BackupRestoreService {
     if (sources.length > 0) {
       await CredentialStore.canonicalize([], sources, true);
     }
-    return restored;
+    return result;
   }
 }

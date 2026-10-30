@@ -653,24 +653,65 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     if (path.length === 0) {
       return;
     }
+    const tmp = `${path}.mtu.tmp`;
     try {
       const text = this.readConfigText(path);
       const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
-      if (patched !== text) {
-        // 原子替换（tmp → rename）：startCore 与本改写可能紧邻，半写文件会让内核
-        // 撞上截断 YAML（unexpected end of stream）。同目录 rename 在 POSIX 语义下
-        // 对读者要么旧文件、要么新文件，永不半份。
-        const tmp = `${path}.mtu.tmp`;
-        const wf = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-        try {
-          fs.writeSync(wf.fd, patched);
-        } finally {
-          fs.closeSync(wf);
-        }
-        fs.renameSync(tmp, path);
+      if (patched === text) {
+        // Wi-Fi / 以太网：activeMtu 与生成器缺省值（ClashConfigGenerator 的 1400）一致，
+        // 无需改写。注意这是**只有蜂窝才会走下面写盘分支**的原因，也是本函数
+        // 历次事故「蜂窝必现、Wi-Fi 从不复现」的共同根源。
+        return;
       }
+      // 显式 UTF-8 编码：配置里含中文注释，patched.length（JS 字符数）≠ 字节数。
+      // 用字符数比对短写会对**每一份**配置误判为失败；writeSync 返回的是字节数，
+      // 必须与 byteLength 同口径（PrivateFileStore.writePrivate 同款）。
+      const bytes = util.TextEncoder.create('utf-8').encode(patched);
+      const total = bytes.byteLength;
+      // 原子替换（tmp → rename）：startCore 与本改写可能紧邻，半写文件会让内核
+      // 撞上截断 YAML（unexpected end of stream）。同目录 rename 在 POSIX 语义下
+      // 对读者要么旧文件、要么新文件，永不半份。
+      const wf = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        // 【2026-10-29 蜂窝断网修复】循环写直到全部落盘。writeSync 是 POSIX write
+        // 语义，**允许短写**：单次返回 < 请求字节数是合法的，大配置（真机 4846+ 行）
+        // 尤其明显。旧实现忽略返回值直接 rename，等于把可能被截断的半份 YAML
+        // 原子提升为正式配置 —— 内核整份拒载（unexpected end of stream）后，
+        // TUN 默认路由（Kill Switch）仍在 → 全量黑洞，就是用户看到的「断网」。
+        // 2026-10-24 已把**读**侧改成循环读到 EOF，写侧当时漏了，本次补齐。
+        let remain: Uint8Array = bytes;
+        let done = 0;
+        while (remain.byteLength > 0) {
+          const n = fs.writeSync(wf.fd, remain.slice().buffer as ArrayBuffer);
+          if (n <= 0) {
+            throw new Error(`config mtu write stalled at ${done}/${total} bytes`);
+          }
+          done += n;
+          remain = remain.subarray(n);
+        }
+        if (done !== total) {
+          throw new Error(`config mtu write incomplete: ${done}/${total} bytes`);
+        }
+        // rename 前 fsync（与 ConnectionOrchestrator 资产下载同口径）：避免 rename
+        // 已生效而数据仍在页缓存，掉电/被杀后内核读到空洞。
+        fs.fsyncSync(wf.fd);
+      } finally {
+        fs.closeSync(wf);
+      }
+      fs.renameSync(tmp, path);
+      AppLogger.info(TAG, `config mtu synced to ${this.activeMtu} (${total} bytes)`);
     } catch (e) {
-      AppLogger.warn(TAG, `config mtu sync skipped: ${AppLogger.errText(e)}`);
+      // 改写失败时**保留原配置**（mtu 维持生成器缺省值），绝不把半份 YAML 提升上去。
+      // 宁可 TUN 与内核 MTU 暂时不一致（只影响分片/吞吐），也不能让内核整份拒载
+      // （那会直接黑洞全部流量）。残留 tmp 必须清掉，否则下次改写基于脏 tmp。
+      try {
+        fs.unlinkSync(tmp);
+      } catch (ignore) {
+        // tmp 可能尚未创建（openSync 就失败），忽略
+      }
+      // 用 error 而非 warn：这条路径失败意味着 MTU 不变量已被破坏，需要能被诊断到。
+      AppLogger.error(TAG, `config mtu sync FAILED, kept original config `
+        + `(activeMtu=${this.activeMtu}): ${AppLogger.errText(e)}`);
     }
   }
 
@@ -818,8 +859,16 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     }
     routes.push({
       interface: TUN_IFNAME,
-      destination: { address: { address: '::' }, prefixLength: 0 },
-      gateway: { address: '0.0.0.0' },
+      // 【family 必须显式给 2】SDK 定义：NetAddress.family 缺省为 **1（IPv4）**。
+      // 旧实现漏写 family，这条 ::/0 会被平台当成「IPv4 族、目的地为 :: 字面量」的
+      // 畸形路由：轻则整条被丢弃（v6 绕过 TUN 直连，泄露），重则与上面那条
+      // 真正的 v4 默认路由冲突（两条 isDefaultRoute: true）→ 路由表错乱。
+      // 为何只在蜂窝暂露：国内蜂窝普遍下发 v6 且常为 v6 优先，客户端真会走
+      // AAAA；而家用 WiFi 多为 v4 优先，这条路由几乎不被命中——又是一例
+      // 「蜂窝必现、WiFi 不复现」。gateway 同步改为 v6 字面量（hasGateway=false
+      // 时不参与选路，但类型上不能给 v6 路由配 v4 网关）。
+      destination: { address: { address: '::', family: 2 }, prefixLength: 0 },
+      gateway: { address: '::', family: 2 },
       hasGateway: false,
       isDefaultRoute: true
     });
@@ -933,9 +982,21 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       // MTU 变化必须重建 TUN 才能生效：这是唯一必要的重建，其余情况只做内核热恢复。
       this.activeMtu = nextMtu;
       this.scheduleTunnelRebuild('mtu-change');
-    } else if (previous === NetTypes.NONE || previous !== netType) {
-      this.activeMtu = nextMtu;
-      this.scheduleCoreRecovery(ReconnectReason.NETWORK_CHANGED);
+    } else {
+      // 走到这里要么 MTU 没变，要么重建预算已封顶。**两种情况都不能动 activeMtu**：
+      // 平台 TUN 的 MTU 只能随重建改变，而 ensureConfigMtu 会按 activeMtu 改写内核
+      // YAML。旧实现在这里无条件 activeMtu = nextMtu，于是热恢复路径（也调
+      // ensureConfigMtu）会得到「配置 1360 / TUN 仍 1400」——正是 onCreate 里
+      // 「内核 MTU 必须与 VpnConfig.mtu 一致」不变量的反面：内核按 1400 出包、
+      // 平台 TUN 只收 1360，大包全丢 → 同样是「断网」。
+      if (nextMtu !== this.activeMtu) {
+        AppLogger.warn(TAG, `mtu ${this.activeMtu}->${nextMtu} deferred: rebuild budget `
+          + `exhausted (${this.tunnelRebuilds}/${MAX_TUNNEL_REBUILDS}), keeping TUN and `
+          + `config consistent at ${this.activeMtu}`);
+      }
+      if (previous === NetTypes.NONE || previous !== netType) {
+        this.scheduleCoreRecovery(ReconnectReason.NETWORK_CHANGED);
+      }
     }
   }
 

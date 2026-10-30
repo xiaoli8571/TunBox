@@ -10,6 +10,7 @@
  */
 import { router } from '@kit.ArkUI';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxTextColors } from '../theme/TextColors';
 
 @Component
 export struct TopNavBar {
@@ -52,7 +53,7 @@ export struct TopNavBar {
       Text(this.title)
         .fontSize(20)
         .fontWeight(FontWeight.Bold)
-        .fontColor(TunBoxColors.textPrimary)
+        .fontColor(TunBoxTextColors.primary)
         .margin({ left: this.hasBack ? 8 : 0 })
         // 2026-10-19 防溢出：标题与右侧操作区共存时，标题过长不得撑破导航条。
         // 用 layoutWeight(1) 让标题占用剩余空间并可被压缩（原 Blank() 与权重

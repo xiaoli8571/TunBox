@@ -366,8 +366,37 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return ConnectionOrchestrator.shared;
   }
 
+  /**
+   * 内核即将停止（拆隧道 / 回收测速核）前的收尾钩子。
+   *
+   * 记账侧（TrafficStatsStore）在此注册：内核进程一停，它那份累计计数器就随之消失，
+   * 尚未落盘的增量会永久丢失。用"注册表"而不是直接 import，是为了避免与
+   * TrafficStatsStore 形成循环依赖（后者已 import 本类）。
+   */
+  static readonly preCoreStopHooks: (() => void)[] = [];
+
+  /** 内核（含测速核）即将停止：先让记账侧把未落盘的增量补齐并落盘。 */
+  private flushTrafficAccounting(): void {
+    for (const hook of ConnectionOrchestrator.preCoreStopHooks) {
+      try {
+        hook();
+      } catch (e) {
+        AppLogger.warn(TAG, `traffic flush hook failed: ${AppLogger.errText(e)}`);
+      }
+    }
+  }
+
   state: ConnState = ConnState.DISCONNECTED;
   traffic: TrafficSnapshot = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
+  /**
+   * 内核**累计**流量（仅成功轮询时更新；失败/未连接时保持上一次值）。
+   *
+   * 为什么单列一份：记账（TrafficStatsStore）必须拿到"只增不减"的可信累计值。
+   * `traffic` 在探测失败时会被清零（UI 语义），拿它做差分会把"探测失败"误判成
+   * "内核归零"，既丢量也虚高。`-1` = 本进程尚未拿到任何有效样本。
+   */
+  coreTotalUp: number = -1;
+  coreTotalDown: number = -1;
   publicIp: string = '';
   startedAt: number = 0;
   lastError: string = '';
@@ -789,6 +818,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return state;
   }
 
+  /** 把 App 自身的 HTTP 请求接入当前 mixed-port，并在发 CONNECTED 事件前确认监听已就绪。 */
+  private async activateAppHttpProxy(source: string): Promise<boolean> {
+    AppProxyRoute.apply(this.mixedPort);
+    const ready: boolean = await AppProxyRoute.waitUntilReady(4000);
+    if (!ready) {
+      AppLogger.warn(TAG, `app http proxy not ready (${source}): port=${this.mixedPort}`);
+    }
+    return ready;
+  }
+
   /** 恢复真实隧道的 controller；只读本机配置头，凭据仍只从 AssetStore 获取。 */
   private async restoreTunnelController(snapshot: ConnectionSnapshot, verifyResponse: boolean): Promise<boolean> {
     if (this.context === null || !snapshot.desiredConnected
@@ -825,6 +864,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       this.apiSecret = secret;
       this.api.setEndpoint(port, secret);
+      await this.activateAppHttpProxy('restore');
+      if (seq !== this.connectSeq || this.disconnectRequested
+        || !await this.isCurrentSession(snapshot.sessionGeneration)) {
+        return false;
+      }
       return true;
     } catch (e) {
       AppLogger.warn(TAG, `runtime controller restore failed: ${AppLogger.errText(e)}`);
@@ -3500,6 +3544,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.resetTestCoreChannelState();
       return;
     }
+    // 测速核与真实隧道共用同一个 VpnExtensionAbility 进程：停测速核会连带停扩展，
+    // 先 flush，避免隧道那份尚未落盘的累计增量随进程消失。
+    this.flushTrafficAccounting();
     await this.testCoreFlight.stop();
     // 状态机只负责状态位；secret / endpoint / 负缓存 / 单飞复位统一在这里显式清零
     this.testCoreActive = false;
@@ -4656,6 +4703,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return false; // 已被更新的连接请求/用户停止取代
       }
 
+      // 连接成功事件会同步通知数据页；必须先把 App HTTP 请求接入 mixed-port 并探测就绪，
+      // 否则订阅方在事件回调里立刻查询出口 IP 时，usingProxy 会是 false，绕过代理。
+      await this.activateAppHttpProxy('connect');
       this.setState(ConnState.CONNECTED);
       attempt.complete();
       this.startedAt = Date.now();
@@ -4698,11 +4748,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       TunBoxNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${finalNodeName}`);
-      // 隧道就绪：把 **App 自身** 的 HTTP 请求导到本地 mixed 端口。
-      // 否则出口 IP 查询（api64.ipify.org）与 geo/规则集/模型下载（GitHub 镜像）
-      // 都从物理网卡直连 —— 国内即表现为「节点能测速、出口 IP 获取失败、
-      // 数据与规则全部源下载失败」（2026-10-22 真机）。
-      AppProxyRoute.apply(this.mixedPort);
+      // 隧道就绪时 App HTTP 代理已在 CONNECTED 事件发出前挂好（见上方），
+      // 避免 IP 查询先于 apply() 启动而从物理网卡直连。
       // P0-2 订阅自救：连接成功 → 隧道已可用（拉订阅天然走 VPN 出网），
       // 把此前网络性拉取失败（被阻断面板）的订阅自动补拉一次。只记日志不弹 UI：
       // 这是无感修复，失败也不影响本次连接结果（advice 已在原失败时提示过用户）。
@@ -5606,6 +5653,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
     }
     await this.clearSessionIntent(expectedGeneration);
+    // 内核一停，它的累计计数器就没了：先把当前增量补记并落盘，否则这段流量永久丢失。
+    this.flushTrafficAccounting();
     try {
       await coreBridge.stopCore();
     } catch (e) {
@@ -5665,11 +5714,25 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       this.trafficPollRunning = true;
       const seq = this.connectSeq;
-      this.api.traffic().then((t: TrafficSnapshot) => {
+      this.api.traffic().then((t: TrafficSnapshot | null) => {
         if (!this.isCurrentMonitor(generation, seq)) { return; }
-        this.traffic = t;
-        ConnectionEvents.emit(ConnEvent.traffic(t.uploadSpeed, t.downloadSpeed,
-          t.uploadBytes, t.downloadBytes));
+        if (t !== null) {
+          this.traffic = t;
+          // 只有成功样本才推进累计基线；失败时保留上次值，供记账跨进程/跨后台对齐
+          this.coreTotalUp = t.uploadBytes;
+          this.coreTotalDown = t.downloadBytes;
+        } else {
+          // 探测失败：保留总量、只把速率清零（卡片不跳 0，记账不受影响）
+          this.traffic = {
+            uploadBytes: this.traffic.uploadBytes,
+            downloadBytes: this.traffic.downloadBytes,
+            uploadSpeed: 0,
+            downloadSpeed: 0
+          };
+        }
+        const snap: TrafficSnapshot = this.traffic;
+        ConnectionEvents.emit(ConnEvent.traffic(snap.uploadSpeed, snap.downloadSpeed,
+          snap.uploadBytes, snap.downloadBytes));
         if (this.state === ConnState.CONNECTED) {
           this.exitPollTick++;
           if (this.exitPollTick % 5 === 0) {
@@ -5681,7 +5744,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             this.notifyNodeText(this.lastNodeName.length > 0 ? this.lastNodeName : '已连接'),
             // 2026-10-19：实况通知单行宽度有限，速率串用紧凑写法（去掉多余空格），
             // 配合 TaskProgressUpdater 里「只放速率、不放时长」的改动，避免被截断。
-            `↓${this.formatSpeed(t.downloadSpeed)} ↑${this.formatSpeed(t.uploadSpeed)}`,
+            `↓${this.formatSpeed(snap.downloadSpeed)} ↑${this.formatSpeed(snap.uploadSpeed)}`,
             this.connDurationText());
         }
         this.notify();

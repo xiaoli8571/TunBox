@@ -487,17 +487,45 @@ console.log('[A6] 所有 refreshPublicIp( 调用点都传了 trigger');
       }
     }
     const args = end > 0 ? home.slice(open + 1, end).trim() : '';
-    callSites.push({ line: home.slice(0, m.index).split('\n').length, args });
+    // codeOnly() 是**等长就地替换**（注释与字符串内容抹成空格、保留换行与引号），
+    // 所以 home 里的下标与 homeRaw 1:1 对应。trigger 名字必须从 homeRaw 取：
+    // 在 home 上只能拿到 `'             '` 这种被抹空的字面量，无法按名校验。
+    const rawArgs = end > 0 ? homeRaw.slice(open + 1, end).trim() : '';
+    callSites.push({ line: home.slice(0, m.index).split('\n').length, args, rawArgs });
   }
 
   const empty = callSites.filter((c) => c.args.length === 0);
   ok('a6.no-empty-call-site', empty.length === 0,
     `有空参调用点（旧版形态）：${empty.map((c) => 'L' + c.line).join(', ')}`);
 
-  // 至少覆盖 7 个已知触发点：home-bootstrap / node-switched / after-connect-shortcut /
-  // after-disconnect / after-connect / after-mode-change / user-retry
-  ok('a6.call-site-count', callSites.length >= 7,
-    `调用点数量 ${callSites.length}，少于已知的 7 个触发点（可能漏改了调用）`);
+  // 触发点清单（2026-10-29 与实现对齐）：
+  //   node-switched / reconnect-recover / after-connect-shortcut /
+  //   after-disconnect / after-connect / after-mode-change
+  //
+  // 旧清单里的两项已不存在，此前长期红灯（a6 要求 ≥7、实际 6）：
+  //   · home-bootstrap —— 已并入 schedulePublicIpRecover()：连接态跃迁（含启动后首次
+  //     落到 CONNECTED）统一走补查，trigger 记为 'reconnect-recover'；
+  //   · user-retry —— 从未作为独立调用点存在。出口 IP 画在 CelestialPowerOrb 内部
+  //     （ipText），该组件唯一手势是 onToggle→toggleConnection()，不是 IP 重试。
+  //
+  // 断言改为**按名校验**而非数数：数量阈值会在触发点被合并/改名时静默失真，
+  // 按名则能直接指出漏的是哪一个。
+  const REQUIRED_TRIGGERS = [
+    'node-switched', 'reconnect-recover', 'after-connect-shortcut',
+    'after-disconnect', 'after-connect', 'after-mode-change'
+  ];
+  const foundTriggers = callSites
+    .map((c) => {
+      const q = c.rawArgs.match(/^'([^']*)'/) || c.rawArgs.match(/^"([^"]*)"/);
+      return q ? q[1] : '';
+    })
+    .filter((t) => t.length > 0);
+  const missingTriggers = REQUIRED_TRIGGERS.filter((t) => foundTriggers.indexOf(t) < 0);
+  ok('a6.required-triggers', missingTriggers.length === 0,
+    `缺少必需触发点：${missingTriggers.join(', ') || '（无）'}；现有：${foundTriggers.join(', ')}`);
+
+  ok('a6.call-site-count', callSites.length >= REQUIRED_TRIGGERS.length,
+    `调用点数量 ${callSites.length}，少于必需触发点数量 ${REQUIRED_TRIGGERS.length}（可能漏改了调用）`);
 
   // 每个参数都得是字符串字面量或 trigger 变量（拒绝 undefined / 空）。
   const bad = callSites.filter((c) => !/^(['"]|trigger\b)/.test(c.args));

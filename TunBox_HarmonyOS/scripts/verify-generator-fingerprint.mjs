@@ -10,7 +10,7 @@
  * 生成器改了、指纹没刷，verify-all 照样全绿）。
  *
  * 本脚本把同一条检查抽出来，让它进入总闸；两处共用同一份指纹文件与同一条算法
- * （sha256 前 16 位十六进制），不会出现「两套口径」。
+ * （先统一换行符为 LF，再取 SHA-256 前 16 位十六进制），不会出现「两套口径」或平台换行差异。
  *
  * ## 规则
  *
@@ -39,8 +39,8 @@ function ok(cond, label) {
 }
 
 console.log('── 配置生成器指纹 ──');
-const gen = fs.readFileSync(genPath, 'utf8');
-const actual = crypto.createHash('sha256').update(gen).digest('hex').slice(0, 16);
+const gen = fs.readFileSync(genPath, 'utf8').replace(/\r\n/g, '\n');
+const actual = crypto.createHash('sha256').update(gen, 'utf8').digest('hex').slice(0, 16);
 let expected = '';
 try {
   expected = JSON.parse(fs.readFileSync(fpPath, 'utf8')).sha256_16 || '';

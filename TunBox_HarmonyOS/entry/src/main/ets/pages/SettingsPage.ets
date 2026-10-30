@@ -25,6 +25,7 @@ import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { common } from '@kit.AbilityKit';
 import { privacyManager } from '@kit.AppGalleryKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxTextColors } from '../theme/TextColors';
 import { ThemeService, AppThemeMode, AppBgTheme, BgThemeColors } from '../theme/ThemeService';
 import { TopNavBar } from '../components/TopNavBar';
 import { AppInfo } from '../commons/utils/AppInfo';
@@ -384,13 +385,13 @@ export struct SettingsView {
                 .width(28).height(28).borderRadius(8)
                 .backgroundColor(TunBoxColors.primaryLight)
                 .justifyContent(FlexAlign.Center)
-                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)
               }.width('100%').alignItems(VerticalAlign.Center)
               Text(this.appRoutingSummary)
-                .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+                .fontSize(12).fontColor(TunBoxTextColors.secondary).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -408,13 +409,13 @@ export struct SettingsView {
                 .width(28).height(28).borderRadius(8)
                 .backgroundColor(TunBoxColors.primaryLight)
                 .justifyContent(FlexAlign.Center)
-                Text('网站分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Text('网站分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)
               }.width('100%').alignItems(VerticalAlign.Center)
               Text(`代理 ${this.settings.forceProxySites.length} · 直连 ${this.settings.forceDirectSites.length}`)
-                .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+                .fontSize(12).fontColor(TunBoxTextColors.secondary).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -432,13 +433,13 @@ export struct SettingsView {
                 .width(28).height(28).borderRadius(8)
                 .backgroundColor(TunBoxColors.primaryLight)
                 .justifyContent(FlexAlign.Center)
-                Text('路由与规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                Text('路由与规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)
               }.width('100%').alignItems(VerticalAlign.Center)
               Text(this.adRulesSummary)
-                .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+                .fontSize(12).fontColor(TunBoxTextColors.secondary).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -453,25 +454,25 @@ export struct SettingsView {
 
               Row() {
                 Text('IPv6 双栈')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.ipv6Enabled })
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setIpv6Enabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('IPv6 也走代理；关闭则纯 IPv4。改动会自动重连。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
 
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
 
               Row() {
                 Text('DNS 覆写')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.dnsOverrideEnabled })
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setDnsOverrideEnabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('开启后使用 TunBox 配置的加密上游（DoT）；关闭后优先保留订阅 DNS。改动会自动重连。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
 
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
 
@@ -481,17 +482,17 @@ export struct SettingsView {
               Row({ space: 8 }) {
                 Column({ space: 2 }) {
                   Text('Smart 选点模型')
-                    .fontSize(14).fontColor(TunBoxColors.textPrimary)
+                    .fontSize(14).fontColor(TunBoxTextColors.primary)
                     .maxLines(1)
                   Text(this.smartModelStatusText())
-                    .fontSize(11).fontColor(TunBoxColors.textMuted)
+                    .fontSize(11).fontColor(TunBoxTextColors.muted)
                     .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
                 }
                 .layoutWeight(1)
                 .alignItems(HorizontalAlign.Start)
                 Text(this.geoUpdatingId === 'model' ? '更新中…' : '更新')
                   .fontSize(13).fontWeight(FontWeight.Medium)
-                  .fontColor(this.geoUpdatingId === 'model' ? TunBoxColors.textMuted : TunBoxColors.primary)
+                  .fontColor(this.geoUpdatingId === 'model' ? TunBoxTextColors.muted : TunBoxTextColors.accentBlue)
                   .padding({ left: 12, right: 12, top: 6, bottom: 6 })
                   .borderRadius(10)
                   .backgroundColor(TunBoxColors.primaryLight)
@@ -514,21 +515,21 @@ export struct SettingsView {
               this.SectionHeader($r('app.media.ic_globe'), $r('app.string.settings_about_title'))
               Row() {
                 Text($r('app.string.settings_version_label'))
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
                 Text(AppInfo.version())
-                  .fontSize(13).fontColor(TunBoxColors.textSecondary)
+                  .fontSize(13).fontColor(TunBoxTextColors.secondary)
               }.width('100%')
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               // 2026-10-23 用户口径：主题跟随系统放在「版本」和「隐私政策」中间
               Row() {
                 Text('主题跟随系统')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.themeMode === AppThemeMode.SYSTEM })
                   .selectedColor(TunBoxColors.primary)
                   .onChange((v: boolean): void => this.setFollowSystemTheme(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('关闭后由主页太阳按钮手动切换深浅色。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               // 2026-10-28 用户要求：浅色模式下背景色可选 Mint / Homebrew / Noctis Hibernus
               // （深色只有一套夜间配色，故深色下这组选择器隐藏而不是置灰 —— 置灰会让人以为选不了是 bug）
@@ -539,7 +540,7 @@ export struct SettingsView {
               // 2026-10-27：主页右上角「备份」迁到这里（关于与隐私卡内），功能不变。
               Row() {
                 Text('配置备份与恢复')
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)
               }.width('100%').alignItems(VerticalAlign.Center)
@@ -549,17 +550,17 @@ export struct SettingsView {
                 });
               })
               Text('导出/导入订阅、节点与自定义规则；支持 AES-256 加密备份。')
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               Row() {
                 Text($r('app.string.settings_privacy_policy_row'))
-                  .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
                 Image($r('app.media.ic_arrow_right'))
                   .width(16).height(16).fillColor(TunBoxColors.textMuted)
               }.width('100%').alignItems(VerticalAlign.Center)
               .onClick(() => this.openPrivacyPolicy())
               Text($r('app.string.settings_privacy_policy_desc'))
-                .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -587,7 +588,7 @@ export struct SettingsView {
   SectionHeader(icon: Resource, title: ResourceStr) {
     Row({ space: 8 }) {
       Image(icon).width(18).height(18).fillColor(TunBoxColors.primary)
-      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
       Blank()
     }
     .width('100%')
@@ -625,9 +626,9 @@ export struct SettingsView {
     Column({ space: 10 }) {
       Row() {
         Text('浅色背景')
-          .fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+          .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
         Text(this.bgThemeLabel(this.bgTheme))
-          .fontSize(12).fontColor(TunBoxColors.textSecondary)
+          .fontSize(12).fontColor(TunBoxTextColors.secondary)
       }.width('100%').alignItems(VerticalAlign.Center)
       Row({ space: 10 }) {
         ForEach(BG_THEME_OPTIONS, (item: AppBgTheme) => {
@@ -645,7 +646,7 @@ export struct SettingsView {
               })
             Text(this.bgThemeLabel(item))
               .fontSize(11)
-              .fontColor(this.bgTheme === item ? TunBoxColors.primary : TunBoxColors.textSecondary)
+              .fontColor(this.bgTheme === item ? TunBoxTextColors.accentBlue : TunBoxTextColors.secondary)
               .fontWeight(this.bgTheme === item ? FontWeight.Medium : FontWeight.Regular)
           }
           .layoutWeight(1)
@@ -662,7 +663,7 @@ export struct SettingsView {
         }, (item: AppBgTheme) => item)
       }.width('100%')
       Text('只影响浅色模式：页面背景、卡片与输入框会一起换成同色系；文字与品牌色不变。深色模式固定一套夜间配色。')
-        .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+        .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
     }
     .width('100%')
   }

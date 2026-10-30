@@ -7,6 +7,7 @@ import { window, display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { SettingsService } from '../commons/services/SettingsService';
+import { TrafficStatsStore } from '../commons/services/TrafficStatsStore';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { UiGuardian } from '../commons/services/UiGuardian';
@@ -177,6 +178,9 @@ export default class EntryAbility extends UIAbility {
     SettingsService.flushNow().catch((e: Error): void => {
       AppLogger.warn(TAG, `settings flush on background failed: ${e.message}`);
     });
+    // 流量记账同理：进后台是最后一个可靠刷盘点。内核累计计数器只在隧道存活期间有效，
+    // 若不在此把增量补齐落盘，App 随后被系统回收就会把这段流量永久丢掉。
+    TrafficStatsStore.flushNow();
     // 进后台时若隧道确实活着，补一次驻留凭证：UiGuardian.registered 是进程级静态
     // 布尔，进程重启后必然为 false，只有 HomePage 存在时才会被重新 engage ——
     // 卡片/快捷方式路径拉起的会话没有页面，这里兜住最后一环。

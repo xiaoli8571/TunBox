@@ -11,6 +11,7 @@ import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { ConnEvent, ConnEventKind, ConnListener } from '../commons/services/ConnectionEvents';
 import { window } from '@kit.ArkUI';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxTextColors } from '../theme/TextColors';
 import { TopNavBar } from '../components/TopNavBar';
 import { CelestialPowerOrb } from '../components/CelestialPowerOrb';
 import { SubscriptionSection } from '../components/SubscriptionSection';
@@ -714,7 +715,7 @@ export struct HomePage {
       Text(label)
         .fontSize(14)
         .fontWeight(this.proxyMode === mode ? FontWeight.Bold : FontWeight.Medium)
-        .fontColor(this.proxyMode === mode ? TunBoxColors.primary : TunBoxColors.textSecondary)
+        .fontColor(this.proxyMode === mode ? TunBoxTextColors.accentBlue : TunBoxTextColors.secondary)
         .textAlign(TextAlign.Center)
         .height(34)
         .padding({ left: 20, right: 20 })

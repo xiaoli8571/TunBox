@@ -5,6 +5,7 @@ import { TopNavBar } from '../components/TopNavBar';
 import { AppSettings, CustomRuleSet } from '../commons/models/AppSettings';
 import { RulesEditorSnapshot, RulesPageParams } from '../commons/models/RulesEditorSnapshot';
 import { SettingsService } from '../commons/services/SettingsService';
+import { ImportFilePolicy } from '../commons/services/ImportFilePolicy';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 
@@ -130,9 +131,21 @@ export struct RulesView {
     this.settingsReady = true;
   }
 
-  /** 保存 YAML 覆盖层（P2）：生成器侧 validateYamlOverride 白名单在生成时把关 */
+  /**
+   * 保存 YAML 覆盖层（P2）：生成器侧 validateYamlOverride 白名单在生成时把关。
+   *
+   * 超长**显式拒绝**而非 slice 后谎报「已保存」（对齐 AppRoutingPolicy /
+   * SiteRoutingPolicy 的「不会自动截断」范式）。旧实现在这里 slice(0,8192)，
+   * AppSettings 反序列化时又 slice 一次，用户粘贴超长覆盖层会静默丢尾巴。
+   */
   private async saveYamlOverride(): Promise<void> {
-    const text = this.yamlOverrideText.slice(0, 8192);
+    const text = this.yamlOverrideText;
+    const lenError: string = ImportFilePolicy.validateLength(
+      text, ImportFilePolicy.YAML_OVERRIDE_MAX_CHARS, 'YAML 覆盖层');
+    if (lenError.length > 0) {
+      promptAction.showToast({ message: lenError });
+      return;
+    }
     this.settings.yamlOverride = text;
     // 字段级写入口（审计 F2）：只写覆盖层这一个字段。
     await SettingsService.patchSettings((s: AppSettings): void => {
@@ -574,6 +587,9 @@ export struct RulesView {
                   .fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
                 TextArea({ placeholder: '如：\nprofile:\n  store-selected: true', text: this.yamlOverrideText })
                   .enabled(true)
+                  // 录入侧即挡住超长（maxLength），保存侧 validateLength 再兜一层；
+                  // 计数让用户看见上限，而不是提交后才发现被拒。
+                  .maxLength(ImportFilePolicy.YAML_OVERRIDE_MAX_CHARS)
                   .onChange((value: string) => { this.yamlOverrideText = value; })
                   .width('100%').height(120)
                   .fontSize(12).fontFamily('monospace').lineHeight(20)
@@ -583,6 +599,8 @@ export struct RulesView {
                   .borderRadius(14)
                   .padding(12)
                   .border({ width: 1, color: TunBoxColors.codeBorder(this.themeRevision) })
+                Text(`${this.yamlOverrideText.length}/${ImportFilePolicy.YAML_OVERRIDE_MAX_CHARS}`)
+                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%').textAlign(TextAlign.End)
                 Text('保存').fontSize(14).fontWeight(FontWeight.Bold)
                   .fontColor(TunBoxColors.textOnPrimary)
                   .textAlign(TextAlign.Center).width('100%').padding(10)

@@ -20,7 +20,7 @@
  *  8. 取消 ≠ 失败；通道不可用 ≠ 节点失败
  *  9. 组条目与内建项必须被过滤（PROXY.all 里混着 14 个组）
  * 10. 内核回收必须避开"用户正在用 VPN"的四种状态
- * 11. ClashConfigGenerator 未被本次重做改动（逐字节）
+ * 11. ClashConfigGenerator 逻辑内容指纹未被本次重做改动（忽略 CRLF/LF 行尾差异）
  */
 
 const fs = require('fs');
@@ -388,9 +388,9 @@ check('排序语义与页面的落盘口径一致（只有真结论才参与排�
 });
 
 // ── 11. 生成器未被本次重做改动 ───────────────────────────────────────────
-check('ClashConfigGenerator 逐字节未变（除 unified-delay 以外本次不碰）', () => {
-  const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'));
-  const hash = crypto.createHash('sha256').update(gen).digest('hex').slice(0, 16);
+check('ClashConfigGenerator 逻辑内容指纹未变（忽略 CRLF/LF 行尾差异）', () => {
+  const gen = fs.readFileSync(rel(svc + 'ClashConfigGenerator.ets'), 'utf8').replace(/\r\n/g, '\n');
+  const hash = crypto.createHash('sha256').update(gen, 'utf8').digest('hex').slice(0, 16);
   // 记录当前指纹：本次延迟重做不应改动配置生成器（避免牵连隧道行为）
   const expected = require('./latency-gen-fingerprint.json').sha256_16;
   assert.strictEqual(hash, expected,

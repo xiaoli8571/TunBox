@@ -70,6 +70,10 @@ const FILES = [
   // 测速地址唯一真源（零 import ⇒ 任何层都能安全引）
   { src: 'commons/latency/LatencyTestUrl.ets', out: 'LatencyTestUrl.ts', map: {} },
   { src: 'commons/latency/LatencyKinds.ets', out: 'LatencyKinds.ts', map: {} },
+  // 导入体积上限唯一真源（同样零 import）。必须作为真模块转译而非映射到 stubs：
+  // AppSettings.fromJson 会读 ImportFilePolicy.YAML_OVERRIDE_MAX_CHARS 做防御性裁剪，
+  // 打 stub 会让它取到 undefined，slice(0, undefined) 静默失效。
+  { src: 'commons/services/ImportFilePolicy.ets', out: 'ImportFilePolicy.ts', map: {} },
   {
     src: 'commons/services/YamlMerger.ets', out: 'YamlMerger.ts',
     map: { '@kit.ArkTS': './stubs.ts' },
@@ -122,6 +126,8 @@ const FILES = [
       '../utils/AppLogger': './stubs.ts',
       // 2026-10-20（latency-core 的测速地址唯一真源）：AppSettings 也引用了它
       '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
+      // 2026-10-29（导入上限收口）：yamlOverride 裁剪上限改为引用 ImportFilePolicy
+      '../services/ImportFilePolicy': './ImportFilePolicy.ts',
     },
   },
   {

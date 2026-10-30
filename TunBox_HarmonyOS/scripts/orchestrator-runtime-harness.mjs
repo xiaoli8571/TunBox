@@ -39,6 +39,7 @@ export function harness() {
     config: 'mixed-port: 17890\nexternal-controller: 127.0.0.1:19090\nsecret: "not-read"\ndns:\n  listen: 127.0.0.1:11053\n',
     storedSecret: 'fixture-secret', acceptedSecret: 'fixture-secret', controllerPort: 19090,
     writes: 0, losses: 0, readGate: null, apiCalls: 0, testCoreStarts: 0, ruleReady: false,
+    appProxyPort: 0, appProxyApplyCount: 0,
     trafficGate: null, trafficFailure: false, trafficReply: null, liveUpdates: 0 };
   class Clock extends Date { static now() { return now; } }
   class Api {
@@ -61,7 +62,8 @@ export function harness() {
       : path.endsWith('mihomo_config.yaml') ? h.config : '';
     return { ok: text.length > 0, text, truncated: false };
   }
-  const subs = { nodes: [{ id: 'fixture-node', name: 'test-node' }], async init() {} };
+  const subs = { nodes: [{ id: 'fixture-node', name: 'test-node' }], async init() {},
+    fallbackConnectionNode() { return this.nodes[0] ?? null; } };
   const context = vm.createContext({
     Date: Clock, Math, Promise, Map, Set, Number,
     setInterval(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay }); return id; },
@@ -69,6 +71,13 @@ export function harness() {
     setTimeout(fn, delay) { const id = ++timerId; timers.set(id, { fn, delay, once: true }); return id; },
     clearTimeout(id) { timers.delete(id); },
     ClashApiService: Api, ConnectionSnapshot: class {},
+    AppProxyRoute: {
+      apply(port) { h.appProxyPort = port; h.appProxyApplyCount++; },
+      async waitUntilReady() { return h.appProxyPort > 0; },
+      clear() { h.appProxyPort = 0; },
+      isReady() { return h.appProxyPort > 0; },
+      activePort() { return h.appProxyPort; }
+    },
     // 2026-10-27：状态枚举/事务/状态机已抽成独立模块，沙箱里必须提供等价替身，
     // 否则字段初始化（new ConnectionAttemptClock()）与 setState 门禁会 ReferenceError。
     // 数值必须与 entry/src/main/ets/commons/services/connection/ConnState.ets 一致。

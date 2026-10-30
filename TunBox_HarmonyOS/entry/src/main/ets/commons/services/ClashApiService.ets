@@ -1258,8 +1258,17 @@ export class ClashApiService {
     }
   }
 
-  async traffic(): Promise<TrafficSnapshot> {
-    const empty: TrafficSnapshot = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
+  /**
+   * 拉取内核累计流量。
+   *
+   * 返回 `null` 表示**本次轮询失败**（内核不可达 / 非 200 / 空响应）。调用方**必须**
+   * 把 null 当"无有效样本"，而不是"流量为 0"：
+   * - 记账侧（TrafficStatsStore）靠它区分"真的 0"与"探测失败"。旧实现失败返回全 0，
+   *   记账会把 0 当成"内核累计值归零"重建基线，随后一次成功又把**整个累计值**当增量
+   *   补记 —— 既会多记（2026-10-29 单日虚高 819MB 的来源）也会少记。
+   * - UI 侧失败时只清零速率、保留上次总量，避免卡片跳 0。
+   */
+  async traffic(): Promise<TrafficSnapshot | null> {
     const req = http.createHttp();
     try {
       const resp = await req.request(`${this.baseUrl()}/connections`, {
@@ -1276,7 +1285,7 @@ export class ClashApiService {
         body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
       }
       if (resp.responseCode !== 200 || body.length === 0) {
-        return empty;
+        return null;
       }
       const json = JSON.parse(body) as Record<string, number>;
       const uploadBytes = json['uploadTotal'] !== undefined ? json['uploadTotal'] : 0;
@@ -1311,7 +1320,7 @@ export class ClashApiService {
         this.trafficLogged = this.trafficLogged + 1;
         AppLogger.info(TAG, `traffic diag: request failed ${AppLogger.errText(e)}`);
       }
-      return empty;
+      return null;
     } finally {
       req.destroy();
     }

@@ -118,7 +118,7 @@
   源码级接线与**旧缺陷不许复活**的负向断言 —— 唯一入口、禁止 `/group/*/delay`、
   未连接路径必须经 `ensureLatencyApi`、HTTPS URL、并发上限、`timeout` 显式且 ≤32767、
   硬截止不写失败、取消≠失败、通道不可用≠节点失败、组条目过滤、回收安全闸、
-  生成器逐字节未变（指纹 `scripts/latency-gen-fingerprint.json`）。
+  生成器内容指纹未变（`scripts/latency-gen-fingerprint.json`；CRLF/LF 行尾先统一为 LF 后比较）。
 - `scripts/verify-latency-cache.mjs`：把 `LatencyState.ets` / `LatencyController.ets`
   按 `.ts` 暂存后在 Node 里**真实驱动**（45 项）—— 五态迁移、`0ms` 不是延迟、
   `65535` 不是延迟、排序、组过滤、`retainOnly`。
@@ -560,3 +560,16 @@ provider 声明段），与延迟判定口径无关：
 
 > 复现门禁：`node scripts/verify-generator-fingerprint.mjs`（2/0）与
 > `node scripts/verify-config-generation-integrity.mjs`。
+
+## 二十、2026-10-31 指纹补记（provider 订阅池作用域修正）
+
+§十九记录的 `46c1d5c19a30bd90` 对应提交 `8fe3a636`（2026-10-28）；当前 HEAD `8b7f3da` 的生成器内容指纹为 `bcfa84b2ffef61df`。两者不一致不是单纯的行尾转换：当前提交之后确有配置生成器的功能性改动，主要是：
+
+| 项 | 改动 | 目的 |
+|---|---|---|
+| ① | smart 组作用域的节点数改按 `validNodes` 计算；有效订阅节点不足 2 个才回退全局池。达到阈值时，静态节点与 `use:` provider 均按当前订阅收窄 | provider 接管的节点不在 `staticNodes`；旧逻辑将订阅误判为空池并静默退回跨订阅全局测速/优选，破坏「仅在该订阅内优选」 |
+| ② | 无可用节点时的操作指引改为主页「订阅」入口 | 与当前信息架构一致 |
+
+此前 §十九所述的 `lastEffectiveNodeName` 与 DNS 恒接管契约仍在当前生成器中。指纹脚本已统一先把 CRLF 转为 LF 再计算 SHA-256 前 16 位：当前工作副本原始 CRLF 哈希为 `8c0e2a4a6d2dc56c`，Git 中 LF 内容与归一后的哈希均为 `bcfa84b2ffef61df`。因此换行风格不会制造误报，但上述生成器内容改动仍会触发指纹门禁。
+
+> 复现门禁：`node scripts/verify-generator-fingerprint.mjs`、`node scripts/test-latency-engine.js`。

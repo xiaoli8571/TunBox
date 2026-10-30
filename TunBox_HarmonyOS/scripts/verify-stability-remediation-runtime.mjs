@@ -270,7 +270,7 @@ try {
       const h = harness(), destination = '/sandbox/geoip.metadb';
       const files = new Map([[destination, 'old-resource']]); let opened = '', closed = 0, destroyed = 0;
       const responseBytes = vm.runInContext('new ArrayBuffer(32)', h.platform);
-      h.platform.AppProxyRoute = { activePort: () => 0 };
+      h.platform.AppProxyRoute = { isReady: () => false };
       h.platform.http = { RequestMethod: { GET: 'GET' }, HttpDataType: { ARRAY_BUFFER: 0 }, createHttp() {
         return { async request() { return { responseCode: 200, result: responseBytes }; },
           destroy() { destroyed++; } };

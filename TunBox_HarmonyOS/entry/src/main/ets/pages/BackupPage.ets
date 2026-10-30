@@ -14,6 +14,7 @@ import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings } from '../commons/models/AppSettings';
 import { BackupRestoreService, RestoreOutcome } from '../commons/services/BackupRestoreService';
 import { BackupCrypto } from '../commons/services/BackupCrypto';
+import { ImportFilePolicy } from '../commons/services/ImportFilePolicy';
 import { AppLogger } from '../commons/utils/AppLogger';
 
 const TAG = 'BackupPage';
@@ -197,8 +198,14 @@ struct BackupPage {
       let text = '';
       try {
         const stat = fs.statSync(file.fd);
-        if (stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
-          promptAction.showToast({ message: '文件大小需在 4MB 以内' });
+        // 上限取自 ImportFilePolicy 单一来源。它同时是**内存护栏**：下面按
+        // stat.size 全量分配 ArrayBuffer，随后还要整份 JSON.parse（解析后对象图
+        // 的内存峰值是文本的数倍），无上限时用户误选大文件即 OOM/卡死主线程。
+        const sizeError: string = ImportFilePolicy.validateSize(
+          Number(stat.size), ImportFilePolicy.BACKUP_JSON_MAX_BYTES, '备份文件');
+        if (sizeError.length > 0) {
+          promptAction.showToast({ message: sizeError });
+          AppLogger.warn(TAG, `backup import rejected: ${sizeError}`);
           return;
         }
         const buf = new ArrayBuffer(Number(stat.size));

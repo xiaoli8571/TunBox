@@ -38,8 +38,19 @@ export const RAW_PROVIDER_PATH_MODE: string = 'relative';
 export const RAW_PROVIDER_RELATIVE_PREFIX = './';
 /** 单个订阅原文上限：超过则不落盘（内核 provider 也会因过大而拖慢启动） */
 export const RAW_SUB_MAX_BYTES = 8 * 1024 * 1024;
-/** 读回校验/估算时的读取上限 */
-export const RAW_SUB_READ_CAP = 4 * 1024 * 1024;
+/**
+ * 读回上限：**必须 ≥ 写回上限**。
+ *
+ * 此前这里是 4 MiB 而写回上限是 8 MiB，造成 4–8 MiB 区间的订阅「能写进去、
+ * 读回来只剩半份」，而 readRaw() 又把 readCapped 的 truncated 标志丢掉了 ——
+ * 半份原文会静默流进缓存、撤销快照与节点重解析（数据损坏）。
+ *
+ * 口径说明：writeRaw 卡的是 content.length（字符数），readCapped 卡的是字节数。
+ * UTF-8 下一个 BMP 字符最多 3 字节，所以极端多字节内容理论上仍可能触顶；
+ * 真订阅以 ASCII 为主（bytes ≈ chars），两者对齐即可，剩下的极端情况由
+ * readRaw() 的 truncated 分支**显式失败**兜底，绝不再返回半份原文。
+ */
+export const RAW_SUB_READ_CAP = RAW_SUB_MAX_BYTES;
 /** 最小权限位（尽量收紧：目录 0700 / 文件 0600） */
 export const RAW_SUB_DIR_MODE = 0o700;
 export const RAW_SUB_FILE_MODE = 0o600;
@@ -334,13 +345,29 @@ export class RawSubscriptionStore {
     return out;
   }
 
-  /** 读取落盘原文（上限内）；失败返回空串，绝不抛出 */
+  /**
+   * 读取落盘原文；失败**或被截断**返回空串，绝不抛出、绝不返回半份原文。
+   *
+   * truncated 必须显式处理：调用方（loadRawBodiesIntoCache / removeSubscription 的
+   * 撤销快照 / refreshLocalSubscription 的节点重解析）都拿它当**完整原文**用，
+   * 半份 YAML 会导致配置生成出错、撤销后配置损坏、节点静默丢失。
+   * 返回空串是各调用方都已实现的「无原文」降级路径（后台补拉 / 保留现有节点）。
+   */
   static readRaw(subscriptionId: string): string {
     if (!RawSubscriptionStore.isReady()) {
       return '';
     }
-    const read = privateFs.readCapped(RawSubscriptionStore.filePathFor(subscriptionId), RAW_SUB_READ_CAP);
-    return read.ok ? read.text : '';
+    const path = RawSubscriptionStore.filePathFor(subscriptionId);
+    const read = privateFs.readCapped(path, RAW_SUB_READ_CAP);
+    if (!read.ok) {
+      return '';
+    }
+    if (read.truncated) {
+      AppLogger.warn(TAG, `[raw-truncated/${subscriptionId}] 落盘原文超过读回上限 ${RAW_SUB_READ_CAP} 字节，` +
+        '按「无原文」降级（不返回半份内容，避免污染缓存/撤销快照/节点解析）');
+      return '';
+    }
+    return read.text;
   }
 
   /** 是否已落盘（只探测存在性） */

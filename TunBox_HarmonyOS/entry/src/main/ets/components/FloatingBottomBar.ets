@@ -52,6 +52,7 @@
  * 也不能按百分比猜位置 —— 百分比 `position` 不参与动画插值，会瞬移。
  */
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxTextColors } from '../theme/TextColors';
 import { ThemeService } from '../theme/ThemeService';
 import { ImmersiveMaterial, ImmersiveMaterialAttr } from '../theme/ImmersiveMaterial';
 import { dockPressLight } from '../theme/PressLight';
@@ -490,7 +491,7 @@ export struct FloatingBottomBar {
                 // 没有 SemiBold）。12fp 的 Regular 笔画只有约 1 个物理像素宽，
                 // 压在模糊玻璃上边缘立刻被抹平。
                 .fontWeight(this.currentTab === item.id ? FontWeight.Bold : FontWeight.Medium)
-                .fontColor(this.currentTab === item.id ? TunBoxColors.primary : TunBoxColors.dockIconInactive)
+                .fontColor(this.currentTab === item.id ? TunBoxTextColors.accentBlue : TunBoxTextColors.secondary)
             }
             .alignItems(VerticalAlign.Center)
             .padding({ left: 16, right: 16, top: 8, bottom: 8 })

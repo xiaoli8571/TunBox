@@ -94,11 +94,29 @@ export class TrafficStatsStore {
   private static readonly KEY_RESET_DAY: string = 'traffic_reset_day';
   private static readonly KEY_LAST_RESET_MONTH: string = 'traffic_last_reset_month';
   private static readonly KEY_DAILY: string = 'daily_traffic_by_ymd_v1';
+  /** 基线所属内核实例（orchestrator.startedAt） */
+  private static readonly KEY_CORE_START: string = 'core_session_start';
+  /** 该实例上一次记账时的内核累计上下行字节 */
+  private static readonly KEY_CORE_TOTAL_UP: string = 'core_total_up';
+  private static readonly KEY_CORE_TOTAL_DOWN: string = 'core_total_down';
+  /** 记账基线落盘节流间隔（ms） */
+  private static readonly ACCOUNTING_PERSIST_INTERVAL_MS: number = 5000;
 
   // ── 记账调度（App 级，独立于任何页面是否可见）──
   private static accountingToken: number = -1;
-  private static lastUpBytes: number = -1;
-  private static lastDownBytes: number = -1;
+  /** 是否已注册「内核停止前收尾」钩子 */
+  private static hookRegistered: boolean = false;
+
+  // ── 记账基线（落盘，跨进程 / 跨后台与内核累计计数器对齐）──
+  /** 基线所属的内核隧道实例（orchestrator.startedAt）；<=0 = 尚未建立 */
+  private static coreStart: number = 0;
+  /** 该实例上一次记账时的内核累计上下行字节；-1 = 尚未建立 */
+  private static coreTotalUp: number = -1;
+  private static coreTotalDown: number = -1;
+  /** 基线有变更、等待落盘 */
+  private static accountingDirty: boolean = false;
+  /** 上次基线落盘时刻（ms），用于节流 */
+  private static lastPersistAt: number = 0;
 
   /**
    * 启动每秒记账。
@@ -125,35 +143,121 @@ export class TrafficStatsStore {
     }
   }
 
-  /** 每秒：把内核累计计数器的增量写进 累计/按日/本次会话，并采样瞬时速率 */
-  private static accountingTick(): void {
-    const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
-    const upBytes: number = orch.traffic.uploadBytes;
-    const downBytes: number = orch.traffic.downloadBytes;
-    if (TrafficStatsStore.lastUpBytes < 0 || upBytes < TrafficStatsStore.lastUpBytes) {
-      // 首次采样 / 内核计数器归零（重连）：只重建基线，不产生假增量
-      TrafficStatsStore.lastUpBytes = upBytes;
-      TrafficStatsStore.lastDownBytes = downBytes;
-    } else {
-      const dUp: number = upBytes - TrafficStatsStore.lastUpBytes;
-      const dDown: number = downBytes - TrafficStatsStore.lastDownBytes;
-      TrafficStatsStore.lastUpBytes = upBytes;
-      TrafficStatsStore.lastDownBytes = downBytes;
-      TrafficStatsStore.addDelta(dUp, dDown);
+  /** 注册「内核即将停止」收尾钩子（拆隧道 / 回收测速核前由 orchestrator 调用）。 */
+  private static registerCoreStopHook(): void {
+    if (TrafficStatsStore.hookRegistered) {
+      return;
     }
-    TrafficStatsStore.sampleSpeed(orch.traffic.uploadSpeed, orch.traffic.downloadSpeed);
+    TrafficStatsStore.hookRegistered = true;
+    ConnectionOrchestrator.preCoreStopHooks.push((): void => {
+      TrafficStatsStore.flushNow();
+    });
   }
 
-  /** 会话起点清零记账基线（新建隧道时调用，避免跨会话增量被算到新会话） */
+  /**
+   * 每秒：把**内核累计计数器**的增量写进 累计/按日/本次会话，并采样瞬时速率。
+   *
+   * ## 为什么改成以「落盘的内核累计值」为基线
+   *
+   * 旧实现把基线放在进程内存（`lastUpBytes`），且只在 tick 时更新。于是：
+   * - 进程被系统回收 → 基线为 -1 → 重开后第一 tick 只重建基线，**整段流量丢失**；
+   * - 内核重启（重连 / 测速核顶替）→ 累计值回退 → 同样只重建基线，丢失未记账部分。
+   * 用户日常把 App 放后台/被回收，于是出现「跑了两小时只记十几 MB」。
+   *
+   * 新实现把「内核实例 + 该实例已记账到的累计值」一并落盘，tick 对**落盘基线**做差：
+   * - 内核没重启（`inst === coreStart`）：直接取差，跨进程/跨后台都能对上；
+   * - 内核换了实例：说明这个实例我们一次都没记过 ⇒ 把当前累计值**整体计入**（不是丢弃）；
+   * - 轮询失败：`orch.coreTotalUp` 保持上次值（见 ClashApiService.traffic 返回 null 的约定），
+   *   不会把"探测失败"误判成"归零"，避免随后一次成功把整个累计值当增量补记（虚高）。
+   */
+  private static accountingTick(): void {
+    const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+    const inst: number = orch.startedAt;
+    const upNow: number = orch.coreTotalUp;
+    const downNow: number = orch.coreTotalDown;
+    TrafficStatsStore.sampleSpeed(orch.traffic.uploadSpeed, orch.traffic.downloadSpeed);
+    if (inst <= 0 || upNow < 0 || downNow < 0) {
+      // 还没有有效内核样本（未连接 / 轮询尚未成功 / 进程刚起）
+      return;
+    }
+    if (TrafficStatsStore.coreStart <= 0 || TrafficStatsStore.coreTotalUp < 0) {
+      // 首次建立基线（含旧版本升级）：只落基线，不追溯补记，避免与历史累计重复
+      TrafficStatsStore.coreStart = inst;
+      TrafficStatsStore.coreTotalUp = upNow;
+      TrafficStatsStore.coreTotalDown = downNow;
+      TrafficStatsStore.accountingDirty = true;
+    } else if (inst !== TrafficStatsStore.coreStart) {
+      // 内核换了实例：本实例此前一次都没记过 ⇒ 当前累计值整体计入
+      TrafficStatsStore.coreStart = inst;
+      TrafficStatsStore.coreTotalUp = upNow;
+      TrafficStatsStore.coreTotalDown = downNow;
+      TrafficStatsStore.addDelta(upNow, downNow);
+      TrafficStatsStore.accountingDirty = true;
+      AppLogger.info(TAG, `adopted new core session; up=${upNow} down=${downNow}`);
+    } else {
+      const dUp: number = upNow - TrafficStatsStore.coreTotalUp;
+      const dDown: number = downNow - TrafficStatsStore.coreTotalDown;
+      TrafficStatsStore.coreTotalUp = upNow;
+      TrafficStatsStore.coreTotalDown = downNow;
+      if (dUp >= 0 && dDown >= 0) {
+        if (dUp > 0 || dDown > 0) {
+          TrafficStatsStore.addDelta(dUp, dDown);
+          TrafficStatsStore.accountingDirty = true;
+        }
+      } else {
+        // 同一实例内累计值回退（罕见：计数器被重置）：只重建基线，不产生假增量
+        AppLogger.warn(TAG, `core counters regressed within a session (dUp=${dUp} dDown=${dDown})`);
+      }
+    }
+    TrafficStatsStore.maybePersist();
+  }
+
+  /** 基线变更后节流落盘（避免每秒 tick 都写 flash） */
+  private static maybePersist(): void {
+    if (!TrafficStatsStore.accountingDirty) {
+      return;
+    }
+    const now: number = Date.now();
+    if (now - TrafficStatsStore.lastPersistAt < TrafficStatsStore.ACCOUNTING_PERSIST_INTERVAL_MS) {
+      return;
+    }
+    TrafficStatsStore.accountingDirty = false;
+    TrafficStatsStore.lastPersistAt = now;
+    TrafficStatsStore.persist(false).catch((): void => {});
+  }
+
+  /**
+   * 立即把当前内核累计增量补齐并落盘。调用点：拆隧道 / 回收测速核前、进后台。
+   *
+   * 同步部分先把增量记进内存（内核一停就再也读不到了），落盘异步进行 ——
+   * 调用方进程仍存活即可完成写盘。
+   */
+  static flushNow(): void {
+    TrafficStatsStore.accountingTick();
+    TrafficStatsStore.accountingDirty = true;
+    TrafficStatsStore.lastPersistAt = Date.now();
+    TrafficStatsStore.persist(true).catch((): void => {});
+  }
+
+  /**
+   * 重置记账基线（默认**无调用点**）。
+   *
+   * 注意：正常新建隧道**不要**调用它 —— 更换内核实例由 `accountingTick` 依据
+   * `startedAt` 自动识别；调用本方法反而会丢掉跨进程恢复的补记能力。
+   * 仅当明确确认"内核已换新实例且不希望补记该实例已有累计值"时才用。
+   */
   static resetAccountingBaseline(): void {
-    TrafficStatsStore.lastUpBytes = -1;
-    TrafficStatsStore.lastDownBytes = -1;
+    TrafficStatsStore.coreStart = 0;
+    TrafficStatsStore.coreTotalUp = -1;
+    TrafficStatsStore.coreTotalDown = -1;
+    TrafficStatsStore.accountingDirty = true;
   }
 
   static async init(context: Context): Promise<void> {
     if (TrafficStatsStore.inited) {
       return;
     }
+    TrafficStatsStore.registerCoreStopHook();
     try {
       TrafficStatsStore.store = await preferences.getPreferences(context, PREF_NAME);
       const p: preferences.Preferences = TrafficStatsStore.store;
@@ -164,11 +268,16 @@ export class TrafficStatsStore {
         await p.get(TrafficStatsStore.KEY_LAST_RESET_MONTH, '') as string;
       const raw: string = await p.get(TrafficStatsStore.KEY_DAILY, '{}') as string;
       TrafficStatsStore.daily = TrafficStatsStore.decodeDaily(raw);
+      // 记账基线（跨进程恢复的关键）：内核实例 + 该实例已记到的累计值
+      TrafficStatsStore.coreStart = await p.get(TrafficStatsStore.KEY_CORE_START, 0) as number;
+      TrafficStatsStore.coreTotalUp = await p.get(TrafficStatsStore.KEY_CORE_TOTAL_UP, -1) as number;
+      TrafficStatsStore.coreTotalDown = await p.get(TrafficStatsStore.KEY_CORE_TOTAL_DOWN, -1) as number;
       TrafficStatsStore.inited = true;
       TrafficStatsStore.normalizeResetDay();
       await TrafficStatsStore.applyMonthlyResetIfDue();
       AppLogger.info(TAG, `init lifetime=${TrafficStatsStore.lifetimeUp}/${TrafficStatsStore.lifetimeDown} `
-        + `resetDay=${TrafficStatsStore.resetDay} days=${TrafficStatsStore.daily.size}`);
+        + `resetDay=${TrafficStatsStore.resetDay} days=${TrafficStatsStore.daily.size} `
+        + `coreStart=${TrafficStatsStore.coreStart} coreTotal=${TrafficStatsStore.coreTotalUp}/${TrafficStatsStore.coreTotalDown}`);
     } catch (e) {
       AppLogger.warn(TAG, `init failed: ${AppLogger.errText(e)}`);
       TrafficStatsStore.inited = true;
@@ -307,7 +416,11 @@ export class TrafficStatsStore {
     TrafficStatsStore.sessionDownSum = 0;
   }
 
-  /** 立即落盘（调用点：每秒记账 tick、清零、切后台） */
+  /**
+   * 落盘。调用点：记账节流（每 5s，见 maybePersist）、清零、拆核/进后台（flushNow）。
+   * 除累计/按日外，**记账基线**（内核实例 + 已记累计值）也必须一并落盘 ——
+   * 否则 App 被回收后重新打开时无法把内核那段累计值补记回来。
+   */
   static async persist(force: boolean = false): Promise<void> {
     const p: preferences.Preferences | null = TrafficStatsStore.store;
     if (p === null) {
@@ -319,10 +432,9 @@ export class TrafficStatsStore {
       await p.put(TrafficStatsStore.KEY_RESET_DAY, TrafficStatsStore.resetDay);
       await p.put(TrafficStatsStore.KEY_LAST_RESET_MONTH, TrafficStatsStore.lastResetMonth);
       await p.put(TrafficStatsStore.KEY_DAILY, TrafficStatsStore.encodeDaily());
-      if (force) {
-        await p.flush();
-        return;
-      }
+      await p.put(TrafficStatsStore.KEY_CORE_START, TrafficStatsStore.coreStart);
+      await p.put(TrafficStatsStore.KEY_CORE_TOTAL_UP, TrafficStatsStore.coreTotalUp);
+      await p.put(TrafficStatsStore.KEY_CORE_TOTAL_DOWN, TrafficStatsStore.coreTotalDown);
       await p.flush();
     } catch (e) {
       AppLogger.warn(TAG, `persist failed: ${AppLogger.errText(e)}`);

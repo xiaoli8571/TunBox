@@ -15,6 +15,7 @@ import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import scanBarcode from '@hms.core.scan.scanBarcode';
 import { TunBoxColors, TunBoxGeometry, TunBoxPing } from '../theme/TunBoxTokens';
+import { TunBoxTextColors } from '../theme/TextColors';
 import { SubscriptionSummary } from '../commons/utils/SubscriptionSummary';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { Subscription, SubscriptionRefreshStatus } from '../commons/models/Subscription';
@@ -30,6 +31,7 @@ import { ProfileRepository } from '../commons/flclash/ProfileRepository';
 import { ProfileConfigMerger } from '../commons/flclash/ProfileConfigMerger';
 import { SubConverter } from '../commons/flclash/SubConverter';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
+import { ImportFilePolicy } from '../commons/services/ImportFilePolicy';
 import { MIN_UPDATE_INTERVAL_MINUTES, MAX_UPDATE_INTERVAL_MINUTES } from '../commons/services/SubscriptionUpdateScheduler';
 import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
 import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
@@ -67,7 +69,7 @@ struct AddSubDialog {
   build() {
     Column({ space: 14 }) {
       Text('添加订阅')
-        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
         .width('100%')
 
       // 三模式切换
@@ -85,17 +87,17 @@ struct AddSubDialog {
           .height(44).borderRadius(12).fontSize(14)
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-          .fontColor(TunBoxColors.textPrimary)
+          .fontColor(TunBoxTextColors.primary)
         TextInput({ placeholder: 'https://example.com/sub', text: this.urlText })
           .onChange((v: string) => { this.urlText = v; })
           .height(44).borderRadius(12).fontSize(13)
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-          .fontColor(TunBoxColors.textPrimary)
+          .fontColor(TunBoxTextColors.primary)
         // 2026-10-28 用户要求：明文 HTTP 开关从设置页挪到这里（只影响订阅拉取）
         Row() {
           Text('允许明文 HTTP 订阅')
-            .fontSize(13).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+            .fontSize(13).fontColor(TunBoxTextColors.primary).layoutWeight(1)
           Toggle({ type: ToggleType.Switch, isOn: this.allowInsecure })
             .selectedColor(TunBoxColors.primary)
             .onChange((v: boolean) => {
@@ -108,8 +110,8 @@ struct AddSubDialog {
       } else if (this.mode === 'qr') {
         Column({ space: 8 }) {
           Image($r('app.media.ic_globe')).width(48).height(48).fillColor(TunBoxColors.textMuted)
-          Text('扫描订阅二维码').fontSize(13).fontColor(TunBoxColors.textSecondary)
-          Text('二维码内容需是 Clash 订阅链接').fontSize(11).fontColor(TunBoxColors.textMuted)
+          Text('扫描订阅二维码').fontSize(13).fontColor(TunBoxTextColors.secondary)
+          Text('二维码内容需是 Clash 订阅链接').fontSize(11).fontColor(TunBoxTextColors.muted)
         }
         .width('100%')
         .padding({ top: 20, bottom: 20 })
@@ -122,14 +124,14 @@ struct AddSubDialog {
           .height(120).borderRadius(12).fontSize(12)
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-          .fontColor(TunBoxColors.textPrimary)
+          .fontColor(TunBoxTextColors.primary)
         Text('分享链接会转换成本地 Clash 配置并加入订阅列表。')
-          .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+          .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
       } else {
         Column({ space: 8 }) {
           Image($r('app.media.ic_doc')).width(48).height(48).fillColor(TunBoxColors.textMuted)
-          Text('从文件导入').fontSize(13).fontColor(TunBoxColors.textSecondary)
-          Text('支持 .yaml / .yml（Clash 配置，4MB 以内）').fontSize(11).fontColor(TunBoxColors.textMuted)
+          Text('从文件导入').fontSize(13).fontColor(TunBoxTextColors.secondary)
+          Text('支持 .yaml / .yml（Clash 配置，8MB 以内）').fontSize(11).fontColor(TunBoxTextColors.muted)
         }
         .width('100%')
         .padding({ top: 20, bottom: 20 })
@@ -140,7 +142,7 @@ struct AddSubDialog {
 
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).height(44).borderRadius(12).fontSize(14)
-          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxColors.textPrimary)
+          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxTextColors.primary)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -177,7 +179,7 @@ struct AddSubDialog {
     Text(label)
       .fontSize(13)
       .fontWeight(this.mode === value ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.mode === value ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+      .fontColor(this.mode === value ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondary)
       .textAlign(TextAlign.Center)
       .layoutWeight(1)
       .height(36)
@@ -253,36 +255,36 @@ struct EditSubDialog {
   build() {
     Column({ space: 12 }) {
       Text('编辑配置信息')
-        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
         .width('100%')
 
       // ── 字段区：可滚动 + 高度上限（2026-10-29 用户报「键盘弹出后弹窗变细长」）──
       Scroll() {
         Column({ space: 12 }) {
-      Text('配置名称').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+      Text('配置名称').fontSize(12).fontColor(TunBoxTextColors.muted).width('100%')
       TextInput({ text: this.editName, placeholder: '配置名称' })
         .onChange((v: string) => { this.editName = v; })
         .height(44).borderRadius(12).fontSize(14)
         .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
         .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-        .fontColor(TunBoxColors.textPrimary)
+        .fontColor(TunBoxTextColors.primary)
 
-      Text('订阅链接或 URL').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+      Text('订阅链接或 URL').fontSize(12).fontColor(TunBoxTextColors.muted).width('100%')
       TextInput({ text: this.editUrl, placeholder: 'https://example.com/sub' })
         .onChange((v: string) => { this.editUrl = v; })
         .height(44).borderRadius(12).fontSize(13)
         .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
         .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-        .fontColor(TunBoxColors.textPrimary)
+        .fontColor(TunBoxTextColors.primary)
 
       Row() {
-        Text('自动更新').fontSize(14).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+        Text('自动更新').fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.autoUpdate })
           .selectedColor(TunBoxColors.primary)
           .onChange((v: boolean) => { this.autoUpdate = v; })
       }.width('100%').alignItems(VerticalAlign.Center)
 
-      Text('自动更新间隔（分钟）').fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+      Text('自动更新间隔（分钟）').fontSize(12).fontColor(TunBoxTextColors.muted).width('100%')
       // 可自定义（2026-10-29 用户要求）：以前这里是一个只读 Row + 「跟随系统」文案，
       // 值由 `return '360'` 写死，用户根本改不了。现在换成数字输入框。
       Row({ space: 6 }) {
@@ -297,8 +299,8 @@ struct EditSubDialog {
           .backgroundColor(Color.Transparent)
           .borderRadius(0)
           .padding({ left: 0, right: 0 })
-          .fontColor(TunBoxColors.textPrimary)
-        Text('分钟').fontSize(11).fontColor(TunBoxColors.textMuted).flexShrink(0)
+          .fontColor(TunBoxTextColors.primary)
+        Text('分钟').fontSize(11).fontColor(TunBoxTextColors.muted).flexShrink(0)
       }
       .width('100%').height(44)
       .padding({ left: 12, right: 12 })
@@ -308,7 +310,7 @@ struct EditSubDialog {
       .alignItems(VerticalAlign.Center)
 
       Text(`范围 ${MIN_UPDATE_INTERVAL_MINUTES}~${MAX_UPDATE_INTERVAL_MINUTES} 分钟，超出自动取边界值`)
-        .fontSize(10).fontColor(TunBoxColors.textMuted).width('100%')
+        .fontSize(10).fontColor(TunBoxTextColors.muted).width('100%')
         }
         .width('100%')
       }
@@ -318,7 +320,7 @@ struct EditSubDialog {
 
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).height(44).borderRadius(12).fontSize(14)
-          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxColors.textPrimary)
+          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxTextColors.primary)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -1011,8 +1013,15 @@ export struct SubscriptionSection {
       const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
       try {
         const stat = fs.statSync(file.fd);
-        if (stat.size <= 0 || stat.size > 4 * 1024 * 1024) {
-          this.toast('文件大小需在 4MB 以内');
+        // 8 MiB 与下游一致（ProfileRepository.MAX_PROFILE_BYTES /
+        // RawSubscriptionStore.RAW_SUB_MAX_BYTES / BackupRestoreService /
+        // VpnExtensionAbility.readConfigText / SubscriptionFetchPolicy）。
+        // 此前这里独一份写 4 MiB，是整条链路唯一的窄口：同一份 5MB 配置走
+        // 订阅 URL 能进、走文件导入却被挡。上限同样兼任下面全量分配的内存护栏。
+        const sizeError: string = ImportFilePolicy.validateSize(
+          Number(stat.size), ImportFilePolicy.YAML_MAX_BYTES, '配置文件');
+        if (sizeError.length > 0) {
+          this.toast(sizeError);
           return;
         }
         const buf = new ArrayBuffer(Number(stat.size));
@@ -1260,10 +1269,10 @@ export struct SubscriptionSection {
       Text('订阅')
         .fontSize(15)
         .fontWeight(FontWeight.Bold)
-        .fontColor(TunBoxColors.textPrimary)
+        .fontColor(TunBoxTextColors.primary)
       Text(`${this.subs.length}`)
         .fontSize(11)
-        .fontColor(TunBoxColors.primary)
+        .fontColor(TunBoxTextColors.accentBlue)
         .padding({ left: 6, right: 6, top: 1, bottom: 1 })
         .backgroundColor(TunBoxColors.primaryLight)
         .borderRadius(TunBoxGeometry.pillRadius)
@@ -1325,20 +1334,20 @@ export struct SubscriptionSection {
         Column({ space: 2 }) {
           Row({ space: 6 }) {
             Text(sub.name.length > 0 ? sub.name : '未命名订阅')
-              .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+              .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
               .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
             if (sub.id === this.currentProfileId) {
               Text('使用中')
-                .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.success)
+                .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.tagTextGreen)
                 .padding({ left: 6, right: 6, top: 1, bottom: 1 })
                 .borderRadius(TunBoxGeometry.pillRadius)
-                .backgroundColor(TunBoxColors.successLight)
+                .backgroundColor(TunBoxTextColors.tagBgGreen)
                 .flexShrink(0)
             }
           }.width('100%')
           Text(`${this.updateText(sub)} · ${this.nodeCountText(sub)}`)
-            .fontSize(11).fontColor(TunBoxColors.textMuted)
+            .fontSize(11).fontColor(TunBoxTextColors.secondary)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
         }
@@ -1363,17 +1372,17 @@ export struct SubscriptionSection {
 
       Row() {
         Text(`↑ ${this.upText(sub)}`)
-          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.primary)
+          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlue)
           .maxLines(1)
         Text(`  ↓ ${this.downText(sub)}`)
-          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.success)
+          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentGreen)
           .maxLines(1)
         Text(`  / ${this.totalText(sub)}`)
-          .fontSize(11).fontColor(TunBoxColors.textMuted)
+          .fontSize(11).fontColor(TunBoxTextColors.muted)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         Text(this.expiryText(sub))
-          .fontSize(11).fontColor(TunBoxColors.textSecondary)
+          .fontSize(11).fontColor(TunBoxTextColors.secondary)
           .maxLines(1)
           .flexShrink(0)
       }
@@ -1430,7 +1439,7 @@ export struct SubscriptionSection {
     Text(name)
       .fontSize(12)
       .fontWeight(this.selectedGroup === name ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.selectedGroup === name ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+      .fontColor(this.selectedGroup === name ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondary)
       .padding({ left: 12, right: 12, top: 6, bottom: 6 })
       .borderRadius(TunBoxGeometry.pillRadius)
       .backgroundColor(this.selectedGroup === name ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
@@ -1454,11 +1463,11 @@ export struct SubscriptionSection {
     Row({ space: 10 }) {
       Column({ space: 3 }) {
         Text(ClashConfigGenerator.SMART_GROUP_NAME)
-          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimary)
+          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
         Text('内核智能选点 · 只在本订阅内择优')
-          .fontSize(11).fontColor(TunBoxColors.textMuted)
+          .fontSize(11).fontColor(TunBoxTextColors.muted)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -1466,7 +1475,7 @@ export struct SubscriptionSection {
       .alignItems(HorizontalAlign.Start)
 
       Text('内核')
-        .fontSize(11).fontColor(TunBoxColors.primary)
+        .fontSize(11).fontColor(TunBoxTextColors.accentBlue)
         .padding({ left: 8, right: 8, top: 2, bottom: 2 })
         .backgroundColor(TunBoxColors.primaryLight)
         .borderRadius(TunBoxGeometry.pillRadius)
@@ -1495,11 +1504,11 @@ export struct SubscriptionSection {
     Row({ space: 10 }) {
       Column({ space: 3 }) {
         Text(node.name)
-          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimary)
+          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
         Text(this.protoOf(node))
-          .fontSize(11).fontColor(TunBoxColors.textMuted)
+          .fontSize(11).fontColor(TunBoxTextColors.muted)
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -1649,23 +1658,23 @@ export struct SubscriptionSection {
       Column({ space: 0 }) {
         Row({ space: 8 }) {
           Text('删除节点')
-            .fontSize(15).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimary)
+            .fontSize(15).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
           Blank()
           Text(this.deleteSheetIds.length > 0 ? `已选 ${this.deleteSheetIds.length}` : '未选择')
-            .fontSize(12).fontColor(TunBoxColors.textMuted)
+            .fontSize(12).fontColor(TunBoxTextColors.muted)
         }
         .width('100%')
         .padding({ left: 20, right: 20, top: 16, bottom: 2 })
 
         Text('点上方节点可多选；删除后重新导入订阅可恢复。')
-          .fontSize(11).fontColor(TunBoxColors.textMuted)
+          .fontSize(11).fontColor(TunBoxTextColors.muted)
           .width('100%')
           .padding({ left: 20, right: 20, bottom: 4 })
 
         Row({ space: 10 }) {
           Button('取消')
             .layoutWeight(1).height(44).fontSize(14)
-            .fontColor(TunBoxColors.textPrimary)
+            .fontColor(TunBoxTextColors.primary)
             .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
             .borderRadius(TunBoxGeometry.controlRadius)
             .onClick((): void => { this.closeDeleteSheet(); })
@@ -1734,7 +1743,7 @@ export struct SubscriptionSection {
           Row({ space: 4 }) {
             Image($r('app.media.ic_sort')).width(13).height(13).fillColor(TunBoxColors.textMuted)
             Text(this.sortByDelay ? '按延迟' : '原始')
-              .fontSize(11).fontColor(TunBoxColors.textMuted).maxLines(1)
+              .fontSize(11).fontColor(TunBoxTextColors.muted).maxLines(1)
           }
           .padding({ left: 10, right: 10, top: 6, bottom: 6 })
           .borderRadius(TunBoxGeometry.pillRadius)
@@ -1752,9 +1761,9 @@ export struct SubscriptionSection {
       if (this.panelNodes().length === 0) {
         Column({ space: 6 }) {
           Text('该分组暂无可用节点')
-            .fontSize(13).fontColor(TunBoxColors.textMuted)
+            .fontSize(13).fontColor(TunBoxTextColors.muted)
           Text('换一个分组，或用卡片上的刷新按钮更新订阅')
-            .fontSize(11).fontColor(TunBoxColors.textMuted)
+            .fontSize(11).fontColor(TunBoxTextColors.muted)
         }
         .width('100%')
         .padding({ top: 40 })
@@ -1789,7 +1798,7 @@ export struct SubscriptionSection {
         .width('100%')
         .height(44)
         .fontSize(14)
-        .fontColor(TunBoxColors.textPrimary)
+        .fontColor(TunBoxTextColors.primary)
         .backgroundColor(TunBoxColors.background(this.themeRevision))
         .borderRadius(TunBoxGeometry.controlRadius)
         .margin({ left: 24, right: 24, top: 4, bottom: 12 })
@@ -1826,7 +1835,7 @@ export struct SubscriptionSection {
         Row({ space: 8 }) {
           Image($r('app.media.ic_nodes')).width(18).height(18).fillColor(TunBoxColors.textMuted)
           Text('还没有订阅，点右上菜单「添加订阅」')
-            .fontSize(12).fontColor(TunBoxColors.textMuted)
+            .fontSize(12).fontColor(TunBoxTextColors.muted)
             .layoutWeight(1)
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })

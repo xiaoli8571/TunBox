@@ -26,6 +26,7 @@ await test('cold UI restores the existing runtime and original start time', asyn
   assert.equal(h.orch.startedAt, h.snapshot.startedAt);
   assert.equal(h.orch.api.currentPort(), 19090);
   assert.equal(h.orch.mixedPort, 17890); assert.equal(h.orch.dnsPort, 11053);
+  assert.equal(h.appProxyPort, 17890);
   assert.equal(h.writes, 0); h.stop();
 });
 await test('fresh leases require no controller polling', async () => {

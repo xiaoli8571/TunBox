@@ -1,7 +1,7 @@
 {
   "modelVersion": "5.0.0",
   "name": "nexus_client",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Nexus - Mihomo (Clash Meta) VPN client for HarmonyOS.",
   "license": "MIT",
   "dependencies": {},
