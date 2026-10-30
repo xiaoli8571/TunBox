@@ -14,9 +14,11 @@
  *
  * ## 本闸门守的契约
  *
- *  A. 状态栏直接采用**页面背景色**（浅 #F4F6FB / 深 #0B1220，与 ui_background / 渐变起点同值）铺满整条，图标颜色
- *     跟随主题（浅色底深字 / 深色底浅字）；不许再回到「透明色条 + 系统底色」那种
- *     被切割的形态。
+ *  A. 系统栏（状态栏 / 导航条）**透明**，那一条的底色由 App 窗口自绘：窗口底色 =**页面背景色**
+ *     （浅 #F4F6FB / 深 #0B1220，与 ui_background / 渐变起点同值），页面背景再
+ *     `expandSafeArea(TOP/BOTTOM)` 铺到栏下；图标颜色跟随主题（浅色底深字 / 深色底浅字）。
+ *     不许把不透明色刷到系统栏上：系统栏是独立系统窗口，上滑进后台（窗口缩放）时它不跟着动，
+ *     顶部就留一条不动的 pageBg（浅色像留白、深色像黑条，2026-10-30 用户报障）。
  *  B. 转场时长按**物理像素 + 真实 densityDPI** 换算英寸（不能用 densityPixels，
  *     系统显示缩放会把它改小 → 12.6" 平板被算成 9.4" → 只给 250ms，不达 300ms）；
  *     三档下限 200/250/300 必须存在；所有 PageTransitionEnter/Exit 都用
@@ -56,23 +58,27 @@ function ok(cond, label, actual) {
 }
 
 function checkTheme(src) {
-  // 2026-10-28：浅色背景支持 Mint / Homebrew / Noctis 三套配色（用户要求），
-  // 状态栏/窗口底色不再是一串写死的字面量，统一从 ThemeService.bgColors() 取（与页面渐变同源）。
-  // 这里断言的**语义不变**：状态栏底色必须就是页面背景色，只是取值方式从字面量换成了调色板。
+  // 2026-10-28：浅色背景支持 Mint / Homebrew / Noctis 三套配色（用户要求），底色不再是一串
+  // 写死的字面量，统一从 ThemeService.bgColors() 取（与页面渐变同源）。
+  // 2026-10-30：系统栏改回透明（用户报障「上滑进后台顶部留白 / 深色留黑条」）—— 那一层是
+  // 独立系统窗口，刷不透明色就会在窗口缩放时留下一条不动的色带。断言的**语义不变**：
+  // 状态栏那一条的底色仍然必须是页面背景色，只是改由窗口底色 + 页面 expandSafeArea 绘制。
   ok(/const palette = ThemeService\.bgColors\(\);/.test(src) && /const pageBg = palette\.start;/.test(src),
-    '状态栏底色 = 页面背景色（取自 ThemeService.bgColors().start，浅色随配色 / 深 #0B1220）');
-  ok(/statusBarColor: pageBg,/.test(src),
-    '状态栏铺页面背景色（不是透明色条，避免被单独切割）');
+    '状态栏那一条的底色 = 页面背景色（取自 ThemeService.bgColors().start，浅色随配色 / 深 #0B1220）');
+  ok(/static readonly BAR_TRANSPARENT: string = '#00000000';/.test(src),
+    '透明色集中定义（不与「不透明 pageBg」写法混淆）');
+  ok(/statusBarColor: ThemeService\.BAR_TRANSPARENT,/.test(src),
+    '状态栏透明（底色归 App 窗口绘制，转场时随窗口缩放，不留静态色条）');
   ok(/const contentColor = dark \? '#F5F7FF' : '#171B2A';/.test(src),
     '状态栏图标颜色随主题切换（深色底浅字 / 浅色底深字）');
   ok(/statusBarContentColor: contentColor,/.test(src),
     '状态栏图标颜色接到 window 属性');
-  ok(/navigationBarColor: bottomBg,/.test(src) && /navigationBarContentColor: contentColor,?/.test(src),
-    '底部导航条同色 + 图标同口径（bottomBg = bgColors().end）');
+  ok(/navigationBarColor: ThemeService\.BAR_TRANSPARENT,/.test(src) && /navigationBarContentColor: contentColor,?/.test(src),
+    '底部导航条透明 + 图标同口径（底部色由页面渐变终点 expandSafeArea 铺出）');
   ok(/win\.setWindowBackgroundColor\(pageBg\);/.test(src),
-    '窗口底色与页面同色（切换/首帧缝隙不露色）');
-  ok(!/statusBarColor: '#00000000'/.test(src),
-    '没有退回「透明状态栏」旧实现（那会露出系统底色形成色条）');
+    '窗口底色 = 页面背景色（系统栏透明的实际色源，切换/首帧缝隙也不露色）');
+  ok(!/statusBarColor: pageBg,/.test(src) && !/navigationBarColor: bottomBg,/.test(src),
+    '没有退回「系统栏刷不透明色」旧实现（那会在上滑转场留白 / 留黑条）');
 }
 
 function checkMotion(entrySrc, tokensSrc, pageSources) {
@@ -103,6 +109,9 @@ function checkMotion(entrySrc, tokensSrc, pageSources) {
     ok(enter > 0 && enter === msEnter && exit > 0 && exit === msExit,
       `${path.basename(file)}：全屏转场时长全部走 TunBoxMotion.ms（无字面量）`,
       `enter ${msEnter}/${enter}, exit ${msExit}/${exit}`);
+    // 系统栏透明的**前提**：每条页面的背景都靠自己铺到上下栏下，否则栏下会露窗口底色。
+    ok(/\.expandSafeArea\(\[SafeAreaType\.SYSTEM\], \[SafeAreaEdge\.TOP, SafeAreaEdge\.BOTTOM\]\)/.test(src),
+      `${path.basename(file)}：页面背景 expandSafeArea 铺到上下系统栏下`);
   }
   const mainSrc = pageSources.get('pages/MainPage.ets');
   const tabMs = (mainSrc.match(/\.animation\(\{ duration: TunBoxMotion\.ms, curve: TunBoxMotion\.curve \}\)/g) || []).length;
@@ -128,9 +137,16 @@ function loadSources() {
 function selfTest(baseSources) {
   const cases = [
     {
-      name: '状态栏退回透明色条',
+      name: '系统栏退回不透明色（转场留白 / 黑条）',
       mutate: (s) => s.set('theme/ThemeService.ets',
-        s.get('theme/ThemeService.ets').replace('statusBarColor: pageBg,', "statusBarColor: '#00000000',"))
+        s.get('theme/ThemeService.ets')
+          .replace('statusBarColor: ThemeService.BAR_TRANSPARENT,', 'statusBarColor: pageBg,'))
+    },
+    {
+      name: '页面不再把背景铺到系统栏下（栏下露底色）',
+      mutate: (s) => s.set('pages/RulesPage.ets',
+        s.get('pages/RulesPage.ets')
+          .replace('.expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])', ''))
     },
     {
       name: '英寸换算退回 densityPixels',

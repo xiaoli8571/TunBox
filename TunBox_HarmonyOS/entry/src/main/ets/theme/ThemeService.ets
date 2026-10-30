@@ -139,6 +139,9 @@ export class ThemeService {
     return ThemeService.mode;
   }
 
+  /** 系统栏透明色：栏下那一条由窗口底色 + 页面 expandSafeArea 绘制（见 syncSystemBars）。 */
+  static readonly BAR_TRANSPARENT: string = '#00000000';
+
   static isDark(): boolean {
     if (ThemeService.mode === AppThemeMode.DARK) {
       return true;
@@ -213,29 +216,38 @@ export class ThemeService {
    * 状态栏区域的背景色选择合适的状态栏颜色（黑/白）；避免左右半区对比差异过大」。
    *
    * 做法：
-   *  1) 状态栏底色 = **页面背景色本身**（浅 #F4F6FB / 深 #0F131D），整条单一颜色，
-   *     不再是透明让系统/窗口底色透出来的独立色条 —— 页面顶部与状态栏同色，
-   *     视觉上是一个整体，也不会出现左右半区深浅不一（整条一个色）。
+   *  1) 系统栏**透明**，那一条的底色由 App 自己的窗口绘制：窗口底色 = 页面背景色
+   *     起点色（浅 #F4F6FB / 深 #0B1220），页面背景再 `expandSafeArea(TOP/BOTTOM)`
+   *     铺到栏下。深浅两种主题下「状态栏 + 页面顶部」依旧同色、整条单一颜色，
+   *     不会出现左右半区深浅不一，AGC 那条「避免单独切割」的诉求仍然满足。
    *  2) 状态栏图标颜色跟随主题：浅色底用深色字 (#171B2A)，深色底用浅色字 (#F5F7FF)，
    *     保证时间/电量/SIM 图标在每个主题下都清晰可读。
-   *  3) 底部导航条同色（页面底部渐变终点色），不出现底部白条。
+   *  3) 底部导航条同样透明（底部色由页面渐变终点 expandSafeArea 铺出），不出现底部白条。
+   *
+   * 为什么必须是透明（2026-10-30 用户报障：上滑进后台过程中顶部留白 / 深色留黑条）：
+   *  真机窗口栈显示 App 窗口本身是满屏 [0,0,1600,2560]，而状态栏是**另一个系统窗口**
+   *  `SCBStatusBar31 [0,0,1600,104]`（zOrd 2202，压在 App 窗口 101 之上）。给它刷不透明
+   *  色时，系统把这一条画在系统窗口上；上滑回桌面时 App 窗口缩放/淡出，这条系统窗口不跟着
+   *  动 —— 于是顶部留下一整条不动的 pageBg（浅色像「留白」，深色像一根黑条），直到系统
+   *  把状态栏换成桌面的透明态才消失。改成透明后这条归属 App 窗口，跟着窗口一起缩放淡出。
+   *  早前「透明会露出系统底色」的顾虑已不成立：窗口底色现在也被显式刷成 pageBg。
    */
   static async syncSystemBars(win: window.Window): Promise<void> {
     const dark = ThemeService.isDark();
     // 深色底取 #0B1220：与 ui_background（平板/页面平色底）和渐变起点同值，
     // 状态栏、页面顶部、平色页三者同色，整条不会被切成独立色带。
-    // 浅色：三套背景配色（AppBgTheme）各自取自己的起止色，状态栏随背景一起换，
+    // 浅色：三套背景配色（AppBgTheme）各自取自己的起止色，窗口底色随背景一起换，
     // 否则选了薄荷/暖米后状态栏还留着旧的蓝灰，顶上就断出一条色带。
     const palette = ThemeService.bgColors();
     const pageBg = palette.start;
-    const bottomBg = palette.end;
     const contentColor = dark ? '#F5F7FF' : '#171B2A';
-    // 窗口底色与页面同色：加载首帧/页面切换的缝隙也不会露出另一层颜色。
+    // 窗口底色与页面同色：这是系统栏那一条的实际来源（栏本身透明），
+    // 同时让加载首帧/页面切换的缝隙也不会露出另一层颜色。
     win.setWindowBackgroundColor(pageBg);
     await win.setWindowSystemBarProperties({
-      statusBarColor: pageBg,
+      statusBarColor: ThemeService.BAR_TRANSPARENT,
       statusBarContentColor: contentColor,
-      navigationBarColor: bottomBg,
+      navigationBarColor: ThemeService.BAR_TRANSPARENT,
       navigationBarContentColor: contentColor
     });
   }
