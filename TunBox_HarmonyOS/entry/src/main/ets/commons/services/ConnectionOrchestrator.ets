@@ -4743,8 +4743,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       TunBoxNotifier.ensurePermission(this.context).catch((e: Object): void => {
         AppLogger.warn(TAG, `ensure notification permission failed: ${AppLogger.errText(e)}`);
       });
-      // 节点/速率/时长合并进系统长时任务通知（LIVE_VIEW），应用自有常驻通知已废除
-      // —— 两条通知重复（用户实锤），这里只清掉可能残留的旧 id-1001
+      // 节点/速率/时长由应用自有常驻通知（TunBoxNotifier）承载 —— 不再写系统实况窗：
+      // 实况窗模板（downloadTemplate）右侧自带一个圆环，用户要求去掉，只能不发实况窗。
+      // 旧 id-1001 的残留无需清理，这里保留 cancel 只为兼容历史会话的快照。
       TunBoxNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${finalNodeName}`);

@@ -354,8 +354,9 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
    *
    * 统一走 UiGuardian.applyContinuousTask（全工程唯一调用 startBackgroundRunning
    * 的地方）：优先 taskKeeping（VPN 隧道保活的正确类型），未获受限权限
-   * ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM 时自动回退 dataTransfer
-   * （实况窗 + 5 分钟进度心跳，与改造前一致）。
+   * ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM 时自动回退 dataTransfer。
+   * 两种类型下的通知内容都由应用自有常驻通知（TunBoxNotifier）承载 —— 不再写系统
+   * 实况窗，因为实况窗模板右侧自带圆环（用户要求完全去掉）。
    * 成功 → 常驻并低频轮询权威租约；失败（如通知被禁用）→ 如实记录并恢复自毁路径，
    * 让系统按既有语义处理会话，绝不静默伪装成功。
    */
