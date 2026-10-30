@@ -48,6 +48,18 @@ import type { ContinuousTaskVerdict } from './BackgroundTaskWatch';
 const TAG = 'UiGuardian';
 const WATCHDOG_INTERVAL_MS: number = 30000;
 const WATCHDOG_RETRY_LIMIT: number = 3;
+/**
+ * 2026-10-30 实验开关：是否申请长时任务。
+ *
+ * true （原行为）：优先 taskKeeping，失败回退 dataTransfer；代价是通知栏多一张
+ *                 系统卡（内容、文案均由系统写死，第三方改不了）。
+ * false（当前）：完全不申请，也不回退 —— 通知栏只留应用自有速率卡一条，
+ *                 后台存活交给 VPN 扩展能力（主进程可能被冻结，卡片会停更）。
+ * 改回 true 即可恢复原行为。
+ */
+const CONTINUOUS_TASK_ENABLED: boolean = false;
+/** 关闭时回给调用方的 detail（QuickToggleAbility 据此不把会话判成失败） */
+export const CONTINUOUS_TASK_DISABLED_DETAIL: string = 'continuous task disabled by config';
 
 /**
  * 一次长时任务申请的结果。
@@ -117,6 +129,20 @@ export class UiGuardian {
    * （TaskProgressUpdater 按类型分叉）、清理退避门禁。
    */
   static async applyContinuousTask(context: Context): Promise<ContinuousTaskApplyResult> {
+    if (!CONTINUOUS_TASK_ENABLED) {
+      // 实验：不申请长时任务；顺手清掉上一次运行可能残留的任务（系统卡随之消失）
+      try {
+        await backgroundTaskManager.stopBackgroundRunning(context);
+      } catch (e) {
+        // 没有存量任务时会报错，忽略
+      }
+      const off: ContinuousTaskApplyResult = new ContinuousTaskApplyResult();
+      off.ok = false;
+      off.kind = ContinuousTaskKind.NONE;
+      off.detail = CONTINUOUS_TASK_DISABLED_DETAIL;
+      AppLogger.info(TAG, 'continuous task disabled by config: app notification is the only card');
+      return off;
+    }
     const generation = UiGuardian.generation;
     const operation = UiGuardian.taskWrites.then(async (): Promise<ContinuousTaskApplyResult> => {
       if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) {
@@ -318,6 +344,7 @@ export class UiGuardian {
   }
 
   private static async checkBackgroundTask(): Promise<void> {
+    if (!CONTINUOUS_TASK_ENABLED) { return; }
     const context = UiGuardian.watchdogContext;
     const check = UiGuardian.sessionCheck;
     if (context === null || check === null || UiGuardian.watchdogBusy || UiGuardian.engaging

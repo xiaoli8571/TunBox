@@ -33,7 +33,7 @@ import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager'
 import { BusinessError } from '@kit.BasicServicesKit';
 import { VpnQuickStart } from '../commons/services/VpnQuickStart';
 import { VpnGuardianPolicy } from '../commons/services/VpnGuardianPolicy';
-import { UiGuardian } from '../commons/services/UiGuardian';
+import { UiGuardian, CONTINUOUS_TASK_DISABLED_DETAIL } from '../commons/services/UiGuardian';
 import {
   BackgroundTaskWatch,
   ContinuousTaskCancelListener,
@@ -364,7 +364,9 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     this.clearLifetimeGuard();
     try {
       const result = await UiGuardian.applyContinuousTask(this.context);
-      if (!result.ok) {
+      // 配置层面关闭长时任务时 detail 为 CONTINUOUS_TASK_DISABLED_DETAIL：
+      // 这不是申请失败（不是权限/机型问题），不能走失败自毁分支。
+      if (!result.ok && result.detail !== CONTINUOUS_TASK_DISABLED_DETAIL) {
         const detail = `guard-denied(${result.detail})`;
         AppLogger.warn(TAG, `continuous task registration failed: ${detail}`);
         const record = new ShortcutOutcomeRecord();
