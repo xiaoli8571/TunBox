@@ -63,7 +63,8 @@ export class TaskProgressUpdater {
    * 无论哪种长时任务类型都只写应用自有通知 —— 系统长时任务通知一律不碰，
    * 实况窗（圆环）不再发布。
    */
-  static updateLive(nodeText: string, speedLine: string, durationText: string): void {
+  static updateLive(nodeText: string, speedLine: string, durationText: string,
+    force: boolean = false): void {
     TaskProgressUpdater.lastNodeText = nodeText.trim().length > 0 ? nodeText.trim() : 'TunBox';
     TaskProgressUpdater.lastSpeedLine = speedLine;
     TaskProgressUpdater.lastDurationText = durationText;
@@ -76,7 +77,7 @@ export class TaskProgressUpdater {
       : speed;
     TunBoxNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`,
       TaskProgressUpdater.lastNodeText,
-      liveLine).catch((): void => {});
+      liveLine, force).catch((): void => {});
   }
 
   /**

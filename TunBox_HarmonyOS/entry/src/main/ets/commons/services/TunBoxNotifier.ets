@@ -16,10 +16,14 @@ const TAG = 'TunBoxNotifier';
 const NOTIFICATION_ID = 1001;
 /** 通知被禁用后的退避时长：避免每秒 publish 失败风暴 */
 const DISABLED_BACKOFF_MS = 60000;
+/** 内容未变时的重发心跳：卡片若被系统回收（非应用主动撤），最多 60s 内被补回来 */
+const RESEND_HEARTBEAT_MS = 60000;
 
 export class TunBoxNotifier {
   private static lastText: string = '';
   private static lastUpdateAt: number = 0;
+  /** 最近一次成功发布时间（用于「内容没变但卡片丢了」的兜底重发） */
+  private static lastPublishAt: number = 0;
   /** 退避截止时间戳（>now 表示通知当前不可用，跳过 publish） */
   private static disabledUntil: number = 0;
   /** 最近一次失败错误码（0 表示无失败），供 UI/诊断读取 */
@@ -27,29 +31,65 @@ export class TunBoxNotifier {
   /** 点击通知回前台的 WantAgent（懒构建、进程内复用；构建失败不影响通知发布） */
   private static clickAgent: WantAgent | null = null;
   private static agentBuilding: boolean = false;
-  /** 通知授权是否已问过（每进程一次；用户拒绝后系统不允许再弹框） */
-  private static permissionRequested: boolean = false;
+  /** 本进程是否已弹过系统授权框（系统对同一应用只允许弹一次；仅用于去重） */
+  private static permissionPrompted: boolean = false;
+  /** 最近一次复核结论：通知是否可用（供 UI 提示 / 诊断读取） */
+  private static permissionOk: boolean = true;
 
   /**
-   * 通知权限从未授予时弹一次系统授权框（连接成功时调用）。
-   * 真机日志实锤：通知权限未授予时 publish 一直 1600004（disabled），通知栏
-   * 只剩系统自己的 VPN 通知（只有运行时长）。isNotificationEnabled() 对
-   * 「从未问过」与「用户已拒绝」都返回 false；拒绝后 requestEnableNotification
-   * 无法再弹框（系统限制），失败静默——发布路径的退避语义不变。
+   * 通知可用性复核 —— **每次连接都调用**（2026-10-30 修正）。
+   *
+   * 旧实现用 `permissionRequested` 在本进程内只查一次：用户点过「暂不」之后，
+   * 即便他后来在系统设置里手动打开通知，本进程内也**永远**不再复核 → 速率卡
+   * 一直发不出去（通知栏只剩系统长时任务卡：没有速率、没有运行时长）。
+   *
+   * 真机日志实锤（旧注释保留）：通知未授权时 publish 一直 1600004（disabled）。
+   * 现在的语义：
+   *  · 每次连接都 `isNotificationEnabled()` 复核（开销极小）；
+   *  · 已授予 → 立即解除 1600004 退避并返回 true（调用方据此补发首帧）；
+   *  · 未授予且本进程还没弹过 → 弹一次系统框；拒绝后系统不允许再弹，返回 false。
+   *
+   * @returns true = 通知当前可用（可以发布常驻通知）
    */
-  static async ensurePermission(context: Context): Promise<void> {
-    if (TunBoxNotifier.permissionRequested) {
-      return;
-    }
-    TunBoxNotifier.permissionRequested = true;
+  static async ensurePermission(context: Context): Promise<boolean> {
+    let enabled = false;
     try {
-      const enabled = await notificationManager.isNotificationEnabled();
-      if (!enabled) {
-        await notificationManager.requestEnableNotification(context as common.UIAbilityContext);
+      enabled = await notificationManager.isNotificationEnabled();
+    } catch (e) {
+      AppLogger.warn(TAG, `isNotificationEnabled failed: ${AppLogger.errText(e)}`);
+      TunBoxNotifier.permissionOk = false;
+      return false;
+    }
+    if (enabled) {
+      TunBoxNotifier.permissionOk = true;
+      // 用户可能刚在系统设置里打开通知：立刻解除退避，下一帧就能发出去
+      TunBoxNotifier.disabledUntil = 0;
+      TunBoxNotifier.lastErrorCode = 0;
+      return true;
+    }
+    TunBoxNotifier.permissionOk = false;
+    if (TunBoxNotifier.permissionPrompted) {
+      return false;
+    }
+    TunBoxNotifier.permissionPrompted = true;
+    try {
+      await notificationManager.requestEnableNotification(context as common.UIAbilityContext);
+      const granted = await notificationManager.isNotificationEnabled();
+      TunBoxNotifier.permissionOk = granted;
+      if (granted) {
+        TunBoxNotifier.disabledUntil = 0;
+        TunBoxNotifier.lastErrorCode = 0;
       }
+      return granted;
     } catch (e) {
       AppLogger.warn(TAG, `notify permission request failed: ${AppLogger.errText(e)}`);
+      return false;
     }
+  }
+
+  /** 通知当前是否可用（最近一次复核 / 发布结论；false 时速率卡发不出去）。 */
+  static isAvailable(): boolean {
+    return TunBoxNotifier.permissionOk;
   }
 
   /** 通知当前是否因被禁用而处于退避抑制状态 */
@@ -96,15 +136,26 @@ export class TunBoxNotifier {
     }
   }
 
-  static async update(title: string, nodeLine: string, speedLine: string): Promise<void> {
+  /**
+   * 发布 / 更新常驻通知。
+   *
+   * @param force true = 跳过 900ms 节流，强制发一帧。连接成功时的**首帧**必须用它：
+   *   内容与上一会话相同（例如刚断开又连同一节点）时，普通调用会被节流掉，
+   *   卡片就会停在系统长时任务那张空卡上。
+   */
+  static async update(title: string, nodeLine: string, speedLine: string,
+    force: boolean = false): Promise<void> {
     const now = Date.now();
     // 退避窗口内直接返回：通知禁用属于用户设置，重试没有意义
     if (now < TunBoxNotifier.disabledUntil) {
       return;
     }
-    // 节流：内容未变化或距上次刷新不足 900ms 则跳过
+    // 节流：内容与上次相同、且 900ms 内刚发过、且距上次成功发布不足 60s → 跳过。
+    // 最后一项是兜底心跳：内容没变时也要定期重发，否则卡片一旦被系统回收
+    // （权限变更 / 任务重启 / 通知被清理），就再也不会自己回来。
     const text = `${nodeLine}\n${speedLine}`;
-    if (text === TunBoxNotifier.lastText && now - TunBoxNotifier.lastUpdateAt < 900) {
+    if (!force && text === TunBoxNotifier.lastText && now - TunBoxNotifier.lastUpdateAt < 900
+      && now - TunBoxNotifier.lastPublishAt < RESEND_HEARTBEAT_MS) {
       return;
     }
     TunBoxNotifier.lastText = text;
@@ -132,6 +183,8 @@ export class TunBoxNotifier {
       await notificationManager.publish(request);
       TunBoxNotifier.lastErrorCode = 0;
       TunBoxNotifier.disabledUntil = 0;
+      TunBoxNotifier.permissionOk = true;
+      TunBoxNotifier.lastPublishAt = now;
     } catch (e) {
       const err = e as BusinessError;
       const code = (err !== undefined && err !== null) ? err.code : 0;
@@ -157,6 +210,7 @@ export class TunBoxNotifier {
     }
     TunBoxNotifier.lastText = '';
     TunBoxNotifier.lastUpdateAt = 0;
+    TunBoxNotifier.lastPublishAt = 0;
     TunBoxNotifier.disabledUntil = 0;
   }
 }

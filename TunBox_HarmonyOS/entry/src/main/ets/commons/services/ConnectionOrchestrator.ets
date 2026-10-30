@@ -4738,15 +4738,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         await this.disconnectInternal(intentGeneration);
         return false;
       }
-      // 通知权限从未授予时弹一次系统授权框（真机 1600004 disabled 实锤：
-      // 不授权则常驻通知发不出，通知栏只剩系统 VPN 通知的运行时长）
-      TunBoxNotifier.ensurePermission(this.context).catch((e: Object): void => {
+      // 通知权限**每次连接都复核**（用户可能刚在系统设置里打开/关闭；只在未授予
+      // 且本进程还没弹过时才弹一次系统框）。复核通过后立即补发首帧。
+      // 旧行为是「先 cancel 掉 id-1001，再等 1s 流量轮询重建」——轮询未跑起来
+      // （监控启动失败 / 进程被冻结）时通知栏就只剩系统长时任务卡：没有速率、
+      // 没有运行时长（2026-10-30 用户反馈「很多用户只有一条通知」的根因之一）。
+      TunBoxNotifier.ensurePermission(this.context).then((granted: boolean): void => {
+        if (!granted) {
+          // 通知不可用：不补帧（发了也是 1600004），等用户开通后下次连接恢复
+          AppLogger.warn(TAG, 'notification unavailable; speed card not published on connect');
+          return;
+        }
+        TaskProgressUpdater.updateLive(this.notifyNodeText(finalNodeName),
+          '↓ 0 B/s  ↑ 0 B/s', this.connDurationText(), true);
+      }).catch((e: Object): void => {
         AppLogger.warn(TAG, `ensure notification permission failed: ${AppLogger.errText(e)}`);
       });
-      // 节点/速率/时长由应用自有常驻通知（TunBoxNotifier）承载 —— 不再写系统实况窗：
-      // 实况窗模板（downloadTemplate）右侧自带一个圆环，用户要求去掉，只能不发实况窗。
-      // 旧 id-1001 的残留无需清理，这里保留 cancel 只为兼容历史会话的快照。
-      TunBoxNotifier.cancel().catch((): void => {});
       this.notify();
       AppLogger.info(TAG, `connected to node ${finalNodeName}`);
       // 隧道就绪时 App HTTP 代理已在 CONNECTED 事件发出前挂好（见上方），

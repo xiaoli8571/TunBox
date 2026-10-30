@@ -166,7 +166,12 @@ export class VpnQuickStart {
         // 会随之消失。这里立即拉起常驻通知（配合 VpnExtensionAbility 的长时任务），
         // 保证用户能看到"已连接"前台凭证；内核死亡由 EntryFormAbility 的
         // reconcile/updateForm 周期对账负责把卡片改回已断开。
-        await TunBoxNotifier.update('TunBox 已连接', node.name, '↓ 0 B/s  ↑ 0 B/s');
+        //
+        // 2026-10-30 修正：原先这里发的是 `TunBox 已连接 / ↓ 0 B/s ↑ 0 B/s`——
+        // ① 标题格式与主页路径（`TunBox · 节点`）不一致；② 没有运行时长；
+        // ③ 会把 orchestrator 刚补的首帧（带时长）覆盖成无时长版本。
+        // 现在与主页路径同口径，时长由 orchestrator 的流量轮询立即接上。
+        await TunBoxNotifier.update(`TunBox · ${node.name}`, node.name, '↓0B/s ↑0B/s', true);
         FormInfoMetrics.refreshAfterVpnTransition(context);
       }
       AppLogger.info(TAG, `quick ${mode} => ${ok ? 'on' : 'failed'} (node=${node.name})`);
