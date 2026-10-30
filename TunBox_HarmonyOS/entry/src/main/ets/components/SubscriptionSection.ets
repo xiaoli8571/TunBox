@@ -309,7 +309,7 @@ struct EditSubDialog {
       .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
       .alignItems(VerticalAlign.Center)
 
-      Text(`范围 ${MIN_UPDATE_INTERVAL_MINUTES}~${MAX_UPDATE_INTERVAL_MINUTES} 分钟，超出自动取边界值`)
+      Text(`范围 ${MIN_UPDATE_INTERVAL_MINUTES}~${MAX_UPDATE_INTERVAL_MINUTES} 分钟，超出自动取边界值 · 只影响这一个订阅`)
         .fontSize(10).fontColor(TunBoxTextColors.muted).width('100%')
         }
         .width('100%')
@@ -355,6 +355,12 @@ struct EditSubDialog {
     .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
   }
 }
+
+/**
+ * 订阅卡片纵向间距（vp）：必须与 build() 里 `Column({ space: 10 })` 一致。
+ * 长按拖动排序用「实测卡片高度 + 本间距」累计，判断当前拖到了第几张。
+ */
+const SUB_CARD_SPACE: number = 10;
 
 @Component
 export struct SubscriptionSection {
@@ -410,6 +416,20 @@ export struct SubscriptionSection {
   /** 状态栏高度（vp）：全屏覆盖层内容要从状态栏之下起排 */
   @State private statusBarH: number = 24;
 
+  // ── 长按拖动排序（2026-10-30 用户要求：长按订阅可以拖动排序）──
+  /** 正在拖动的订阅 id（'' = 未拖动）；同时用作「是否处于拖动中」的总闸门 */
+  @State private dragSubId: string = '';
+  /** 拖动纵向位移（vp）：被拖卡片跟手平移 */
+  @State private dragDy: number = 0;
+  /** 拖动起始下标 / 目标下标（松手时按目标重排并落盘） */
+  private dragFromIndex: number = -1;
+  private dragToIndex: number = -1;
+  /**
+   * 每张卡片的实测高度（vp）。卡片高度并不一致（有的带「使用中」角标、有的带旧格式提示），
+   * 所以不用「固定行高 × 位移」估算，而是用 onAreaChange 实测值累计判断插入位置。
+   */
+  private subCardHeights: number[] = [];
+
   private service: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private refreshing: boolean = false;
@@ -448,7 +468,10 @@ export struct SubscriptionSection {
         const s: Subscription | null = this.subById(this.editTargetId);
         return s === null ? '' : s.url;
       },
-      getAutoUpdate: (): boolean => this.autoUpdateGlobal,
+      getAutoUpdate: (): boolean => {
+        const s: Subscription | null = this.subById(this.editTargetId);
+        return s === null ? this.autoUpdateGlobal : s.autoUpdate;
+      },
       getIntervalText: (): string => this.refreshIntervalMinutesText(),
       onConfirm: (name: string, url: string, autoUpdate: boolean, intervalMinutes: number): void => {
         this.applyEdit(name, url, autoUpdate, intervalMinutes);
@@ -861,8 +884,16 @@ export struct SubscriptionSection {
     }).catch((): void => {});
   }
 
-  /** 自动更新间隔展示：来自用户设置（默认 360 分钟 = 6h） */
+  /**
+   * 自动更新间隔展示（2026-10-30 用户报障修根）：
+   * 优先取**当前编辑订阅自己的**间隔；订阅没单独设过（0）→ 回退全局默认值。
+   * 旧实现只读全局，于是「编 A 订阅填了 30 分钟」会把全局改掉，B/C 订阅跟着变 30 分钟。
+   */
   private refreshIntervalMinutesText(): string {
+    const s: Subscription | null = this.subById(this.editTargetId);
+    if (s !== null && s.updateIntervalMinutes >= MIN_UPDATE_INTERVAL_MINUTES) {
+      return `${s.updateIntervalMinutes}`;
+    }
     return `${this.autoUpdateIntervalMin}`;
   }
 
@@ -967,6 +998,92 @@ export struct SubscriptionSection {
     this.editTargetId = sub.id;
     this.editTargetName = sub.name;
     this.editDialog.open();
+  }
+
+  // ────────────────────── 长按拖动排序 ──────────────────────
+
+  /** 长按达时：进入拖动态（订阅少于 2 条时没有排序意义，直接忽略） */
+  private beginSubDrag(id: string, index: number): void {
+    if (this.subs.length < 2) {
+      return;
+    }
+    this.dragSubId = id;
+    this.dragFromIndex = index;
+    this.dragToIndex = index;
+    this.dragDy = 0;
+  }
+
+  /** 取第 i 张卡片的实测高度（未实测到时给个保守默认值，避免除零/跳变） */
+  private subCardHeight(i: number): number {
+    const h: number = this.subCardHeights[i];
+    return Number.isFinite(h) && h > 0 ? h : 120;
+  }
+
+  /**
+   * 拖动中：跟手平移 + 按实际位移算出「松手后应该插到第几张」。
+   * 判定规则：越过某张卡片高度的一半即视为跨过它（与系统列表拖拽排序手感一致）。
+   */
+  private updateSubDrag(dy: number): void {
+    if (this.dragSubId.length === 0) {
+      return;
+    }
+    this.dragDy = dy;
+    const start: number = this.dragFromIndex;
+    if (start < 0) {
+      return;
+    }
+    let target: number = start;
+    let acc: number = 0;
+    if (dy > 0) {
+      for (let i = start + 1; i < this.subs.length; i++) {
+        acc = acc + this.subCardHeight(i) + SUB_CARD_SPACE;
+        if (dy > acc - (this.subCardHeight(i) + SUB_CARD_SPACE) / 2) {
+          target = i;
+        } else {
+          break;
+        }
+      }
+    } else if (dy < 0) {
+      for (let i = start - 1; i >= 0; i--) {
+        acc = acc + this.subCardHeight(i) + SUB_CARD_SPACE;
+        if (-dy > acc - (this.subCardHeight(i) + SUB_CARD_SPACE) / 2) {
+          target = i;
+        } else {
+          break;
+        }
+      }
+    }
+    this.dragToIndex = target;
+  }
+
+  /** 松手：本地先重排（手感即时），再把新顺序落盘 */
+  private endSubDrag(): void {
+    const id: string = this.dragSubId;
+    const from: number = this.dragFromIndex;
+    const to: number = this.dragToIndex;
+    this.dragSubId = '';
+    this.dragDy = 0;
+    this.dragFromIndex = -1;
+    this.dragToIndex = -1;
+    if (id.length === 0 || from < 0 || to < 0 || from === to) {
+      return;
+    }
+    const list: Subscription[] = this.subs.slice();
+    if (from >= list.length || list[from].id !== id) {
+      // 拖动期间列表被后台刷新/重载替换过 → 放弃这次排序，避免插错位置
+      return;
+    }
+    const moved: Subscription = list[from];
+    list.splice(from, 1);
+    const insertAt: number = to > list.length ? list.length : to;
+    list.splice(insertAt, 0, moved);
+    this.subs = list;
+    this.service.reorderSubscriptions(list.map((s: Subscription): string => s.id))
+      .then((): void => { this.toast('排序已保存'); })
+      .catch((e: Object): void => {
+        AppLogger.warn(TAG, `reorder subscriptions failed: ${AppLogger.errText(e)}`);
+        this.toast('排序保存失败');
+      });
   }
 
   /** 扫码导入（相机权限被拒 / 用户取消各有独立提示） */
@@ -1164,25 +1281,17 @@ export struct SubscriptionSection {
       target.url = nextUrl;
     }
     try {
-      await this.service.updateSubscription(target);
-      if (autoUpdate !== this.autoUpdateGlobal) {
-        this.autoUpdateGlobal = autoUpdate;
-        await SettingsService.patchSettings((s: AppSettings): void => {
-          s.autoUpdateSubscription = autoUpdate;
-        });
-      }
-      // 自动更新间隔持久化（2026-10-29 用户要求可自定义修改）。
-      // 双保险夹一次区间：弹窗那边已经夹过，这里防止调用方绕过（存档脏数据同理）。
+      // 自动更新开关与间隔都写到**这个订阅自己**身上（2026-10-30 用户报障）。
+      // 旧实现：`autoUpdate` 与 `subscriptionUpdateIntervalMinutes` 都写全局 AppSettings，
+      // 于是「改一个订阅的刷新时间」= 「把所有订阅的刷新时间都改成它」。
+      // 现在一次 persist 落盘（名称/URL/开关/间隔同一笔），不再碰全局设置。
       const rawInterval: number = Math.floor(intervalMinutes);
       const nextInterval: number = (Number.isFinite(rawInterval)
         && rawInterval >= MIN_UPDATE_INTERVAL_MINUTES
         && rawInterval <= MAX_UPDATE_INTERVAL_MINUTES) ? rawInterval : 360;
-      if (nextInterval !== this.autoUpdateIntervalMin) {
-        this.autoUpdateIntervalMin = nextInterval;
-        await SettingsService.patchSettings((s: AppSettings): void => {
-          s.subscriptionUpdateIntervalMinutes = nextInterval;
-        });
-      }
+      target.autoUpdate = autoUpdate;
+      target.updateIntervalMinutes = nextInterval;
+      await this.service.updateSubscription(target);
       if (urlChanged) {
         await this.service.refreshSubscription(target.id);
       }
@@ -1902,8 +2011,39 @@ export struct SubscriptionSection {
         .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
         .onClick((): void => { this.addDialog.open(); })
       } else {
-        ForEach(this.subs, (sub: Subscription) => {
-          this.SubCard(sub, false)
+        ForEach(this.subs, (sub: Subscription, index: number) => {
+          // 长按拖动排序（2026-10-30 用户要求）：长按 380ms 后进入拖动，竖向跟手移动，
+          // 松手按实际位移重排并落盘。用 GestureGroup(Sequence) 保证「先长按、后拖拽」的时序，
+          // 普通点击/卡片内按钮不受影响（长按不触发 onClick）。
+          Column() {
+            this.SubCard(sub, false)
+          }
+          .width('100%')
+          .translate({ y: this.dragSubId === sub.id ? this.dragDy : 0 })
+          .zIndex(this.dragSubId === sub.id ? 2 : 0)
+          .opacity(this.dragSubId === sub.id ? 0.96 : 1)
+          .scale(this.dragSubId === sub.id ? { x: 1.02, y: 1.02 } : { x: 1, y: 1 })
+          .shadow(this.dragSubId === sub.id
+            ? { radius: 16, color: '#33000000', offsetX: 0, offsetY: 6 }
+            : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
+          .onAreaChange((_oldArea: Area, nextArea: Area): void => {
+            this.subCardHeights[index] = Number(nextArea.height);
+          })
+          .gesture(
+            GestureGroup(GestureMode.Sequence,
+              LongPressGesture({ repeat: false, duration: 380 })
+                .onAction((): void => {
+                  this.beginSubDrag(sub.id, index);
+                }),
+              PanGesture({ direction: PanDirection.Vertical, distance: 3 })
+                .onActionUpdate((event: GestureEvent): void => {
+                  this.updateSubDrag(event.offsetY);
+                })
+                .onActionEnd((): void => {
+                  this.endSubDrag();
+                })
+            )
+          )
         }, (sub: Subscription) => `${sub.id}|${sub.name}|${this.currentProfileId}|${this.currentNodeName}`
           + `|${sub.uploadBytes}|${sub.downloadBytes}|${this.refreshingIds.join(',')}|${this.testingIds.join(',')}`)
       }

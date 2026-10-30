@@ -188,8 +188,6 @@ export class SubscriptionUpdateScheduler {
       const subs = SubscriptionService.instance();
       await subs.init(context);
     const now = Date.now();
-    // 阈值来自用户设置（2026-10-29）：以前这里是常量 6h，改设置完全不生效
-    const configuredStaleMs: number = staleThresholdMs(settings.subscriptionUpdateIntervalMinutes);
     const staleIds: string[] = [];
     let total = 0;
     let ephemeralCount = 0;
@@ -203,6 +201,16 @@ export class SubscriptionUpdateScheduler {
         continue;
       }
       total = total + 1;
+      if (!s.autoUpdate) {
+        // 每个订阅可以单独关掉自动更新（2026-10-30）：旧实现只有全局开关，
+        // 想停一个订阅就只能全部关掉。
+        continue;
+      }
+      // 阈值优先级：订阅自己的间隔（>0）→ 全局设置。
+      // 旧实现只读全局，导致「改一个订阅的刷新时间，全部订阅都改成一个时间」。
+      const subMinutes: number = s.updateIntervalMinutes > 0
+        ? s.updateIntervalMinutes : settings.subscriptionUpdateIntervalMinutes;
+      const subStaleMs: number = staleThresholdMs(subMinutes);
       // 易变域名订阅（加固③）：节点 server 命中 trycloudflare 等临时隧道域名时，
       // 隧道域名轮换后旧节点全部超时，刷新间隔压到 6h（EPHEMERAL_SUBSCRIPTION_REFRESH_MS，
       // 与全局阈值同值 → 当前行为等价；全局阈值将来调大时易变订阅仍保持 6h）。
@@ -218,8 +226,8 @@ export class SubscriptionUpdateScheduler {
         ephemeralCount = ephemeralCount + 1;
       }
       const staleMs = ephemeral
-        ? Math.min(configuredStaleMs, EPHEMERAL_SUBSCRIPTION_REFRESH_MS)
-        : configuredStaleMs;
+        ? Math.min(subStaleMs, EPHEMERAL_SUBSCRIPTION_REFRESH_MS)
+        : subStaleMs;
       if (s.lastFetchedAt <= 0 || now - s.lastFetchedAt > staleMs) {
         staleIds.push(s.id);
       }

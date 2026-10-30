@@ -36,6 +36,20 @@ export class Subscription {
   legacyFormat: boolean = false;
   sortOrder: number = 0;
   /**
+   * 每个订阅自己的「自动更新」开关（2026-10-30 用户报障）。
+   *
+   * 真因：编辑弹窗是**按单个订阅**开的，但保存时把开关写进了全局
+   * `AppSettings.autoUpdateSubscription` —— 改 A 订阅，B/C 订阅跟着变。
+   * 现在开关与间隔都落在订阅自己身上；全局值只作**默认值/回退**。
+   */
+  autoUpdate: boolean = true;
+  /**
+   * 每个订阅自己的刷新间隔（分钟）。
+   * `0` = 未单独设置 → 跟随全局 `AppSettings.subscriptionUpdateIntervalMinutes`。
+   * 同理，旧实现把间隔写进全局，导致「改一个订阅，全部订阅都变成一个刷新时间」。
+   */
+  updateIntervalMinutes: number = 0;
+  /**
    * 双轨「原始订阅 provider」状态（持久化，供订阅卡/诊断并列展示）：
    * '' 未尝试 / 'off' 开关关闭 / 'ready' 原文已落盘可读回 /
    * 'ineligible' 原文不是 Clash YAML（不能作为 file provider）/
@@ -109,6 +123,8 @@ export class Subscription {
     j.expireAt = s.expireAt;
     j.enabled = s.enabled;
     j.sortOrder = s.sortOrder;
+    j.autoUpdate = s.autoUpdate;
+    j.updateIntervalMinutes = s.updateIntervalMinutes;
     j.legacyFormat = s.legacyFormat;
     j.rawProviderState = s.rawProviderState;
     j.rawProviderNodeEstimate = s.rawProviderNodeEstimate;
@@ -136,6 +152,10 @@ export class Subscription {
     s.expireAt = j.expireAt ?? -1;
     s.enabled = j.enabled;
     s.sortOrder = j.sortOrder;
+    // 后加字段：旧存储没有 → 按「自动更新开、间隔跟随全局」处理，行为与旧版一致
+    s.autoUpdate = j.autoUpdate !== false;
+    s.updateIntervalMinutes = typeof j.updateIntervalMinutes === 'number'
+      ? (j.updateIntervalMinutes as number) : 0;
     // 旧版本存储无这两个键（可选字段），缺失一律按「未尝试」处理
     s.legacyFormat = j.legacyFormat === true;
     s.rawProviderState = j.rawProviderState ?? '';
