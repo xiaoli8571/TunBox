@@ -290,9 +290,11 @@ const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets
   // 缺后者平台不接受 v6 地址。两条分支都要在（开关关闭时仍是纯 IPv4）。
   has('ext.ipv6Accepted-true', extSrc, 'isIPv6Accepted: true');
   has('ext.ipv6Accepted-false', extSrc, 'isIPv6Accepted: false');
-  // v6 默认路由写法与 NekoBox4Harmony 一致：不写 family、gateway 用 v4 占位。
-  // 写 `family: 2` 时真机平台会静默丢弃这条路由（v6 继续从 wlan0 泄漏）。
-  has('ext.ipv6-route', extSrc, "destination: { address: { address: '::' }, prefixLength: 0 }");
+  // v6 默认路由：0.7.3 修了「漏写 family」——SDK 定义 NetAddress.family 缺省为 1（IPv4），
+  // 不写就会被当成「IPv4 族 + 目的地 ::」的畸形路由（整条被丢→v6 泄漏，或与 v4 默认路由冲突）。
+  // 现在目的地与网关都必须显式 family: 2，两个字段各守一条（只写一个仍会把另一半当 v4）。
+  has('ext.ipv6-route-family', extSrc, "destination: { address: { address: '::', family: 2 }, prefixLength: 0 }");
+  has('ext.ipv6-gateway-family', extSrc, "gateway: { address: '::', family: 2 }");
   has('ext.ipv6-address-const', extSrc, "TUN_ADDRESS_V6 = 'fdfe:dcba:9876::1'");
   // 开关必须从**生成的 YAML** 读回，不能在 want/设置里另存一份 ——
   // 否则 TUN 与内核会分叉（v6 黑洞或泄漏）。
@@ -401,11 +403,16 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // ArkUI 不把这个分支登记成依赖，用户在设置里删掉 Model.bin、回到订阅页，
   // 卡片还挂着（用户实锤「我删了，没有隐藏」）。现在 seq 变化 ⇒ @Watch 重算 @State。
   {
-    const subPageSrc = readFileSync(join(etsRoot, 'pages', 'SubscriptionPage.ets'), 'utf8');
-    has('sub.smart.seq-watch', subPageSrc, "@Watch('onSmartModelSeq')");
-    has('sub.smart.guard-reads-state', subPageSrc, 'return this.smartModelReady;');
-    has('sub.smart.state-recomputed', subPageSrc,
-      'this.smartModelReady = ConnectionOrchestrator.instance().isSmartModelAvailable();');
+    const subSecSrc = readFileSync(join(etsRoot, 'components/SubscriptionSection.ets'), 'utf8');
+    // 现行实现（2026-10-29 重构）：入口态落到 @State，面板打开时重算 ——
+    // build 里直接调 isSmartModelAvailable() 不会登记依赖，真机就是「删了模型卡片还挂着」。
+    has('sub.smart.state-visible', subSecSrc, '@State private smartVisible: boolean = false;');
+    has('sub.smart.state-selected', subSecSrc, '@State private smartSelected: boolean = false;');
+    has('sub.smart.recomputed', subSecSrc,
+      'ready = ConnectionOrchestrator.instance().ensureSmartModelReady();');
+    has('sub.smart.visible-recomputed', subSecSrc, 'this.smartVisible = ready && nodeCount >= 2;');
+    has('sub.smart.row-gated-by-state', subSecSrc, 'if (this.smartVisible && !this.deleteSheetOn) {');
+    has('sub.smart.recompute-on-open', subSecSrc, 'this.refreshSmartEntry();');
     // 删除与下载成功都必须 bump 信号（只删不装 / 只装不删 都会让入口状态停在旧值）
     const seqBumps = orchSrc.match(/setOrCreate<number>\('smart_model_seq'/g) ?? [];
     ok('orch.smart.mutations-bump-seq', seqBumps.length >= 2, `${seqBumps.length} 处`);
@@ -426,9 +433,13 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // 所以不补一个合成行，用户在「全部节点」里永远看不到它。
   has('orch.smart.ui-ready-api', orchSrc, 'ensureSmartModelReady()');
   has('page.smart.row-id', pageSrc, "const SMART_ROW_ID = '__smart_group__'");
-  has('page.smart.mk-row', pageSrc, 'private mkSmartRow()');
-  has('page.smart.selectable', pageSrc, 'private smartSelectable()');
-  has('page.smart.unshift', pageSrc, 'rows.unshift(this.mkSmartRow())');
+  // 合成行带作用域参数（2026-10-30）：空串 = 全部视图的全局入口，
+  // 订阅 id = 该订阅自己的入口（smart 池按 groupSelected 收窄）。
+  has('page.smart.mk-row', pageSrc, 'private mkSmartRow(subscriptionId: string): NodeRow');
+  has('page.smart.selectable', pageSrc, 'private smartSelectable(): boolean');
+  has('page.smart.unshift', pageSrc, 'rows.unshift(entry);');
+  has('page.smart.scope-all', pageSrc, "this.mkSmartRow('');");
+  has('page.smart.scope-sub', pageSrc, 'this.mkSmartRow(this.filterSubId);');
   has('page.smart.row-flag', pageSrc, 'isSmart?: boolean');
   // 合成行没有 server/port：必须排除在测速之外，否则永远显示「超时」
   has('page.smart.skip-latency', pageSrc, 'if (row.isSmart === true) {');
@@ -537,8 +548,8 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     has('latency.flclash-concurrency-32', flcDelay, 'FLCLASH_DELAY_CONCURRENCY: number = 32');
     has('latency.flclash-timeout-3000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 3000');
     has('latency.flclash-url-gstatic', flcDelay, 'https://www.gstatic.com/generate_204');
-    has('latency.group-test-from-page', readFileSync(join(etsRoot, 'pages/SubscriptionPage.ets'), 'utf8'),
-      'BackgroundLatencyService.runKernelGroupTest(');
+    has('latency.group-test-from-page', readFileSync(join(etsRoot, 'components/SubscriptionSection.ets'), 'utf8'),
+      'BackgroundLatencyService.testSubscription(context, subId)');
     const nodePage = readFileSync(join(etsRoot, 'pages/NodeSelectionPage.ets'), 'utf8');
     notHas('latency.dead-page-no-group-test', nodePage, 'testGroupDetailedResult');
   }
@@ -553,9 +564,13 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     has('subs.legacy-skips-auto-update', schedSrc, 'if (s.legacyFormat) {');
   }
   {
-    const subPage = readFileSync(join(etsRoot, 'pages', 'SubscriptionPage.ets'), 'utf8');
+    const subPage = readFileSync(join(etsRoot, 'components/SubscriptionSection.ets'), 'utf8');
     has('subs.file-yaml-only', subPage, "opts.fileSuffixFilters = ['.yaml', '.yml'];");
-    has('subs.qr-rejects-node-uri', subPage, '扫码只支持 Clash 订阅二维码');
+    // 扫码只收 HTTP(S) 链接，然后复用 applyAdd —— 单节点分享链接在那里被 isNodeUri 拦下
+    has('subs.qr-https-only', subPage, "if (!(lower.startsWith('https://') || lower.startsWith('http://'))) {");
+    has('subs.qr-rejects-node-uri', subPage, "this.toast('二维码里应是 Clash 订阅链接');");
+    has('subs.qr-reuses-applyAdd', subPage, "await this.applyAdd('', raw);");
+    has('subs.node-uri-rejected', subPage, '只支持 Clash 订阅链接，不支持单节点分享链接');
     // 2026-10-21 用户二次定案：订阅刷新/新增/删除/编辑**不自动重连**（保持原行为，
     // 避免用户正在用网时被打断）；只有节点切换才即时重连。
     notHas('subs.no-reconnect-on-subscription-ops', subPage, 'syncTunnelAfterSubChange');

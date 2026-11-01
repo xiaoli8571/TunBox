@@ -7,7 +7,7 @@
  * 复合协议字段），合成 fixture 覆盖不到。本套件把真订阅喂给真解析器，逐节点对账。
  *
  * 做法与 verify-latency-engine-runtime.mjs 相同：把 .ets 暂存为 .ts 后 import。
- * 需要真实 YAML fixture；没有时 SKIP（不算失败）。
+ * 需要含实际节点的真实 YAML fixture；缺失或空样本默认失败，--allow-skip 仅显式跳过缺失文件。
  *
  * 用法：node scripts/verify-subscription-fidelity.mjs <fixture.yaml>
  */
@@ -128,7 +128,14 @@ function expectedNodes(yaml) {
     const joined = item.join(' ');
     const body = joined.replace(/^-\s*/, '');
     const text = body.startsWith('{') ? body.slice(1, body.lastIndexOf('}')) : joined;
-    const name = fieldOf(text, 'name');
+    // YAML plain scalars may contain spaces. Joining block lines then stopping at whitespace
+    // truncated every unquoted multi-word name; preserve the complete name field instead.
+    const nameLine = item.find(line => /^-?\s*name\s*:/.test(line));
+    const flowName = text.match(/(?:^|[,\s])name\s*:\s*('(?:[^']|'')*'|"(?:[^"\\]|\\.)*"|[^,}]+)/);
+    let name = body.startsWith('{') ? (flowName?.[1] ?? '').trim()
+      : (nameLine ?? '').replace(/^-?\s*name\s*:\s*/, '').trim();
+    if (name.startsWith('"') && name.endsWith('"')) name = JSON.parse(name);
+    else if (name.startsWith("'") && name.endsWith("'")) name = name.slice(1, -1).replaceAll("''", "'");
     const type = fieldOf(text, 'type');
     if (name.length === 0 || type.length === 0) continue;
     out.push({
@@ -144,6 +151,10 @@ function expectedNodes(yaml) {
 }
 const expected = expectedNodes(rawYaml);
 const expectedGroupCount = sectionItems(rawYaml, 'proxy-groups').length;
+if (expected.length === 0) {
+  console.error('FAILED: fixture baseline contains no proxy nodes; empty/unsupported input is not fidelity evidence');
+  process.exit(1);
+}
 
 // ── 暂存真代码 ─────────────────────────────────────────────────────────────
 const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'sub-fidelity-'));
@@ -246,6 +257,12 @@ if (importError.length > 0) {
 // ── 真跑 ──────────────────────────────────────────────────────────────────
 const res = Parser.parseDetailed(rawYaml, 'fixture');
 const got = res.nodes;
+const { UnusableLedger } = await import(`file://${path.join(stage, 'UnusableLedger.ts').replace(/\\/g, '/')}`);
+const excluded = UnusableLedger.listFor('fixture').filter(item => item.excluded && item.category === 'info');
+// Product contract excludes subscription status/advertisement rows, but only with an explicit
+// INFO ledger record. All other missing nodes remain failures; no blanket count allowance.
+const excludedKeys = new Set(excluded.map(item => `${item.name}|${item.server}|${item.port}`));
+console.log(`explicit INFO exclusions: ${excluded.length}`);
 console.log(`app parsed: ${got.length} nodes, ${res.groups.length} groups`);
 console.log(`diagnostics: ${JSON.stringify(res.diagnostics)}`);
 
@@ -272,20 +289,33 @@ function isKnownStructured(node) {
 
 check('every mihomo node is parsed (name+server+port)', () => {
   const keys = new Set(got.map(n => `${n.originalName || n.name}|${n.server}|${n.port}`));
-  const missing = expected.filter(e => !keys.has(`${e.name}|${e.server}|${e.port}`));
+  const missing = expected.filter(e => !keys.has(`${e.name}|${e.server}|${e.port}`)
+    && !excludedKeys.has(`${e.name}|${e.server}|${e.port}`));
   ok(missing.length === 0,
     `missing ${missing.length}/${expected.length}: ${missing.slice(0, 4).map(m => `${m.name}(${m.type})`).join(' / ')}`);
 });
 
-check('no node is invented (count <= baseline)', () => {
+check('INFO exclusions have exact source identity and are absent from output', () => {
+  const sourceKeys = new Set(expected.map(e => `${e.name}|${e.server}|${e.port}`));
+  const outputKeys = new Set(got.map(n => `${n.originalName || n.name}|${n.server}|${n.port}`));
+  for (const key of excludedKeys) {
+    ok(sourceKeys.has(key), 'INFO ledger record does not match an original row');
+    ok(!outputKeys.has(key), 'INFO ledger row leaked into output');
+  }
+});
+
+check('no node is invented (source identity and count)', () => {
+  const sourceKeys = new Set(expected.map(e => `${e.name}|${e.server}|${e.port}`));
+  ok(got.every(n => sourceKeys.has(`${n.originalName || n.name}|${n.server}|${n.port}`)),
+    'output contains a node identity absent from the fixture');
   ok(got.length <= expected.length, `got ${got.length} > baseline ${expected.length}`);
 });
 
 check('per-node type matches mihomo', () => {
-  const byKey = new Map(got.map(n => [`${n.server}|${n.port}`, n]));
+  const byKey = new Map(got.map(n => [`${n.originalName || n.name}|${n.server}|${n.port}`, n]));
   const bad = [];
   for (const e of expected) {
-    const g = byKey.get(`${e.server}|${e.port}`);
+    const g = byKey.get(`${e.name}|${e.server}|${e.port}`);
     if (g === undefined) continue;
     const gt = (g.proxyType.length > 0 ? g.proxyType : g.type).toLowerCase();
     if (gt !== e.type.toLowerCase()) bad.push(`${e.name}: mihomo=${e.type} app=${gt}`);

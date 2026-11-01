@@ -64,7 +64,8 @@ export PATH="/path/to/DevEco Studio/jbr/bin:$PATH"   # hvigor 需要 java
 
 node "/path/to/DevEco Studio/tools/hvigor/bin/hvigorw.js" \
   --mode module -p product=default -p module=entry@default \
-  -p buildMode=debug assembleHap --no-daemon
+  -p buildMode=debug clean assembleHap --no-daemon
+node scripts/verify-ui-resource-bindings.mjs
 ```
 
 产物：`entry/build/default/outputs/default/entry-default-signed.hap`（debug 签名）或 `entry-default-unsigned.hap`（release）。

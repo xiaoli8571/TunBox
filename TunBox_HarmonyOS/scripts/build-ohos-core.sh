@@ -2,7 +2,9 @@
 # TunBox HarmonyOS - Mihomo 内核交叉编译脚本
 # 对应 upstream: scripts/build-android-core.sh（recipe 见 assets/libgojni-source.txt）
 #
-# 产物: libgojni.so (ohos arm64, c-shared, tags: with_gvisor,cmfa)
+# 产物: libgojni.so (ohos arm64, c-shared, tags: with_gvisor,cmfa,no_tailscale,no_zerotier,no_easytier)
+# 0.8.0: 裁掉 tailscale/zerotier/easytier（TunBox 侧零引用），包体 -6.26MB；
+#        with_gvisor 保留（WireGuard 依赖）。前端 dropReasonFor 同步拦这三类。
 # 放入: entry/libs/arm64-v8a/ (HVigor 会打包进 HAP 的 /data/storage/el1/bundle/libs/arm64/)
 #
 # 内核来源: mihomo-build/mihomo-smart-<sha>/（vernesong/mihomo, 分支 Alpha；
@@ -85,7 +87,7 @@ export CGO_CFLAGS="${CC_ARGS} -ftls-model=global-dynamic"
 
 "$GO" build \
   -buildmode=c-shared \
-  -tags "with_gvisor,cmfa" \
+  -tags "with_gvisor,cmfa,no_tailscale,no_zerotier,no_easytier" \
   -ldflags "-s -w -buildid=" \
   -o "$OUT_DIR/libgojni.so" \
   .

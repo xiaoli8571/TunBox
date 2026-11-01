@@ -1,5 +1,5 @@
 /**
- * SubscriptionPage 括号配平真检（逐字符状态机，跳过注释/字符串/模板字面量/正则字面量）。
+ * SubscriptionSection 括号配平真检（逐字符状态机，跳过注释/字符串/模板字面量/正则字面量）。
  *
  * 为什么不用朴素计数：文件里大量出现
  *   .padding({ left: 5, right: 5 })
@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const target = process.argv[2] === 'orig'
   ? path.join(process.env.LOCALAPPDATA, 'Temp', 'sub_orig.ets')
-  : path.join(here, '..', 'entry', 'src', 'main', 'ets', 'pages', 'SubscriptionPage.ets');
+  : path.join(here, '..', 'entry', 'src', 'main', 'ets', 'components', 'SubscriptionSection.ets');
 const src = fs.readFileSync(target, 'utf8');
 
 const PAIRS = { ')': '(', '}': '{', ']': '[' };

@@ -142,8 +142,10 @@ ok(buildOk, 'assembleHap 整体成功（含签名打包）');
 
 if (!buildOk) {
   console.log('');
-  console.log('  ⚠ 完整构建未成功，但**编译阶段已通过** —— 下面是与编译无关的失败（通常是签名/打包环境）：');
-  for (const l of out.split('\n').filter((x) => /ERROR|Error Code|ENOENT/.test(x)).slice(0, 8)) {
+  console.log(compiled && arktsErrors.length === 0
+    ? '  ⚠ 编译阶段已通过，但完整构建失败；以下为打包或环境诊断：'
+    : '  ⚠ 构建失败，尚未确认编译通过；以下为实际诊断：');
+  for (const l of out.split('\n').filter((x) => /ERROR|Error Message|At File|Error Code|ENOENT/.test(x)).slice(0, 16)) {
     console.log('    ' + l.trim());
   }
 }

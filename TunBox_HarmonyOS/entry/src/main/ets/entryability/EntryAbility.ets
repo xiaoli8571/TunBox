@@ -17,6 +17,7 @@ import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ThemeService } from '../theme/ThemeService';
+import { SafeArea } from '../theme/SafeArea';
 
 
 const TAG = 'EntryAbility';
@@ -81,8 +82,12 @@ export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     AppLogger.info(TAG, 'onCreate');
     this.applyMotionFloorByScreenSize();
-    // geo 数据随包携带：内核启动前必须就位，否则会卡在联网下载 MMDB（20s 超时）
-    GeoDataInstaller.ensure(this.context);
+    // geo 数据随包携带：内核启动前必须就位，否则会卡在联网下载 MMDB（20s 超时）。
+    // 走 ensureDeferred：解压已改 native zlib（`@ohos.zlib` GZip 流式，百毫秒级），
+    // 但首帧渲染不需要 geo，仍把这段 I/O 排到 loadContent 之后，避免抢同一帧。
+    // 历史：2026-10-31 首版用纯 TS inflate 同步解压 13.4MB 明文，解释执行约 15s，
+    // 用户看到「卡在启动页 + TunBox没有响应」ANR —— 不要退回那条路径。
+    GeoDataInstaller.ensureDeferred(this.context);
     // 长时任务取消监听（进程级幂等，API 15+）：用户删除任务通知 = 用户主动停止，
     // 需刷新记账并抑制自动重挂（《Background Tasks Kit 接入规范》红线）
     BackgroundTaskWatch.ensure();
@@ -331,6 +336,33 @@ export default class EntryAbility extends UIAbility {
     AppLogger.info(TAG, `vpn request queued: mode=${mode} seq=${seq}`);
   }
 
+  /**
+   * 开启窗口级沉浸式布局（2026-10-30 用户报障：底部系统导航条是一条实色带，和 Dock 割裂）。
+   *
+   * 真机像素取证（详见 `theme/SafeArea.ets` 文件头）：那条带 = 页面渐变终点 `#0F131D`
+   * 被系统又压了一层 25% 的黑。`navigationBarColor: '#00000000'` 关不掉它 ——
+   * 非沉浸式时系统把底部那一条当自己的地盘，自己画底以保证手势条可见。
+   * `setWindowLayoutFullScreen(true)` 之后这条归属 App，透明才是真的透明：
+   *   ① 底部不再有实色带，内容能从手势条底下滚过 → 用户说的「遮挡内容」消失；
+   *   ② Dock 不再被那条带顶在上面，可以沉到手势区里 → 用户说的「dock 太高」解决。
+   *
+   * 代价（必须由 SafeArea 补回来）：沉浸式 = 布局不再自动避让状态栏/导航条。
+   * 顶栏留白与 Dock 位置全部改由 `SafeArea` 的实测值驱动，见 `SafeArea.calibrate()`。
+   * 失败不影响启动：拿不到就退回原来的非沉浸式行为（顶栏不补白、Dock 靠 sink 下沉）。
+   */
+  private enableImmersiveLayout(win: window.Window): void {
+    // 必须等 setWindowLayoutFullScreen 完成后再 measure：切换前量到的是旧模式下的避让区
+    win.setWindowLayoutFullScreen(true).then(() => {
+      AppLogger.info(TAG, 'immersive layout enabled');
+      // 沉浸式生效后避让区立刻重算（TYPE_SYSTEM 的 bottomRect 在两种模式下取值不同）。
+      // 必须 await 或链式调用确保顺序，否则仍会拿到旧值。
+      SafeArea.init(win);
+      SafeArea.publish();
+    }).catch((e: BusinessError) => {
+      AppLogger.warn(TAG, `setWindowLayoutFullScreen failed: ${e.message}`);
+    });
+  }
+
   onWindowStageCreate(windowStage: window.WindowStage): void {
     ThemeService.init(this.context).then(() => {
       windowStage.loadContent('pages/MainPage', (err) => {
@@ -342,6 +374,8 @@ export default class EntryAbility extends UIAbility {
         this.publishPendingWant();
         windowStage.getMainWindow((err2, win) => {
           if (!err2.code) {
+            this.enableImmersiveLayout(win);
+            // enableImmersiveLayout 内会 await setWindowLayoutFullScreen 完成后再 measure
             ThemeService.syncSystemBars(win).catch(() => {});
             AppStorage.setOrCreate('main_window', win);
           }
@@ -353,6 +387,14 @@ export default class EntryAbility extends UIAbility {
         if (!err.code) {
           this.windowReady = true;
           this.publishPendingWant();
+          // 主题恢复失败也要开沉浸式：窗口外观可以晚点再刷，底栏割裂是每帧都看得见的
+          windowStage.getMainWindow((err2, win) => {
+            if (!err2.code) {
+              this.enableImmersiveLayout(win);
+              // enableImmersiveLayout 内会 await 沉浸式后再 measure
+              AppStorage.setOrCreate('main_window', win);
+            }
+          });
         }
       });
     });

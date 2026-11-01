@@ -5,9 +5,9 @@
  * 未连接/内核不可达时给出明确提示，不假装列表为空。
  * 操作：单条点击关闭（带确认）、一键关闭全部；展示流量/规则链/出口节点/持续时间。
  */
-import { router, promptAction } from '@kit.ArkUI';
+import { router, promptAction , LengthMetrics} from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
-import { TunBoxColors, TunBoxMotion } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxMotion, TunBoxGeometry} from '../theme/TunBoxTokens';
 import { Ui } from '../theme/UiTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { AppLogger } from '../commons/utils/AppLogger';
@@ -279,6 +279,7 @@ struct ConnectionsPage {
               }
             }, (entry: ConnectionEntry) => entry.id)
           }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .width('100%').layoutWeight(1)
           .padding({ left: 18, right: 18, top: 10, bottom: 20 })
           .scrollBar(BarState.Auto)

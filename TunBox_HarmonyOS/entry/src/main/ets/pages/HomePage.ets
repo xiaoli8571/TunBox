@@ -6,7 +6,7 @@
  * 2026-10-17：规则模式卡片下架，三项迁入 SettingsPage（用户 batch-2）。
  * 后端：复用 ConnectionOrchestrator / SubscriptionService / SettingsService / LatencyController 全量逻辑（未改动）。
  */
-import { router, promptAction } from '@kit.ArkUI';
+import { router, promptAction, LengthMetrics } from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { ConnEvent, ConnEventKind, ConnListener } from '../commons/services/ConnectionEvents';
 import { window } from '@kit.ArkUI';
@@ -41,6 +41,7 @@ export struct HomePage {
    * （2026-10-28 用户报障：选完节点要等启动后才更新）。
    */
   @StorageLink('node_switch_revision') @Watch('onNodeSwitched') nodeSwitchRevision: number = 0;
+
   @State isConnected: boolean = false;
   @State isConnecting: boolean = false;
   /** 乐观反馈（2026-10-17 用户反馈「点启动 1 秒多按钮才动」）：点击瞬间点亮「正在连接」，
@@ -733,7 +734,7 @@ export struct HomePage {
   }
 
   build() {
-    Stack({ alignContent: Alignment.Bottom }) {
+    Stack({ alignContent: Alignment.Top }) {
       // 底层背景列（文档骨架：纯色画布，不再用渐变/玻璃底）；
       // expandSafeArea 仅作用于背景，内容仍布局在安全区内（顶栏不被状态栏遮挡）。
       Column().width('100%').height('100%')
@@ -741,24 +742,6 @@ export struct HomePage {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
-        // ── 1. 顶部导航（文档 §2.1，无返回）：rightSlot 只保留主题切换（备份已迁到设置页） ──
-        TopNavBar({ title: 'TunBox' }) {
-          Row({ space: 8 }) {
-            Button() {
-              SymbolGlyph($r('sys.symbol.sun_max'))
-                .fontSize(20)
-                .fontColor([TunBoxColors.textMuted])
-            }
-            .width(40)
-            .height(40)
-            .borderRadius(20)
-            .backgroundColor(Color.Transparent)
-            .accessibilityText('切换浅色或深色主题')
-            .onClick(() => this.toggleTheme())
-          }
-          .alignItems(VerticalAlign.Center)
-        }
-
         Scroll() {
           Column({ space: 16 }) {
             // ── 2. 天体轨域启动按钮（2026-10-17 用户按 stitch 设计稿「方案一」重构；
@@ -827,9 +810,13 @@ export struct HomePage {
           .padding({
             left: TunBoxGeometry.pagePadding,
             right: TunBoxGeometry.pagePadding,
-            bottom: TunBoxGeometry.dockClearance
+            // 顶栏是浮层（见 build() 末尾）：首屏内容要让出它的总高，
+            // 滚动起来以后内容从玻璃底下穿过 —— 2026-10-30 用户要求「渐变模糊」。
+            top: TunBoxGeometry.headerReserve(),
+            bottom: TunBoxGeometry.dockClearance()
           })
         }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
         .width('100%')
         .layoutWeight(1)
         .scrollBar(BarState.Off)
@@ -837,6 +824,25 @@ export struct HomePage {
       }
       .width('100%')
       .height('100%')
+
+      // ── 1. 顶部导航浮层（文档 §2.1，无返回）：半透明玻璃 + 下缘渐隐，
+      //      内容从它下面滚过去时是「渐变模糊」而不是硬切一块。rightSlot 只留主题切换 ──
+      TopNavBar({ title: 'TunBox' }) {
+        Row({ space: 8 }) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.sun_max'))
+              .fontSize(20)
+              .fontColor([TunBoxColors.textMuted])
+          }
+          .width(40)
+          .height(40)
+          .borderRadius(20)
+          .backgroundColor(Color.Transparent)
+          .accessibilityText('切换浅色或深色主题')
+          .onClick(() => this.toggleTheme())
+        }
+        .alignItems(VerticalAlign.Center)
+      }
 
       // 诊断面板（既有实现不动，仅蒙层色改令牌）
       if (this.showDiagnostics) {

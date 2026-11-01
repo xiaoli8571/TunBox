@@ -45,11 +45,8 @@ const KNOWN_BASELINE_FAILURES = {
       + '[B] 段（真实源码语法解析）是通过的',
     howToConfirm: 'node scripts/verify-types.mjs 在任何历史版本上都报同样的 @ohos.annotation.d.ets TS1128/TS1146/TS1434'
   },
-  'verify-subscription-fidelity.mjs': {
-    reason: '需要真实订阅 fixture（test/fixtures/real-subscription.yaml），仓库不含该文件；'
-      + '脚本按设计在"没跑"时返回失败，避免把"没验证"当成"通过"',
-    howToConfirm: '无 fixture 时脚本自身打印「0 passed, 0 failed, 0 run — 视为失败」'
-  },
+  // 缺真实订阅样本属于未验证，不是既有代码缺陷，不能豁免该门禁的任意失败。
+  // 使用 TUNBOX_SUBSCRIPTION_FIXTURE 提供本地样本；不要把私有订阅提交到仓库。
   // 2026-10-20：旧实现清退闸门**已达成**（LP01..LP13 全绿，LP14/LP15 为永久豁免）
   // ⇒ 已从白名单里删除，不再豁免。
 };
@@ -58,7 +55,9 @@ const KNOWN_BASELINE_FAILURES = {
 const ARG_BUILDERS = {
   'verify-shipped-dns-fix.mjs': (hap) => (hap === null ? null : [hap]),
   'verify-flclash-profile.mjs': (_hap, args) => (args.strict ? ['--require-mihomo'] : []),
-  'verify-smart-active-chains.mjs': () => [] // 无设备时脚本自身会打印 SKIP 并 exit 0
+  'verify-latency-core-v2.mjs': (_hap, args) => (args.strict ? ['--arkts'] : []),
+  // 抓包路径通过环境变量由子门禁接收；缺文件仍明确 SKIP，不伪造验收数据。
+  'verify-smart-active-chains.mjs': () => []
 };
 
 function parseArgs(argv) {
@@ -107,6 +106,12 @@ function main() {
     scripts = scripts.filter((n) => args.only.some((k) => n.includes(k)));
   }
 
+  if (scripts.length === 0) {
+    console.error('RESULT: 未匹配到任何门禁（检查 --only），不得把零执行当成通过');
+    process.exitCode = 1;
+    return;
+  }
+
   console.log('===== TunBox 回归门禁 =====');
   console.log(`工程: ${project}`);
   console.log(`HAP : ${hap ?? '(未找到 dist/*.hap；verify-shipped-dns-fix 将记为跳过)'}`);
@@ -129,17 +134,20 @@ function main() {
     });
     const stdout = (r.stdout ?? '') + (r.stderr ?? '');
     const tail = stdout.trim().split('\n').slice(-3).join(' | ').slice(0, 200);
-    results.push({ name, code: r.status ?? 1, skipped: false, tail });
-    console.log(`${r.status === 0 ? 'PASS' : 'FAIL'} ${name}`);
+    const skipped = r.status === 0 && /^\s*(?:SKIP(?:PED)?\b|RESULT:.*\bskipped\b)/im.test(stdout);
+    results.push({ name, code: r.status ?? 1, skipped, tail });
+    console.log(`${r.status !== 0 ? 'FAIL' : skipped ? 'SKIP' : 'PASS'} ${name}`);
   }
 
+  const skipped = results.filter((r) => r.skipped);
+  const requiredSkips = skipped.filter((r) => args.strict || r.name === 'verify-ui-resource-bindings.mjs');
   const failed = results.filter((r) => !r.skipped && r.code !== 0);
   const whitelisted = failed.filter((r) => KNOWN_BASELINE_FAILURES[r.name] !== undefined);
   const realFailures = failed.filter((r) => KNOWN_BASELINE_FAILURES[r.name] === undefined);
 
   console.log('');
   console.log('-----------------------------------------');
-  console.log(`PASS=${results.filter((r) => r.skipped || r.code === 0).length}`
+  console.log(`PASS=${results.filter((r) => !r.skipped && r.code === 0).length}`
     + ` FAIL=${failed.length}`
     + ` (白名单 ${whitelisted.length} / 真失败 ${realFailures.length})`
     + ` SKIP=${results.filter((r) => r.skipped).length}`);
@@ -163,6 +171,12 @@ function main() {
     }
   }
 
+  if (requiredSkips.length > 0) {
+    for (const r of requiredSkips) console.error(`未执行的必需门禁: ${r.name} — ${r.tail}`);
+    console.error('RESULT: 必需门禁未执行 —— 不得发布');
+    process.exitCode = 1;
+    return;
+  }
   if (args.strict && whitelisted.length > 0) {
     console.log('');
     console.log('RESULT: STRICT 模式下白名单项也失败 —— 发布前必须先解决');
@@ -176,7 +190,9 @@ function main() {
     return;
   }
   console.log('');
-  console.log('RESULT: 全部通过（白名单项已核实为既有缺陷）');
+  console.log(whitelisted.length > 0 || skipped.length > 0
+    ? 'RESULT: 有条件通过（存在白名单失败或跳过；不等于严格发布验收通过）'
+    : 'RESULT: 全部通过');
   process.exitCode = 0;
 }
 

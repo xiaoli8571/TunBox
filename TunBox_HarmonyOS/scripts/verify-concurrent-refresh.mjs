@@ -494,7 +494,8 @@ async function runBatch(svc, lanes, stopAfter) {
 // ══════════════════════════════════════════════════════════════════════
 {
   const service = readSource(join(svcDir, 'SubscriptionService.ets'));
-  const subPage = readSource(join(pageDir, 'SubscriptionPage.ets'));
+  // 2026-10-29 重构后：订阅区是组件 `components/SubscriptionSection.ets`（`pages/SubscriptionPage.ets` 已删）。
+  const subPage = readSource(join(etsRoot, 'components', 'SubscriptionSection.ets'));
   const nodePage = readSource(join(pageDir, 'NodeSelectionPage.ets'));
 
   ok('wire.service.concurrentEntry', /async refreshSubscriptionsConcurrently\(ids: string\[\], lanes: number,/.test(service));
@@ -507,21 +508,24 @@ async function runBatch(svc, lanes, stopAfter) {
   ok('wire.service.prefetchSkipsLocal',
     /sub\.url\.startsWith\('local:\/\/'\)[\s\S]{0,120}return RefreshPrepOutcome\.skipped\(id\);/.test(service));
 
-  ok('wire.subPage.usesConcurrent', /this\.service\.refreshSubscriptionsConcurrently\(ids,/.test(subPage));
-  ok('wire.subPage.lanes', /ConcurrentRefresh\.DEFAULT_LANES/.test(subPage));
-  // 0.4.0 SubscriptionPage 重构：批量刷新在途集合更名为 refreshingIds（每订阅一格的
-  // 行内进度也复用同一集合），重入守卫仍是「新增/全量刷新/逐条刷新任一在途即拒绝」。
-  ok('wire.subPage.reentryGuard',
-    /if \(this\.isAdding \|\| this\.isRefreshing \|\| this\.refreshingIds\.length > 0\)/.test(subPage));
-  // 断言「每完成一条就更新进度」的真实写法（0.4.0 去掉了旧 `head` 模板字符串，
-  // 改为进度回调移除该订阅 + UI 按 refreshingIds 渲染行内 LoadingProgress）。
-  ok('wire.subPage.progressUi',
-    /this\.refreshingIds = this\.refreshingIds\.filter\(\(x\) => x !== item\.id\);/.test(subPage)
-    && /if \(this\.isRefreshingSub\(sub\.id\)\) \{\n\s*LoadingProgress\(\)/.test(subPage));
-  ok('wire.subPage.summaryWithFailReasons', /部分刷新成功（\$\{summary\.okCount\} 成功 \/ \$\{summary\.failCount\} 失败）/.test(subPage));
-  ok('wire.subPage.noSerialLoop',
-    !/for \(const s of this\.subs\.filter\(\(item: Subscription\) => item\.id !== DIRECT_GROUP_ID\)\)/.test(subPage));
+  // 订阅区（SubscriptionSection）走的是**单条串行**契约：卡片上的刷新图标只刷那一条，
+  // 「全部刷新」也是 snapshot 后逐条 await refreshOne。它不是并发服务的接入点，
+  // 所以这里不再拿旧页面的 refreshSubscriptionsConcurrently 断言它（否则会把
+  // 「服务在、页面不用」误判成未接入，也会诱导把串行路径改成并发而丢了逐条进度）。
+  ok('wire.subPage.serialPerSub',
+    /private async refreshAll\(\): Promise<void> \{\n    const snapshot: Subscription\[\] = this\.subs\.slice\(\);\n    for \(let i = 0; i < snapshot\.length; i\+\+\) \{\n      await this\.refreshOne\(snapshot\[i\]\);/.test(subPage));
   ok('wire.subPage.singleRowRefreshKept', /private async refreshOne\(sub: Subscription\): Promise<void>/.test(subPage));
+  // 重入守卫：全量刷新在途 + 单条在途任一个都要拒绝（不只靠 refreshing 布尔量）
+  ok('wire.subPage.reentryGuard',
+    /if \(this\.refreshing \|\| this\.isRefreshingSub\(sub\.id\)\) \{\n      return;/.test(subPage));
+  // 在途集合既做防重入，也做每张卡片的行内进度（busyRef 现读，避免 @Builder 按值捕获）
+  ok('wire.subPage.progressUi',
+    /this\.refreshingIds = this\.refreshingIds\.filter\(\(x: string\): boolean => x !== sub\.id\);/.test(subPage)
+    && /if \(busyRef\(\)\) \{\n        LoadingProgress\(\)/.test(subPage)
+    && /@State private refreshingIds: string\[\] = \[\];/.test(subPage));
+  // 单条刷新必须有结果分支（成功 / 失败都要告诉用户），不能一律报「已刷新」
+  ok('wire.subPage.perItemOutcome',
+    /this\.toast\(ok \? `✓ \$\{sub\.name\} 已刷新` : `刷新失败：\$\{sub\.name\}`\);/.test(subPage));
 
   ok('wire.nodePage.usesConcurrent', /this\.subs\.refreshSubscriptionsConcurrently\(ids,/.test(nodePage));
   ok('wire.nodePage.lanes', /ConcurrentRefresh\.DEFAULT_LANES/.test(nodePage));
@@ -533,6 +537,8 @@ async function runBatch(svc, lanes, stopAfter) {
     /if \(this\.refreshing\) \{\n\s*Text\(`\$\{this\.refreshDone\}\/\$\{this\.refreshTotal\}`\)/.test(nodePage));
   ok('wire.nodePage.noSerialLoop', !/const r = await this\.subs\.refreshSubscription\(s\.id\);/.test(nodePage));
   ok('wire.nodePage.toastSummary', /刷新完成，共 \$\{summary\.nodeCount\} 个节点/.test(nodePage));
+  ok('wire.nodePage.summaryWithFailReasons',
+    /\$\{summary\.okCount\} 成功 \/ `\n\s*\+ `\$\{summary\.failCount\} 失败/.test(nodePage));
 }
 
 // ── 汇总 ────────────────────────────────────────────────────────────

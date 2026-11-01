@@ -19,7 +19,7 @@
  * - 诊断自检 → 默认开启，完全隐藏（自动修复、最多 2 步）
  * 用户感知：无感保障连接质量，无需任何配置。
  */
-import { router, promptAction } from '@kit.ArkUI';
+import { router, promptAction, LengthMetrics } from '@kit.ArkUI';
 import { RulesEditorSnapshot, RulesPageParams } from '../commons/models/RulesEditorSnapshot';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { common } from '@kit.AbilityKit';
@@ -69,6 +69,7 @@ export struct SettingsView {
   @StorageLink('theme_revision') themeRevision: number = 0;
   /** 宿主（底部页签 MainPage / 路由包装页 SettingsPage）「重新展示」通知桥（替代 onPageShow 语义） */
   shownBridge?: TabLifecycleBridge;
+
   @State appRoutingSummary: string = '正在读取应用分流…';
   /** 广告拦截规则状态（原首页「规则模式」卡片迁入，语义与首页 rulesStatusText 一致） */
   @State adRulesSummary: string = '正在读取规则状态…';
@@ -369,10 +370,7 @@ export struct SettingsView {
         .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
-      Column() {
-        // ── 顶栏（底部页签页：无返回）──
-        TopNavBar({ title: this.settingsTitle })
-
+      Stack({ alignContent: Alignment.Top }) {
         Scroll() {
           Column({ space: 14 }) {
             // ── 应用分流：进入统一页面，不在设置页维护第二份编辑状态 ──
@@ -568,16 +566,22 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
             // 页签页底部为悬浮 Dock 预留（契约：≥ TunBoxGeometry.dockClearance）
-            Blank().height(TunBoxGeometry.dockClearance)
+            Blank().height(TunBoxGeometry.dockClearance())
           }
           .width('100%')
           .padding({
-            left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 24
+            left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding,
+            // 顶栏现在是浮层：首屏让出它的总高（滚动起来就从玻璃下面穿过）
+            top: TunBoxGeometry.headerReserve() + 8, bottom: 24
           })
         }.edgeEffect(EdgeEffect.Spring)
-        .width('100%').layoutWeight(1)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
+        .width('100%').height('100%')
         .scrollBar(BarState.Off)
         .align(Alignment.Top)
+
+        // ── 顶栏浮层（底部页签页：无返回）：玻璃 + 下缘渐隐，内容从它下面滚过去 ──
+        TopNavBar({ title: this.settingsTitle })
       }
       .width('100%').height('100%')
     }

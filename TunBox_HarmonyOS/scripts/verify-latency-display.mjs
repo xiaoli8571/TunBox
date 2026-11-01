@@ -128,11 +128,11 @@ ok('测速完成提示不带计数（只有「✓ 测速完成」）',
   /'✓ 测速完成'/.test(persistSrc)
   && !/可用 \$\{progress\.measured\}/.test(persistSrc)
   && !/可用 \$\{progress\.measured\}/.test(fs.readFileSync(
-    path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8')));
+    path.join(root, 'entry/src/main/ets/components/SubscriptionSection.ets'), 'utf8')));
 
 // 2026-10-23 用户要求：所有组级失败统计提示一律移除，诊断数据仍留在日志。
 const subPageSrc = fs.readFileSync(
-  path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets'), 'utf8');
+  path.join(root, 'entry/src/main/ets/components/SubscriptionSection.ets'), 'utf8');
 ok('测速完成提示不带控制器过载计数',
   !/coreOverloaded\s*>\s*0|个节点控制器过载未测/.test(subPageSrc));
 ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress）',
@@ -151,12 +151,14 @@ const flcSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/flclash/FlclashDelay.ets'), 'utf8');
 ok('组测唯一入口 = FlclashLatencyService（逐节点，不再调内核组接口）',
   /FlclashLatencyService\.start\(/.test(bgSrc) && !/testGroupDetailedResult/.test(bgSrc));
-ok('订阅展开区保留可访问的闪电测速入口',
-  /accessibilityText\('闪电测速'\)/.test(subPageSrc)
-  && /onClick\(\(\) => this.speedTestSub\(sub.id\)\)/.test(subPageSrc));
-ok('组测在途有防重入 + 转圈',
-  /if \(this\.groupTesting\) \{\s*return;/.test(subPageSrc)
-  && /@State groupTesting: boolean = false;/.test(subPageSrc));
+ok('订阅卡片保留可访问的测速入口',
+  /this\.CardAction\(\$r\('app.media.ic_bolt'\), '订阅测速'/.test(subPageSrc)
+  && /this\.testSub\(sub.id, sub.name\)/.test(subPageSrc)
+  && /accessibilityText\(label\)/.test(subPageSrc));
+ok('订阅测速在途有防重入与响应式转圈',
+  /if \(this\.isTestingSub\(subId\)\) \{\s*return;/.test(subPageSrc)
+  && /@State private testingIds: string\[\] = \[\];/.test(subPageSrc)
+  && /if \(busyRef\(\)\) \{\s*LoadingProgress\(\)/.test(subPageSrc));
 const flcServiceSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/flclash/FlclashLatencyService.ets'), 'utf8');
 ok('组测/批量结果有可检索的完成日志（total/measured/timeout/failed/cancelled）',
@@ -235,8 +237,8 @@ ok('批次硬截止可注入（0 = 自动，测试注入小值仍生效）',
   && /batchDeadlineMs > 0/.test(engineSrc)
   && /static deadlineForBatch\(nodeCount: number\): number/.test(engineSrc));
 
-for (const name of ['SubscriptionPage', 'NodeSelectionPage']) {
-  const page = fs.readFileSync(path.join(root, 'entry/src/main/ets/pages', `${name}.ets`), 'utf8');
+for (const [name, file] of [['SubscriptionSection', 'components/SubscriptionSection.ets'], ['NodeSelectionPage', 'pages/NodeSelectionPage.ets']]) {
+  const page = fs.readFileSync(path.join(root, 'entry/src/main/ets', file), 'utf8');
   ok(`${name} 不再展示组级失败诊断`,
     !/subDiagnosisText|latencyGroupDiagnosis|groupDiagnosis\(/.test(page));
   ok(`${name} 不再展示超时或过载数量提示`,

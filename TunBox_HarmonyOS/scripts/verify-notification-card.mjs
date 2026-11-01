@@ -102,7 +102,7 @@ const P = {
   // N6 publish 成功要记 lastPublishAt（心跳的基准）
   n6RecordsPublish: (s) => /notificationManager\.publish\(request\);[\s\S]{0,240}TunBoxNotifier\.lastPublishAt = now;/.test(s),
   // N7 cancel 要复位心跳（否则断开再连会被节流吃掉首帧）
-  n7CancelResets: (s) => /static async cancel\(\): Promise<void> \{[\s\S]*?TunBoxNotifier\.lastPublishAt = 0;/.test(s),
+  n7CancelResets: (s) => /static cancel\(\): Promise<void> \{[\s\S]*?TunBoxNotifier\.lastPublishAt = 0;/.test(s),
 
   // P1 内容层透传 force
   p1UpdaterForceParam: (s) => /static updateLive\(nodeText: string, speedLine: string, durationText: string,\s*\n\s*force: boolean = false\)/.test(s),

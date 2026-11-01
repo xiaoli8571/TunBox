@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
 const serviceFile = path.join(root, 'entry/src/main/ets/commons/services/SubscriptionService.ets');
-const pageFile = path.join(root, 'entry/src/main/ets/pages/SubscriptionPage.ets');
+const pageFile = path.join(root, 'entry/src/main/ets/components/SubscriptionSection.ets');
 
 let passed = 0;
 let failed = 0;
@@ -80,15 +80,16 @@ function runChecks(serviceSrc, pageSrc) {
   // ── B. 页面：URL 输入拒绝单节点，指向订阅转换 ────────────────────────────
   ok(!/addDirectNodesText/.test(page), '页面不再调用 addDirectNodesText');
   ok(!/importNodeUris/.test(page), '页面不再有 importNodeUris（节点链接导入方法）');
-  ok(/SubscriptionService\.isNodeUri\(l\)/.test(page),
-    'URL 输入按行识别单节点链接（isNodeUri）');
-  ok(/单节点链接不支持在这里添加/.test(page),
-    'URL 输入拒绝单节点链接，并给出可行动提示');
-  ok(/设置 → 订阅转换/.test(page), '提示里指向「设置 → 订阅转换」');
-  ok(/扫码只支持 Clash 订阅二维码/.test(page) && /设置 → 订阅转换/.test(page),
-    '扫码提示同样指向订阅转换（不再说「+ → URL 里粘贴」）');
-  // 订阅地址分支必须还在：拒绝单节点不能顺手把订阅 URL 也拒了
-  ok(/isValidSubscriptionUrl\(raw/.test(page), '订阅地址校验分支仍在（拒绝单节点不等于拒绝订阅）');
+  ok(/if \(SubscriptionService\.isNodeUri\(nextUrl\)\) \{[\s\S]*?return;/.test(page),
+    'URL 输入识别并拒绝单节点链接（isNodeUri）');
+  ok(/只支持 Clash 订阅链接，不支持单节点分享链接/.test(page),
+    'URL 输入明确提示单节点链接不受支持');
+  ok(/private async importFromConvert\(/.test(page) && /SubConverter\.convert\(body\)/.test(page),
+    '分享链接仍有独立转换导入入口，不恢复虚拟直链分组');
+  ok(/二维码里应是 Clash 订阅链接/.test(page) && /await this\.applyAdd\('', raw\)/.test(page),
+    '扫码仅接受 HTTP(S) 后复用 URL 拒绝分支');
+  ok(/lower\.startsWith\('https:\/\/'\) \|\| lower\.startsWith\('http:\/\/'\)/.test(page),
+    'HTTP(S) 订阅地址校验仍在');
   ok(/this\.service\.addSubscription\(/.test(page), '订阅添加路径仍在');
 }
 
@@ -97,7 +98,7 @@ function selfTest(serviceSrc, pageSrc) {
     {
       name: 'URL 输入重新接受单节点（拒绝分支被删）',
       run: () => runChecks(serviceSrc,
-        pageSrc.replace(/const hasNodeUri = [\s\S]*?\n    \}\n/, ''))
+        pageSrc.replace(/if \(SubscriptionService\.isNodeUri\(nextUrl\)\) \{[\s\S]*?\n    \}/, ''))
     },
     {
       name: '启动时不再清理旧版直链节点（purgeDirectGroup 调用被删）',

@@ -12,7 +12,7 @@
  * ArkUI 的 @Builder 值参数不是响应式的，传进去的 string/number 变化不会重渲染 ——
  * 之前「内存占用 / 运行时间不显示（实际是永不刷新）」就是这个原因。
  */
-import { promptAction } from '@kit.ArkUI';
+import { promptAction , LengthMetrics} from '@kit.ArkUI';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
@@ -73,6 +73,7 @@ function countryCodeToFlag(code: string): string {
 struct StatsRateChart {
   @Prop upPoints: number[] = [];
   @Prop downPoints: number[] = [];
+
   @State private chartW: number = 300;
   @State private chartH: number = 92;
 
@@ -914,6 +915,7 @@ export struct StatsPage {
         .height(Math.min(this.entries.length * 48, 240))
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
       } else {
         Text('暂无目标，点「添加」输入域名')
           .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
@@ -933,9 +935,9 @@ export struct StatsPage {
   }
 
   build() {
-    Column() {
-      TopNavBar({ title: '数据' })
-
+    // 2026-10-30：顶栏改成浮层玻璃（内容从它下面滚过去时渐变模糊，而不是被硬切），
+    // 所以根节点从 Column 换成 Stack：Scroll 铺满、顶栏最后画（在最上层）。
+    Stack({ alignContent: Alignment.Top }) {
       Scroll() {
         Column({ space: 14 }) {
           this.SpeedCard()
@@ -947,14 +949,17 @@ export struct StatsPage {
         .padding({
           left: TunBoxGeometry.pagePadding,
           right: TunBoxGeometry.pagePadding,
-          bottom: TunBoxGeometry.dockClearance
+          top: TunBoxGeometry.headerReserve(),
+          bottom: TunBoxGeometry.dockClearance()
         })
       }
       .edgeEffect(EdgeEffect.Spring)
       .width('100%')
-      .layoutWeight(1)
+      .height('100%')
       .scrollBar(BarState.Off)
       .align(Alignment.Top)
+
+      TopNavBar({ title: '数据' })
     }
     .width('100%')
     .height('100%')

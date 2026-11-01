@@ -85,7 +85,7 @@ const latencyTestUrlStub = [
   `  static readonly LEGACY_CLOUDFLARE_HTTP: string = ${JSON.stringify(latencyTestUrlConst('LEGACY_CLOUDFLARE_HTTP'))};`,
   '}'
 ].join('\n');
-const code = latencyTestUrlStub + '\n' + sortClass + '\n' + policySource + '\n'
+const code = read('commons/services/ImportFilePolicy.ets') + '\n' + latencyTestUrlStub + '\n' + sortClass + '\n' + policySource + '\n'
   + settingsSource.replace(/^import .*;\r?\n/gm, '') + serviceHarness;
 const js = stripTypeScriptTypes(code, { mode: 'strip' });
 const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));

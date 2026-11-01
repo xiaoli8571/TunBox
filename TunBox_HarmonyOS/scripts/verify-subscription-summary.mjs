@@ -26,7 +26,8 @@ const cases = [
   [S.updateTime(now - 86400000, now), '1天前']
 ];
 for (const [actual, expected] of cases) assert.equal(actual, expected);
-const page = fs.readFileSync(new URL('entry/src/main/ets/pages/SubscriptionPage.ets', root), 'utf8');
-assert.ok(page.includes('SubscriptionSummary.traffic(sub.uploadBytes, sub.downloadBytes, sub.totalBytes)'));
-assert.ok(page.includes('${this.trafficSummaryOf(sub)}'));
+const page = fs.readFileSync(new URL('entry/src/main/ets/components/SubscriptionSection.ets', root), 'utf8');
+assert.ok(page.includes('SubscriptionSummary.bytes(sub.uploadBytes)'));
+assert.ok(page.includes('SubscriptionSummary.bytes(sub.downloadBytes)'));
+assert.ok(page.includes('SubscriptionSummary.bytes(sub.totalBytes)'));
 console.log(`PASS subscription summary: ${cases.length} behavior cases + 2 UI wiring checks`);

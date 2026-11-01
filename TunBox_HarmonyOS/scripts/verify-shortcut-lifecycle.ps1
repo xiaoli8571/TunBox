@@ -11,15 +11,26 @@ function Assert-Text([string]$Text, [string]$Pattern, [string]$Message) {
   if ($Text -notmatch $Pattern) { throw $Message }
 }
 
-$shortcut = [IO.File]::ReadAllText($shortcutPath)
+# Desktop shortcuts are optional; service cards still route to QuickToggleAbility.
+$shortcut = if (Test-Path $shortcutPath) { [IO.File]::ReadAllText($shortcutPath) } else { $null }
 $ability = [IO.File]::ReadAllText($abilityPath)
 $entry = [IO.File]::ReadAllText($entryPath)
 $module = [IO.File]::ReadAllText($modulePath)
 $app = [IO.File]::ReadAllText($appPath)
 
-Assert-Text $shortcut '"bundleName"\s*:\s*"com\.tunbox\.client"' 'Shortcut bundleName mismatch'
-Assert-Text $shortcut '"abilityName"\s*:\s*"QuickToggleAbility"' 'Shortcut target mismatch'
-Assert-Text $shortcut '"vpn_shortcut"\s*:\s*"start"' 'Shortcut parameter missing'
+if ($null -ne $shortcut) {
+  Assert-Text $shortcut '"bundleName"\s*:\s*"com\.tunbox\.client"' 'Shortcut bundleName mismatch'
+  Assert-Text $shortcut '"abilityName"\s*:\s*"QuickToggleAbility"' 'Shortcut target mismatch'
+  Assert-Text $shortcut '"vpn_shortcut"\s*:\s*"start"' 'Shortcut parameter missing'
+} else {
+  Assert-Text $module '"name"\s*:\s*"QuickToggleAbility"' 'Card host missing'
+  foreach ($card in @('ToggleCard', 'InfoCard')) {
+    $cardSource = [IO.File]::ReadAllText((Join-Path $root "entry\src\main\ets\widget\$card.ets"))
+    Assert-Text $cardSource "'abilityName'\s*:\s*'QuickToggleAbility'" "$card host mismatch"
+    Assert-Text $cardSource "'vpn_shortcut'\s*:\s*'toggle'" "$card toggle parameter missing"
+  }
+  Write-Output 'PASS desktop shortcut intentionally absent; both service-card routes verified'
+}
 Assert-Text $module '"name"\s*:\s*"QuickToggleAbility"' 'QuickToggleAbility module declaration missing'
 Assert-Text $module '"launchType"\s*:\s*"singleton"' 'QuickToggleAbility must use singleton launchType'
 Assert-Text $ability 'onCreate\s*\(' 'Cold-start onCreate handler missing'
@@ -27,13 +38,18 @@ Assert-Text $ability 'onNewWant\s*\(' 'Existing-instance onNewWant handler missi
 Assert-Text $ability 'onForeground\s*\(' 'Foreground recovery handler missing'
 Assert-Text $ability 'private\s+enqueue\s*\(' 'Shortcut enqueue gate missing'
 Assert-Text $ability 'private\s+drain\s*\(' 'Single-flight drain missing'
-Assert-Text $ability 'if\s*\(this\.running\s*\|\|' 'Single-flight running guard missing'
+Assert-Text $ability 'if\s*\([^\r\n]*this\.running\s*\|\|' 'Single-flight running guard missing'
 Assert-Text $ability 'if\s*\(this\.pendingMode\.length\s*>\s*0\)' 'Deferred click drain missing'
 Assert-Text $entry 'onCreate\s*\(' 'EntryAbility onCreate missing'
 Assert-Text $entry 'onNewWant\s*\(' 'EntryAbility onNewWant missing'
 Assert-Text $app '"bundleName"\s*:\s*"com\.tunbox\.client"' 'App bundleName mismatch'
-Assert-Text $app '"versionName"\s*:\s*"5\.2"' 'versionName is not 5.2'
-Assert-Text $app '"versionCode"\s*:\s*50200' 'versionCode is not 50200'
+$versionName = [regex]::Match($app, '"versionName"\s*:\s*"([^"]+)"').Groups[1].Value
+Assert-Text $app '"versionCode"\s*:\s*[1-9]\d*' 'versionCode must be positive'
+foreach ($manifest in @('oh-package.json5', 'entry\oh-package.json5')) {
+  $text = [IO.File]::ReadAllText((Join-Path $root $manifest))
+  Assert-Text $text ('"version"\s*:\s*"' + [regex]::Escape($versionName) + '"') "$manifest version mismatch"
+}
+if (-not $versionName) { throw 'App versionName missing' }
 
 function Invoke-Model([string]$State, [string[]]$Events) {
   $running = $false

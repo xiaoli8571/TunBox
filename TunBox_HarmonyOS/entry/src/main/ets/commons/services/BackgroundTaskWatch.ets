@@ -107,6 +107,10 @@ function isMisuseCancelReason(reasonCode: number): boolean {
  * 官方枚举：ContinuousTaskDetailedCancelReason。
  */
 function isMisuseDetailedReason(code: number): boolean {
+  // API24/25 不提供该枚举；缺少细分信息时仍按粗分类继续清账，不能在事件回调中崩溃。
+  if (code <= 0 || typeof backgroundTaskManager.ContinuousTaskDetailedCancelReason === 'undefined') {
+    return false;
+  }
   return code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED
     || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_NOT_UPDATE
     || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_USE_ILLEGALLY
@@ -152,7 +156,9 @@ export function classifyCancelReason(reasonCode: number, detailedReasonCode: num
   verdict.detailedReasonCode = detailedReasonCode;
   if (reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.USER_CANCEL
     || reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.USER_CANCEL_REMOVE_NOTIFICATION
-    || detailedReasonCode === backgroundTaskManager.ContinuousTaskDetailedCancelReason.USER_CANCEL_REMOVE_NOTIFICATION) {
+    || (detailedReasonCode > 0
+      && typeof backgroundTaskManager.ContinuousTaskDetailedCancelReason !== 'undefined'
+      && detailedReasonCode === backgroundTaskManager.ContinuousTaskDetailedCancelReason.USER_CANCEL_REMOVE_NOTIFICATION)) {
     // 用户主动停止：规范明文"不得立即再次申请" → 只能等显式用户操作。
     // 第三个条件覆盖"粗分类只给了 SYSTEM_CANCEL、细分类才指出是用户删通知"的情况
     // （SDK 两种枚举都有 USER_CANCEL_REMOVE_NOTIFICATION = 3）。

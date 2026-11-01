@@ -23,6 +23,7 @@
 import { FloatingBottomBar } from '../components/FloatingBottomBar';
 import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
+import { SafeArea } from '../theme/SafeArea';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { HomePage } from './HomePage';
 import { StatsPage } from './StatsPage'; // 页签 1「数据」= ClashPlus 数据页
@@ -143,6 +144,13 @@ struct MainPage {
       }
       .width('100%')
       .height('100%')
+      // 2026-10-30：安全区自校准的取样点（见 theme/SafeArea.ets 文件头）。
+      // 这个 Stack 是「100% 高 + 没掛 expandSafeArea」的容器：它的实测高度就是布局可用高度。
+      // 沉浸式生效时它 = 整屏；仍在避让时它 = 整屏 − 状态栏 − 手势区 —— 两者一比就知道
+      // 要不要给顶栏补白、要不要把 Dock 往下沉。取第一次非零值，偏差 2vp 内算「没避让」。
+      .onAreaChange((_old: Area, cur: Area) => {
+        SafeArea.calibrate(Number(cur.height));
+      })
 
       // 底部悬浮导航栏（文档 §2.2，浮在内容之上，栏体完全透明）
       FloatingBottomBar({

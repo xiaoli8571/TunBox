@@ -3,7 +3,13 @@
   "buildOption": {
     "externalNativeOptions": {
       "path": "./src/main/cpp/CMakeLists.txt",
-      "arguments": "",
+      // 2026-10-31：libc++ 静态链接，去掉随包的 libc++_shared.so（1.20MB 未压缩 / 0.38MB 压缩）。
+      // 依据：全工程只有一个 C++ 产物 libtunbox_core_napi.so，它引用的 C++ 符号只有
+      //   std::__n1::basic_string::assign / mutex / operator new / delete / __cxa_*，
+      //   不存在「跨 .so 共享 libc++ 对象」的场景（libgojni.so 是 Go，只 NEEDED libc.so）。
+      // OHOS_STL 由 ohos.toolchain.cmake 读取：c++_static ⇒ 追加 -static-libstdc++，
+      // 且不再把 libc++_shared.so 拷进 libs/arm64-v8a/。
+      "arguments": "-DOHOS_STL=c++_static",
       "cppFlags": "",
       "abiFilters": ["arm64-v8a"]
     }

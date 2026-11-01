@@ -12,6 +12,7 @@
  * 深浅切换在渲染时即时解析（页面持有 @StorageLink('theme_revision') 即重渲染）。
  */
 import { AppBgTheme, ThemeService } from './ThemeService';
+import { SafeArea } from './SafeArea';
 import { LatencyRecord, LatencyPolicy, LatencyState } from '../commons/services/LatencyState';
 import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore';
 
@@ -371,6 +372,22 @@ export class TunBoxColors {
    *
    * 终点色仍跟当前背景配色走（薄荷/暖米/暮蓝），否则选了彩色背景后底栏还留在蓝灰系，边边会脱开。
    */
+  /**
+   * 顶栏玻璃染色（2026-10-31 七修）。
+   *
+   * 前几版给的 alpha 是 0.22/0.05 这种量级，实测顶栏内部像素 (243,246,253)、页面底色
+   * (243,246,251) —— **差 0~2 级**，用户看到的就是「没有任何变化」。而底部 Dock 之所以明显，
+   * 是它比页面亮 15 级（内部 252 vs 页面 237）还带一道白光边。
+   * 这里直接按 Dock 的实测亮度反推 alpha：浅色要 ~0.55 才够，深色 ~0.34。
+   */
+  static headerGlassTop(rev: number): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(38, 46, 66, 0.42)' : 'rgba(255, 255, 255, 0.62)';
+  }
+
+  static headerGlassBottom(rev: number): ResourceColor {
+    return ThemeService.isDark() ? 'rgba(24, 32, 48, 0.30)' : 'rgba(255, 255, 255, 0.34)';
+  }
+
   static dockGradientTop(rev: number): ResourceColor {
     TunBoxColors.syncPalette(rev);
     if (ThemeService.isDark()) {
@@ -419,6 +436,11 @@ export class TunBoxColors {
   static dockGlassTint(rev: number): ResourceColor {
     return ThemeService.isDark() ? 'rgba(20, 26, 40, 0.10)' : 'rgba(255, 255, 255, 0.06)';
   }
+
+  // ── 顶栏玻璃（2026-10-30 二修：用户「往上滑动被上面完全遮挡」+「感觉不够透明」）────────────
+
+
+
 
   /** 液态玻璃上沿的镜面高光起点：浅色接近纯白，深色只留一层冷调微光，避免夜间「发白发脏」 */
   static dockSheenStrong(rev: number): ResourceColor {
@@ -547,6 +569,58 @@ export class TunBoxGeometry {
   static readonly controlRadius: number = 14;
   /** 列表间距 12vp */
   static readonly listGap: number = 12;
+  /**
+   * 滚动容器两端「渐隐」长度 vp（2026-10-30 用户：往上滑动会被顶栏完全遮挡，要渐变模糊）。
+   *
+   * 页签页是 `Column { 顶栏 ; Scroll }`，内容滚到 Scroll 顶边就被**硬切**——
+   * 用户看到的是「被上面完全遮挡」。`fadingEdge` 是 ArkUI 原生的边缘渐隐：
+   * 内容进入这两条就会按线性 alpha 淡出（比给每个页面再加一层遮罩便宜，也没有接缝）。
+   * 48vp ≈ 三行卡片的 1/4，够长才看得出「渐变」；想更柔就调到 64。
+   */
+  static readonly scrollFadeEdge: number = 48;
+
+  /**
+   * 滚动内容顶部要预留的高度 = 顶栏浮层总高（状态栏让白 + 顶栏行）。
+   * 顶栏现在是 Stack 里的浮层（铺在内容之上），所以内容得自己让出这一段，
+   * 首屏才不会第一张卡被标题压住；滚动起来以后则从玻璃底下穿过。
+   */
+  static headerReserve(): number {
+    return SafeArea.topPad() + TunBoxGeometry.navHeight;
+  }
+
+  /**
+   * 顶栏「渐变模糊」的半径上限（vp）—— 2026-10-31 十三修。
+   *
+   * 走的是官方 `linearGradientBlur(radius, { fractionStops, direction })`：
+   * 系统按停靠点插值算模糊，天生连续，**不会**出现分带拼接出来的条块/马赛克
+   * （那是逐条 `backgroundEffect` 各自取样才有的毛病，见 docs/HEADER_GRADIENT_BLUR_2026-10-31.md）。
+   * 渐变模糊作用在滚动容器的内容上：越靠顶越糊，到顶栏下沿附近归零。
+   */
+  static topBlurRadius(): number {
+    return 16;
+  }
+
+  /**
+   * 渐变模糊停靠点 `[模糊度, 位置]`，位置按**滚动容器高度**归一化（0=顶部，1=底部）。
+   *
+   * 关键约束（2026-10-31 十五修，用户报「点订阅后第一个节点变模糊了」）：
+   * 模糊区**必须收在 `headerReserve()` 以内**。列表静止时的首项正好从
+   * `headerReserve()` 这一行开始，一旦把收口点放到 1.15×，首项顶边就落进模糊区
+   * —— 于是静止状态也糊，看起来像坏了。现在收到 1.0×（再留 2% 余量防取整）：
+   *   - 静止：首项完全在清晰区；
+   *   - 滚动：内容进入顶栏那一段才逐渐糊，出顶栏即清晰。
+   * 位置必须严格递增，否则系统按非法值记日志并忽略。
+   */
+  static topBlurStops(): Array<[number, number]> {
+    const measured: number = AppStorage.get<number>(SafeArea.KEY_SCREEN_VP) ?? 0;
+    const base: number = measured > 200 ? measured : 800;
+    const reserve: number = TunBoxGeometry.headerReserve();
+    const solid: number = Math.min(0.85, (reserve * 0.50) / base);
+    const clear: number = Math.min(0.95, (reserve * 0.98) / base);
+    return [[1, 0], [1, solid], [0, clear]];
+  }
+
+
   /** 卡片内边距 16~20vp */
   static readonly cardPadding: number = 16;
   static readonly cardPaddingLarge: number = 18;
@@ -555,20 +629,44 @@ export class TunBoxGeometry {
   /** 底部悬浮栏：64 高 / 32 圆角；沉浸式下贴近系统手势区。 */
   static readonly dockHeight: number = 64;
   static readonly dockRadius: number = 32;
-  static readonly dockBottomMargin: number = 0;
+
+  /**
+   * Dock 底边到**屏幕底边**的目标间距。
+   *
+   * 2026-10-30 用户要求「dock 往下调一点，让导航栏和 dock 融为一体」：
+   * 原来底部那一条是系统画的实色遮罩（详见 `theme/SafeArea.ets` 文件头的像素取证），
+   * Dock 被它顶在上面，两者看起来是两块。改成沉浸式后那一条归 App，Dock 直接
+   * 沉到手势区里，只留 `SafeArea.dockGap()`（手势区高度的 60%，夹 8~22vp）——
+   * 于是 Dock 的底沿正好压在手势指示条上沿，视觉上是一块。
+   */
+  static dockBottomMargin(): number {
+    return SafeArea.dockMargin();
+  }
+
+  /** 沉浸式没生效（布局仍在避让系统栏）时，Dock 需要额外往下沉的量 */
+  static dockSink(): number {
+    return SafeArea.dockSink();
+  }
+
   /** 底栏底部渐隐底高度：盖住底栏本体 + 上方一段过渡，让内容在进入底栏前淡出 */
   static readonly dockScrimHeight: number = 170;
   /**
-   * 页面底部为悬浮栏留白（栏高 + 下边距 + 余量）
+   * 页面底部为悬浮栏留白（栏高 + 下边距 + 余量）。
    *
    * 2026-10-29 真机取证：70 太小，内容（末张卡片 + 其投影）底边落在 2347px，
    * 而栏体顶边在 2342px —— 内容正好卡在栏口。栏体的 `backgroundEffect` 模糊半径 26vp
    * 会把这弡暗边**向下抹进栏内约 62px**，于是栏内上半比下半暗 16~28 级，
    * 看上去就是用户报障的「底框一半是阴影」（与栏体自身 shadow 无关，删掉阴影像素纹丝不动）。
-   * 现在抬到 112vp（≈266px），静止时内容底边约 2228px，高于模糊能够到的 2280px ——
-   * 栏内上下亮度一致；滑动中内容从玻璃下穿过时仍然是正常的毛玻璃透出。
+   * 当时写死 112vp（≈266px）解决。
+   *
+   * 2026-10-30：改成**跟着实测手势区走**的动态值 `SafeArea.dockClearance()`
+   * = 栏高 64 + Dock 底距 gap + 呼吸 40，并 clamp 到不低于 112（不比旧值小，模糊半径够不着）。
+   * 写死的 112 在沉浸式之后会多留一条空档：那 112 是从「安全区底边」算的，
+   * 而安全区底边比屏幕底边还高一整个手势区。
    */
-  static readonly dockClearance: number = 112;
+  static dockClearance(): number {
+    return SafeArea.dockClearance();
+  }
   /** 首页「天体轨域」启动按钮（CelestialPowerOrb）：
    *  最外呼吸光晕 / 点阵轨道 / 渐变轨环(弧线) / 核心亚克力盘。
    *

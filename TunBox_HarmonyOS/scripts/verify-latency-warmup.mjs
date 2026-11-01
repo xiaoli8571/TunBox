@@ -81,7 +81,7 @@ const pagesDir = path.join(etsRoot, 'pages');
 
 const ORCH = path.join(svcDir, 'ConnectionOrchestrator.ets');
 const BG = path.join(svcDir, 'BackgroundLatencyService.ets');
-const SUB_PAGE = path.join(pagesDir, 'SubscriptionPage.ets');
+const SUB_PAGE = path.join(pagesDir, 'NodeSelectionPage.ets');
 const NODE_PAGE = path.join(pagesDir, 'NodeSelectionPage.ets');
 
 // ── 断言收集 ──────────────────────────────────────────────────────────
@@ -418,7 +418,7 @@ const REMAINING_DIFF_RE = new RegExp(
 console.log('===== 测速通道预热 / 秒开 —— 结构不变量闸门 =====');
 console.log(`ConnectionOrchestrator      : ${ORCH}`);
 console.log(`BackgroundLatencyService   : ${BG}`);
-console.log(`SubscriptionPage            : ${SUB_PAGE}`);
+console.log(`NodeSelectionPage (subscription replacement): ${SUB_PAGE}`);
 console.log(`NodeSelectionPage           : ${NODE_PAGE}`);
 console.log('-----------------------------------------');
 
@@ -665,23 +665,23 @@ console.log('[A9] BackgroundLatencyService 有 prewarm 静态方法');
 // ═══════════════════════════════════════════════════════════════════════
 // A10 页面预热调用点
 // ═══════════════════════════════════════════════════════════════════════
-console.log('[A10] SubscriptionPage / NodeSelectionPage 至少一个页面有预热调用');
+console.log('[A10] NodeSelectionPage 页面有预热调用');
 {
   const subHit = /prewarm/i.test(sub.code);
   const nodeHit = /prewarm/i.test(node.code);
   ok('a10.page-prewarm-call', subHit || nodeHit,
-    'SubscriptionPage.ets 与 NodeSelectionPage.ets 里都找不到 prewarm 调用');
+    'NodeSelectionPage.ets 里找不到 prewarm 调用');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // A11 SubscriptionPage 的「准备…通道」用户可见提示文案
 // ═══════════════════════════════════════════════════════════════════════
-console.log('[A11] SubscriptionPage 有「准备…通道」的用户可见提示文案');
+console.log('[A11] NodeSelectionPage 有「准备…通道」的用户可见提示文案');
 {
   const literalHit = findChannelHintLiteral(sub.lit);
   ok('a11.prepare-channel-text', literalHit !== null,
     literalHit === null
-      ? 'SubscriptionPage.ets 里找不到同时含「准备」与「通道」的字符串字面量'
+      ? 'NodeSelectionPage.ets 里找不到同时含「准备」与「通道」的字符串字面量'
         + '（测速预检阶段要给出「准备测速通道」这类用户可见提示）'
       : '');
   if (literalHit) {

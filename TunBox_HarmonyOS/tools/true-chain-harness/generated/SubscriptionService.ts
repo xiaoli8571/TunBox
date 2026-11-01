@@ -1298,6 +1298,17 @@ export class SubscriptionService {
       if (typeof j.etag !== 'string' || j.etag.length > 1024) {
         j.etag = '';
       }
+      // 每订阅自动更新开关/间隔（2026-10-30 用户报障后新增）
+      // 与其它后加字段同策略：非法值就地归一，绝不因新字段丢弃整条订阅。
+      if (typeof j.autoUpdate !== 'boolean') {
+        j.autoUpdate = true;
+      }
+      if (typeof j.updateIntervalMinutes !== 'number'
+        || !Number.isInteger(j.updateIntervalMinutes)
+        || (j.updateIntervalMinutes as number) < 0
+        || (j.updateIntervalMinutes as number) > 7 * 24 * 60) {
+        j.updateIntervalMinutes = 0;
+      }
       // 订阅自带 rules/rule-providers：非法值就地归一（旧存储无这些键），绝不丢订阅
       if (typeof j.subRules !== 'string' || j.subRules.length > 256 * 1024) {
         j.subRules = '';
@@ -3628,6 +3639,37 @@ export class SubscriptionService {
   }
 
   /**
+   * 长按拖动排序（2026-10-30 用户要求）：按给定 id 顺序重排并落盘。
+   *
+   * 只动 `sortOrder` 与内存数组顺序，不触碰节点/凭据/刷新状态，因此不需要重建节点池。
+   * 容错：orderedIds 里缺失的订阅（并发的后台新增）按原顺序追加到末尾，绝不丢订阅。
+   */
+  async reorderSubscriptions(orderedIds: string[]): Promise<void> {
+    const byId = new Map<string, Subscription>();
+    for (const s of this.subscriptions) {
+      byId.set(s.id, s);
+    }
+    const next: Subscription[] = [];
+    for (const id of orderedIds) {
+      const s: Subscription | undefined = byId.get(id);
+      if (s !== undefined) {
+        next.push(s);
+        byId.delete(id);
+      }
+    }
+    for (const s of this.subscriptions) {
+      if (byId.has(s.id)) {
+        next.push(s);
+      }
+    }
+    for (let i = 0; i < next.length; i++) {
+      next[i].sortOrder = i;
+    }
+    this.subscriptions = next;
+    await this.persist();
+  }
+
+  /**
    * Nexus 备份恢复入口：整体覆盖订阅/节点/代理组/隐藏名单后全量落盘。
    * 调用方（BackupRestoreService）负责 JSON 结构校验与字段清洗，这里只做覆盖 + persist。
    */
@@ -3929,6 +3971,10 @@ export class SubscriptionJson {
   expireAt?: number;
   enabled: boolean = true;
   sortOrder: number = 0;
+  /** 每订阅自动更新开关（后加字段，旧存储无此键 → 读取端按 true 兜底） */
+  autoUpdate?: boolean;
+  /** 每订阅刷新间隔分钟（后加字段，旧存储无此键 → 读取端按 0 = 跟随全局 md 兜底） */
+  updateIntervalMinutes?: number;
   /** 双轨 provider 状态（见 Subscription.rawProviderState；旧存储无此键，读取端 ?? '' 兜底） */
   /** 旧格式（非 Clash）标记：停止刷新但节点仍可用 */
   legacyFormat: boolean = false;

@@ -111,7 +111,7 @@ ${method(service, 'flushNow')}
 ${method(service, 'patchSettings')}
 }
 `;
-const code = latencyTestUrlStub + '\n' + sort + '\n' + read('commons/services/AppRoutingPolicy.ets') + '\n' + policy + '\n'
+const code = read('commons/services/ImportFilePolicy.ets') + '\n' + latencyTestUrlStub + '\n' + sort + '\n' + read('commons/services/AppRoutingPolicy.ets') + '\n' + policy + '\n'
   + settings.replace(/^import .*;\r?\n/gm, '') + '\n' + harness + '\n' + pageClass;
 const js = stripTypeScriptTypes(code, { mode: 'strip' });
 const mod = await import('data:text/javascript;base64,' + Buffer.from(js).toString('base64'));

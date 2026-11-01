@@ -112,9 +112,9 @@ await test('cancel restores the previous conclusion and clears owned spinners',a
   assert.equal(V.stateFor('A'),LatencyState.MEASURED);assert.equal(V.latencyFor('A'),80);
   assert.equal(V.stateFor('B'),LatencyState.UNTESTED);
 });
-await test('guard expiration clears TESTING without inventing a timeout',async()=>{
+await test('guard expiration clears TESTING with a timeout for unanswered probes',async()=>{
   const session=S.start(api,['guard'],'','manual');await session.wait();
-  assert.equal(V.stateFor('guard'),LatencyState.UNTESTED);
+  assert.equal(V.stateFor('guard'),LatencyState.TIMEOUT);
 });
 await test('an old batch cannot clear a new batch testing mark',async()=>{
   const first=S.start(api,['same'],'','manual');
@@ -166,32 +166,35 @@ await test('manual delay does not replace a responding controller with the wrong
   h.orch.restoreTunnelController=async()=>true;h.orch.api.probeController=async()=>({reachable:true});
   assert.equal(await h.orch.ensureTestCore(h.subs,{},true),false);assert.equal(h.testCoreStarts,0);h.stop();
 });
-await test('the actual subscription page never reports completion for a skipped batch',async()=>{
-  const page=fs.readFileSync(path.join(sources,'pages/SubscriptionPage.ets'),'utf8');
-  const start=page.indexOf('  private async speedTestSub('),end=page.indexOf('\n  /**',start);
-  const method=page.slice(start,end).replace('private async speedTestSub','async speedTestSub');
+function subscriptionTestMethod() {
+  const page=fs.readFileSync(path.join(sources,'components/SubscriptionSection.ets'),'utf8').replace(/\r\n/g,'\n');
+  const start=page.indexOf('  private async testSub('),end=page.indexOf('  private openEdit(',start);
+  assert.ok(start >= 0 && end > start, '必须提取现行 testSub 方法');
+  return page.slice(start,end).replace('private async testSub','async testSub');
+}
+async function runSubscriptionTest(result, failure, method=subscriptionTestMethod()) {
   const messages=[];
-  const pageContext=vm.createContext({getContext:()=>({}),AppLogger:logger,
-    BackgroundLatencyService:{async testSubscription(){return null;}}});
+  const pageContext=vm.createContext({getContext:()=>({}),AppLogger:logger,TAG:'test',
+    BackgroundLatencyService:{async testSubscription(){if(failure)throw new Error('测速通道未就绪');return result;}}});
   const Page=vm.runInContext(stripTypeScriptTypes(`(class {${method}})`,{mode:'transform'}),pageContext);
-  const instance=new Page();Object.assign(instance,{speedTestingIds:[],showToast:t=>messages.push(t),
-    async activateProfile(){},refreshCoreNodes(){}});
-  await instance.speedTestSub('s');assert.ok(messages.some(t=>t.includes('测速通道未就绪')),messages.join('|'));
-  assert.ok(!messages.some(t=>t.includes('测速完成')));
+  const instance=new Page();Object.assign(instance,{testingIds:[],latencyRevision:0,
+    isTestingSub(id){return this.testingIds.includes(id);},toast:t=>messages.push(t)});
+  await instance.testSub('s','订阅');
+  assert.equal(instance.testingIds.length,0);
+  assert.equal(instance.latencyRevision,1);
+  return messages;
+}
+await test('订阅区测速通道失败时显示失败提示，不伪报完成',async()=>{
+  assert.deepEqual(await runSubscriptionTest(null,true),['测速失败，请重试']);
 });
-await test('mixed node failures complete without classification or timeout-count prompts',async()=>{
-  const page=fs.readFileSync(path.join(sources,'pages/SubscriptionPage.ets'),'utf8');
-  const start=page.indexOf('  private async speedTestSub('),end=page.indexOf('\n  /**',start);
-  const method=page.slice(start,end).replace('private async speedTestSub','async speedTestSub');
-  const messages=[];let persisted=0;
-  const pageContext=vm.createContext({getContext:()=>({}),AppLogger:logger,
-    BackgroundLatencyService:{async testSubscription(){return {total:11,measured:0,timeout:5,failed:6,coreOverloaded:0};}},
-    LatencyStoreBridge:{async persistConclusions(){persisted++;}}});
-  const Page=vm.runInContext(stripTypeScriptTypes(`(class {${method}})`,{mode:'transform'}),pageContext);
-  const instance=new Page();Object.assign(instance,{speedTestingIds:[],coreNodes:[{name:'failed-node'}],
-    showToast:t=>messages.push(t),async activateProfile(){},refreshCoreNodes(){}});
-  await instance.speedTestSub('s');assert.equal(persisted,1);
-  assert.deepEqual(messages,['准备测速通道…','✓ 测速完成']);
+await test('订阅区跳过测速不伪报完成，并以负对照验证守卫',async()=>{
+  assert.deepEqual(await runSubscriptionTest(null,false),['测速未执行，请稍后重试']);
+  const broken=subscriptionTestMethod().replace(/if \(progress === null\) \{[\s\S]*?\n      \}/,'');
+  assert.notEqual(broken,subscriptionTestMethod());
+  assert.deepEqual(await runSubscriptionTest(null,false,broken),['✓ 测速完成']);
+});
+await test('订阅区混合节点失败仍只显示完成，不带分类或计数噪音',async()=>{
+  assert.deepEqual(await runSubscriptionTest({total:11,measured:0,timeout:5,failed:6,coreOverloaded:0},false),['✓ 测速完成']);
 });
 console.log(`ALL PASS ${count} review regression cases`);
 // Only this test's verified direct scratch directory may be removed.

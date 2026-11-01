@@ -114,7 +114,7 @@ console.log('[PC6] 旧「决策式」命名必须退役');
     join(ETS, 'commons', 'services', 'SubscriptionService.ets'),
     join(ETS, 'commons', 'services', 'VpnQuickStart.ets'),
     join(ETS, 'pages', 'HomePage.ets'),
-    join(ETS, 'pages', 'SubscriptionPage.ets'),
+    join(ETS, 'components', 'SubscriptionSection.ets'),
     join(ETS, 'pages', 'NodeSelectionPage.ets')];
   let stale = '';
   for (const f of files) {
@@ -163,11 +163,11 @@ console.log('[PC8] ConnectionOrchestrator 拆分边界与统一读取口');
   ok('pc8.unified-api', /getCurrentNodeName\(\): string/.test(o) && /getCurrentConnectionTarget\(\): ConnectionTarget \| null/.test(o),
     '缺少 getCurrentNodeName()/getCurrentConnectionTarget() 统一读取口');
   const hp = join(ETS, 'pages', 'HomePage.ets');
-  const subp = join(ETS, 'pages', 'SubscriptionPage.ets');
+  const subp = join(ETS, 'pages', 'NodeSelectionPage.ets');
   const hpText = exists(hp) ? read(hp) : '';
   const subText = exists(subp) ? read(subp) : '';
-  ok('pc8.ui-uses-unified', /getCurrentNodeName\(\)/.test(hpText) && /getCurrentNodeName\(\)/.test(subText),
-    '主页/订阅页必须调用 getCurrentNodeName()（不得再传 preferredNodeId）');
+  ok('pc8.ui-uses-unified', /getCurrentNodeName\(\)/.test(hpText),
+    '主页必须调用 getCurrentNodeName()（节点选择页的 selectedName 是编辑态选择，不是当前内核出口）');
   ok('pc8.ui-no-legacy-args', !/displayNodeName\(\s*this\.settings\.preferredNodeId/.test(hpText + subText),
     '页面不得再用 displayNodeName(preferredNodeId, …) 旧签名');
 }

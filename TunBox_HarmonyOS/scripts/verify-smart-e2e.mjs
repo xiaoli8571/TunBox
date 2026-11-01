@@ -151,6 +151,7 @@ const want = [
   ['RawSubscriptionStore.ets', 'RawSubscriptionStore.ts'],
   // RawSubscriptionStore 依赖配置校验闸门（C23/C26：落盘前 YAML 校验）→ 必须一并 stage
   ['ConfigValidator.ets', 'ConfigValidator.ts'],
+  ['ImportFilePolicy.ets', 'ImportFilePolicy.ts'],
   // 2026-10-21（原文透传）：生成器从订阅原文切片节点定义 → 纯逻辑，stage 真源码
   ['RawProxyYaml.ets', 'RawProxyYaml.ts'],
 ];

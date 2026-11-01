@@ -573,3 +573,9 @@ provider 声明段），与延迟判定口径无关：
 此前 §十九所述的 `lastEffectiveNodeName` 与 DNS 恒接管契约仍在当前生成器中。指纹脚本已统一先把 CRLF 转为 LF 再计算 SHA-256 前 16 位：当前工作副本原始 CRLF 哈希为 `8c0e2a4a6d2dc56c`，Git 中 LF 内容与归一后的哈希均为 `bcfa84b2ffef61df`。因此换行风格不会制造误报，但上述生成器内容改动仍会触发指纹门禁。
 
 > 复现门禁：`node scripts/verify-generator-fingerprint.mjs`、`node scripts/test-latency-engine.js`。
+
+## 二十一、2026-10-31 指纹补记（0.8.0 配置生成器同步）
+
+本轮同步了 0.8.0 内核裁剪后的生成器约束：对已移除的协议能力保持生成侧拦截，并同步 true-chain harness 生成代码。当前归一化内容指纹为 `a0b6fa50eeb09783`。
+
+> 复现门禁：`node scripts/verify-generator-fingerprint.mjs`。

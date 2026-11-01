@@ -9,7 +9,7 @@
  * 3. 区块标题右侧是**菜单按钮**（原「管理」入口已删除、订阅管理页已并入本区块）：
  *    添加订阅 / 刷新全部 / 测速全部 / 删除订阅。
  */
-import { promptAction, window, display } from '@kit.ArkUI';
+import { promptAction, window, display , LengthMetrics} from '@kit.ArkUI';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -981,8 +981,12 @@ export struct SubscriptionSection {
     this.testingIds = this.testingIds.concat([subId]);
     try {
       const context: Context = getContext(this) as Context;
-      await BackgroundLatencyService.testSubscription(context, subId);
-      this.toast(`✓ ${subName} 测速完成`);
+      const progress = await BackgroundLatencyService.testSubscription(context, subId);
+      if (progress === null) {
+        this.toast('测速未执行，请稍后重试');
+        return;
+      }
+      this.toast('✓ 测速完成');
     } catch (e) {
       AppLogger.warn(TAG, `latency test failed: ${AppLogger.errText(e)}`);
       this.toast('测速失败，请重试');
@@ -1955,6 +1959,7 @@ export struct SubscriptionSection {
         .margin({ bottom: this.deleteSheetOn ? 108 : 0 })
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
       }
 
       // 底部返回：与页面背景同色，融为一体

@@ -2,7 +2,14 @@
 # NOTE: keep this file ASCII-only. PS5.1 reads UTF-8-no-BOM as ANSI/GBK and a
 #       Chinese comment with odd UTF-8 byte count eats the trailing CR and
 #       merges the next line into the comment.
-# Output: entry\libs\arm64-v8a\libgojni.so (ohos arm64, musl, c-shared, tags: with_gvisor,cmfa)
+# Output: entry\libs\arm64-v8a\libgojni.so (ohos arm64, musl, c-shared, tags: with_gvisor,cmfa,no_tailscale,no_zerotier,no_easytier)
+#
+# 2026-10-31 (0.8.0): added no_tailscale,no_zerotier,no_easytier. Those three
+# outbound stacks are unreachable from TunBox (zero references under entry/), and
+# dropping them cut the packaged .so from 62.96MB to 43.62MB (21.19MB -> 14.93MB
+# after deflate). with_gvisor stays: WireGuard needs it.
+# IMPORTANT: ClashConfigGenerator.dropReasonFor() must keep rejecting these three
+# protocol names, because mihomo rejects the WHOLE config on one unknown type.
 #
 # Kernel source of record: mihomo-build\mihomo-smart-<sha>\ (vernesong/mihomo,
 # branch Alpha; 462455136157a760937c666bba71afe33b1a809e = upstream mihomo v1.19.33
@@ -90,7 +97,7 @@ Set-Location $SrcDir
 Write-Host "==> building mihomo c-shared for ohos arm64 from $SrcDir ..."
 $outLog = Join-Path $LogDir 'tunbox_go_build_out.log'
 $errLog = Join-Path $LogDir 'tunbox_go_build_err.log'
-$argLine = 'build -p 1 -buildmode=c-shared -tags with_gvisor,cmfa -ldflags "-s -w -buildid=" -o "' + "$OutDir\libgojni.so" + '" .'
+$argLine = 'build -p 1 -buildmode=c-shared -tags with_gvisor,cmfa,no_tailscale,no_zerotier,no_easytier -ldflags "-s -w -buildid=" -o "' + "$OutDir\libgojni.so" + '" .'
 $p = Start-Process -FilePath $GoExe `
   -ArgumentList $argLine `
   -WorkingDirectory $SrcDir -NoNewWindow -PassThru -Wait `

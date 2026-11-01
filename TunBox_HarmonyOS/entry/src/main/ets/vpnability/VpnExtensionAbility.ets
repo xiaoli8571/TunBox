@@ -1447,8 +1447,22 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     this.stopped = false;
     this.lifecycleGeneration++;
     AppLogger.info(TAG, 'vpn onCreate');
-    // 扩展进程可能先于 UIAbility 被系统拉起：geo 数据在这里也要保证就位
-    GeoDataInstaller.ensure(this.context as common.Context);
+    // 扩展进程可能先于 UIAbility 被系统拉起：geo 数据在这里也要保证就位。
+    // 这里**只做毫秒级检查**（stat + 有界探测）：已就位就正常跑；没就位就排到内核
+    // 启动之后再装，本次连接按 geoipReady=false 降级生成配置（不含 GEOIP 规则），
+    // 内核不会去联网下载 MMDB（坑 40），下次连接自动恢复完整分流。
+    // 为什么不在 onCreate 里 await ensure()：系统对扩展进程有启动超时 —— 实测
+    // 2026-10-31 旧版同步解压 13.4MB 时进程 1.3s 就被杀（pid 30435
+    // com.tunbox.client:vpn APPSPAWN 15:29:26.054 → onProcessDied 15:29:27.401）。
+    // 解压已换成 native zlib（百毫秒级），但扩展启动路径仍不为它排队。
+    // 用 ensureDeferred 而不是直接放弃：快捷方式/卡片路径可能完全不经过 UI 进程，
+    // 那时这里就是唯一的安装点。
+    if (GeoDataInstaller.isReady(this.context as common.Context)) {
+      AppLogger.info(TAG, 'geo assets ready');
+    } else {
+      AppLogger.warn(TAG, 'geo assets not ready; deferring install, this session degrades to no-GEOIP');
+      GeoDataInstaller.ensureDeferred(this.context as common.Context);
+    }
     this.writeLaunchEpoch();
     this.appRouting = new AppRoutingRuntime();
     this.tunConfig = null;

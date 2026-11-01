@@ -18,7 +18,7 @@ function deferred() {
 }
 async function flush() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
 
-function harness({ deny = [] } = {}) {
+function harness({ deny = [], detailedReasons = true } = {}) {
   let now = 100000, id = 0, progressActive = false;
   const timers = new Map(), calls = [], logs = [];
   const h = { deny, tasks: [], alive: true,
@@ -48,6 +48,7 @@ function harness({ deny = [] } = {}) {
       return h.tasks;
     }
   };
+  if (!detailedReasons) delete bg.ContinuousTaskDetailedCancelReason;
   const ctx = vm.createContext({
     Date: Clock, Uint8Array, Math, Promise,
     setInterval(fn, delay) { const key = ++id; timers.set(key, { fn, delay }); return key; },
@@ -84,15 +85,17 @@ function harness({ deny = [] } = {}) {
 let passed = 0;
 async function test(name, fn) { await fn(); passed++; console.log('PASS ' + name); }
 
-await test('default keeps taskKeeping and queries at 30s without extra registration', async () => {
+await test('default keeps dataTransfer and queries at 30s without extra registration', async () => {
   const h = harness(); assert.equal(await h.guardian.engage(h.context, h.check), true);
-  assert.equal(h.guardian.currentTaskType(), 'taskKeeping');
+  assert.equal(h.guardian.currentTaskType(), 'dataTransfer');
   assert.equal([...h.timers.values()][0].delay, 30000);
   await h.tick(); assert.equal(h.starts().length, 1); await h.close();
 });
-await test('permission denial retains existing dataTransfer fallback', async () => {
-  const h = harness({ deny: ['taskKeeping'] }); await h.guardian.engage(h.context, h.check);
-  assert.equal(h.guardian.currentTaskType(), 'dataTransfer'); await h.close();
+await test('dataTransfer denial falls back to taskKeeping without progress updates', async () => {
+  const h = harness({ deny: ['dataTransfer'] }); await h.guardian.engage(h.context, h.check);
+  assert.equal(h.guardian.currentTaskType(), 'taskKeeping');
+  assert.equal(h.calls.filter(x => x[0] === 'progress' && x[2] === 'dataTransfer').length, 0);
+  await h.close();
 });
 await test('missing task waits for recheck and re-arms once after backoff', async () => {
   const h = harness(); await h.guardian.engage(h.context, h.check); h.tasks = [];
@@ -181,6 +184,25 @@ await test('watchdog observes resume even when the suspend event arrived but res
   h.guardian.noteExternalSuspend({ requireUserAction: false, category: 'general', reasonCode: 2 }, true);
   h.tasks[0].suspendState = false; await h.tick();
   assert.equal(h.guardian.isRegistered(), true); await h.close();
+});
+await test('API24 generic cancellation works without API26 detailed-reason enum', async () => {
+  const h = harness({ detailedReasons: false }); await h.guardian.engage(h.context, h.check);
+  const id = h.tasks[0].continuousTaskId; h.tasks = [];
+  h.watch.dispatchCancel({ id, reason: 2 }); await h.tick();
+  assert.equal(h.starts().length, 2); await h.close();
+});
+await test('API24 cancellation tolerates an unexpected numeric detailed code without the enum', async () => {
+  const h = harness({ detailedReasons: false }); await h.guardian.engage(h.context, h.check);
+  const id = h.tasks[0].continuousTaskId; h.tasks = [];
+  h.watch.dispatchCancel({ id, reason: 2, detailedReason: 999 }); await h.tick();
+  assert.equal(h.starts().length, 2); await h.close();
+});
+await test('API26 detailed user-removal still suppresses a generic cancellation', async () => {
+  const h = harness(); await h.guardian.engage(h.context, h.check);
+  h.watch.dispatchCancel({ id: h.tasks[0].continuousTaskId, reason: 2, detailedReason: 3 });
+  await flush();
+  assert.equal(h.guardian.isAutoEngageSuppressed(), true);
+  assert.equal(h.guardian.isWatching(), false); await h.close();
 });
 await test('confirmed generic cancellation re-arms after one backoff window', async () => {
   const h = harness(); await h.guardian.engage(h.context, h.check);

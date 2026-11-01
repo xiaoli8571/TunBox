@@ -5,7 +5,7 @@
  * 系统文件选择器导入、加密备份密码重试（最多 3 次）、恢复后重载设置。
  * 入口在「设置 → 关于与隐私 → 配置备份与恢复」。
  */
-import { promptAction } from '@kit.ArkUI';
+import { promptAction , LengthMetrics} from '@kit.ArkUI';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
@@ -348,13 +348,14 @@ struct BackupPage {
                 .borderRadius(9999).backgroundColor(TunBoxColors.success)
                 .width('100%').textAlign(TextAlign.Center)
             }
-            Blank().height(TunBoxGeometry.dockClearance)
+            Blank().height(TunBoxGeometry.dockClearance())
           }
           .width('100%')
           .padding({
             left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 24
           })
         }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
         .width('100%').layoutWeight(1)
         .scrollBar(BarState.Off)
         .align(Alignment.Top)

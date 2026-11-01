@@ -2414,6 +2414,21 @@ export class ClashConfigGenerator {
     if (proxyType === 'direct') {
       return n.name.length === 0 ? ProxyDropReason.MISSING_FIELD : ProxyDropReason.NONE;
     }
+    // ── 0.8.0：内核已裁掉的三个协议，必须在生成侧就拦住 ────────────────────
+    // 内核自 0.8.0 起用 no_tailscale,no_zerotier,no_easytier 编译（省 6.26MB 包体），
+    // 这三个 outbound 在二进制里已不存在。而 mihomo 对未知类型的处理是
+    //   adapter/parser.go: default: return nil, fmt.Errorf("unsupport proxy type: %s")
+    // 且 config/config.go:922 一旦 err != nil 就
+    //   return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
+    // —— **整份配置拒载**，不是丢那一个节点。
+    //
+    // 而下面白名单末尾的 YamlMerger.isRelayType() 带兜底正则
+    //   /^[a-z][a-z0-9-]{0,31}$/
+    // tailscale / zerotier / easytier 全都匹配 ⇒ 不拦就会写进配置 ⇒ 用户整个代理起不来。
+    // 所以这一条必须在 isRelayType 之前短路：丢掉这几个节点 + 计数提示，其余照常。
+    if (proxyType === 'tailscale' || proxyType === 'zerotier' || proxyType === 'easytier') {
+      return ProxyDropReason.UNSUPPORTED_PROTOCOL;
+    }
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
       && proxyType !== 'vmess' && proxyType !== 'trojan' && proxyType !== 'hysteria2'
       && !YamlMerger.isRelayType(proxyType)) {

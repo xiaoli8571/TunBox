@@ -562,8 +562,15 @@ export struct FloatingBottomBar {
     // 那是 API 26 才有的 CommonMethod，旧系统上属性对象没有该方法，`build()` 里调用即 TypeError
     // （0.7.1 被 AGC 兼容性测试判「启动失败」的第二个隐患）。走属性修饰器，内部 try/catch。
     .attributeModifier(this.dockAttr)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
-    .margin({ bottom: TunBoxGeometry.dockBottomMargin })
+    // ── 底部几何（2026-10-30 用户要求「dock 往下调一点，跟系统导航条融为一体」）──
+    // 原来这里是 `.expandSafeArea(BOTTOM)` + margin 0：只在「非沉浸式」下勉强贴住安全区底边，
+    // 而安全区底边本身又在系统那条实色带之上 —— 用户看到的就是「dock 飘在半空」。
+    // 现在窗口是沉浸式的（底部那一条归 App），Dock 直接按「距屏幕底边 SafeArea.dockGap()」定位：
+    //   · margin.bottom：沉浸式生效时 = gap（布局已经能贴到屏幕底边）；
+    //   · translate.y   ：设备仍在避让时（自校准判出来的）把 Dock 往下沉 insetBottom−gap，
+    //                     两种设备最后落在同一个视觉位置。
+    .margin({ bottom: TunBoxGeometry.dockBottomMargin() })
+    .translate({ y: TunBoxGeometry.dockSink() })
     // 量栏体真实宽度（vp）：只有知道宽度才能算出三个页签各自的中心，把光影落在正确的格子上
     .onAreaChange((_old: Area, cur: Area) => {
       const w: number = Number(cur.width);

@@ -11,26 +11,29 @@
  *
  * ── 合规边界（对照官方《Background Tasks Kit 接入规范》）──────────────────
  *  - **类型**：长时任务类型表里 DATA_TRANSFER =「非托管形式的上传、下载」，
- *    TASK_KEEPING =「计算任务」（场景举例：杀毒软件）。VPN 隧道保活属于后者。
- *    因此本服务**优先申请 taskKeeping**；但 SDK `BackgroundTaskMode` 注释原文：
- *    「... of a non-PC/2-in-1 device is MODE_TASK_KEEPING, you need to request the
- *    ACL permission `ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM` before
- *    calling APIs related to continuous tasks.」—— 受限权限未获 AGC 审批前拿不到
- *    taskKeeping，此时**回退**到 dataTransfer 字符串重载，行为与改造前完全一致
- *    （实况窗 LIVE_VIEW + 5 分钟进度心跳）。dataTransfer 现仅作为回退类型。
+ *    TASK_KEEPING =「计算任务」（场景举例：杀毒软件）。VPN 隧道保活语义上更接近后者，
+ *    但 taskKeeping 依赖受限权限 `ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM`
+ *    （SDK `BackgroundTaskMode` 注释原文：非 PC/2-in-1 设备用 MODE_TASK_KEEPING 需先申请
+ *    该 ACL 权限），未获 AGC 审批前拿不到。
+ *    → **现行策略：优先 dataTransfer**（实况窗 LIVE_VIEW + 通知栏配额圆环 + 5 分钟进度心跳，
+ *    与 0.7.5 外观一致）；仅在申请被拒时**回退** taskKeeping（两条卡、无圆环、不改进度）。
  *  - **dataTransfer 的固有风险（已由 SDK 枚举坐实）**：系统会因
  *    「DATA_TRANSFER 类型但传输速率过低」取消 / 暂停长时任务
  *    （ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED = 4、
  *    ContinuousTaskSuspendReason.SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED = 4）。
  *    VPN 隧道空闲时用户流量本就低，会稳定踩中 → 长时任务一被取消/暂停，
  *    全应用失去「所有进程不被挂起」的保护 → 扩展进程定时器停摆 → 存活租约停更
- *    → UI 误判 core died → 拆隧道重连。改用 taskKeeping 正是为了拆掉这条链。
+ *    → UI 误判 core died → 拆隧道重连。
+ *    这条链**不能靠换类型解决**（taskKeeping 基本申请不到），靠三件套兜：
+ *    ① TaskProgressUpdater 周期推进度，避免被判「无进度」；
+ *    ② BackgroundTaskWatch 感知取消/暂停；
+ *    ③ UiGuardian 看门狗按退避重挂（earliestRearmAt / watchdogAttempts）。
  *  - **用户主动停止**：删除长时任务通知 = 用户主动停止后台任务。由
  *    BackgroundTaskWatch 感知并按 reason 分类后，本服务进入抑制态
  *    （autoEngageSuppressed）；抑制期内的自动补挂一律跳过，只有显式用户操作
  *    （连接按钮 / 卡片 / 快捷方式 → clearExternalCancelSuppression()）才会
  *    清除抑制并允许重挂。
- *  - **进度更新**：dataTransfer 要求周期更新进度（首次不得超过 10 分钟），
+ *  - **进度更新**：只有 dataTransfer 能推实况窗进度（首次不得超过 10 分钟），
  *    由 TaskProgressUpdater 用申请返回的 notificationId 承担；taskKeeping
  *    **不得**修改长时任务通知内容（非数据传输任务），故不推实况窗进度，
  *    速率/运行时长继续由应用自有常驻通知（TunBoxNotifier）承载。
@@ -49,15 +52,13 @@ const TAG = 'UiGuardian';
 const WATCHDOG_INTERVAL_MS: number = 30000;
 const WATCHDOG_RETRY_LIMIT: number = 3;
 /**
- * 2026-10-30 实验开关：是否申请长时任务。
+ * 长时任务开关（0.7.7.1 恢复）。
  *
- * true （原行为）：优先 taskKeeping，失败回退 dataTransfer；代价是通知栏多一张
- *                 系统卡（内容、文案均由系统写死，第三方改不了）。
- * false（当前）：完全不申请，也不回退 —— 通知栏只留应用自有速率卡一条，
- *                 后台存活交给 VPN 扩展能力（主进程可能被冻结，卡片会停更）。
- * 改回 true 即可恢复原行为。
+ * true ：申请长时任务 —— **优先 dataTransfer**（实况窗，通知栏右侧带配额圆环，
+ *        与 0.7.5 外观一致）；失败才回退 taskKeeping（两条卡、无圆环）。
+ * false：完全不申请，通知栏只留应用自有速率卡（0.7.7 的实验形态，已放弃）。
  */
-const CONTINUOUS_TASK_ENABLED: boolean = false;
+const CONTINUOUS_TASK_ENABLED: boolean = true;
 /** 关闭时回给调用方的 detail（QuickToggleAbility 据此不把会话判成失败） */
 export const CONTINUOUS_TASK_DISABLED_DETAIL: string = 'continuous task disabled by config';
 
@@ -201,7 +202,30 @@ export class UiGuardian {
       return result;
     }
 
-    // ① 优先 taskKeeping（VPN 隧道保活的正确类型）
+    // ① 优先 dataTransfer —— 通知栏右侧圆环（实况窗）只有这个类型能写：
+    //    官方规范允许 DATA_TRANSFER 更新通知进度，而 taskKeeping 明令禁止改通知内容。
+    //    代价是低速率场景下可能被系统判成「无进度」取消任务，故保留 5 分钟进度
+    //    心跳（TaskProgressUpdater），并由 UiGuardian 看门狗重挂兜底。
+    if (generation !== UiGuardian.generation) { return new ContinuousTaskApplyResult(); }
+    try {
+      const modes: string[] = ['dataTransfer'];
+      const res = await backgroundTaskManager.startBackgroundRunning(context, modes, agent);
+      result.ok = true;
+      result.kind = ContinuousTaskKind.DATA_TRANSFER;
+      result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
+      result.continuousTaskId = res?.continuousTaskId ?? -1;
+      result.detail = 'dataTransfer';
+      await UiGuardian.acceptApplication(context, generation, result);
+      AppLogger.info(TAG, 'continuous task registered (type=dataTransfer, live view + quota ring)');
+      return result;
+    } catch (e) {
+      AppLogger.warn(TAG,
+        `dataTransfer continuous task request failed, falling back to taskKeeping: ${AppLogger.errText(e)}`);
+    }
+
+    // ② 回退 taskKeeping（需要受限权限 ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM，
+    //    多数设备拿不到；挂上时通知栏是「系统卡 + 应用卡」两条，没有圆环）
+    if (generation !== UiGuardian.generation) { return new ContinuousTaskApplyResult(); }
     try {
       const request = new backgroundTaskManager.ContinuousTaskRequest();
       request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_TASK_KEEPING];
@@ -214,32 +238,12 @@ export class UiGuardian {
       result.continuousTaskId = res?.continuousTaskId ?? -1;
       result.detail = 'taskKeeping';
       await UiGuardian.acceptApplication(context, generation, result);
-      AppLogger.info(TAG, 'continuous task registered (type=taskKeeping submode=normalNotification)');
-      return result;
-    } catch (e) {
-      // 最常见原因：非 PC/2-in-1 设备上没有 ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM
-      // 受限权限 → 官方 SDK 注释明确要求该权限才能用 MODE_TASK_KEEPING。
-      AppLogger.warn(TAG,
-        `taskKeeping continuous task request failed, falling back to dataTransfer: ${AppLogger.errText(e)}`);
-    }
-
-    // ② 回退 dataTransfer（与改造前完全一致：实况窗 + 5 分钟进度心跳）
-    if (generation !== UiGuardian.generation) { return new ContinuousTaskApplyResult(); }
-    try {
-      const modes: string[] = ['dataTransfer'];
-      const res = await backgroundTaskManager.startBackgroundRunning(context, modes, agent);
-      result.ok = true;
-      result.kind = ContinuousTaskKind.DATA_TRANSFER;
-      result.notificationId = (res !== undefined && res !== null) ? res.notificationId : -1;
-      result.continuousTaskId = res?.continuousTaskId ?? -1;
-      result.detail = 'dataTransfer';
-      await UiGuardian.acceptApplication(context, generation, result);
-      AppLogger.info(TAG, 'continuous task registered (type=dataTransfer, fallback path)');
+      AppLogger.info(TAG, 'continuous task registered (type=taskKeeping submode=normalNotification, fallback)');
       return result;
     } catch (e) {
       result.ok = false;
       result.kind = ContinuousTaskKind.NONE;
-      result.detail = `both taskKeeping and dataTransfer failed: ${AppLogger.errText(e)}`;
+      result.detail = `both dataTransfer and taskKeeping failed: ${AppLogger.errText(e)}`;
       AppLogger.warn(TAG, `continuous task registration failed: ${result.detail}`);
       return result;
     }

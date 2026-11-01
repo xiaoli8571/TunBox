@@ -9,6 +9,7 @@ import { stripTypeScriptTypes } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 if (!process.execArgv.includes('--experimental-transform-types')) {
   const child = spawnSync(process.execPath, ['--experimental-transform-types', '--no-warnings',
@@ -18,6 +19,12 @@ if (!process.execArgv.includes('--experimental-transform-types')) {
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ets = path.join(root, 'entry/src/main/ets');
 const rawDir = path.join(root, 'entry/src/main/resources/rawfile');
+const geoBytes = name => {
+  const compressed = path.join(rawDir, name + '.gz');
+  return fs.existsSync(compressed)
+    ? zlib.gunzipSync(fs.readFileSync(compressed))
+    : fs.readFileSync(path.join(rawDir, name));
+};
 const tempRoot = fs.realpathSync(os.tmpdir());
 const scratch = fs.mkdtempSync(path.join(tempRoot, 'tunbox-startup-assets-'));
 const baseline = process.argv.includes('--baseline');
@@ -29,7 +36,10 @@ if (baseline) {
 }
 const logger = { info() {}, warn() {}, errText: String };
 const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
-const sameFile = (actual, expected) => assert.equal(digest(fs.readFileSync(actual)), digest(fs.readFileSync(expected)));
+const sameFile = (actual, expected) => assert.equal(
+  digest(fs.readFileSync(actual)),
+  digest(Buffer.isBuffer(expected) ? expected : fs.readFileSync(expected))
+);
 function load(source, names, context) {
   const text = source.replace(/^import\b[\s\S]*?;\r?\n/gm, '').replace(/^export /gm, '');
   return vm.runInContext(stripTypeScriptTypes(`(()=>{${text}\nreturn {${names}};})()`,
@@ -38,7 +48,8 @@ function load(source, names, context) {
 let serial = 0, passed = 0, failed = 0;
 function harness() {
   const dir = path.join(scratch, 'installer-' + serial++); fs.mkdirSync(dir);
-  const state = { reads: 0, writes: 0, resourceFailure: false, writeFailure: false, shortWrite: false, views: false };
+  const state = { reads: 0, writes: 0, resourceFailure: false, writeFailure: false,
+    shortWrite: false, views: false, corruptResource: false, gzReads: [], stagingLeft: [] };
   const handles = new Map();
   const io = {
     OpenMode: { READ_WRITE: fs.constants.O_RDWR, READ_ONLY: fs.constants.O_RDONLY,
@@ -57,6 +68,49 @@ function harness() {
     },
     renameSync: fs.renameSync, unlinkSync: fs.unlinkSync,
   };
+  // 生产实现用 @ohos.zlib 的 GZip 流式接口（native C 解压）。这里用 Node 的 zlib
+  // 提供同语义 stub：open 读整个文件并 gunzip、read 分块吐、close 收尾；
+  // 单次上限 512KB 是为了强制走多轮 read 循环（真机 1MB 分块同理）。
+  // 支持 gzopen(path) 与 gzdopen(fd) 两个入口、gzread / gzfread 两种读法，
+  // 以及 state.gzOpenBroken（复现真机 17800009：gzopen 坏、gzdopen 好）。
+  const makeGzip = () => {
+    let plain = null, pos = 0, ownFd = null;
+    const open = (name, fd) => {
+      state.gzReads.push(`open:${name}`);
+      if (state.corruptResource) { plain = null; throw Error('17800009 injected gzip failure'); }
+      plain = zlib.gunzipSync(fs.readFileSync(fd === null ? name : handles.get(fd)));
+      pos = 0; ownFd = fd;
+    };
+    const pull = (buf, limit) => {
+      assert.ok(plain !== null, 'read before open');
+      const want = Math.max(0, Math.min(buf.byteLength, limit, 512 * 1024, plain.length - pos));
+      Buffer.from(buf).set(plain.subarray(pos, pos + want)); pos += want;
+      state.gzReads.push(want);
+      return want;
+    };
+    return {
+      async gzopen(file, mode) {
+        assert.ok(mode === 'r' || mode === 'rb', 'gzopen must open in read mode');
+        if (state.gzOpenBroken) { throw Error('17800009 Internal structure error'); }
+        open(file, null);
+      },
+      async gzdopen(fd, mode) {
+        assert.ok(mode === 'r' || mode === 'rb', 'gzdopen must open in read mode');
+        open('fd', fd);
+      },
+      async gzread(buf) { return pull(buf, buf.byteLength); },
+      async gzfread(buf, size, nitems) {
+        assert.equal(size, 1, 'production reads one byte-block per item');
+        return pull(buf, size * nitems);
+      },
+      async gzclose() {
+        if (ownFd !== null) { try { fs.closeSync(ownFd); } catch (e) { /* already closed */ } }
+        plain = null; pos = 0; ownFd = null;
+        state.gzReads.push('close'); return 0;
+      },
+    };
+  };
+  const zlibStub = { async createGZip() { return makeGzip(); }, createGZipSync() { return makeGzip(); } };
   const context = { cacheDir: dir, resourceManager: { getRawFileContentSync(name) {
     state.reads++;
     if (state.resourceFailure) throw Error('injected missing resource');
@@ -65,8 +119,10 @@ function harness() {
     const buffer = new Uint8Array(raw.length + 10); buffer.set(raw, 4);
     return buffer.subarray(4, raw.length + 4);
   } } };
-  const sandbox = vm.createContext({ fs: io, util: { generateRandomUUID: () => crypto.randomUUID() },
-    AppLogger: logger, Uint8Array, ArrayBuffer, Map, Math });
+  const sandbox = vm.createContext({ fs: io, zlib: zlibStub,
+    util: { generateRandomUUID: () => crypto.randomUUID() },
+    HttpBodyCodec: { decompress: bytes => new Uint8Array(zlib.gunzipSync(Buffer.from(bytes))) },
+    AppLogger: logger, Uint8Array, ArrayBuffer, Map, Math, setTimeout, Promise });
   const { GeoDataInstaller } = load(installerSource, 'GeoDataInstaller', sandbox);
   return { ...state, state, dir, context, installer: GeoDataInstaller };
 }
@@ -74,45 +130,70 @@ async function test(name, run) {
   try { await run(); passed++; console.log('PASS ' + name); }
   catch (e) { failed++; console.log('FAIL ' + name + ': ' + e.message); }
 }
-await test('copy failure can retry in the same process', () => {
-  const h = harness(); h.state.writeFailure = true; h.installer.ensure(h.context);
-  h.installer.ensure(h.context);
-  sameFile(path.join(h.dir, 'geoip.metadb'), path.join(rawDir, 'geoip.metadb'));
+await test('copy failure can retry in the same process', async () => {
+  const h = harness(); h.state.writeFailure = true; await h.installer.ensure(h.context);
+  await h.installer.ensure(h.context);
+  sameFile(path.join(h.dir, 'geoip.metadb'), geoBytes('geoip.metadb'));
 });
-await test('missing resources can recover without restarting the app', () => {
-  const h = harness(); h.state.resourceFailure = true; h.installer.ensure(h.context);
-  h.state.resourceFailure = false; h.installer.ensure(h.context);
+await test('missing resources can recover without restarting the app', async () => {
+  const h = harness(); h.state.resourceFailure = true; await h.installer.ensure(h.context);
+  h.state.resourceFailure = false; await h.installer.ensure(h.context);
   assert.ok(fs.existsSync(path.join(h.dir, 'geoip.metadb')));
 });
-await test('deleted cache files are restored in the same process', () => {
-  const h = harness(); h.installer.ensure(h.context); fs.unlinkSync(path.join(h.dir, 'geosite.dat'));
-  h.installer.ensure(h.context); assert.ok(fs.existsSync(path.join(h.dir, 'geosite.dat')));
+await test('deleted cache files are restored in the same process', async () => {
+  const h = harness(); await h.installer.ensure(h.context); fs.unlinkSync(path.join(h.dir, 'geosite.dat'));
+  await h.installer.ensure(h.context); assert.ok(fs.existsSync(path.join(h.dir, 'geosite.dat')));
 });
-await test('same-sized and larger corrupt files are repaired', () => {
+await test('same-sized and larger corrupt files are repaired', async () => {
   const h = harness();
   for (const name of ['geoip.metadb', 'geosite.dat']) {
-    fs.writeFileSync(path.join(h.dir, name), Buffer.alloc(fs.statSync(path.join(rawDir, name)).size + 8, 0x58));
+    fs.writeFileSync(path.join(h.dir, name), Buffer.alloc(geoBytes(name).length + 8, 0x58));
   }
-  h.installer.ensure(h.context);
+  await h.installer.ensure(h.context);
   for (const name of ['geoip.metadb', 'geosite.dat']) {
-    sameFile(path.join(h.dir, name), path.join(rawDir, name));
+    sameFile(path.join(h.dir, name), geoBytes(name));
   }
 });
-await test('shared resource-buffer views never write unrelated bytes', () => {
-  const h = harness(); h.state.views = true; h.installer.ensure(h.context);
-  sameFile(path.join(h.dir, 'geoip.metadb'), path.join(rawDir, 'geoip.metadb'));
+await test('shared resource-buffer views never write unrelated bytes', async () => {
+  const h = harness(); h.state.views = true; await h.installer.ensure(h.context);
+  sameFile(path.join(h.dir, 'geoip.metadb'), geoBytes('geoip.metadb'));
 });
-await test('short writes preserve the original file and leave no temporary files', () => {
+await test('short writes preserve the original file and leave no temporary files', async () => {
   const h = harness(); const old = Buffer.from('previous-invalid-database');
   fs.writeFileSync(path.join(h.dir, 'geoip.metadb'), old); h.state.shortWrite = true;
-  h.installer.ensure(h.context); assert.equal(digest(fs.readFileSync(path.join(h.dir, 'geoip.metadb'))), digest(old));
-  assert.ok(!fs.readdirSync(h.dir).some(n => n.endsWith('.tmp')));
-  h.state.shortWrite = false; h.installer.ensure(h.context);
-  assert.equal(fs.statSync(path.join(h.dir, 'geoip.metadb')).size, fs.statSync(path.join(rawDir, 'geoip.metadb')).size);
+  await h.installer.ensure(h.context); assert.equal(digest(fs.readFileSync(path.join(h.dir, 'geoip.metadb'))), digest(old));
+  assert.ok(!fs.readdirSync(h.dir).some(n => n.endsWith('.tmp') || n.endsWith('.gz')));
+  h.state.shortWrite = false; await h.installer.ensure(h.context);
+  assert.equal(fs.statSync(path.join(h.dir, 'geoip.metadb')).size, geoBytes('geoip.metadb').length);
 });
-await test('healthy cache is neither replaced nor reread from rawfile', () => {
-  const h = harness(); h.installer.ensure(h.context); const writes = h.state.writes, reads = h.state.reads;
-  h.installer.ensure(h.context); assert.equal(h.state.writes, writes); assert.equal(h.state.reads, reads);
+await test('corrupt gzip never leaves a half-written geo file', async () => {
+  const h = harness(); h.state.corruptResource = true;
+  await h.installer.ensure(h.context);
+  assert.ok(!fs.existsSync(path.join(h.dir, 'geoip.metadb')), 'failed inflate must not create the target');
+  assert.ok(!fs.readdirSync(h.dir).some(n => n.endsWith('.tmp') || n.endsWith('.gz')), 'staging files must be cleaned');
+  h.state.corruptResource = false; await h.installer.ensure(h.context);
+  sameFile(path.join(h.dir, 'geoip.metadb'), geoBytes('geoip.metadb'));
+});
+await test('inflate is streamed in bounded chunks, not one full-明文 read', async () => {
+  const h = harness(); await h.installer.ensure(h.context);
+  const reads = h.state.gzReads.filter(v => typeof v === 'number' && v > 0);
+  assert.ok(reads.length > 1, `expected multiple read rounds, got ${reads.length}`);
+  assert.ok(reads.every(n => n <= 512 * 1024), 'each round must stay within the chunk budget');
+  assert.equal(h.state.gzReads[h.state.gzReads.length - 1], 'close');
+});
+await test('gzdopen fallback rescues a device where gzopen is broken', async () => {
+  // 2026-10-31 真机：gzopen + gzfread 报 17800009 Internal structure error，
+  // 必须能在不换实现的前提下走 gzdopen(fd) 通道拿到同样的明文。
+  const h = harness(); h.state.gzOpenBroken = true;
+  await h.installer.ensure(h.context);
+  sameFile(path.join(h.dir, 'geoip.metadb'), geoBytes('geoip.metadb'));
+  sameFile(path.join(h.dir, 'geosite.dat'), geoBytes('geosite.dat'));
+  assert.ok(h.state.gzReads.some(v => v === 'open:fd'), 'expected the gzdopen channel to be used');
+  assert.ok(!fs.readdirSync(h.dir).some(n => n.endsWith('.tmp') || n.endsWith('.gz')));
+});
+await test('healthy cache is neither replaced nor reread from rawfile', async () => {
+  const h = harness(); await h.installer.ensure(h.context); const writes = h.state.writes, reads = h.state.reads;
+  await h.installer.ensure(h.context); assert.equal(h.state.writes, writes); assert.equal(h.state.reads, reads);
 });
 
 if (process.argv.includes('--installer-only')) {
@@ -144,7 +225,7 @@ const profileYaml = 'proxies:\n  - {name: A, type: socks5, server: 127.0.0.1, po
 const liveConfigs = [];
 for (const profileBacked of [false, true]) for (let flags = 0; flags < 16; flags++) {
   await test(`offline kernel: profile=${profileBacked} rule/ad/IPv6/sniff=${flags.toString(2).padStart(4, '0')}`, async () => {
-    const h = harness(); h.installer.ensure(h.context);
+    const h = harness(); await h.installer.ensure(h.context);
     fs.mkdirSync(path.join(h.dir, 'ruleset'));
     fs.copyFileSync(path.join(rawDir, 'hyper_adrules_ads.mrs'), path.join(h.dir, 'ruleset/hyper_adrules_ads.mrs'));
     const p = new runtime.RuntimeConfigProfile(); p.nodes = [node];

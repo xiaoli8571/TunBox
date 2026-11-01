@@ -35,6 +35,19 @@ export class TunBoxNotifier {
   private static permissionPrompted: boolean = false;
   /** 最近一次复核结论：通知是否可用（供 UI 提示 / 诊断读取） */
   private static permissionOk: boolean = true;
+  /**
+   * 是否已被长时任务实况窗接管（true = 应用自有卡必须沉默）。
+   *
+   * 为什么需要这个位（2026-10-31 真机取证「通知栏两条」）：
+   * 连接成功的首帧（force）与 UiGuardian.engage() 的实况窗接管是两条**并行**
+   * 异步链，`update()` 里还要先 await `ensureClickAgent()` 再 publish。于是
+   * 「attach → cancel(1001)」可能先跑完，随后那一帧 publish 才落地，把卡复活成
+   * 永远停在 0:00:00 的死卡（之后 updateLive 只走 push()，再没人碰它）。
+   * 有了这个位：接管期间 update() 直接返回，publishNow 落地前再复查一次。
+   */
+  private static takenOver: boolean = false;
+  /** 发布 / 撤销的串行队列：保证 cancel 一定排在所有已入队的 publish 之后 */
+  private static opChain: Promise<void> = Promise.resolve();
 
   /**
    * 通知可用性复核 —— **每次连接都调用**（2026-10-30 修正）。
@@ -97,6 +110,41 @@ export class TunBoxNotifier {
     return Date.now() < TunBoxNotifier.disabledUntil;
   }
 
+  /**
+   * 标记「实况窗已接管通知栏」：此后本类不再贴应用自有卡。
+   * 由长时任务 attach（dataTransfer）调用。
+   */
+  static takeOver(): void {
+    TunBoxNotifier.takenOver = true;
+  }
+
+  /**
+   * 解除接管（断开 / 回落到 taskKeeping / 实况窗撤销）：应用自有卡恢复可发布。
+   */
+  static release(): void {
+    TunBoxNotifier.takenOver = false;
+  }
+
+  /** 当前是否已被实况窗接管（诊断用） */
+  static isTakenOver(): boolean {
+    return TunBoxNotifier.takenOver;
+  }
+
+  /**
+   * 发布 / 撤销串行队列。
+   *
+   * 为什么必须串行：`update()` 发布前要 await `ensureClickAgent()`，而 `cancel()`
+   * 是另一次独立异步调用；没有队列时 cancel 可能先到、publish 后到，把那帧内容
+   * 复活成一条永不刷新的死卡（真机 2026-10-31 取证：卡停在 0:00:00，9 分钟没动）。
+   */
+  private static enqueue(op: () => Promise<void>): Promise<void> {
+    const next: Promise<void> = TunBoxNotifier.opChain.then(op, op);
+    TunBoxNotifier.opChain = next.then((): void => {
+    }, (): void => {
+    });
+    return next;
+  }
+
   /** 最近一次通知失败错误码（0=无失败）；1600004 表示通知被用户/系统禁用 */
   static lastCode(): number {
     return TunBoxNotifier.lastErrorCode;
@@ -145,6 +193,18 @@ export class TunBoxNotifier {
    */
   static async update(title: string, nodeLine: string, speedLine: string,
     force: boolean = false): Promise<void> {
+    // 实况窗接管期间：应用自有卡必须彻底沉默，否则通知栏就是两条
+    // （系统实况卡 + 这张僵尸卡），而且这张再也拿不到后续帧。
+    if (TunBoxNotifier.takenOver) {
+      return;
+    }
+    return TunBoxNotifier.enqueue((): Promise<void> =>
+      TunBoxNotifier.publishNow(title, nodeLine, speedLine, force));
+  }
+
+  /** update() 的串行化实体：入队后、真正 publish 前再复查一次接管位。 */
+  private static async publishNow(title: string, nodeLine: string, speedLine: string,
+    force: boolean): Promise<void> {
     const now = Date.now();
     // 退避窗口内直接返回：通知禁用属于用户设置，重试没有意义
     if (now < TunBoxNotifier.disabledUntil) {
@@ -177,6 +237,11 @@ export class TunBoxNotifier {
       };
       // 官方 VPN 指南要求：点击通知将应用调入前台（wantAgent 默认为空 = 点击无动作）
       const agent = await TunBoxNotifier.ensureClickAgent();
+      // await 期间实况窗可能已经接管（attach 走完并 cancel 过）：
+      // 这一帧再发出去就是「cancel 之后复活」的那条僵尸卡，直接丢弃。
+      if (TunBoxNotifier.takenOver) {
+        return;
+      }
       if (agent !== null) {
         request.wantAgent = agent;
       }
@@ -202,15 +267,24 @@ export class TunBoxNotifier {
     }
   }
 
-  static async cancel(): Promise<void> {
-    try {
-      await notificationManager.cancel(NOTIFICATION_ID);
-    } catch (e) {
-      // 忽略：通知可能本就不存在
-    }
-    TunBoxNotifier.lastText = '';
-    TunBoxNotifier.lastUpdateAt = 0;
-    TunBoxNotifier.lastPublishAt = 0;
-    TunBoxNotifier.disabledUntil = 0;
+  /**
+   * 撤销应用自有常驻通知。
+   *
+   * 入队执行：保证它一定排在所有已入队的 publish 之后 —— 否则「cancel 先到、
+   * 首帧 publish 后到」就会把卡复活成一条永不刷新的死卡。
+   */
+  static cancel(): Promise<void> {
+    return TunBoxNotifier.enqueue(async (): Promise<void> => {
+      try {
+        await notificationManager.cancel(NOTIFICATION_ID);
+      } catch (e) {
+        // 忽略：通知可能本就不存在；真正的失败原因在 publish 侧已经记过
+        AppLogger.warn(TAG, `cancel failed: ${AppLogger.errText(e)}`);
+      }
+      TunBoxNotifier.lastText = '';
+      TunBoxNotifier.lastUpdateAt = 0;
+      TunBoxNotifier.lastPublishAt = 0;
+      TunBoxNotifier.disabledUntil = 0;
+    });
   }
 }

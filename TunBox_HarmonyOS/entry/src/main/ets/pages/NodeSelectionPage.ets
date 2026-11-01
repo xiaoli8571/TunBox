@@ -8,9 +8,10 @@
  * 页面不再自己拉起第二个内核、不再自己开并发 lane、不再维护 URL 降级与看门狗
  * （旧实现真机表现为慢、成批假超时，以及"点了测速像没反应"）。
  */
-import { router, promptAction } from '@kit.ArkUI';
+import { router, promptAction , LengthMetrics} from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
-import { TunBoxColors, TunBoxMotion } from '../theme/TunBoxTokens';
+import { SafeArea } from '../theme/SafeArea';
+import { TunBoxColors, TunBoxMotion, TunBoxGeometry} from '../theme/TunBoxTokens';
 import { Ui, LatencyStyle, NodeDisplay } from '../theme/UiTokens';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
@@ -1751,6 +1752,7 @@ struct NodeSelectionPage {
               }, (chip: SubChip) => chip.id + '#' + chip.name)
             }
           }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .scrollable(ScrollDirection.Horizontal)
           .scrollBar(BarState.Off)
           .width('100%')
@@ -1892,6 +1894,7 @@ struct NodeSelectionPage {
             }, (groupRow: ProxyGroupRow) => this.groupKey(groupRow.group) + '#'
               + this.expandedGroupKeys.join('|') + '#' + this.testingName)
           }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
           .scrollBar(BarState.Off)
@@ -1918,12 +1921,16 @@ struct NodeSelectionPage {
               }))
             }, (row: NodeRow) => row.node.id + '#' + this.testingName + '#' + this.statusKey(row.status))
           }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
           .scrollBar(BarState.Off)
         }
       }
       .width('100%').height('100%')
+      // 2026-10-30：窗口沉浸式后布局不再避让状态栏，自绘顶栏要自己让出这一条
+      // （见 theme/SafeArea.ets；仍在避让的设备上 topPad() 为 0，不会重复留白）
+      .padding({ top: SafeArea.topPad() })
     }
     .width('100%').height('100%')
   }

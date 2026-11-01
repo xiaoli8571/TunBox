@@ -843,7 +843,8 @@ if (process.argv.includes('--arkts')) {
         }
       }
       const arktsErrors = out.split('\n')
-        .filter((l) => /ArkTS Compiler Error|ERROR: 10605\d+|arkts-no-|Failed :entry:default@CompileArkTS/i.test(l));
+        // arkts-no-* 也可能仅是 WARN；不能把成功构建中的 warning 误判成编译失败。
+        .filter((l) => /ArkTS Compiler Error|ERROR: 10605\d+|ERROR: ArkTS|Failed :entry:default@CompileArkTS/i.test(l));
       const buildOk = /BUILD SUCCESSFUL/.test(out);
       const logPath = path.join(os.tmpdir(), 'latency-v2-arkts-build.log');
       fs.writeFileSync(logPath, out, 'utf8');

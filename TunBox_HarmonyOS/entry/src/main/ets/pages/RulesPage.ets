@@ -614,12 +614,13 @@ export struct RulesView {
               .borderRadius(TunBoxGeometry.cardRadius)
               .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
               // 页签页底部为悬浮 Dock 预留（契约：≥ TunBoxGeometry.dockClearance）
-              Blank().height(TunBoxGeometry.dockClearance)
+              Blank().height(TunBoxGeometry.dockClearance())
             }.width('100%')
             .padding({
               left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
             })
           }.width('100%').layoutWeight(1).scrollBar(BarState.Off).edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
         } else {
           TopNavBar({ title: '路由与规则' })
           Text('正在读取规则设置…').fontSize(14).fontColor(TunBoxColors.textMuted).margin({ top: 24 })

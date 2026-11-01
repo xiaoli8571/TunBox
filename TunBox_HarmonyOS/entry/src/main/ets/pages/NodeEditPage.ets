@@ -2,8 +2,9 @@
  * 节点编辑页（手工添加/编辑节点）— 视觉对齐 upstream 新令牌（UiTokens）
  * 移植自 upstream: TunBox_Android/lib/screens/node_edit_screen.dart
  */
-import { router, promptAction } from '@kit.ArkUI';
-import { TunBoxColors, TunBoxMotion } from '../theme/TunBoxTokens';
+import { router, promptAction , LengthMetrics} from '@kit.ArkUI';
+import { SafeArea } from '../theme/SafeArea';
+import { TunBoxColors, TunBoxMotion, TunBoxGeometry} from '../theme/TunBoxTokens';
 import { util } from '@kit.ArkTS';
 import { Ui } from '../theme/UiTokens';
 import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
@@ -240,11 +241,15 @@ struct NodeEditPage {
           .padding({ left: 18, right: 18, bottom: 40 })
           .width('100%')
         }.edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
         .layoutWeight(1)
         .scrollBar(BarState.Off)
         .align(Alignment.Top)
       }
       .width('100%').height('100%')
+      // 2026-10-30：窗口沉浸式后布局不再避让状态栏，自绘顶栏要自己让出这一条
+      // （见 theme/SafeArea.ets；仍在避让的设备上 topPad() 为 0，不会重复留白）
+      .padding({ top: SafeArea.topPad() })
     }
     .width('100%').height('100%')
   }
