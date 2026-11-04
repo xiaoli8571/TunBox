@@ -134,6 +134,7 @@ export class LatencyKernelEndpoint {
   baseUrl: string = 'http://127.0.0.1:9090';
   /** 控制面密钥（空 = 不带鉴权头） */
   secret: string = '';
+  providerName: string = '';
 
   /** 鉴权头 */
   authHeaders(): Record<string, string> {
@@ -252,7 +253,11 @@ export class LatencyProbe {
   /** 构造延迟探测的 URL（与内核路由 `/proxies/{name}/delay` 对齐） */
   static delayUrl(endpoint: LatencyKernelEndpoint, nodeName: string, testUrl: string,
     nodeTimeoutMs: number): string {
-    return `${endpoint.baseUrl}/proxies/${encodeURIComponent(nodeName)}/delay`
+    const name: string = encodeURIComponent(nodeName);
+    const path: string = endpoint.providerName.length > 0
+      ? `/providers/proxies/${encodeURIComponent(endpoint.providerName)}/${name}/healthcheck`
+      : `/proxies/${name}/delay`;
+    return `${endpoint.baseUrl}${path}`
       + `?url=${encodeURIComponent(testUrl)}&timeout=${nodeTimeoutMs}`;
   }
 

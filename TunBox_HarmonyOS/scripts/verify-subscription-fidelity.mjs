@@ -141,7 +141,8 @@ function expectedNodes(yaml) {
     out.push({
       name, type,
       server: fieldOf(text, 'server'),
-      port: fieldOf(text, 'port'),
+      port: fieldOf(text, 'port') || '0',
+      hasCredential: ['password','uuid','auth','auth-str'].some(key => hasRealValue(text,key)),
       hasSni: hasRealValue(text, 'sni'),
       hasSkipCertVerify: hasRealValue(text, 'skip-cert-verify'),
       skipCertVerify: fieldOf(text, 'skip-cert-verify').toLowerCase() === 'true'
@@ -323,13 +324,16 @@ check('per-node type matches mihomo', () => {
   ok(bad.length === 0, `${bad.length} mismatched: ${bad.slice(0, 3).join(' / ')}`);
 });
 
-check('every node has server and port', () => {
-  const bad = got.filter(n => n.server.length === 0 || !(n.port > 0));
+check('remote proxy nodes have server and port; built-in adapters need neither', () => {
+  const policies = new Set(['direct','reject','reject-drop','pass','compatible','dns']);
+  const bad = got.filter(n => !policies.has((n.proxyType || '').toLowerCase()) && (n.server.length === 0 || !(n.port > 0)));
   ok(bad.length === 0, `${bad.length} missing server/port: ${bad.slice(0, 3).map(n => n.name).join(' / ')}`);
 });
 
 check('credentials are reachable per contract (structured slot, or extraOpts relay)', () => {
   const bad = got.filter(n => {
+    const source = expected.find(e => e.name === (n.originalName || n.name) && e.server === n.server && Number(e.port) === n.port);
+    if (source && !source.hasCredential) return false;
     const eo = extraOptMap(n);
     if (n.uuid.length > 0 || n.password.length > 0) return false;
     if (eo.has('uuid') || eo.has('password') || eo.has('auth') || eo.has('auth-str')) return false;

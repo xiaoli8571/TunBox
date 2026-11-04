@@ -119,9 +119,9 @@ ok('B5 候选兜底回写偏好带 !intentLive 闸门',
   || /if \(!intentLive\) \{\n\s*try \{\n\s*await SettingsService\.patchSettings/.test(orch),
   '缺 !intentLive 闸门：钉不上候选节点时会覆盖用户选择');
 
-ok('B6 「目标不在组里」的偏好改写带 !built.pinMatched 闸门',
-  /if \(effectiveName !== target\.name && !built\.pinMatched\)/.test(orch),
-  '意图还在配置里时不得改写偏好');
+ok('B6 偏好自愈仅限自动模式的未命中目标',
+  /if \(effectiveName !== target\.name && !built\.pinMatched\s*&& settings\.autoSelectMode === AutoSelectModes\.AUTO\)/.test(orch),
+  '手动选择或意图还在配置里时不得改写偏好');
 
 section('C. 成员注入（真跑 ProfileConfigMerger）');
 

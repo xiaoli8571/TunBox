@@ -21,12 +21,12 @@
 import { ClashApiService } from '../services/ClashApiService';
 import { ConnectionOrchestrator } from '../services/ConnectionOrchestrator';
 import { AppLogger } from '../utils/AppLogger';
-import { LatencyRecord, LatencyState, LatencyChannel } from '../services/LatencyState';
+import { LatencyContext, LatencyRecord, LatencyState, LatencyChannel } from '../services/LatencyState';
 import { LatencyLiveView } from '../services/LatencyLiveView';
 import { LatencyProbeKind, LatencyStrategy } from '../latency/LatencyKinds';
 import {
   DelayResult, DelayTarget, FlclashDelayRun, FlclashDelaySummary,
-  FLCLASH_DELAY_TIMED_OUT, FLCLASH_DELAY_FAILED, FLCLASH_DELAY_URL, delayTestKey
+  FLCLASH_DELAY_TIMED_OUT, FLCLASH_DELAY_FAILED, FLCLASH_DELAY_URL
 } from '../flclash/FlclashDelay';
 
 const TAG = 'FlclashLatencyService';
@@ -55,35 +55,24 @@ export class FlclashLatencySession {
   private readonly targets: DelayTarget[];
   private readonly runId: number;
   private readonly previous: Map<string, LatencyRecord>;
-  /**
-   * 本批是否被**显式取消**（用户又点了测速 / 新批抢占 / 关页面）。
-   *
-   * 为什么必须区分：收尾时「没测出结论」的节点要收回到某个状态。
-   *  - 被抢占 = 我们主动不测了 ⇒ 不能给节点盖章（沿用旧结论，没有就「未测」）；
-   *  - 没被取消却没结论 = 请求挂到守护上限（10s）才被收尾、或压根没发出去
-   *    ⇒ 这就是「问了、等到超时也没答」，应当如实显示「超时」。
-   * 旧实现两种情况一律回到 `untested`，真机表现就是 2026-10-29 用户反馈的
-   * 「测速完过一会一部分节点显示 --」（59 节点批：measured=18 timeout=16
-   * failed=23 **cancelled=2**，那 2 条正好永久停在 `--`）。
-   */
+  /** Explicit cancellation and a missing controller response both produce no node verdict. */
   private explicitCancel: boolean = false;
+  private readonly contexts: Map<string, LatencyContext>;
+  private readonly current: () => boolean;
 
   private clearOwnTesting(): void {
     for (const target of this.targets) {
-      if (LatencyLiveView.isTestingOwnedBy(target.proxyName, this.runId)) {
-        const old = this.previous.get(target.proxyName);
-        if (old !== undefined) {
-          LatencyLiveView.setRecord(old);
-          continue;
-        }
-        if (this.explicitCancel) {
-          LatencyLiveView.setRecord(LatencyRecord.untested(target.proxyName));
-          continue;
-        }
-        // 非取消却无结论：请求发出后挂死到守护上限，等同超时（用户口径
-        // 2026-10-18：要么给延迟、要么给超时/失败，不要模棱两可的第三种结果）。
-        LatencyLiveView.setRecord(LatencyRecord.failed(target.proxyName, LatencyState.TIMEOUT,
-          Date.now(), LatencyChannel.CORE, LatencyProbeKind.TIMEOUT));
+      const context = this.contexts.get(target.key) ?? null;
+      if (!LatencyLiveView.isTestingOwnedBy(target.proxyName, this.runId, context)) { continue; }
+      const old = this.previous.get(target.key);
+      if (old !== undefined) {
+        LatencyLiveView.setRecord(old);
+      } else {
+        // Missing controller response is not evidence of a node timeout.
+        const rec = LatencyRecord.untested(target.proxyName);
+        rec.context = context;
+        rec.failKind = this.explicitCancel ? LatencyProbeKind.CANCELLED : LatencyProbeKind.CORE_NOT_READY;
+        LatencyLiveView.setRecord(rec);
       }
     }
     LatencyLiveView.flushNow();
@@ -93,8 +82,12 @@ export class FlclashLatencySession {
   private readonly donePromise: Promise<FlclashLatencyProgress>;
 
   constructor(api: ClashApiService, targets: DelayTarget[], source: string,
-    runId: number, previous: Map<string, LatencyRecord>) {
+    runId: number, previous: Map<string, LatencyRecord>,
+    contexts: Map<string, LatencyContext> = new Map<string, LatencyContext>(),
+    current: () => boolean = (): boolean => true) {
     this.api = api;
+    this.contexts = contexts;
+    this.current = current;
     this.targets = targets;
     this.runId = runId;
     this.previous = previous;
@@ -126,11 +119,18 @@ export class FlclashLatencySession {
   }
 
   private apply(result: DelayResult): void {
+    if (this.finished || !this.current()) { return; }
+    const context = this.contexts.get(result.key) ?? null;
+    if (!LatencyLiveView.isTestingOwnedBy(result.proxyName, this.runId, context)) { return; }
     const now = Date.now();
     // 【2026-10-22 真机 bug 修复】失败分类必须是 `LatencyProbeKind` 里的**真分类**：
     // 旧实现写的是字面量 `'failed'`，而 `LatencyStore.describe()` 只认表内分类
     // （timeout / network_unreachable / switch_failed / …），认不出就走 `else → '--'`。
     // 真机表现就是「20 个节点测完，13 个失败的全部显示 --，不是超时/拨号失败」。
+    if (!LatencyStrategy.isValidDelay(result.value)) {
+      // 404 = 内核里没有这个名字；其它 = 拨了没通。用户报障排查需要名字+码。
+      AppLogger.warn(TAG, `delay failed: ${result.proxyName} http=${result.httpCode} value=${result.value}`);
+    }
     let failKind: string = LatencyProbeKind.TIMEOUT;
     if (result.value !== FLCLASH_DELAY_TIMED_OUT) {
       // 404 = 内核里没有这个节点（名字对不上/没进配置）→「未生效」，不是节点坏；
@@ -147,6 +147,8 @@ export class FlclashLatencySession {
         result.value === FLCLASH_DELAY_TIMED_OUT ? LatencyState.TIMEOUT : LatencyState.FAILED,
         now, LatencyChannel.CORE, failKind);
     rec.source = this.source;
+    rec.context = context;
+    rec.runId = this.runId;
     LatencyLiveView.setRecord(rec);
     this.progress.started = this.progress.started + 1;
     if (valid) {
@@ -180,6 +182,8 @@ export class FlclashLatencySession {
     this.explicitCancel = true;
     this.run.cancel();
     this.clearOwnTesting();
+    this.progress.cancelled = Math.max(0, this.progress.total - this.progress.measured
+      - this.progress.timeout - this.progress.failed);
     this.progress.running = false;
     this.finished = true;
     this.resolveDone(this.progress);
@@ -199,32 +203,45 @@ export class FlclashLatencyService {
    */
   static start(api: ClashApiService, nodeNames: string[], testUrl: string,
     source: string = 'manual',
-    perNodeUrl: Map<string, string> | null = null): FlclashLatencySession {
-    if (FlclashLatencyService.current !== null) {
-      FlclashLatencyService.current.cancel();
-    }
+    perNodeUrl: Map<string, string> | null = null,
+    expected: string = '', context: LatencyContext | null = null,
+    current: () => boolean = (): boolean => true): FlclashLatencySession {
     const effectiveUrl = testUrl.length > 0 ? testUrl : FLCLASH_DELAY_URL;
-    const seen: Set<string> = new Set<string>();
+    const targets: DelayTarget[] = [];
+    for (const name of nodeNames) {
+      const url = perNodeUrl !== null ? perNodeUrl.get(name) ?? effectiveUrl : effectiveUrl;
+      targets.push(new DelayTarget(name, url || effectiveUrl, '', expected, api.providerForProxy(name)));
+    }
+    return FlclashLatencyService.startTargets(api, targets, source, context, current);
+  }
+
+  /** Explicit per-target policy; deduplication and ownership use the full identity. */
+  static startTargets(api: ClashApiService, requested: DelayTarget[], source: string = 'manual',
+    context: LatencyContext | null = null,
+    current: () => boolean = (): boolean => true): FlclashLatencySession {
+    if (FlclashLatencyService.current !== null) { FlclashLatencyService.current.cancel(); }
     const targets: DelayTarget[] = [];
     const previous: Map<string, LatencyRecord> = new Map<string, LatencyRecord>();
-    // 批次身份：发号统一走 LatencyLiveView.nextRunId —— 与 LatencyEngine 共用
-    // 同一序列，跨引擎永不撞号（旧批收尾误清新批 TESTING 标记的结构性根因）。
+    const contexts: Map<string, LatencyContext> = new Map<string, LatencyContext>();
+    const seen: Set<string> = new Set<string>();
     const runId = LatencyLiveView.nextRunId();
-    for (const name of nodeNames) {
-      if (name.length === 0 || seen.has(name)) {
-        continue;
-      }
-      seen.add(name);
-      const url = perNodeUrl !== null && perNodeUrl.has(name) ? perNodeUrl.get(name) as string : effectiveUrl;
-      targets.push(new DelayTarget(name, url.length > 0 ? url : effectiveUrl,
-        delayTestKey(url.length > 0 ? url : effectiveUrl, name)));
-      const old = LatencyLiveView.recordFor(name);
-      if (old !== null && old.state !== LatencyState.TESTING) { previous.set(name, old); }
-      LatencyLiveView.markTesting(name, runId);
+    for (const target of requested) {
+      if (target.proxyName.length === 0) { continue; }
+      const scoped = context === null ? null
+        : new LatencyContext(context.profileId, context.revision, target.testUrl, target.expected);
+      target.key = scoped === null ? JSON.stringify([target.testUrl, target.expected, target.proxyName])
+        : scoped.key(target.proxyName);
+      if (seen.has(target.key)) { continue; }
+      seen.add(target.key);
+      if (scoped !== null) { contexts.set(target.key, scoped); }
+      targets.push(target);
+      const old = LatencyLiveView.recordFor(target.proxyName, scoped);
+      if (old !== null && old.state !== LatencyState.TESTING) { previous.set(target.key, old); }
+      LatencyLiveView.markTesting(target.proxyName, runId, scoped);
     }
-    const session = new FlclashLatencySession(api, targets, source, runId, previous);
+    const session = new FlclashLatencySession(api, targets, source, runId, previous, contexts, current);
     FlclashLatencyService.current = session;
-    AppLogger.info(TAG, `delay batch start: nodes=${targets.length} url=${effectiveUrl} source=${source}`);
+    AppLogger.info(TAG, `delay batch start: targets=${targets.length} source=${source}`);
     return session;
   }
 
@@ -248,8 +265,8 @@ export class FlclashLatencyService {
    * 返回被取消/未开始的节点数由 session 自己的 summary 负责。
    */
   static startGroup(api: ClashApiService, groupNodeNames: string[], testUrl: string,
-    source: string = 'manual'): FlclashLatencySession {
-    return FlclashLatencyService.start(api, groupNodeNames, testUrl, source, null);
+    source: string = 'manual', expected: string = ''): FlclashLatencySession {
+    return FlclashLatencyService.start(api, groupNodeNames, testUrl, source, null, expected);
   }
 }
 

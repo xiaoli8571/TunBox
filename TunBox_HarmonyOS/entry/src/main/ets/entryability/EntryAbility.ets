@@ -16,6 +16,7 @@ import { SubscriptionUpdateScheduler } from '../commons/services/SubscriptionUpd
 import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { PersistentLogStore } from '../commons/services/PersistentLogStore';
 import { ThemeService } from '../theme/ThemeService';
 import { SafeArea } from '../theme/SafeArea';
 
@@ -80,6 +81,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    PersistentLogStore.init(this.context, 'app');
     AppLogger.info(TAG, 'onCreate');
     this.applyMotionFloorByScreenSize();
     // geo 数据随包携带：内核启动前必须就位，否则会卡在联网下载 MMDB（20s 超时）。
@@ -178,6 +180,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onBackground(): void {
+    PersistentLogStore.flush();
     // 设置采用「内存 → 合并 → 防抖落盘」（2026-10-27 写放大整治）：
     // 进后台是最后一个可靠的刷盘点，必须强制落盘，否则防抖窗口内的改动会丢。
     SettingsService.flushNow().catch((e: Error): void => {
@@ -401,6 +404,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    PersistentLogStore.flush();
     AppLogger.info(TAG, 'onDestroy: UI ability released; preserve active VPN runtime artifacts');
     SettingsService.flushNow().catch((e: Error): void => {
       AppLogger.warn(TAG, `settings flush on destroy failed: ${e.message}`);

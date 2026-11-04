@@ -82,6 +82,40 @@ export class GroupMemberResult {
 }
 
 export class ProfileConfigMerger {
+  /** Final platform invariants, after every user/profile merge (never change DNS upstreams). */
+  static enforceTunnelContract(yaml: string, mtu: number, ipv6Enabled: boolean): string {
+    let out = yaml;
+    const tun = ProfileConfigMerger.sectionText(out, 'tun');
+    if (tun.length > 0) {
+      const clean = tun.split('\n').filter((line: string): boolean => !/^  mtu:/.test(line));
+      clean.splice(1, 0, `  mtu: ${mtu}`);
+      out = ProfileConfigMerger.removeKey(out, 'tun') + '\n' + clean.join('\n');
+    }
+    const dns = ProfileConfigMerger.sectionText(out, 'dns');
+    if (dns.length === 0) { throw new Error('运行配置缺少 DNS 段'); }
+    const read = (key: string): string => {
+      for (const line of dns.split('\n')) {
+        const match = line.match(new RegExp('^  ' + key + ':\\s*(.*?)\\s*(?:#.*)?$'));
+        if (match !== null) { return match[1].replace(/^["']|["']$/g, '').trim(); }
+      }
+      return '';
+    };
+    const mode = read('enhanced-mode');
+    const fake = mode === 'fake-ip';
+    const dns6 = ipv6Enabled && fake && read('ipv6') !== 'false';
+    // On affected OHOS versions only the ULA on-link route is reliable. Real AAAA
+    // cannot be declared captured. Preserve explicit redir-host, use A-only DNS there.
+    if (ipv6Enabled && !fake) {
+      AppLogger.warn(TAG, 'real-address DNS mode: IPv6 answers disabled on this platform; DNS mode/upstreams preserved');
+    }
+    const lines = dns.split('\n').filter((line: string): boolean =>
+      !/^  (ipv6|fake-ip-range6):/.test(line));
+    lines.splice(1, 0, '  ipv6: ' + (dns6 ? 'true' : 'false'));
+    if (dns6) { lines.splice(2, 0, '  fake-ip-range6: fdfe:dcba:9876::/64'); }
+    out = ProfileConfigMerger.removeKey(out, 'dns') + '\n' + lines.join('\n') + '\n';
+    return out;
+  }
+
   /**
    * 订阅原文是否是内核可解析的 Clash 配置。
    *

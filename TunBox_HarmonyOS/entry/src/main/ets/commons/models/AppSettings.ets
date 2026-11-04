@@ -183,7 +183,7 @@ export class AppSettingsJson {
   smartPolicyPriority: string = '';
   /**
    * 域名嗅探（sniffer）：从 TLS ClientHello / HTTP Host / QUIC 握手里还原真实目标域名。
-   * DNS 恒由内核接管（redir-host：应答是真实地址），DOMAIN 规则靠 IP→域名映射反查；
+   * DNS 默认为 fake-ip，DOMAIN 规则靠假地址映射；采用订阅模式时仍由内核接管。
    * TLS SNI 与 DNS 不一致的场景（CDN / 直连 IP 访问）仍必须靠嗅探才能分对流向。
    * 默认开启，与 Clash Verge / FlClash 等主流客户端一致。旧版本配置缺字段时取默认 true。
    */
@@ -620,7 +620,7 @@ export class AppSettings {
     // 表现就是「VPN 连上了但代理完全不生效、公网 IP 是本地出口」——这正是 0.4.0
     // 被反馈的一类故障形态，而且用户很难自己发现是模式问题。
     //
-    // 因此：`direct` 只在**本次运行期**有效（运行期切模式走 ClashApiService.setMode，
+    // 因此：`direct` 只在**本次运行期**有效（运行期切模式由编排器携带临时 mode 重启代理，
     // 热更新不改磁盘语义），重启后一律回落 `rule`。需要直连的场景重新点一下按钮即可，
     // 代价是点一次，收益是**不可能被粘在直连态**。
     const parsedMode: string = j.proxyMode;

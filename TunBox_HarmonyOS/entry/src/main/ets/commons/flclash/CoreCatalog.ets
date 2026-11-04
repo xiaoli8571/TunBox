@@ -116,6 +116,7 @@ export class CoreNode {
   lastDelay: number = -1;
   /** 组测速地址；非组或未配置为空 */
   url: string = '';
+  expectedStatus: string = '';
   /** 是否在 rule 模式下隐藏（当前只有内置 GLOBAL） */
   hidden: boolean = false;
   /** 是否组（CORE_GROUP_TYPES 成员） */
@@ -137,6 +138,7 @@ export class CoreGroup {
   all: CoreNode[] = [];
   /** 组测速地址（组未配置时为空，调用方回落全局 testUrl） */
   url: string = '';
+  expectedStatus: string = '';
   /** rule 模式下是否隐藏 */
   hidden: boolean = false;
 
@@ -150,6 +152,7 @@ export class CoreGroup {
     const copy = new CoreGroup(group.name, group.type);
     copy.now = group.now;
     copy.url = group.url;
+    copy.expectedStatus = group.expectedStatus;
     copy.hidden = group.hidden;
     copy.all = all;
     return copy;
@@ -305,6 +308,7 @@ export class CoreCatalog {
       node.all = CoreCatalog.namesOf(entry['all']);
       node.lastDelay = CoreCatalog.lastDelayOf(entry['history']);
       node.url = CoreCatalog.groupUrlOf(entry);
+      node.expectedStatus = CoreCatalog.textOf(entry['expectedStatus']) || CoreCatalog.textOf(entry['expected-status']);
       node.hidden = node.isGroup ? CoreCatalog.hiddenOf(key, entry) : false;
       model.byName[key] = node;
       order.push(key);
@@ -337,6 +341,7 @@ export class CoreCatalog {
       const group = new CoreGroup(node.name, node.type);
       group.now = node.now;
       group.url = node.url;
+      group.expectedStatus = node.expectedStatus;
       group.hidden = node.hidden;
       group.all = CoreCatalog.resolveMembers(node.all, model.byName);
       model.groups.push(group);

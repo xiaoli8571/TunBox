@@ -201,6 +201,8 @@ export class ClashApiService {
   static readonly GROUP_TYPES: string[] = GROUP_TYPES;
   private apiPort: number = 9090;
   private secret: string = '';
+  private endpointRevision: number = 0;
+  private proxyProviders: Map<string, string> = new Map<string, string>();
 
   /**
    * 在途延迟测试请求集合。
@@ -236,8 +238,17 @@ export class ClashApiService {
   }
 
   setEndpoint(port: number, secret: string): void {
+    if (this.apiPort !== port || this.secret !== secret) {
+      this.endpointRevision++;
+      this.proxyProviders.clear();
+    }
     this.apiPort = port;
     this.secret = secret;
+  }
+
+  /** Provider-owned proxies use the provider healthcheck route, not /proxies/{name}. */
+  providerForProxy(name: string): string {
+    return this.proxyProviders.get(name) ?? '';
   }
 
   /**
@@ -387,20 +398,92 @@ export class ClashApiService {
    *  每个 hop 带 type：只有 Selector 可 PUT（2026-10-25 定案：URLTest/Fallback/Smart
    *  是策略组，mihomo 对它们的 PUT 一律 400 —— 机场组结构下按整链 PUT 必挂）。 */
   private selectionPath(table: Record<string, Object>, group: string, target: string,
-    visited: string[]): SelectionHop[] {
+    visited: string[], selectorsOnly: boolean = false): SelectionHop[] {
     if (visited.includes(group) || visited.length > 32) { return []; }
     const entry = table[group] as Record<string, Object>;
     if (entry === undefined || entry === null || !Array.isArray(entry['all'])) { return []; }
     const type = entry['type'] as string;
     if (!['Selector', 'URLTest', 'Fallback', 'Smart'].includes(type)) { return []; }
+    if (selectorsOnly && type !== 'Selector') { return []; }
     const members = entry['all'] as string[];
     if (members.includes(target)) { return [new SelectionHop(group, type)]; }
     const next = visited.concat([group]);
     for (const member of members) {
-      const path = this.selectionPath(table, member, target, next);
+      const path = this.selectionPath(table, member, target, next, selectorsOnly);
       if (path.length > 0) { return [new SelectionHop(group, type)].concat(path); }
     }
     return [];
+  }
+
+  /**
+   * 按组名直接钉选成员（FlClash `patchSelectGroup` 等价物）。
+   *
+   * 与 `selectNode` 的差别：**不改组结构推导**，只对这一组 PUT 一次，成员名可以是
+   * 子策略组（模板类配置的用户选择就是「默认代理 → 香港自动」）。
+   */
+  async applyGroupSelection(groupName: string, member: string): Promise<boolean> {
+    if (groupName.length === 0 || member.length === 0) { return false; }
+    try {
+      return await this.selectInGroup(groupName, member);
+    } catch (e) {
+      AppLogger.warn(TAG, `applyGroupSelection failed: ${groupName} -> ${member}: ${AppLogger.errText(e)}`);
+      return false;
+    }
+  }
+
+  /** Apply one explicit startup intent within its primary selector. Automatic
+   * children keep their policy when selected as a group; a concrete leaf must
+   * have a fully controllable selector path. Unrelated groups cannot prove it. */
+  async selectNodeInGroup(groupName: string, nodeName: string,
+    current: () => boolean = (): boolean => true,
+    timeoutMs: number = SELECT_CONVERGE_TIMEOUT_MS): Promise<boolean> {
+    if (groupName.length === 0 || nodeName.length === 0) { return false; }
+    const revision = this.endpointRevision;
+    const deadline = Date.now() + Math.max(0, Math.min(12000, timeoutMs));
+    while (current() && revision === this.endpointRevision) {
+      const json = await this.proxiesJson();
+      if (!current() || revision !== this.endpointRevision) { return false; }
+      if (json !== null) {
+        try {
+          const parsed = JSON.parse(json) as Record<string, Object>;
+          const table = parsed['proxies'] as Record<string, Object>;
+          const path: SelectionHop[] = table === undefined || table[nodeName] === undefined ? []
+            : this.selectionPath(table, groupName, nodeName, [], true);
+          let accepted = path.length > 0 || (groupName === nodeName && table !== undefined
+            && table[nodeName] !== undefined);
+          for (let i = path.length - 1; i >= 0 && accepted; i--) {
+            if (!current() || revision !== this.endpointRevision) { return false; }
+            const member = i + 1 < path.length ? path[i + 1].name : nodeName;
+            accepted = await this.selectInGroup(path[i].name, member);
+          }
+          if (accepted) {
+            const afterJson = await this.proxiesJson();
+            if (!current() || revision !== this.endpointRevision) { return false; }
+            if (afterJson !== null) {
+              const after = (JSON.parse(afterJson) as Record<string, Object>)['proxies'] as Record<string, Object>;
+              for (let i = 0; i < path.length; i++) {
+                const entry = after[path[i].name] as Record<string, Object>;
+                const member = i + 1 < path.length ? path[i + 1].name : nodeName;
+                if (entry === undefined || entry['now'] !== member) { accepted = false; break; }
+              }
+              if (accepted) {
+                const selected = await this.readKernelSelection(groupName);
+                if (!current() || revision !== this.endpointRevision) { return false; }
+                const exit = selected === null ? undefined : after[selected.now] as Record<string, Object>;
+                if (selected !== null && selected.group === groupName && selected.nowIsLeaf
+                  && exit !== undefined
+                  && !['Compatible', 'Reject', 'RejectDrop', 'Pass', 'PassRule'].includes(exit['type'] as string)) { return true; }
+              }
+            }
+          }
+        } catch (e) {
+          AppLogger.warn(TAG, `scoped selection failed: ${AppLogger.errText(e)}`);
+        }
+      }
+      if (Date.now() >= deadline) { return false; }
+      await new Promise<void>((resolve) => setTimeout((): void => resolve(), SELECT_CONVERGE_INTERVAL_MS));
+    }
+    return false;
   }
 
   async selectNode(nodeName: string): Promise<boolean> {
@@ -502,16 +585,34 @@ export class ClashApiService {
     const nowRaw = groupEntry['now'] as string;
     out.now = nowRaw === undefined || nowRaw === null ? '' : nowRaw;
     const all = groupEntry['all'] as string[];
+    const collectLeaves = (name: string, visited: Set<string>): void => {
+      if (visited.has(name)) { return; }
+      visited.add(name);
+      const entry = table[name] as Record<string, Object>;
+      if (entry === undefined || entry === null) { return; }
+      if (!groupNames.has(name)) {
+        if (!name.startsWith('__') && name.indexOf('剩余') < 0 && name.indexOf('到期') < 0
+          && !out.leafMembers.includes(name)) { out.leafMembers.push(name); }
+        return;
+      }
+      if (Array.isArray(entry['all'])) {
+        for (const member of entry['all'] as string[]) { collectLeaves(member, visited); }
+      }
+    };
     if (Array.isArray(all)) {
       for (const m of all) {
         if (m.length === 0) { continue; }
         out.members.push(m);
-        if (groupNames.has(m)) { continue; }
-        if (m.indexOf('剩余') >= 0 || m.indexOf('到期') >= 0) { continue; }
-        const leaf = table[m] as Record<string, Object>;
-        if (leaf === undefined || leaf === null) { continue; }
-        out.leafMembers.push(m);
       }
+      collectLeaves(out.group, new Set<string>());
+    }
+    // now may be a child group. Follow the selected chain, never an arbitrary
+    // first leaf, so the home label and live exit describe the same route.
+    const selectedPath: Set<string> = new Set<string>();
+    while (groupNames.has(out.now) && !selectedPath.has(out.now)) {
+      selectedPath.add(out.now);
+      const child = table[out.now] as Record<string, Object>;
+      out.now = typeof child['now'] === 'string' ? child['now'] as string : '';
     }
     for (const leaf of out.leafMembers) {
       if (leaf === out.now) { out.nowIsLeaf = true; break; }
@@ -749,7 +850,7 @@ export class ClashApiService {
   }
 
   /**
-   * 原始 `GET /proxies` 响应（FlClash `core.getProxiesGroups` 的对等数据源）。
+   * 内核完整目录：合并 `GET /proxies` 与 `GET /providers/proxies`。
    *
    * FlClash 的节点/分组一律来自内核，App 不持有清单；TunBox 走同一份内核数据源，
    * 由 `commons/flclash/CoreCatalog` 解析成组/节点模型。
@@ -759,6 +860,7 @@ export class ClashApiService {
    */
   async proxiesJson(): Promise<string | null> {
     const req = http.createHttp();
+    const revision = this.endpointRevision;
     this.inflight.add(req);
     try {
       const resp = await req.request(`${this.baseUrl()}/proxies`, {
@@ -771,15 +873,89 @@ export class ClashApiService {
       if (resp.responseCode !== 200) {
         return null;
       }
+      let body: string = '';
       if (typeof resp.result === 'string') {
-        return resp.result as string;
+        body = resp.result as string;
+      } else if (resp.result instanceof ArrayBuffer) {
+        body = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
       }
+      const merged = await this.withProviderProxies(body, revision);
+      return revision === this.endpointRevision ? merged : null;
+    } catch (e) {
+      AppLogger.warn(TAG, `proxiesJson failed: ${this.errText(e)}`);
+      return null;
+    } finally {
+      this.inflight.delete(req);
+      req.destroy();
+    }
+  }
+
+  /** mihomo REST /proxies omits provider-owned outbounds. Build the same complete
+   * view as FlClash's tunnel.AllProxies(), keeping static names authoritative. */
+  private async withProviderProxies(json: string, revision: number): Promise<string | null> {
+    let root: Record<string, Object>;
+    try {
+      root = JSON.parse(json) as Record<string, Object>;
+    } catch (_e) { return null; }
+    if (root === null || typeof root !== 'object' || Array.isArray(root)) { return null; }
+    const raw = root['proxies'];
+    if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) { return null; }
+    const table = raw as Record<string, Object>;
+    const occupied: Set<string> = new Set<string>(Object.keys(table));
+    const owners: Map<string, string> = new Map<string, string>();
+    const providersJson = await this.providersJson();
+    if (revision !== this.endpointRevision) { return null; }
+    if (providersJson !== null) {
+      try {
+        const providersRoot = JSON.parse(providersJson) as Record<string, Object>;
+        const providers = providersRoot['providers'] as Record<string, Object>;
+        if (providers !== null && providers !== undefined && typeof providers === 'object'
+          && !Array.isArray(providers)) {
+          for (const providerName of Object.keys(providers)) {
+            const entry = providers[providerName] as Record<string, Object>;
+            if (entry === null || entry === undefined || !Array.isArray(entry['proxies'])) { continue; }
+            const proxies = entry['proxies'] as Object[];
+            for (const value of proxies) {
+              if (value === null || typeof value !== 'object' || Array.isArray(value)) { continue; }
+              const proxy = value as Record<string, Object>;
+              const name = proxy['name'];
+              if (typeof name !== 'string' || name.length === 0 || typeof proxy['type'] !== 'string') { continue; }
+              if (occupied.has(name)) { continue; }
+              table[name] = proxy;
+              occupied.add(name);
+              owners.set(name, providerName);
+            }
+            AppLogger.info(TAG, `provider ${providerName}: nodes=${proxies.length}`);
+          }
+        }
+      } catch (e) {
+        AppLogger.warn(TAG, `provider catalog parse failed: ${this.errText(e)}`);
+      }
+    }
+    this.proxyProviders = owners;
+    return JSON.stringify(root);
+  }
+
+  /** `GET /providers/proxies`：provider 元数据与真实节点；失败返回 null。 */
+  async providersJson(): Promise<string | null> {
+    const req = http.createHttp();
+    this.inflight.add(req);
+    try {
+      const resp = await req.request(`${this.baseUrl()}/providers/proxies`, {
+        method: http.RequestMethod.GET,
+        header: this.authHeader(),
+        connectTimeout: 2500,
+        readTimeout: 4000,
+        usingCache: false
+      });
+      if (resp.responseCode !== 200) { return null; }
+      if (typeof resp.result === 'string') { return resp.result as string; }
       if (resp.result instanceof ArrayBuffer) {
         return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(resp.result));
       }
       return null;
     } catch (e) {
-      AppLogger.warn(TAG, `proxiesJson failed: ${this.errText(e)}`);
+      AppLogger.warn(TAG, `providersJson failed: ${this.errText(e)}`);
       return null;
     } finally {
       this.inflight.delete(req);
@@ -1106,6 +1282,7 @@ export class ClashApiService {
     const endpoint = new LatencyKernelEndpoint();
     endpoint.baseUrl = this.baseUrl();
     endpoint.secret = this.secret;
+    endpoint.providerName = this.providerForProxy(nodeName);
     const transport = new ClashApiDelayTransport(this);
     // => 测速内核（commons/latency/LatencyProbe.ets）：**一次请求**语义 +
     //    单一失败分类表 + **完整失败响应体**进日志 + DNS 预检短路，

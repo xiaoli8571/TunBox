@@ -568,6 +568,39 @@ export class ProxyProviderParser {
   }
 
   /**
+   * url 明显不是可拉取链接（占位符 / 相对路径 / 缺 scheme）。
+   *
+   * 2026-11-03 用户报障「本地 YAML 导入一直 0 节点、测速说没有可用代理」：那份模板的
+   * `proxy-providers.HH.url` 写的是字面值 `订阅URL`，fetch 只会得到
+   * `unsupported protocol scheme ""`，笼统的「拉取失败」让用户以为应用坏了。
+   * 这里在**拉取前**就给出可执行文案；返回空串表示 url 形态可用。
+   */
+  static invalidUrlReason(entry: ProxyProviderEntry): string {
+    if (!entry.isSupportedType() || entry.url.length === 0) {
+      return '';
+    }
+    const lower = entry.url.toLowerCase();
+    if (lower.startsWith('http://') || lower.startsWith('https://')) {
+      return '';
+    }
+    const name = entry.name.length > 0 ? entry.name : 'provider';
+    const shown = entry.url.length > 40 ? `${entry.url.substring(0, 40)}…` : entry.url;
+    return `provider「${name}」的 url 不是可拉取链接（当前值：${shown}）：`
+      + '看起来是面板模板里的占位符，请换成自己的订阅地址后重新导入或刷新';
+  }
+
+  /** 本批 provider 里 url 形态非法的条目（拉取前静态判定） */
+  static invalidUrlEntries(entries: ProxyProviderEntry[]): ProxyProviderEntry[] {
+    const out: ProxyProviderEntry[] = [];
+    for (const e of entries) {
+      if (ProxyProviderParser.invalidUrlReason(e).length > 0) {
+        out.push(e);
+      }
+    }
+    return out;
+  }
+
+  /**
    * 单个 provider 无法使用时的**明确文案**（供上层直接展示给用户）。
    *
    * 关键约定：file 类型指向的是**面板本机**路径（例如 ./providers/p.yaml），

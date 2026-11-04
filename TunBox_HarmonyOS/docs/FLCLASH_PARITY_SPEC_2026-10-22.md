@@ -157,3 +157,8 @@ renderThrottleDuration = 300ms     // 结果合批刷新 UI
 | `convertProxies` in Go | ArkTS 移植 `ConvertsV2Ray` | 端侧无 Go 运行时 |
 | profile 原文作为 base | 原文文本切片内联进主配置 | 设备侧 provider 有两个 home 目录问题（见 skill） |
 | `core.getProxiesGroups` | REST `/proxies` | 同一份内核数据 |
+
+
+## 2026-11-03 补充：作用域与独立测试的鸿蒙实现
+
+测速记录在 URL/出口之外增加 profile 与内容修订及 expected-status，避免跨配置、跨测试策略沿用结论；嵌套组策略解析与 UI 查找共用同一函数。非当前订阅的测试使用 UI 进程独立无头核和物理网络 socket 绑定，在线 VPN Extension 维持原配置，不以切换当前 profile 模拟独立测试。没有内核响应时不写节点结论，保留旧值并报告未完成；3000 ms/64/10000 ms 既定参数不变。实现与验收记录见 `REVIEW_REMAINING_FIXES_2026-11-03.md`。

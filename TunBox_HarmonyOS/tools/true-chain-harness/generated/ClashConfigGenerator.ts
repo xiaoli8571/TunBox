@@ -4,7 +4,7 @@
  * 移植自 upstream: packages/tunbox_shared/lib/services/clash_config_generator.dart
  *
  * 关键约束（与 upstream 行为一致）：
- * - DNS 恒接管（设置页无开关）：`dns.enable: true` + `tun.dns-hijack: any:53` +
+ * - DNS 恒接管（覆写开关只决定配置来源）：`dns.enable: true` + `tun.dns-hijack: any:53` +
  *   VpnConfig.dnsAddresses 指向 TUN sentinel，三处同生同灭
  * - IPv6 双栈由设置项 ipv6Enabled 决定（默认开）：开 ⇒ ipv6: true + dns.ipv6: true +
  *   fake-ip-range6（假 v6 池落在 TUN 自己的 fdfe:dcba:9876::/64 内 ⇒ AAAA 返回隧道内地址，
@@ -22,6 +22,7 @@ import { AppSettings, AutoSelectModes, CustomRuleSet } from './AppSettings.ts';
 // 生成器不再自己读用户配置、也不再自带任何 url 规则（审计 F12）。
 import { LatencyTestUrl } from './LatencyTestUrl.ts';
 import { YamlMerger } from './YamlMerger.ts';
+import { BASE_MTU } from './VpnRecoveryPolicy.ts';
 import { AppLogger } from './stubs.ts';
 import {
   RawProviderEntry, RawProviderPlan, RawProviderStats, RawSubscriptionStore,
@@ -340,7 +341,7 @@ export class ClashConfigGenerator {
     // 说明：strict-route 依赖 nftables/iptables，OHOS gvisor+fd 注入沙箱不可用，
     // 故不启用；Kill Switch 由 Extension 的默认路由（IPv4 0.0.0.0/0 + 可选 IPv6 ::/0）
     // 与内核存活监控保证。
-    lines.push('  mtu: 1400');          // 缺省值；Extension 按物理承载改写并下发 VpnConfig.mtu
+    lines.push(`  mtu: ${BASE_MTU}`);   // Same value as platform TUN; no bearer-dependent rewrite.
     // ── mips 栈 TCP 拥塞控制（2026-10-25 gVisor → mips 迁移后的栈级调优）──────
     // 这是 mips 下**唯一**真正生效的栈级性能旋钮：内核把 tun.congestion-controller
     // 透传为 sing-tun 的 StackOptions.TCPCongestionControl → mipstack 的
@@ -591,6 +592,26 @@ export class ClashConfigGenerator {
     // 按名字引用会指向不存在的节点 → 内核报 proxy not found 整份拒载。
     const proxyMembers: string[] = [];
     const selectedFromProvider = !staticNodes.includes(groupSelected);
+    // ── 选中项是**策略组**时，让 PROXY 首位直接指向它（2026-11-03 真机报障定案）──
+    //
+    // 用户报障：「选『台湾手动』，启动代理后显示小组里的节点，但出口还是真实出口 IP」。
+    // 面板里组行是可选项（FlClash 口径），此时 `preferredNodeName` 是一个**组名**，
+    // 它不在 validNodes 里 → 旧逻辑让 PROXY 首位落到 `validNodes[0]`（订阅里第一
+    // 个代理，很多机场正好是 `直连`）→ 规则 `MATCH,PROXY` 直接命中 DIRECT →
+    // 隧道通了但一律直连，而界面读的是机场主组（默认代理）的链路 → 显示台湾01。
+    //
+    // 正确做法：用户选的是哪一层，PROXY 的首位就指向哪一层，让内核自己沿
+    // `now` 链往下走（PROXY → 台湾手动 → 台湾01），既保住用户意图也不会掉到 DIRECT。
+    const emittedNameSet: Set<string> = new Set<string>();
+    for (const g of emittedGroups) {
+      emittedNameSet.add(g.name);
+    }
+    const preferredGroupName: string = settings.preferredNodeName.length > 0
+      && emittedNameSet.has(settings.preferredNodeName) ? settings.preferredNodeName : '';
+    if (preferredGroupName.length > 0) {
+      proxyMembers.push(preferredGroupName);
+      AppLogger.info(TAG, `PROXY primary member is a strategy group: ${preferredGroupName}`);
+    }
     if (emitSmart) {
       // 自动模式下 PROXY 默认指向 smart 组：内核按每条连接的目标特征（ASN/GeoIP/
       // 端口/域名类型）在组内动态选点，而不是整条隧道钉死在一个节点上。
@@ -1128,12 +1149,8 @@ export class ClashConfigGenerator {
   /**
    * DNS 段（全仓唯一写入点）：`dns:` 整块由本方法产出。
    *
-   * 2026-10-27：设置页恢复「DNS 接管」开关（`AppSettings.dnsOverrideEnabled`，默认 true）。
-   *   · true（默认）⇒ 整段照旧（enable/listen/fake-ip/DoT/policy/…）；
-   *   · false ⇒ **只写** `dns: { enable: false }`，并让 generate() 不写 `tun.dns-hijack`；
-   *     扩展侧读**同一份 YAML 的 dns.enable 行**决定是否下发 VpnConfig.dnsAddresses。
-   * 三处同源（YAML 是唯一真源），不存在「内核不跑 DNS 却仍劫持 53」的黑洞中间态
-   * （2026-10-21 之前的老实现正是败在这一点：TunFlags.dnsOverride 默认值与内核不一致）。
+   * dnsOverrideEnabled only selects app DNS vs subscription DNS; it never disables interception.
+   * Final IPv6 pool compatibility is enforced after all merges by RuntimeConfigBuilder.
    *
    * 调用点只允许 generate() 一处（隧道与测速核共用同一份 dns 段；
    * 闸门 verify-config-single-source 会比对两份产物的一致性）。

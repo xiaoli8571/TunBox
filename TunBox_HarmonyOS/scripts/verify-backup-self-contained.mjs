@@ -19,6 +19,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { stripTypeScriptTypes } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ets = path.join(here, '..', 'entry', 'src', 'main', 'ets');
@@ -78,6 +81,27 @@ ok(/const live = await SettingsService\.load\(\);/.test(settingsBlock),
 ok(/settings\.proxyMode = live\.proxyMode;/.test(settingsBlock),
   '恢复后必须保留本机代理模式，不能用备份里的 global 覆盖');
 
+// Exercise the importer with real subscription defaults; replace persistence only.
+let restored;
+const context = vm.createContext({ JSON, Array, Set, Number, Date,
+  setTimeout() {}, AppLogger:{warn(){},errText:String},
+  ProfileRepository:{isReady(){return false;}},
+  SubscriptionService:{instance(){return {async restoreBackup(subs){restored=subs;}}}}
+});
+function loadProduction(source, name) {
+  const code = source.replace(/^import\b[\s\S]*?;\r?\n/gm,'').replace(/^export /gm,'');
+  return vm.runInContext(stripTypeScriptTypes(`(()=>{${code}\nreturn ${name}})()`,{mode:'transform'}),context);
+}
+context.Subscription = loadProduction(read('commons/models/Subscription.ets'),'Subscription');
+const Importer = loadProduction(backup,'BackupRestoreService');
+for (const input of [{autoUpdate:false,updateIntervalMinutes:45}, {autoUpdate:true,updateIntervalMinutes:1800}, {}]) {
+  const result=await Importer.importJsonText(JSON.stringify({subscriptions:[{id:'s',name:'local',url:'local://s',...input}]}));
+  assert.equal(result.ok,true);
+  assert.equal(restored[0].autoUpdate,input.autoUpdate ?? true);
+  assert.equal(restored[0].updateIntervalMinutes,input.updateIntervalMinutes ?? 0);
+  passed++;
+}
+
 if (failures.length > 0) {
   console.error('\n备份自包含闸门：FAIL');
   for (const f of failures) {
@@ -85,4 +109,4 @@ if (failures.length > 0) {
   }
   process.exit(1);
 }
-console.log(`备份自包含闸门：PASS（${passed} 项断言，SOURCE）`);
+console.log(`备份自包含闸门：PASS（${passed} 项；含 3 个生产导入运行用例）`);

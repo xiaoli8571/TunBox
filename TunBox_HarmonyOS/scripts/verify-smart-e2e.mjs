@@ -154,6 +154,7 @@ const want = [
   ['ImportFilePolicy.ets', 'ImportFilePolicy.ts'],
   // 2026-10-21（原文透传）：生成器从订阅原文切片节点定义 → 纯逻辑，stage 真源码
   ['RawProxyYaml.ets', 'RawProxyYaml.ts'],
+  ['VpnRecoveryPolicy.ets', 'VpnRecoveryPolicy.ts'],
 ];
 for (const [file, out] of want) {
   const p = path.join(svc, file);

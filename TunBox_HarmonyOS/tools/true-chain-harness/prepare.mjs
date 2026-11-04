@@ -29,6 +29,7 @@ const FILES = [
   // 2026-10-21：按订阅绑定的 DNS 上游载体（纯数据类，无依赖，不走桩）
   { src: 'commons/models/SubDnsUpstream.ets', out: 'SubDnsUpstream.ts', map: {} },
   { src: 'commons/services/RawProxyYaml.ets', out: 'RawProxyYaml.ts', map: {} },
+  { src: 'commons/services/VpnRecoveryPolicy.ets', out: 'VpnRecoveryPolicy.ts', map: {} },
   // ── 订阅解析内核化（2026-10-20）：规范解析层是真源，不能打桩 ──
   { src: 'commons/subscription/ProtocolParamTable.ets', out: 'ProtocolParamTable.ts', map: {} },
   {
@@ -202,6 +203,7 @@ const FILES = [
       '../utils/AppLogger': './stubs.ts',
       './RawSubscriptionStore': './stubs.ts',
       './RawProxyYaml': './RawProxyYaml.ts',
+      './VpnRecoveryPolicy': './VpnRecoveryPolicy.ts',
       // 2026-10-20（A12c）：测速地址唯一真源
       '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
     },

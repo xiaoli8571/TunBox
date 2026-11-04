@@ -46,7 +46,7 @@ import { ClashApiService } from './ClashApiService';
 // 全部由内核的判定表回答，引擎只负责批次调度（队列/在途/进度/取消/DNS 结论下发）。
 import { LatencyProbeKind, LatencyProbeResult } from '../latency/LatencyKinds';
 import { ConnectionOrchestrator, LatencyHostSnapshot } from './ConnectionOrchestrator';
-import { LatencyChannel, LatencyPolicy, LatencyRecord, LatencyState } from './LatencyState';
+import { LatencyChannel, LatencyContext, LatencyPolicy, LatencyRecord, LatencyState } from './LatencyState';
 import { LatencyLiveView } from './LatencyLiveView';
 import { ProxyNode } from '../models/ProxyNode';
 import { DoHResolver } from './DoHResolver';
@@ -354,6 +354,8 @@ export class LatencyInflightGate {
 const DNS_TRUST_EMPTY_SNAPSHOT: boolean = false;
 
 export class LatencyProgress {
+  /** No-target/channel diagnostics are not successful node measurements. */
+  message: string = '';
   total: number = 0;
   finished: number = 0;
   measured: number = 0;
@@ -403,6 +405,7 @@ export type LatencyProgressSink = (p: LatencyProgress) => void;
 
 /** 批次参数 */
 export class LatencyRunOptions {
+  context: LatencyContext | null = null;
   timeoutMs: number = LATENCY_TIMEOUT_MS;
   /** true=全部重测；false=跳过仍新鲜的实测结果（进页面自动测速用） */
   force: boolean = true;
@@ -422,6 +425,8 @@ export class LatencyRunOptions {
  * 单批测速会话。同一个引擎上同时只允许一个会话；新会话使旧会话立即作废。
  */
 export class LatencyRun {
+  private readonly context: LatencyContext | null;
+  private readonly previous: Map<string, LatencyRecord> = new Map<string, LatencyRecord>();
   private readonly api: ClashApiService | null;
   private readonly nodes: ProxyNode[];
   private readonly url: string;
@@ -472,8 +477,9 @@ export class LatencyRun {
 
   constructor(api: ClashApiService | null, nodes: ProxyNode[], url: string, timeoutMs: number,
     force: boolean, onResult: LatencyResultSink | null, onProgress: LatencyProgressSink | null,
-    source: string = 'manual', batchDeadlineMs: number = 0) {
+    source: string = 'manual', batchDeadlineMs: number = 0, context: LatencyContext | null = null) {
     this.api = api;
+    this.context = context;
     this.nodes = nodes;
     this.url = url;
     this.timeoutMs = timeoutMs;
@@ -547,58 +553,15 @@ export class LatencyRun {
    * 所有退出路径（正常结束 / 取消 / 作废 / 异常）上都保证不再留下 TESTING。
    */
   private clearOwnTestingMarks(): void {
-    let cleared = 0;
     for (const node of this.nodes) {
-      // 只收回**本批**打上的 TESTING：runId 是批次身份，抢占后的新批在
-      // 同一节点上重新 markTesting(runId'≠runId)，旧批收尾不得清掉它。
-      if (LatencyLiveView.isTestingOwnedBy(node.name, this.runId)) {
-        LatencyLiveView.setRecord(LatencyRecord.untested(node.name));
-        cleared = cleared + 1;
-      }
+      if (!LatencyLiveView.isTestingOwnedBy(node.name, this.runId, this.context)) { continue; }
+      const old = this.previous.get(node.name);
+      if (old !== undefined) { LatencyLiveView.setRecord(old); continue; }
+      const rec = LatencyRecord.untested(node.name);
+      rec.context = this.context;
+      LatencyLiveView.setRecord(rec);
     }
-    // ⚠ 这里**不再**回滚已盖章的失败结论（2026-10-18 用户裁定后移除）。
-    //
-    // 旧实现（coreUnavailable 时把本批 failure 章一并改回 untested）的理由是
-    // 「通道故障批的章不可信」，但代码路径上根本不成立：通道级故障
-    // （failKind=CORE_NOT_READY）在 probeThroughCore 里走的是「通道级故障」分支
-    // —— **从不发布任何记录**（判定权在内核的 isVerdictKind）。因此能被回滚的
-    // 失败章，100% 都是内核针对该节点给出的真实拨号结论（504 → TIMEOUT）。
-    //
-    // 真机取证 2026-10-18（飞鸟云 37 节点批）：内核已把 14 个节点盖成「超时」，
-    // 随后 controller 瞬时过载触发整批作废，这 14 个真实结论被改回「未测」，
-    // 连同 20 个未探测节点，用户看到 34/38 行都是 `--`。用户明确要求
-    // 「要么超时、要么显示延迟，不要第三种结果」——故此处只收回 TESTING
-    // （"我们不知道"才是诚实的中性态），已确定的节点结论一律保留。
-    // ── 兜底盖章（2026-10-18 用户裁定）：因**通道不可用**被搁置的节点补「超时」 ──
-    //
-    // 用户诉求：「要么显示延迟多少、要么显示超时，不要第三种结果」。
-    // 通道作废整批时，没来得及拨号的节点此前会永远留 `--`（未测），用户会误以为
-    // 根本没测速。这里给它们一个明确结论：内核不可用 → 该节点本轮无法使用 → 超时。
-    //
-    // 边界（很重要，别扩大）：
-    //  · 只在 coreUnavailable（引擎判定通道不可用）时补章；
-    //  · **用户主动取消 / 新批次抢占**（userCancelled）绝不补章 —— 那不是节点的错；
-    //  · 已有结论的节点一律不动（上面已保证真实结论不被回滚）。
-    let strandedStamped = 0;
-    if (this.progress.coreUnavailable && !this.userCancelled) {
-      for (const node of this.nodes) {
-        if (LatencyLiveView.stateFor(node.name) === LatencyState.UNTESTED) {
-          // 通道不可用 ≠ 节点失败：分类标 core_not_ready（NodeSortPersistence 把它
-          // 列为「非节点判定」，持久化时沿用上次结论，不再把整批写成「全失败」）。
-          this.publish(node.name, LatencyRecord.failed(node.name, LatencyState.TIMEOUT, Date.now(),
-            LatencyChannel.CORE, LatencyProbeKind.CORE_NOT_READY));
-          strandedStamped = strandedStamped + 1;
-        }
-      }
-      this.progress.timeout = this.progress.timeout + strandedStamped;
-    }
-    if (cleared > 0 || strandedStamped > 0) {
-      AppLogger.info(TAG, `latency cleanup: ${cleared} node(s) left TESTING -> untested`
-        + `${strandedStamped > 0 ? `, ${strandedStamped} stranded node(s) stamped TIMEOUT` : ''} `
-        + `(cancelled=${this.cancelled} userCancelled=${this.userCancelled} `
-        + `unavailable=${this.progress.coreUnavailable}); stamped node verdicts kept`);
-      LatencyLiveView.notify();
-    }
+    LatencyLiveView.flushNow();
   }
 
   /** 执行整批，返回最终进度 */
@@ -779,7 +742,7 @@ export class LatencyRun {
 
       // force=false：仍新鲜的实测结果直接跳过，不浪费一次拨号
       if (!this.force) {
-        const existing = LatencyLiveView.recordFor(node.name);
+        const existing = LatencyLiveView.recordFor(node.name, this.context);
         if (existing !== null && existing.channel === LatencyChannel.CORE && existing.hasValue()
           && Date.now() - existing.atMs < FRESH_RESULT_MS) {
           this.progress.skipped = this.progress.skipped + 1;
@@ -789,7 +752,9 @@ export class LatencyRun {
         }
       }
 
-      LatencyLiveView.markTesting(node.name, this.runId);
+      const old = LatencyLiveView.recordFor(node.name, this.context);
+      if (old !== null && old.state !== LatencyState.TESTING) { this.previous.set(node.name, old); }
+      LatencyLiveView.markTesting(node.name, this.runId, this.context);
       if (this.isAborted(generation)) {
         return;
       }
@@ -1140,6 +1105,7 @@ export class LatencyRun {
   private publish(nodeName: string, rec: LatencyRecord): void {
     // runId 写进每条已落库记录：通道故障批收尾据此认出本批盖的失败章并收回。
     // source 随批落库：auto 来源的失败 UI 显示中性「未测」，manual 保持红。
+    rec.context = this.context;
     rec.runId = this.runId;
     rec.source = this.source;
     LatencyLiveView.setRecord(rec);
@@ -1188,7 +1154,7 @@ export class LatencyEngine {
       LatencyEngine.current.cancel();
     }
     const run = new LatencyRun(api, nodes, url, opts.timeoutMs, opts.force,
-      opts.onResult, opts.onProgress, opts.source, opts.batchDeadlineMs);
+      opts.onResult, opts.onProgress, opts.source, opts.batchDeadlineMs, opts.context);
     LatencyEngine.current = run;
     return run;
   }

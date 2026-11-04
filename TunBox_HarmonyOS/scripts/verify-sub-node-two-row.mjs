@@ -52,13 +52,13 @@ check('卡片包含名称/测速行与协议/状态行', rows.length >= 4);
 const firstRow = rows.length >= 2 ? blockAt(card, rows[1].index + rows[1][0].lastIndexOf('{')) : '';
 const secondRow = rows.length >= 4 ? blockAt(card, rows[3].index + rows[3][0].lastIndexOf('{')) : '';
 check('名称行使用省略显示并占据弹性宽度', /Text\(NodeDisplay\.withoutLeadingFlag\(row\.node\.name\)\)[\s\S]*?\.layoutWeight\(1\)/.test(firstRow));
-check('名称行有独立测速状态与重测操作', /LatencyStoreBridge\.stateFor\(row\.node\.name\)/.test(firstRow) && /this\.testOne\(row\.node\)/.test(firstRow));
+check('名称行有独立测速状态与重测操作', /LatencyStoreBridge\.stateFor\(row\.node\.name, this\.latencyContext\(row\.node\)\)/.test(firstRow) && /this\.testOne\(row\.node\)/.test(firstRow));
 check('第二行调用统一协议展示 Builder', /this\.ProtocolText\(row\.node\)/.test(secondRow));
 check('第二行展示测速状态徽标', /this\.NodeStatusBadge\(row\.status\)/.test(secondRow));
 check('协议文本使用 NodeProtocolPolicy', /Text\(NodeProtocolPolicy\.fromNode\(node\)\.display\(\)\)/.test(methodBody('ProtocolText')));
 check('选中节点由统一 onNodeTap 处理', /\.onClick\(\(\) => this\.onNodeTap\(row\.node\)\)/.test(card));
 check('批量选择态渲染 SelectDot', /if \(this\.selectMode\)\s*\{\s*this\.SelectDot\(row\.node\.id\)/.test(card));
-check('LatencyStoreBridge 是当前卡片测速来源', /LatencyStoreBridge\.recordFor\(row\.node\.name\)/.test(card));
+check('LatencyStoreBridge 是当前卡片测速来源', /LatencyStoreBridge\.recordFor\(row\.node\.name, this\.latencyContext\(row\.node\)\)/.test(card));
 check('当前卡片不依赖已删除 nodeCard/旧延迟门面', !/nodePingText|nodePingColor|LatencyController|this\.nodeCard\(/.test(code));
 
 let depth = 0;

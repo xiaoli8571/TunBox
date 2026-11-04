@@ -214,6 +214,9 @@ export class BackupRestoreService {
       s.expireAt = typeof j.expireAt === 'number' ? j.expireAt : -1;
       s.enabled = typeof j.enabled === 'boolean' ? j.enabled : true;
       s.sortOrder = typeof j.sortOrder === 'number' ? j.sortOrder : 0;
+      s.autoUpdate = j.autoUpdate !== false;
+      s.updateIntervalMinutes = typeof j.updateIntervalMinutes === 'number'
+        ? j.updateIntervalMinutes : 0;
       s.rawProviderState = typeof j.rawProviderState === 'string' ? j.rawProviderState : '';
       s.rawProviderNodeEstimate = typeof j.rawProviderNodeEstimate === 'number' ? j.rawProviderNodeEstimate : 0;
       s.etag = typeof j.etag === 'string' ? j.etag : '';

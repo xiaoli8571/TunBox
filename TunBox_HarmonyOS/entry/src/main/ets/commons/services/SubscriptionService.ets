@@ -466,8 +466,8 @@ export class SubscriptionService {
     // 历史数据可能存在重名节点(内核会拒绝启动), 加载时即去重并落库
     const renamed = this.ensureUniqueNames();
 
-    // 4.5) 分组恢复兜底：旧存储没有 proxy_groups_json 但存在 yaml_cache_ 的订阅，
-    //      从结构化缓存重解析分组并按当前节点池物化（升级后首次启动即可用）。
+    // 4.5) 从内核已展开别名的完整 profile 恢复分组，修复旧版仅解析原文而丢失
+    //      << 合并成员的存量数据。只在初始化读一次，不在 UI 每次渲染时读文件。
     const groupsRebuilt = await this.rebuildGroupsFromCacheIfMissing();
     AppLogger.info(TAG, `[perf] stage3 groups done at +${Date.now() - t0}ms`);
 
@@ -488,9 +488,9 @@ export class SubscriptionService {
   }
 
   /**
-   * 升级恢复路径：proxy_groups_json 缺失（旧版本存储）但有 yaml_cache_ 结构化缓存的
-   * 订阅，从缓存重解析分组并物化动态成员。结果随后随 init 末尾的 persist 落盘，
-   * 幂等（有持久化分组的订阅不重建）。
+   * 规范化 profile 是分组真源（原始 YAML 的锚点由 native preparer 展开）。
+   * 即使已有分组也要校正：旧版本可能保存了仅有名字、没有继承成员的空组。
+   * 没有完整 profile 时才保留旧的 yaml_cache 缺组恢复路径，不覆盖有效旧数据。
    */
   private async rebuildGroupsFromCacheIfMissing(): Promise<boolean> {
     if (this.store === null) {
@@ -502,14 +502,18 @@ export class SubscriptionService {
     }
     let rebuilt = false;
     for (const s of this.subscriptions) {
-      if (s.id === DIRECT_GROUP_ID || hasGroupsFor.has(s.id)) {
+      if (s.id === DIRECT_GROUP_ID) {
         continue;
       }
-      let cached = '';
-      try {
-        cached = await this.store.get(`yaml_cache_${s.id}`, '') as string;
-      } catch (e) {
-        continue;
+      let cached = ProfileRepository.read(s.id);
+      const fromProfile = cached.length > 0;
+      if (!fromProfile) {
+        if (hasGroupsFor.has(s.id)) { continue; }
+        try {
+          cached = await this.store.get(`yaml_cache_${s.id}`, '') as string;
+        } catch (e) {
+          continue;
+        }
       }
       if (cached.length === 0) {
         continue;
@@ -519,9 +523,12 @@ export class SubscriptionService {
         continue;
       }
       SubscriptionParser.materializeDynamicGroups(groups, this.nodesOf(s.id));
-      this.proxyGroups = this.proxyGroups.concat(groups);
+      const previous = this.proxyGroups.filter((g: ProxyGroup): boolean => g.subscriptionId === s.id);
+      if (JSON.stringify(previous) === JSON.stringify(groups)) { continue; }
+      this.proxyGroups = this.proxyGroups.filter((g: ProxyGroup): boolean => g.subscriptionId !== s.id)
+        .concat(groups);
       rebuilt = true;
-      AppLogger.info(TAG, `rebuilt ${groups.length} proxy group(s) from cached yaml `
+      AppLogger.info(TAG, `rebuilt ${groups.length} proxy group(s) from ${fromProfile ? 'prepared profile' : 'cached yaml'} `
         + `for subscription ${s.id}`);
     }
     return rebuilt;
@@ -2387,7 +2394,9 @@ export class SubscriptionService {
       // 该订阅的不可用台账先清空（重新导入 ⇒ 台账反映最新一次结果）
       UnusableLedger.clearFor(sub.id);
       // 先解码再判是不是 YAML 文档（base64 包裹的 Clash YAML 不能掉进链接分支）
-      const dispatch = BodyDispatch.classify(body);
+      // validateAndStore 已由 native 展开整份 YAML 的锚点；UI 表也必须读同一份，
+      // 不能再次解析带 << 的原文，否则组成员/节点/provider 继承字段会丢失。
+      const dispatch = BodyDispatch.classify(ProfileRepository.read(sub.id));
       const structuredYaml = dispatch.kind === BodyKind.YAML;
       if (structuredYaml) {
         // Clash YAML 订阅：走合并引擎（跨刷新保留节点名称，限额与去重对齐 upstream）
@@ -2456,7 +2465,7 @@ export class SubscriptionService {
       }
 
       // ---- proxy-providers：节点放在 provider 段而 proxies 为空的配置也必须导入 ----
-      const providerEntries = ProxyProviderParser.parse(body);
+      const providerEntries = ProxyProviderParser.parse(dispatch.body);
       let providerImported = 0;
       if (providerEntries.length > 0) {
         const fetchable = ProxyProviderParser.fetchable(providerEntries);
@@ -2703,8 +2712,18 @@ export class SubscriptionService {
       diagnostics.providerFailedCount = diagnostics.providerFailedCount + missingUrl;
       SubscriptionService.appendProviderFailure(diagnostics, `provider 缺少 url ${missingUrl} 个`);
     }
-    for (let pi = 0; pi < fetchable.length; pi++) {
-      const entry = fetchable[pi];
+    // 占位符/缺 scheme 的 url 不必发请求：拉取只会得到 unsupported protocol scheme，
+    // 用户看到的是笼统「拉取失败」。这里在拉取前就给出可执行文案（2026-11-03 模板报障）。
+    const badUrl = ProxyProviderParser.invalidUrlEntries(fetchable);
+    const fetchableValid: ProxyProviderEntry[] = fetchable.filter((entry: ProxyProviderEntry): boolean =>
+      ProxyProviderParser.invalidUrlReason(entry).length === 0);
+    for (const entry of badUrl) {
+      diagnostics.providerFailedCount = diagnostics.providerFailedCount + 1;
+      SubscriptionService.appendProviderFailure(diagnostics, ProxyProviderParser.invalidUrlReason(entry));
+      AppLogger.warn(TAG, `proxy-provider url invalid: ${entry.name} url=${entry.url}`);
+    }
+    for (let pi = 0; pi < fetchableValid.length; pi++) {
+      const entry = fetchableValid[pi];
       try {
         const providerInsecureAllowed: boolean =
           await SubscriptionService.insecureSubscriptionHttpAllowed();
@@ -2734,7 +2753,7 @@ export class SubscriptionService {
   }
 
   /**
-   * 本地 YAML 伪订阅的刷新：从落盘原文（双轨 raw，缺失时退 yaml_cache）重解析
+   * 本地 YAML 伪订阅的刷新：优先读规范化完整 profile，再退双轨 raw/yaml_cache。
    * 静态节点与分组，并**重拉 providers** —— 这是 provider 拉取失败后的重试入口，
    * 也让 provider 内容能随刷新更新（对齐 mihomo 的 interval 行为的用户侧等价物）。
    * 原文与缓存都缺失时保持旧行为（按现有节点数报成功，不动任何数据）。
@@ -2743,7 +2762,10 @@ export class SubscriptionService {
     diagnostics: SubscriptionImportDiagnostics): Promise<SubscriptionRefreshResult> {
     const id = sub.id;
     const localCount = this.nodesOf(id).length;
-    let body = RawSubscriptionStore.isReady() ? RawSubscriptionStore.readRaw(id) : '';
+    let body = ProfileRepository.read(id);
+    if (body.length === 0 && RawSubscriptionStore.isReady()) {
+      body = RawSubscriptionStore.readRaw(id);
+    }
     if (body.length === 0 && this.store !== null) {
       try {
         body = await this.store.get(`yaml_cache_${id}`, '') as string;
@@ -2772,7 +2794,7 @@ export class SubscriptionService {
       // 该订阅的不可用台账先清空（重新导入 ⇒ 台账反映最新一次结果）
       UnusableLedger.clearFor(id);
       // 先解码再判是不是 YAML 文档（base64 包裹的 Clash YAML 不能掉进链接分支）
-      const dispatch = BodyDispatch.classify(body);
+      const dispatch = BodyDispatch.classify(await ProfileRepository.prepare(BodyDispatch.classify(body).body));
       const structuredYaml = dispatch.kind === BodyKind.YAML;
       if (structuredYaml) {
         const merged: MergedProxy[] = YamlMerger.merge([dispatch.body], sub.name, '');        SubscriptionService.absorbYamlMergeStats(diagnostics);
@@ -2798,7 +2820,7 @@ export class SubscriptionService {
         diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
           parseResult.diagnostics.unsupportedTypes);
       }
-      const providerEntries = ProxyProviderParser.parse(body);
+      const providerEntries = ProxyProviderParser.parse(dispatch.body);
       if (providerEntries.length > 0) {
         const providerImported = await this.appendProviderNodes(providerEntries, id,
           '', '', parsed, diagnostics);
@@ -2888,7 +2910,7 @@ export class SubscriptionService {
     let localEligible = false;
     try {
       YamlMerger.resetSkipStats();
-      const localDispatch = BodyDispatch.classify(trimmed);
+      const localDispatch = BodyDispatch.classify(ProfileRepository.read(sub.id));
       localEligible = localDispatch.kind === BodyKind.YAML;
       if (localEligible) {
         const merged: MergedProxy[] = YamlMerger.merge([localDispatch.body], sub.name, '');
@@ -2926,7 +2948,7 @@ export class SubscriptionService {
       // ---- proxy-providers：本地 YAML 的 provider 段同样拉取（对齐 mihomo 语义）----
       // mihomo 的 include-all/use 组包含 provider 节点；本地导入不拉取的话，
       // 「全部节点/国家组」与内核客户端（BettBox 等）的分组内容差距巨大。
-      const providerEntries = ProxyProviderParser.parse(trimmed);
+      const providerEntries = ProxyProviderParser.parse(localDispatch.body);
       if (providerEntries.length > 0) {
         const providerImported = await this.appendProviderNodes(providerEntries, sub.id,
           '', '', parsed, diagnostics);
@@ -3374,7 +3396,8 @@ export class SubscriptionService {
     // 【2026-10-24 加固】存量节点表可能残留订阅信息条目（「剩余流量：xxx GB」这类，
     // 旧解析混入、刷新后清除）——绝不能当连接目标（内核里没有这个名字，钉选必失败）。
     const local = this.nodes.find((node: ProxyNode): boolean =>
-      node.subscriptionId === current && !NodeUsability.isInfoEntry(node.name));
+      node.subscriptionId === current && !NodeUsability.isInfoEntry(node.name)
+        && !['direct', 'reject', 'reject-drop', 'pass', 'compatible'].includes(node.proxyType.toLowerCase()));
     if (local !== undefined) { return local; }
     if (this.hasUsableProfile()) {
       const node = new ProxyNode();
@@ -3561,7 +3584,8 @@ export class SubscriptionService {
         return byName;
       }
     }
-    return await this.restoreRememberedPreferredNode(remembered, current);
+    return await this.restoreRememberedPreferredNode(
+      s.preferredNodeSubscriptionId === current ? s.preferredNodeName : remembered, current);
   }
 
   /**
@@ -3581,7 +3605,23 @@ export class SubscriptionService {
       n.subscriptionId === current && n.name === remembered
       && !NodeUsability.isInfoEntry(n.name));
     if (target === undefined) {
-      return null;
+      // Provider leaves and strategy groups need not exist in the static node
+      // table. Keep the scoped intent until the running kernel can validate it.
+      // Replacing it with the only static entry (often Direct) loses the pick.
+      if (current.length === 0 || !ProfileRepository.exists(current)
+        || remembered.length === 0 || remembered.startsWith('__')
+        || NodeUsability.isInfoEntry(remembered)) { return null; }
+      const intent = new ProxyNode();
+      intent.id = `core:${remembered}`;
+      intent.name = remembered;
+      intent.originalName = remembered;
+      intent.subscriptionId = current;
+      await SettingsService.patchSettings((p: AppSettings): void => {
+        p.preferredNodeId = intent.id;
+        p.preferredNodeSubscriptionId = current;
+        p.preferredNodeName = remembered;
+      });
+      return intent;
     }
     await SettingsService.patchSettings((p: AppSettings): void => {
       p.preferredNodeId = target.id;
@@ -3617,10 +3657,11 @@ export class SubscriptionService {
     if (id.startsWith('core:')) {
       const name = id.substring('core:'.length);
       const model = CoreCatalogService.current();
-      if (model !== null) {
+      const current = ProfileRepository.currentId();
+      if (model !== null && CoreCatalogService.profileIdOfSnapshot() === current) {
         const entry = model.byName[name];
-        if (entry !== undefined && !entry.isGroup) {
-          return CoreNodeBridge.toProxyNode(entry);
+        if (entry !== undefined) {
+          return CoreNodeBridge.toProxyNode(entry, current);
         }
       }
     }

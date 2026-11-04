@@ -66,6 +66,36 @@ export class LatencyChannel {
   static readonly OFFLINE: string = 'offline';
 }
 
+/** The complete identity of a measurement. Empty context is reserved for legacy
+ * callers; scoped readers never fall back to those unproven old results. */
+export class LatencyContext {
+  profileId: string = '';
+  revision: string = '';
+  testUrl: string = '';
+  expected: string = '';
+
+  constructor(profileId: string = '', revision: string = '', testUrl: string = '', expected: string = '') {
+    this.profileId = profileId;
+    this.revision = revision;
+    this.testUrl = testUrl.trim();
+    this.expected = expected.trim();
+  }
+
+  key(name: string): string {
+    return `ls3:${JSON.stringify([this.profileId, this.revision, this.testUrl, this.expected, name])}`;
+  }
+
+  static fromKey(key: string): string[] | null {
+    if (!key.startsWith('ls3:')) { return null; }
+    try {
+      const parts = JSON.parse(key.substring(4)) as string[];
+      if (!Array.isArray(parts) || parts.length !== 5) { return null; }
+      for (const part of parts) { if (typeof part !== 'string') { return null; } }
+      return parts;
+    } catch (_e) { return null; }
+  }
+}
+
 /**
  * 单个节点的延迟记录。
  *
@@ -74,6 +104,7 @@ export class LatencyChannel {
  */
 export class LatencyRecord {
   name: string = '';
+  context: LatencyContext | null = null;
   /** TESTING 所属批次；旧批收尾不得清除新批标记。非持久化字段。 */
   runId: number = 0;
   state: number = LatencyState.UNTESTED;

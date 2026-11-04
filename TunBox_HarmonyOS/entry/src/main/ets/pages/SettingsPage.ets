@@ -40,6 +40,7 @@ import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPo
 import { SubConverter } from '../commons/flclash/SubConverter';
 import { ProfileConfigMerger } from '../commons/flclash/ProfileConfigMerger';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { DiagnosticExportService } from '../commons/services/DiagnosticExportService';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
 
 /**
@@ -97,6 +98,7 @@ export struct SettingsView {
   @StorageLink('bg_theme') bgTheme: AppBgTheme = AppBgTheme.DEFAULT;
   // ── 关于与隐私 ──
   @State privacyUrl: string = '';
+  @State collectingLogs: boolean = false;
   /** 顶栏标题（app.string.settings_title 的本地化取值；TopNavBar.title 为 string 型） */
   private settingsTitle: string = '';
 
@@ -138,6 +140,25 @@ export struct SettingsView {
     this.refreshGeoStatuses();
     this.refreshNodeAndSwitchInfo();
     this.refreshPrivacyLink();
+  }
+
+  private async exportDiagnosticLogs(): Promise<void> {
+    if (this.collectingLogs) { return; }
+    this.collectingLogs = true;
+    try {
+      const context = getContext(this) as Context;
+      const dialog = new picker.DocumentViewPicker(context);
+      const options = new picker.DocumentSaveOptions();
+      options.newFileNames = [`TunBox-diagnostics-${Date.now()}.txt`];
+      options.fileSuffixChoices = ['诊断日志|.txt'];
+      const uris = await dialog.save(options);
+      if (uris.length === 0) { return; }
+      const count = await DiagnosticExportService.export(context, uris[0], String(this.orchestrator.state));
+      promptAction.showToast({ message: `已导出诊断日志（${count} 个来源），分享前请检查隐私` });
+    } catch (e) {
+      AppLogger.error('SettingsPage', `diagnostic export failed: ${AppLogger.errText(e)}`);
+      promptAction.showToast({ message: '日志导出失败，请检查保存位置和剩余空间后重试' });
+    } finally { this.collectingLogs = false; }
   }
 
   private async openRulesPage(): Promise<void> {
@@ -536,29 +557,55 @@ export struct SettingsView {
                 Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               }
               // 2026-10-27：主页右上角「备份」迁到这里（关于与隐私卡内），功能不变。
-              Row() {
-                Text('配置备份与恢复')
-                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
-                Image($r('app.media.ic_arrow_right'))
-                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
-              }.width('100%').alignItems(VerticalAlign.Center)
+              // 2026-11-03 用户反馈「点功能的其他位置没反应」：可点区域原来只有标题 Text 那一行
+              // （约 15vp 高），标题上下留白与说明文字都不在命中区内。三行统一改成
+              // 「标题 + 说明」整块 Column 绑定 onClick，并给上下 8vp 内边距撑到舒适点击区。
+              Column({ space: 6 }) {
+                Row() {
+                  Text('配置备份与恢复')
+                    .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  Image($r('app.media.ic_arrow_right'))
+                    .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text('导出/导入订阅、节点与自定义规则；支持 AES-256 加密备份。')
+                  .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+              }
+              .width('100%')
+              .padding({ top: 8, bottom: 8 })
               .onClick(() => {
                 router.pushUrl({ url: 'pages/BackupPage' }).catch((): void => {
                   promptAction.showToast({ message: '打开备份页面失败，请重试' });
                 });
               })
-              Text('导出/导入订阅、节点与自定义规则；支持 AES-256 加密备份。')
-                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
-              Row() {
-                Text($r('app.string.settings_privacy_policy_row'))
-                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
-                Image($r('app.media.ic_arrow_right'))
-                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
-              }.width('100%').alignItems(VerticalAlign.Center)
+              Column({ space: 6 }) {
+                Row() {
+                  Text(this.collectingLogs ? '正在收集日志…' : '一键收集并导出日志')
+                    .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  Image($r('app.media.ic_arrow_right'))
+                    .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text('收集应用、VPN、内核及资源记录，自动脱敏；不包含订阅配置。')
+                  .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+              }
+              .width('100%')
+              .padding({ top: 8, bottom: 8 })
+              .enabled(!this.collectingLogs)
+              .onClick(() => this.exportDiagnosticLogs())
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
+              Column({ space: 6 }) {
+                Row() {
+                  Text($r('app.string.settings_privacy_policy_row'))
+                    .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  Image($r('app.media.ic_arrow_right'))
+                    .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text($r('app.string.settings_privacy_policy_desc'))
+                  .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+              }
+              .width('100%')
+              .padding({ top: 8, bottom: 8 })
               .onClick(() => this.openPrivacyPolicy())
-              Text($r('app.string.settings_privacy_policy_desc'))
-                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)

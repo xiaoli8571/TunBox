@@ -50,18 +50,18 @@ if (-not $SrcDir) {
 
 $SdkNative = $env:OHOS_NDK
 if (-not $SdkNative) {
-  $SdkNative = Join-Path $env:LOCALAPPDATA 'OpenHarmony\Sdk\23\native'
+  $SdkNative = Join-Path $env:LOCALAPPDATA 'OpenHarmony\Sdk\26.0.0\native'
 }
-$NdkClang = Join-Path $SdkNative 'llvm\bin\clang.exe'
-$NdkClangxx = Join-Path $SdkNative 'llvm\bin\clang++.exe'
-$NdkSysroot = Join-Path $SdkNative 'sysroot'
+$NdkClang = (Join-Path $SdkNative 'llvm\bin\clang.exe').Replace('\', '/')
+$NdkClangxx = (Join-Path $SdkNative 'llvm\bin\clang++.exe').Replace('\', '/')
+$NdkSysroot = (Join-Path $SdkNative 'sysroot').Replace('\', '/')
 $GoRoot = $env:OHOS_GOROOT
 if (-not $GoRoot) {
   $GoRoot = Join-Path $env:USERPROFILE 'ohos-go-build\ohos_golang_go'
 }
 $GoExe = Join-Path $GoRoot 'bin\go.exe'
 $OutDir = Join-Path $ProjRoot 'entry\libs\arm64-v8a'
-$LogDir = $ProjRoot
+$LogDir = Join-Path $env:LOCALAPPDATA 'Temp'
 
 if (-not (Test-Path $NdkClang)) { Write-Error "NDK clang not found: $NdkClang"; exit 1 }
 if (-not (Test-Path $GoExe)) { Write-Error "OpenHarmony Go not found: $GoExe"; exit 1 }
@@ -87,25 +87,29 @@ $env:GOOS = 'openharmony'
 $env:GOARCH = 'arm64'
 $env:GOFLAGS = '-trimpath'
 $env:GOMAXPROCS = '1'
-$env:CC = "$NdkClang --target=aarch64-linux-ohos --sysroot=$NdkSysroot"
-$env:CXX = "$NdkClangxx --target=aarch64-linux-ohos --sysroot=$NdkSysroot"
-$env:CGO_CFLAGS = "--target=aarch64-linux-ohos --sysroot=$NdkSysroot -ftls-model=global-dynamic"
+$env:CC = '"' + $NdkClang + '" --target=aarch64-linux-ohos "--sysroot=' + $NdkSysroot + '"'
+$env:CXX = '"' + $NdkClangxx + '" --target=aarch64-linux-ohos "--sysroot=' + $NdkSysroot + '"'
+$env:CGO_CFLAGS = '--target=aarch64-linux-ohos "--sysroot=' + $NdkSysroot + '" -ftls-model=global-dynamic'
 $env:CGO_CPPFLAGS = $env:CGO_CFLAGS
 $env:CGO_CXXFLAGS = $env:CGO_CFLAGS
 
 Set-Location $SrcDir
 Write-Host "==> building mihomo c-shared for ohos arm64 from $SrcDir ..."
-$outLog = Join-Path $LogDir 'tunbox_go_build_out.log'
-$errLog = Join-Path $LogDir 'tunbox_go_build_err.log'
+$outLog = Join-Path $LogDir 'tunbox-probe-go-build-out.log'
+$errLog = Join-Path $LogDir 'tunbox-probe-go-build-err.log'
 $argLine = 'build -p 1 -buildmode=c-shared -tags with_gvisor,cmfa,no_tailscale,no_zerotier,no_easytier -ldflags "-s -w -buildid=" -o "' + "$OutDir\libgojni.so" + '" .'
-$p = Start-Process -FilePath $GoExe `
-  -ArgumentList $argLine `
-  -WorkingDirectory $SrcDir -NoNewWindow -PassThru -Wait `
-  -RedirectStandardOutput $outLog -RedirectStandardError $errLog
-if ($p.ExitCode -ne 0) {
-  Write-Host "--- go build failed (exit $($p.ExitCode)), stderr tail: ---"
+# Direct native invocation avoids Windows PowerShell Start-Process rebuilding an
+# inherited environment containing both HTTPS_PROXY and https_proxy as duplicate keys.
+$previousErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+& $GoExe build -p 1 -buildmode=c-shared -tags with_gvisor,cmfa,no_tailscale,no_zerotier,no_easytier `
+  -ldflags '-s -w -buildid=' -o "$OutDir\libgojni.so" . 1> $outLog 2> $errLog
+$buildExit = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorAction
+if ($buildExit -ne 0) {
+  Write-Host "--- go build failed (exit $buildExit), stderr tail: ---"
   Get-Content $errLog -Tail 30
-  exit $p.ExitCode
+  exit $buildExit
 }
 Write-Host '--- build stderr (last lines) ---'
 Get-Content $errLog -Tail 5

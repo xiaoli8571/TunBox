@@ -381,7 +381,7 @@ await checkAsync('内核回 200 但 delay==0（失败语义）不得记为有效
 // 新契约（用户裁定「要么显示延迟、要么显示超时，不要第三种结果」）：
 // 通道不可用 -> 整批作废，但**被搁置的节点补 TIMEOUT**，绝不留 `--`；
 // 同时**绝不**写成 FAILED（FAILED 表示协议/认证层失败，与"够不着"不同）。
-await checkAsync('内核全程不可用：不留未测、搁置节点补超时，且绝不写成失败', async () => {
+await checkAsync('内核全程不可用：清除测试标记，保留未知，绝不伪造节点超时', async () => {
   fresh();
   ConnectionOrchestrator.recoverResult = false; // 自愈失败 -> 通道不可用
   ClashApiService.handler = async () => probeResult(-1, LatencyProbeKind.CORE_NOT_READY, 0);
@@ -390,7 +390,7 @@ await checkAsync('内核全程不可用：不留未测、搁置节点补超时�
   LatencyEngine.release(run);
   eq(p.coreUnavailable, true, 'batch must be flagged unavailable');
   eq(p.failed, 0, 'a dead core must NOT produce FAILED verdicts');
-  ok(p.timeout > 0, `stranded nodes must be stamped TIMEOUT (got ${p.timeout})`);
+  eq(p.timeout, 0, 'a dead controller is not evidence of a node timeout');
   let untested = 0;
   let testing = 0;
   for (let i = 0; i < 30; i++) {
@@ -400,7 +400,7 @@ await checkAsync('内核全程不可用：不留未测、搁置节点补超时�
     ok(st !== LatencyState.FAILED, `node-${i} must not be FAILED (got ${st})`);
   }
   eq(testing, 0, 'no node may be left TESTING (the forever-spinner bug)');
-  eq(untested, 0, 'no node may be left "--" when the channel died (user requirement)');
+  eq(untested, 30, 'unanswered nodes remain unknown; only a kernel 504 is a timeout verdict');
   ok(p.finished < 30, `batch should still abort early (finished=${p.finished})`);
   ok(ConnectionOrchestrator.recoverCalls <= 1, 'recovery attempted at most once per batch');
 });

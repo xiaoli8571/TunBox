@@ -75,6 +75,7 @@ import { DoHResolver } from '../services/DoHResolver';
 // 订阅原文 → overlay 合并（FlClash mergeProfileBase 的等价实现）
 import { ProfileConfigMerger } from '../flclash/ProfileConfigMerger';
 import { AppLogger } from '../utils/AppLogger';
+import { BASE_MTU } from '../services/VpnRecoveryPolicy';
 
 const TAG = 'RuntimeConfigBuilder';
 
@@ -574,6 +575,7 @@ export class RuntimeConfigBuilder {
       }
     }
 
+    finalYaml = ProfileConfigMerger.enforceTunnelContract(finalYaml, BASE_MTU, ipv6Enabled);
     const result = new RuntimeConfigResult();
     result.yaml = finalYaml;
     result.mode = mode;
@@ -653,8 +655,14 @@ export class RuntimeConfigBuilder {
     const groupNames: Set<string> = new Set<string>();
     for (const g of groups) { groupNames.add(g.name); }
 
-    // ① 规则指向的 select 组（真正的用户可见选择组）；找不到就退首个组。
+    // The first declared selector is the profile's primary panel. Rules are
+    // ordered by traffic matching priority: the first one may target AI or
+    // YouTube and must not become the app's default exit group.
+    for (const g of groups) {
+      if (g.type === 'select' && g.name !== 'GLOBAL') { out.groupName = g.name; break; }
+    }
     for (const tgt of rules) {
+      if (out.groupName.length > 0) { break; }
       const g: YamlGroupInfo | null = RuntimeConfigBuilder.findGroup(groups, tgt);
       if (g !== null && g.type === 'select') { out.groupName = g.name; break; }
     }
@@ -673,10 +681,18 @@ export class RuntimeConfigBuilder {
     // 多个分组，只有直连成员能被 SET 到），再退到全量 proxies：
     // 精确命中 → 归一化命中 → 地区关键词命中 → 组内首个叶子节点 → 任意叶子节点。
     const preferred: string = preferredName.startsWith('__') ? '' : preferredName.trim();
-    out.nodeName = RuntimeConfigBuilder.pickExisting(members, groupNames, preferred, true);
+    // A selected child strategy is a valid target, with its own selection and
+    // policy. It must not be replaced by the first static leaf (often Direct).
+    out.nodeName = RuntimeConfigBuilder.kernelLeafFor(Array.from(groupNames), preferred);
+    if (out.nodeName.length === 0) {
+      out.nodeName = RuntimeConfigBuilder.pickExisting(members, groupNames, preferred, true);
+    }
     if (out.nodeName.length === 0) {
       out.nodeName = RuntimeConfigBuilder.pickExisting(proxies, groupNames, preferred, true);
     }
+    const providerIntent: boolean = out.nodeName.length === 0 && preferred.length > 0
+      && RuntimeConfigBuilder.splitYamlLines(yaml).some((line: string): boolean => line === 'proxy-providers:');
+    if (providerIntent) { out.nodeName = preferred; }
     if (out.nodeName.length === 0) {
       // 组里第一个**真节点**（跳过策略组与「剩余流量/到期」信息条目）。
       for (const m of members) {
@@ -699,7 +715,7 @@ export class RuntimeConfigBuilder {
     // 地区自愈（`新加坡01aws` → `🇸🇬新加坡•移联01`）与组内首叶子**一律不算**：
     // 它们是替身，不能让连接路径以为用户意图已经落地。
     const wantKey: string = RuntimeConfigBuilder.nodeKey(preferred);
-    out.matched = wantKey.length > 0
+    out.matched = wantKey.length > 0 && !providerIntent
       && RuntimeConfigBuilder.nodeKey(out.nodeName) === wantKey;
     return out;
   }

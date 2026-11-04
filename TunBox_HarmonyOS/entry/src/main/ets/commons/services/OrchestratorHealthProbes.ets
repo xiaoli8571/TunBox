@@ -40,7 +40,7 @@ export interface OrchestratorHealthView {
   checkClashApiReachable(): Promise<boolean>;
   /** DNS 是否可解析 */
   checkDnsResolvable(): Promise<boolean>;
-  /** 客户端侧 AAAA 解析是否真的能拿到 v6 地址（IPv6 双栈的端到端判据） */
+  /** 客户端侧能否拿到 AAAA；不代表实际出口 IPv6 可用 */
   checkIpv6Resolvable(): Promise<boolean>;
   /** IPv4 出口是否连通（generate_204） */
   checkEgressReachable(): Promise<boolean>;
@@ -137,17 +137,7 @@ export class OrchestratorHealthProbes implements LinkHealthProbes {
     });
   }
 
-  /**
-   * IPv6 双栈探针（2026-10-21 DNS 恒接管后重写判据）。
-   *
-   * 判据：**客户端侧 AAAA 解析**能不能拿到 v6 地址。
-   *
-   * DNS 已恒接管、且生成器改用 `enhanced-mode: redir-host`（没有 fake 池），
-   * AAAA 由 `withResolver` 直接向上游要真实地址，只受 `dns.ipv6` 控制
-   * （dns/middleware.go:205-208）。所以「拿不到 AAAA」不再是配置必然，而是
-   * 当前网络/上游确实没有 v6 ⇒ 如实报 fail 并建议关闭开关（避免设备一半流量
-   * 走不通），修复动作标 check-uplink。开关关闭时仍 skip。
-   */
+  /** AAAA availability only. Fake answers do not establish TUN capture or IPv6 egress. */
   probeIpv6(): Promise<ProbeOutcome> {
     if (!this.view.isIpv6Enabled()) {
       return Promise.resolve(ProbeOutcome.skip('IPv6 双栈已在设置中关闭（设置 → 网络）'));
@@ -157,10 +147,10 @@ export class OrchestratorHealthProbes implements LinkHealthProbes {
     }
     return this.view.checkIpv6Resolvable().then((ok: boolean): ProbeOutcome => {
       if (ok) {
-        return ProbeOutcome.pass('IPv6 双栈生效（AAAA 解析正常）');
+        return ProbeOutcome.pass('IPv6 DNS 可返回 AAAA（不代表出口已验证）');
       }
-      return ProbeOutcome.fail('IPv6 双栈已开启，但当前网络解析不到 v6 地址',
-        '当前网络/运营商未提供 IPv6：建议在「设置 → 网络」关闭 IPv6 双栈', 'check-uplink');
+      return ProbeOutcome.fail('未取得 AAAA；当前 DNS 模式也可能主动抑制 IPv6 应答',
+        '检查最终 DNS 模式与假 IPv6 池；此结果不能单独判定运营商或代理出口不支持 IPv6', 'check-uplink');
     });
   }
 

@@ -579,3 +579,25 @@ provider 声明段），与延迟判定口径无关：
 本轮同步了 0.8.0 内核裁剪后的生成器约束：对已移除的协议能力保持生成侧拦截，并同步 true-chain harness 生成代码。当前归一化内容指纹为 `a0b6fa50eeb09783`。
 
 > 复现门禁：`node scripts/verify-generator-fingerprint.mjs`。
+
+## 二十二、2026-11-03 指纹补记（已有网络优化的 MTU 真源）
+
+本次代码审查发现工作树已经把生成器内的 MTU 字面量改为引用
+`VpnRecoveryPolicy.BASE_MTU`，使平台 TUN 和 YAML 使用同一常量；DNS 注释也已更新为
+恒接管、覆写只选择配置来源的当前契约。这是本轮开始前已有的网络优化，生成器正文
+没有因 provider 测速修复而改动。重新执行真实生成器、mihomo `-t` 和配置完整性回归后，
+将归一化内容指纹从 `a0b6fa50eeb09783` 同步为 `704b554944a2f45a`。
+
+
+## 23. 2026-11-03：审查剩余项闭环
+
+测量身份改为 profile、内容修订、URL、expected-status、出口的组合；旧无作用域记录不补造来源。Preferences 使用短字段槽及完整身份校验，支持长 URL/emoji 节点并防止错误身份借用；UI 修订在数据边界缓存，行绘制不读 profile 文件。
+
+父组测试沿当前选择链继承子组 URL/期望码，再按完整策略和出口去重。主页面板和旧平面节点页均使用共享 Flclash 测速服务；后者按订阅分批并按每行作用域排序，保留跨订阅同名行。旧 LatencyEngine 仅保留兼容与回归，通道故障也不再补造节点超时。
+
+非当前 profile 使用 UI 进程中的独立无头核，不切换在线 profile 或 Extension。Go 出站经 NAPI 系统 API 绑定物理网络，失败拒绝拨号；在线 VPN 的 protect 收据逻辑不变。详细边界、回归和设备验收见 `REVIEW_REMAINING_FIXES_2026-11-03.md`。
+
+## 2026-11-03 指纹变更说明（策略组选择复核）
+
+- 指纹 `704b554944a2f45a` → `884dcfa9b60b41c0`。复核已存在的 `preferredGroupName` 发射改动：手动选择策略组时把有效组名放入 PROXY 首项，不能把 provider-only 组降为静态 Direct。
+- 本轮补齐指纹台账，没有改变测速 URL、测速并发或内核探测策略。在线选择统一改为完整重启，启动阶段继续校验真实流量入口的选中链。

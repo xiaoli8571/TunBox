@@ -31,6 +31,7 @@ import {
 import { PublicIpService } from '../commons/services/PublicIpService';
 import { PublicIpInfo } from '../commons/models/PublicIpInfo';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { MemorySamplePolicy } from '../commons/services/MemorySamplePolicy';
 import { ConnEvent, ConnEventKind } from '../commons/services/ConnectionEvents';
 
 const TAG = 'StatsPage';
@@ -378,9 +379,8 @@ export struct StatsPage {
   }
 
   /**
-   * 内存占用：优先内核 `/memory`；该端点在本内核上实测会 Operation timeout
-   * （真机日志 code=2300028），因此失败时回落到**扩展进程写出的 VmRSS 采样**
-   * （内核就活在扩展进程里，两者是同一份内存）。
+   * 内存占用：只显示扩展进程 PSS（含 SwapPss），不再对无限流 /memory 作普通 GET。
+   * 样本超过 15 秒失效；RSS 与 Go 堆分别保留在诊断报告，不与 PSS 混用。
    */
   private async refreshMemory(): Promise<void> {
     if (this.memoryBusy) {
@@ -388,11 +388,6 @@ export struct StatsPage {
     }
     this.memoryBusy = true;
     try {
-      const inuse: number = await this.orchestrator.api.fetchMemoryInuse();
-      if (inuse > 0) {
-        this.memoryText = this.formatBytes(inuse);
-        return;
-      }
       const kb: number = this.readProcRssKb();
       this.memoryText = kb > 0 ? this.formatBytes(kb * 1024) : '--';
     } catch (e) {
@@ -402,13 +397,13 @@ export struct StatsPage {
     }
   }
 
-  /** 读扩展进程写出的 `vpn_mem_kb.txt`（VmRSS，单位 kB）；不可用返回 -1 */
+  /** 读带时间戳的 PSS 样本；不可用返回负数。 */
   private readProcRssKb(): number {
     const ctx: Context = getContext(this) as Context;
-    const path: string = `${ctx.cacheDir}/vpn_mem_kb.txt`;
+    const path: string = `${ctx.cacheDir}/vpn_mem.json`;
     try {
-      const text: string = fs.readTextSync(path);
-      const kb: number = Number(text.trim());
+      const text: string = fs.readTextSync(path, { length: 4096 });
+      const kb: number = MemorySamplePolicy.bytes(text, Date.now()) / 1024;
       if (!this.rssReadLogged) {
         this.rssReadLogged = true;
         AppLogger.info(TAG, `rss sample read ok: ${kb} kB from ${path}`);

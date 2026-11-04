@@ -242,6 +242,18 @@ export class PreferencesLatencyPersistence implements LatencyPersistence {
 
   /** key 构造：节点名做 URL 编码（节点名可能带 emoji/空格/斜杠） */
   static key(name: string, field: string): string {
+    if (name.startsWith('ls3:')) {
+      // Preferences keys are limited to 1024 bytes. Keep identity as a value,
+      // using a bounded token for slots; every read/write verifies the identity
+      // so even a token collision can never return another context's result.
+      let first = 2166136261;
+      let second = 5381;
+      for (let i = 0; i < name.length; i++) {
+        first = Math.imul(first ^ name.charCodeAt(i), 16777619);
+        second = Math.imul(second, 33) ^ name.charCodeAt(i);
+      }
+      return `lv3_${name.length}_${(first >>> 0).toString(16)}${(second >>> 0).toString(16)}_${field}`;
+    }
     return `${PreferencesLatencyPersistence.KEY_PREFIX}${encodeURIComponent(name)}_${field}`;
   }
 
@@ -272,6 +284,8 @@ export class PreferencesLatencyPersistence implements LatencyPersistence {
       return null;
     }
     try {
+      if (name.startsWith('ls3:')
+        && await store.get(PreferencesLatencyPersistence.key(name, 'identity'), '') !== name) { return null; }
       const delayRaw = await store.get(PreferencesLatencyPersistence.key(name, LatencyStoreField.DELAY_MS), '-2') as string;
       const kindRaw = await store.get(PreferencesLatencyPersistence.key(name, LatencyStoreField.FAIL_KIND), '') as string;
       const atRaw = await store.get(PreferencesLatencyPersistence.key(name, LatencyStoreField.TESTED_AT), '0') as string;
@@ -296,6 +310,12 @@ export class PreferencesLatencyPersistence implements LatencyPersistence {
       return;
     }
     try {
+      if (name.startsWith('ls3:')) {
+        const slot = PreferencesLatencyPersistence.key(name, 'identity');
+        const identity = await store.get(slot, '');
+        if (identity !== '' && identity !== name) { throw new Error('测速缓存标识冲突，已保留原记录'); }
+        await store.put(slot, name);
+      }
       await store.put(PreferencesLatencyPersistence.key(name, field), value);
     } catch (e) {
       AppLogger.warn(TAG, `save latency field failed: ${AppLogger.errText(e)}`);
@@ -323,7 +343,10 @@ export class PreferencesLatencyPersistence implements LatencyPersistence {
       const all = await store.getAll();
       const out: string[] = [];
       for (const key of Object.keys(all)) {
-        const name = PreferencesLatencyPersistence.nameOfKey(key);
+        const identity = key.startsWith('lv3_') && key.endsWith('_identity')
+          ? await store.get(key, '') as string : '';
+        const name = key.startsWith('lv3_') && key.endsWith('_identity') && typeof identity === 'string'
+          && identity.startsWith('ls3:') ? identity : PreferencesLatencyPersistence.nameOfKey(key);
         if (name.length > 0 && out.indexOf(name) < 0) {
           out.push(name);
         }

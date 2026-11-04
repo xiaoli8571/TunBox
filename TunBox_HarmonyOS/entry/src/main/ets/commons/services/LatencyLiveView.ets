@@ -27,7 +27,7 @@
  * 每条结果重建整张列表（106 个节点即 106 次重排）。这里把通知合并到最多每 200ms
  * 一次，仅压缩刷新频率，数值本身不丢。
  */
-import { LatencyChannel, LatencyPolicy, LatencyRecord, LatencyState } from './LatencyState';
+import { LatencyChannel, LatencyContext, LatencyPolicy, LatencyRecord, LatencyState } from './LatencyState';
 
 const NOTIFY_COALESCE_MS = 200;
 
@@ -54,14 +54,14 @@ export class LatencyLiveView {
   }
 
   /** 完整记录（新代码入口） */
-  static recordFor(nodeName: string): LatencyRecord | null {
-    const v = LatencyLiveView.map.get(nodeName);
+  static recordFor(nodeName: string, context: LatencyContext | null = null): LatencyRecord | null {
+    const v = LatencyLiveView.map.get(context === null ? nodeName : context.key(nodeName));
     return v === undefined ? null : v;
   }
 
   /** 状态（缺省 = UNTESTED，绝不缺省成"超时"） */
-  static stateFor(nodeName: string): number {
-    const v = LatencyLiveView.map.get(nodeName);
+  static stateFor(nodeName: string, context: LatencyContext | null = null): number {
+    const v = LatencyLiveView.map.get(context === null ? nodeName : context.key(nodeName));
     return v === undefined ? LatencyState.UNTESTED : v.state;
   }
 
@@ -71,8 +71,8 @@ export class LatencyLiveView {
    * 收尾方据此避免误清新批：runId 不匹配说明这条转圈是**别人**打上的。
    * runId===0 表示调用方未参与代次管理（旧调用点），退回"只看状态"的宽松语义。
    */
-  static isTestingOwnedBy(nodeName: string, runId: number): boolean {
-    const v = LatencyLiveView.map.get(nodeName);
+  static isTestingOwnedBy(nodeName: string, runId: number, context: LatencyContext | null = null): boolean {
+    const v = LatencyLiveView.map.get(context === null ? nodeName : context.key(nodeName));
     if (v === undefined || v.state !== LatencyState.TESTING) {
       return false;
     }
@@ -83,8 +83,8 @@ export class LatencyLiveView {
    * 兼容视图：数值延迟。
    * MEASURED/OFFLINE → 延迟；TIMEOUT/FAILED → -1；其余（未测/测试中/取消）→ null。
    */
-  static latencyFor(nodeName: string): number | null {
-    const v = LatencyLiveView.map.get(nodeName);
+  static latencyFor(nodeName: string, context: LatencyContext | null = null): number | null {
+    const v = LatencyLiveView.map.get(context === null ? nodeName : context.key(nodeName));
     if (v === undefined) {
       return null;
     }
@@ -99,7 +99,8 @@ export class LatencyLiveView {
 
   /** 写入完整记录 */
   static setRecord(rec: LatencyRecord): void {
-    LatencyLiveView.map.set(rec.name, rec);
+    rec.context = rec.context ?? null;
+    LatencyLiveView.map.set(rec.context === null ? rec.name : rec.context.key(rec.name), rec);
     LatencyLiveView.scheduleNotify();
   }
 
@@ -110,17 +111,23 @@ export class LatencyLiveView {
    * 打上的标记。否则同一节点的旧批次收尾会把新批次的转圈清成 `--`，
    * 用户看到"正在测速的行突然变成未测"。
    */
-  static markTesting(nodeName: string, runId: number = 0): void {
-    const existing = LatencyLiveView.map.get(nodeName);
+  static markTesting(nodeName: string, runId: number = 0, context: LatencyContext | null = null): void {
+    const existing = LatencyLiveView.map.get(context === null ? nodeName : context.key(nodeName));
     const rec = new LatencyRecord();
     rec.name = nodeName;
+    rec.context = context;
     rec.runId = runId;
     rec.state = LatencyState.TESTING;
     rec.delayMs = -1;
     rec.atMs = 0;
     rec.channel = existing === undefined ? LatencyChannel.CORE : existing.channel;
-    LatencyLiveView.map.set(nodeName, rec);
+    LatencyLiveView.map.set(context === null ? nodeName : context.key(nodeName), rec);
     LatencyLiveView.scheduleNotify();
+  }
+
+  private static writeContext(rec: LatencyRecord, context: LatencyContext | null): void {
+    rec.context = context;
+    LatencyLiveView.setRecord(rec);
   }
 
   /**
@@ -146,10 +153,12 @@ export class LatencyLiveView {
    * @param failKind 失败分类（LatencyFailKind.*，空串 = 无分类）
    * @param atMs 该批次的真实时间戳（快照的 testedAt；<=0 = 年龄未知）
    */
-  static restore(nodeName: string, latency: number, failKind: string, atMs: number): void {
+  static restore(nodeName: string, latency: number, failKind: string, atMs: number, context: LatencyContext | null = null): void {
+    const existing = LatencyLiveView.recordFor(nodeName, context);
+    if (existing !== null && (existing.state === LatencyState.TESTING || existing.atMs >= atMs)) { return; }
     if (latency >= 1) {
-      LatencyLiveView.setRecord(
-        LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, atMs));
+      LatencyLiveView.writeContext(
+        LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, atMs), context);
       return;
     }
     if (latency === -1) {
@@ -160,32 +169,32 @@ export class LatencyLiveView {
         // 测速路径写进快照的失败**一定**带分类（见 NodeSelectionPage.toPersistRecord），
         // 所以这里把 '' 判成非结论是安全的（方向也是保守的：宁可显示「--」，
         // 也不显示假的「超时」）。
-        LatencyLiveView.setRecord(LatencyRecord.untested(nodeName));
+        LatencyLiveView.writeContext(LatencyRecord.untested(nodeName), context);
         return;
       }
       // 真实失败结论：保留分类（switch_failed → 显示「未生效」，其余 → 超时/失败）
       const state: number = failKind === 'timeout' ? LatencyState.TIMEOUT : LatencyState.FAILED;
-      LatencyLiveView.setRecord(
-        LatencyRecord.failed(nodeName, state, atMs, LatencyChannel.CORE, failKind));
+      LatencyLiveView.writeContext(
+        LatencyRecord.failed(nodeName, state, atMs, LatencyChannel.CORE, failKind), context);
       return;
     }
-    LatencyLiveView.setRecord(LatencyRecord.untested(nodeName));
+    LatencyLiveView.writeContext(LatencyRecord.untested(nodeName), context);
   }
 
   /** 兼容入口：数字 → 记录 */
-  static set(nodeName: string, latency: number): void {
+  static set(nodeName: string, latency: number, context: LatencyContext | null = null): void {
     if (latency >= 1) {
-      LatencyLiveView.setRecord(
-        LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, Date.now()));
+      LatencyLiveView.writeContext(
+        LatencyRecord.measured(nodeName, latency, LatencyChannel.CORE, Date.now()), context);
       return;
     }
     if (latency === 0 || latency === -1) {
-      LatencyLiveView.setRecord(
-        LatencyRecord.failed(nodeName, LatencyState.TIMEOUT, Date.now()));
+      LatencyLiveView.writeContext(
+        LatencyRecord.failed(nodeName, LatencyState.TIMEOUT, Date.now()), context);
       return;
     }
     // -2（旧"未测"）及其它：回到未测，不盖章成失败
-    LatencyLiveView.setRecord(LatencyRecord.untested(nodeName));
+    LatencyLiveView.writeContext(LatencyRecord.untested(nodeName), context);
   }
 
   static clearAll(): void {
@@ -206,12 +215,16 @@ export class LatencyLiveView {
    * 丢弃当前订阅已不存在节点的延迟，避免订阅反复刷新或换源后 Map 常驻增长。
    * 只有确实删除条目时才通知，因而可安全地在列表重建路径调用。
    */
-  static retainOnly(nodeNames: string[]): void {
+  static retainOnly(nodeNames: string[], context: LatencyContext | null = null): void {
     const active = new Set<string>(nodeNames);
     let changed = false;
-    for (const name of LatencyLiveView.map.keys()) {
-      if (!active.has(name)) {
-        LatencyLiveView.map.delete(name);
+    for (const pair of LatencyLiveView.map) {
+      const rec = pair[1];
+      if (context === null ? rec.context !== null
+        : rec.context === null || rec.context.profileId !== context.profileId) { continue; }
+      if (!active.has(rec.name) || (context !== null && rec.context !== null
+        && rec.context.revision !== context.revision)) {
+        LatencyLiveView.map.delete(pair[0]);
         changed = true;
       }
     }

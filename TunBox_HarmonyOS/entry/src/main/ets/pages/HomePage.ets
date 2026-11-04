@@ -17,7 +17,7 @@ import { CelestialPowerOrb } from '../components/CelestialPowerOrb';
 import { SubscriptionSection } from '../components/SubscriptionSection';
 import { TrafficStatsStore } from '../commons/services/TrafficStatsStore';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
-import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
+import { ConnectionOrchestrator, ConnState, ProxyModeApply } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { SettingsService } from '../commons/services/SettingsService';
 import { PublicIpService } from '../commons/services/PublicIpService';
@@ -77,6 +77,7 @@ export struct HomePage {
   @State showDiagnostics: boolean = false;
   @State diagData: AppDiagnostics | null = null;
   @State proxyMode: string = 'rule';
+  private proxyModeRequest: number = 0;
   @StorageLink('theme_revision') themeRevision: number = 0;
   @StorageLink('public_ip_revision') @Watch('onPublicIpRevision') publicIpRevision: number = 0;
   @StorageLink('vpn_request_seq') @Watch('onVpnRequest') vpnRequestSeq: number = 0;
@@ -285,11 +286,10 @@ export struct HomePage {
       }
     }
     LatencyStoreBridge.flushNow();
-    const pm: string = this.settings.proxyMode;
-    this.proxyMode = (pm === 'global' || pm === 'direct') ? pm : 'rule';
     // 会话接管由编排器统一校验代次；页面不得用异步读到的旧快照改写连接态。
     await this.orchestrator.restoreKilledSession(ctx);
     if (!this.pageMounted) { return; }
+    this.proxyMode = this.orchestrator.currentProxyMode(this.settings.proxyMode);
     // 不在冷启动阶段查询公网 IP。直连查询没有用户价值，还会与首连的 DNS/TLS
     // 和节点握手竞争网络资源；连接成功后由 toggleConnection() 单独刷新隧道出口。
     // ── 冷启 DoH 预热：2026-10-19 **已移除**（稳定性回退）────────────────────
@@ -613,6 +613,12 @@ export struct HomePage {
   private async toggleConnection(): Promise<void> {
     // 显式用户操作（电源按钮/卡片 toggle）：清除长时任务抑制态
     UiGuardian.clearExternalCancelSuppression();
+    if (this.orchestrator.isRestarting()) {
+      await this.orchestrator.disconnect();
+      this.invalidatePublicIpQueries();
+      this.refreshPublicIp('cancel-restart', true);
+      return;
+    }
     if (this.isConnecting || this.pendingStart) {
       return;
     }
@@ -668,41 +674,30 @@ export struct HomePage {
   }
 
   private async applyProxyMode(mode: string): Promise<void> {
-    if (mode === this.proxyMode) {
-      return;
-    }
+    if (mode === this.proxyMode) { return; }
+    const request = ++this.proxyModeRequest;
     this.proxyMode = mode;
     this.settings.proxyMode = mode;
-    // ── `direct` 不落盘（2026-10-19 稳定性裁定）──────────────────────────────
-    //
-    // 「直连」= 所有流量绕过代理。它是排查/临时需求，不是长期配置：
-    // 一旦写进磁盘，用户误触后每次启动都直连，表现是「VPN 连上了但代理不生效、
-    // 公网 IP 是本地出口」，而用户几乎不可能自己想到是模式问题。
-    // 所以 direct 只在本次运行期生效（内存 + 内核热更新），磁盘上保持上一次的
-    // rule/global；重启后由 AppSettings.fromJson 再兜一层（direct → rule）。
-    // 需要直连时再点一次按钮，代价是一次点击，收益是不可能被粘死。
-    if (mode !== 'direct') {
-      // 字段级写入口（审计 F2）：整单 save 会把别的写者刚写进去的字段盖回旧值。
-      // 这里只改 proxyMode 一个字段，其余字段从盘上最新值原样带走。
-      await SettingsService.patchSettings((s: AppSettings): void => {
-        s.proxyMode = mode;
-      });
-    }
-    // 内存里保留 `settings.proxyMode = 'direct'`（上面已赋值），但要注意一个
-    // **有意的行为**：自动重连（网络切换/故障切换）走的是
-    // `ConnectionOrchestrator.connect()` 里 `SettingsService.load()` 的磁盘值，
-    // 那里没有 direct → 重连后自动回到 rule。这符合"direct 是临时诊断态"的定位：
-    // 用户不会因为一次误触而永久直连，代价只是重连后需要重新点一次。
     const label = mode === 'global' ? '全局模式' : (mode === 'direct' ? '直连模式（不保存）' : '规则模式');
-    await this.orchestrator.applyProxyMode(mode);
-    promptAction.showToast({
-      message: this.orchestrator.state === ConnState.CONNECTED
-        ? `已切换${label}` : `已切换${label}，下次连接生效`
-    });
-    // 模式切换会改变出口（尤其 direct），旧 IP 结论作废，立即重查
-    if (this.orchestrator.state === ConnState.CONNECTED) {
-      this.invalidatePublicIpQueries();
-      this.refreshPublicIp('after-mode-change', true);
+    try {
+      // 直连只用于本次会话；由编排器把临时模式带进重启配置，不写入磁盘。
+      if (mode !== 'direct') {
+        await SettingsService.patchSettings((s: AppSettings): void => { s.proxyMode = mode; });
+      }
+      if (request !== this.proxyModeRequest) { return; }
+      const outcome = await this.orchestrator.applyProxyMode(mode);
+      if (request !== this.proxyModeRequest) { return; }
+      promptAction.showToast({ message: outcome === ProxyModeApply.RESTARTED
+        ? `已切换${label}，代理已重启` : `已选择${label}` });
+      if (outcome === ProxyModeApply.RESTARTED) {
+        this.invalidatePublicIpQueries();
+        this.refreshPublicIp('after-mode-change', true);
+      }
+    } catch (e) {
+      if (request !== this.proxyModeRequest) { return; }
+      AppLogger.warn(TAG, `apply proxy mode failed: ${AppLogger.errText(e)}`);
+      this.proxyMode = this.orchestrator.currentProxyMode((await SettingsService.load()).proxyMode);
+      promptAction.showToast({ message: `切换${label}失败，请重试` });
     }
   }
 
