@@ -35,7 +35,9 @@ import { ImportFilePolicy } from '../commons/services/ImportFilePolicy';
 import { MIN_UPDATE_INTERVAL_MINUTES, MAX_UPDATE_INTERVAL_MINUTES } from '../commons/services/SubscriptionUpdateScheduler';
 import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
 import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
-import { CoreGroup } from '../commons/flclash/CoreCatalog';
+import { CoreGroup, CoreCatalogModel } from '../commons/flclash/CoreCatalog';
+import { LatencyContext, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
+import { ProxyPanelMembers } from '../commons/flclash/ProxyPanelMembers';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 
@@ -55,10 +57,11 @@ struct AddSubDialog {
   @State busy: boolean = false;
   @State allowInsecure: boolean = false;
   @State convertText: string = '';
+  @State exportConvertedYaml: boolean = false;
   getAllowInsecure: () => boolean = () => false;
   onToggleInsecure: (v: boolean) => void = () => {};
   onAddUrl: (name: string, url: string) => void = () => {};
-  onConvert: (text: string) => void = () => {};
+  onConvert: (text: string, exportFile: boolean) => void = () => {};
   onScan: () => void = () => {};
   onPickFile: () => void = () => {};
 
@@ -125,7 +128,11 @@ struct AddSubDialog {
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
           .fontColor(TunBoxTextColors.primary)
-        Text('分享链接会转换成本地 Clash 配置并加入订阅列表。')
+        Row({ space: 8 }) {
+          this.ConvertOutputChoice('直接导入 TunBox', false)
+          this.ConvertOutputChoice('导出 YAML 文件', true)
+        }.width('100%')
+        Text(this.exportConvertedYaml ? '转换后选择本机保存位置。' : '转换后加入 TunBox 订阅列表。')
           .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
       } else {
         Column({ space: 8 }) {
@@ -148,7 +155,7 @@ struct AddSubDialog {
               this.controller.close();
             }
           })
-        Button(this.mode === 'url' ? '添加' : (this.mode === 'convert' ? '转换' : '开始'))
+        Button(this.mode === 'url' ? '添加' : (this.mode === 'convert' ? (this.exportConvertedYaml ? '转换并导出' : '转换并导入') : '开始'))
           .layoutWeight(1).height(44).borderRadius(12).fontSize(14)
           .backgroundColor(TunBoxColors.primary).fontColor(Color.White)
           .onClick(() => {
@@ -160,7 +167,7 @@ struct AddSubDialog {
             } else if (this.mode === 'qr') {
               this.onScan();
             } else if (this.mode === 'convert') {
-              this.onConvert(this.convertText);
+              this.onConvert(this.convertText, this.exportConvertedYaml);
             } else {
               this.onPickFile();
             }
@@ -172,6 +179,16 @@ struct AddSubDialog {
     .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
     .borderRadius(20)
     .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
+  }
+
+  @Builder
+  ConvertOutputChoice(label: string, exportFile: boolean) {
+    Button(label)
+      .layoutWeight(1).height(38).borderRadius(10).fontSize(12)
+      .fontColor(this.exportConvertedYaml === exportFile ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondary)
+      .backgroundColor(this.exportConvertedYaml === exportFile
+        ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
+      .onClick(() => { this.exportConvertedYaml = exportFile; })
   }
 
   @Builder
@@ -377,6 +394,13 @@ export struct SubscriptionSection {
   @State private testingIds: string[] = [];
   @State private sortByDelay: boolean = true;
   /**
+   * 节点列表排布（2026-11-03 用户要求：「按延迟」左边加一个双列 / 单列切换按钮）。
+   * false = 单列（沿用原来一行一节点），true = 双列紧凑单元格（一行两个）。
+   * 与 `sortByDelay` 一样是面板内的即时状态，不进 AppSettings。
+   */
+  @State private gridMode: boolean = false;
+  @State private selectingMember: string = '';
+  /**
    * 「长按删除节点」底部弹层（2026-10-29 用户要求：“长按任意节点底部弹删除框，
    * 可以多选也可以单独删除”）。
    * 长按时只勾中该节点（= 单独删除），再点其它行就变成多选，最后一次性提交。
@@ -433,6 +457,7 @@ export struct SubscriptionSection {
   private service: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private refreshing: boolean = false;
+  private converting: boolean = false;
   private editTargetId: string = '';
   private editTargetName: string = '';
   /** 全局「自动更新订阅」开关（编辑弹框里展示/修改的就是它） */
@@ -450,7 +475,7 @@ export struct SubscriptionSection {
       getAllowInsecure: (): boolean => this.allowInsecureSubscriptionHttp,
       onToggleInsecure: (v: boolean): void => { this.setAllowInsecure(v); },
       onAddUrl: (name: string, url: string): void => { this.applyAdd(name, url); },
-      onConvert: (text: string): void => { this.importFromConvert(text); },
+      onConvert: (text: string, exportFile: boolean): void => { this.importFromConvert(text, exportFile); },
       onScan: (): void => { this.importFromQr(); },
       onPickFile: (): void => { this.importYamlFile(); }
     }),
@@ -500,6 +525,7 @@ export struct SubscriptionSection {
   private latencyBound: boolean = false;
   private readonly nodeSetListener: (reason: string) => void = (reason: string): void => {
     AppLogger.info(TAG, `node set changed: ${reason}`);
+    this.profileRevisions.clear();
     this.reload();
   };
   private nodeSetBound: boolean = false;
@@ -510,6 +536,7 @@ export struct SubscriptionSection {
   private orchBound: boolean = false;
 
   aboutToAppear(): void {
+    this.profileRevisions.clear();
     if (!this.latencyBound) {
       this.latencyBound = true;
       LatencyStoreBridge.addListener(this.latencyListener);
@@ -567,27 +594,32 @@ export struct SubscriptionSection {
 
   // ────────────────────────── 数据 ──────────────────────────
 
+  private profileRevisions: Map<string, string> = new Map<string, string>();
+
+  private profileRevisionFor(id: string): string {
+    return this.profileRevisions.get(id) ?? '';
+  }
+
   private reload(): void {
+    for (const sub of this.service.subscriptions) {
+      if (!this.profileRevisions.has(sub.id)) {
+        this.profileRevisions.set(sub.id, ProfileRepository.revisionOf(sub.id));
+      }
+    }
     this.subs = this.service.subscriptions.slice();
     this.currentProfileId = ProfileRepository.currentId();
     const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
-    const target = orch.getCurrentConnectionTarget();
-    if (target !== null && target.nodeName.length > 0) {
-      this.currentNodeName = target.nodeName;
-    } else if (this.settings.preferredNodeName.length > 0) {
-      this.currentNodeName = this.settings.preferredNodeName;
-    }
+    this.currentNodeName = orch.getCurrentNodeName();
     // 偏好必须从磁盘读：本组件此前从未 load 过 AppSettings，
     // 导致「选完节点→重进面板」时 preferredNodeName 恒为空 → 勾选丢失（真机复现）。
     SettingsService.load().then((loaded: AppSettings): void => {
       this.settings = loaded;
+      this.sortByDelay = loaded.nodeListSortMode !== 'default';
       // 间隔是全局设置（2026-10-29）：跟着 settings 一起刷新，弹窗打开时就能看到真值
       this.autoUpdateIntervalMin = loaded.subscriptionUpdateIntervalMinutes;
       this.autoUpdateGlobal = loaded.autoUpdateSubscription;
       this.allowInsecureSubscriptionHttp = loaded.allowInsecureSubscriptionHttp;
-      if (this.currentNodeName.length === 0) {
-        this.currentNodeName = loaded.preferredNodeName;
-      }
+      this.currentNodeName = orch.getCurrentNodeName();
       // 偏好是异步读回来的：入口高亮要跟着它重算，否则重进面板看不到已选中的自动行
       this.refreshSmartEntry();
     }).catch((): void => {});
@@ -628,16 +660,17 @@ export struct SubscriptionSection {
 
  
 
-  private coreCatalogFor(subId: string): boolean {
-    const state = ConnectionOrchestrator.instance().state;
-    return (state === ConnState.CONNECTED || state === ConnState.CONNECTING)
-      && CoreCatalogService.current() !== null
-      && CoreCatalogService.profileIdOfSnapshot() === subId;
+  private catalogFor(subId: string): CoreCatalogModel | null {
+    if (ConnectionOrchestrator.instance().appliedProfile() === subId
+      && CoreCatalogService.profileIdOfSnapshot() === subId) { return CoreCatalogService.current(); }
+    return CoreCatalogService.forProfile(subId, this.profileRevisionFor(subId));
   }
 
+  private coreCatalogFor(subId: string): boolean { return this.catalogFor(subId) !== null; }
+
   private groupsOf(subId: string): ProxyGroup[] {
-    const core = CoreCatalogService.current();
-    if (core !== null && subId === this.currentProfileId && this.coreCatalogFor(subId)) {
+    const core = this.catalogFor(subId);
+    if (core !== null) {
       const fromCore: ProxyGroup[] = [];
       const byName: Map<string, ProxyGroup> = new Map<string, ProxyGroup>();
       for (const source of core.groups) {
@@ -650,7 +683,9 @@ export struct SubscriptionSection {
         group.subscriptionId = subId;
         group.name = source.name;
         group.groupType = source.type;
-        group.members = source.all.filter((node): boolean => !node.isGroup).map((node): string => node.name);
+        group.url = source.url;
+        group.expectedStatus = source.expectedStatus;
+        group.members = source.all.map((node): string => node.name);
         fromCore.push(group);
         byName.set(group.name, group);
       }
@@ -725,81 +760,175 @@ export struct SubscriptionSection {
     return null;
   }
 
+  /**
+   * 订阅里是否至少有一个真实代理（DIRECT/REJECT/策略组都不算）。
+   * 只用于空状态文案：区分「这个组为空」和「整个订阅根本没有代理」。
+   */
+  private subHasRealProxy(): boolean {
+    const nodes: ProxyNode[] = this.service.nodesOf(this.panelSubId);
+    for (const node of nodes) {
+      if (ProxyPanelMembers.isProxy(node)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private panelNodes(): ProxyNode[] {
-    // 订阅隔离：未完成首次刷新（本地节点仍为 0）时，绝不回退到 current profile
-    // 的内核节点表，否则会出现“打开订阅 B，先看到订阅 A 的节点，刷新后才恢复”
-    // 的串订阅现象。
+    // 普通订阅以本地节点作归属证明；provider-only 配置没有本地节点，只有在内核
+    // 快照的 profile 归属戳与面板订阅逐字匹配时，才允许展示运行期注入的节点。
     const localNodes = this.service.nodesOf(this.panelSubId);
-    if (localNodes.length === 0) {
+    if (localNodes.length === 0 && !this.coreCatalogFor(this.panelSubId)
+      && this.activeGroupOf(this.panelSubId) === null) {
       return [];
     }
 
-    const core = CoreCatalogService.current();
+    const core = this.catalogFor(this.panelSubId);
     let arr: ProxyNode[];
-    if (core !== null && this.panelSubId === this.currentProfileId && this.coreCatalogFor(this.panelSubId)) {
+    if (core !== null) {
       arr = this.corePanelNodes(localNodes);
     } else {
       arr = this.localPanelNodes(localNodes);
     }
+    // 2026-11-03 用户报障「jdydy 不按延迟排序」：原写法是「成员里有子策略组就整体不排序」，
+    // 只要订阅带子组（jdydy / ikuuu / 模板）就永远排不了序。正确口径：
+    // 子策略组是「文件夹」→ 保持声明顺序钉在顶部；真实代理按延迟升序；DIRECT/REJECT
+    // 等策略成员与信息型伪节点排在末尾（同样保持声明顺序）。
+    return this.sortPanelRows(arr);
+  }
+
+  /**
+   * 面板行的统一排序口径（组 → 代理按延迟 → 策略/伪成员）。
+   * 顶层列表与内联小分组的成员行共用同一份规则，避免两处排序口径漂移。
+   */
+  private sortPanelRows(list: ProxyNode[]): ProxyNode[] {
     if (!this.sortByDelay) {
-      return arr;
+      return list;
     }
-    return CoreNodeBridge.sortByDelay(arr, (name: string): number | null => {
-      return LatencyStoreBridge.latencyFor(name);
-    });
+    const groups: ProxyNode[] = [];
+    const proxies: ProxyNode[] = [];
+    const policies: ProxyNode[] = [];
+    for (const node of list) {
+      if (ProxyPanelMembers.isGroup(node)) {
+        groups.push(node);
+      } else if (ProxyPanelMembers.isProxy(node)) {
+        proxies.push(node);
+      } else {
+        policies.push(node);
+      }
+    }
+    return groups.concat(CoreNodeBridge.sortByDelay(proxies, (name: string): number | null => {
+      const rec = this.pingRecordForName(name);
+      return rec === null ? null : (rec.hasValue() ? rec.delayMs : (rec.isFailure() ? -1 : null));
+    }), policies);
+  }
+
+  /**
+   * 面板列表的分行结果：单列时一行一个节点，双列时一行两个（奇数个最后一个占半行）。
+   * ForEach 只调用一次，内部也只算一次 `panelNodes()`，避免每行重复排序。
+   */
+  private panelNodeRows(): ProxyNode[][] {
+    const nodes: ProxyNode[] = this.panelNodes();
+    const rows: ProxyNode[][] = [];
+    const step: number = this.gridMode ? 2 : 1;
+    for (let i = 0; i < nodes.length; i += step) {
+      rows.push(nodes.slice(i, i + step));
+    }
+    return rows;
+  }
+
+  /** 行级 ForEach key：沿用原来的失效条件集合，额外带上排布模式与行内每个节点的勾选态。 */
+  private panelRowKey(row: ProxyNode[]): string {
+    let ids: string = '';
+    for (let i = 0; i < row.length; i++) {
+      ids += `${row[i].id}:${this.isDeleteChecked(row[i].id)},`;
+    }
+    return `${ids}|${this.gridMode ? 'g' : 'l'}|${this.selectedGroup}|${this.latencyRevision}`
+      + `|${this.coreRevision}|${this.sortByDelay}|${this.nodeRevision}|${this.deleteSheetOn}`;
   }
 
   /**
    * 内核快照路径的节点行。
    *
-   * **必须**用「本订阅自己的节点名」做归属证明：内核只有一份配置，但 `selectedGroup`
-   * 只是个裸名字，而 `core.findGroup()` 是按名字**全局**查的 —— 任一处对不上就会把
-   * 其它订阅的节点盖着本订阅的戳铺出来。名字交集即归属证明；交集为空或组不存在时
-   * 一律退回本地解析结果，**绝不**回退 `flattenNodes('rule')`（那是全内核节点，是
-   * 串订阅的第二条通路）。
+   * 必须先校验实际应用的 profile 归属戳，组不存在时回退本地解析。
+   * 同一份图里的子策略组和 provider 节点都是合法成员，不能再用本地叶子名字
+   * 交集过滤，否则会把它们一起隐藏。旧快照归属不匹配时 caller 不会进入此分支。
    */
   private corePanelNodes(localNodes: ProxyNode[]): ProxyNode[] {
-    const core = CoreCatalogService.current();
+    const core = this.catalogFor(this.panelSubId);
     if (core === null) {
       return this.localPanelNodes(localNodes);
     }
     const source: CoreGroup | null = core.findGroup(this.selectedGroup);
     if (source === null) {
+      if (localNodes.length === 0) {
+        return CoreNodeBridge.toProxyNodes(ProxyPanelMembers.coreProxies(core), this.panelSubId);
+      }
       return this.localPanelNodes(localNodes);
     }
-    const owned: Set<string> = new Set<string>();
-    for (const local of localNodes) {
-      owned.add(local.name);
-    }
-    const nodes = source.all.filter((node): boolean => !node.isGroup && owned.has(node.name));
-    if (nodes.length === 0) {
-      return this.localPanelNodes(localNodes);
-    }
-    return CoreNodeBridge.toProxyNodes(nodes, this.panelSubId);
+    // The caller already checks the applied profile stamp. Provider nodes and child
+    // groups are both legitimate members of this exact graph, not foreign local nodes.
+    return ProxyPanelMembers.fromCore(source, this.panelSubId, ClashConfigGenerator.SMART_GROUP_NAME);
   }
 
   /** 本地（订阅配置）路径的节点行：不经内核，天然按 subscriptionId 隔离。 */
   private localPanelNodes(localNodes: ProxyNode[]): ProxyNode[] {
     const group: ProxyGroup | null = this.activeGroupOf(this.panelSubId);
     if (group !== null) {
-      return this.service.expandProxyGroup(group);
+      return ProxyPanelMembers.fromLocal(group, this.service.groupsOf(this.panelSubId),
+        localNodes, ClashConfigGenerator.SMART_GROUP_NAME);
     }
     return localNodes.slice();
   }
 
   private protoOf(node: ProxyNode): string {
+    if (ProxyPanelMembers.isGroup(node)) {
+      return ProxyPanelMembers.type(node.proxyType);
+    }
     if (CoreNodeBridge.isShadow(node)) {
       return CoreNodeBridge.protocolLabel(node);
     }
     return NodeProtocolPolicy.fromNode(node).display();
   }
 
+  /**
+   * 行记录：先看自己的名字，再看（组行）末端口 —— 测速目标按 FlClash 口径解析成
+   * 真实出口，结论记在出口名下，组卡片要借出口的记录显示。
+   */
+  private pingRecordForName(name: string): LatencyRecord | null {
+    const profileId = this.panelSubId;
+    const groups = this.service.groupsOf(profileId);
+    const model = this.catalogFor(profileId);
+    const globalUrl = BackgroundLatencyService.resolveTestUrl(this.settings);
+    if (model !== null) {
+      const orch = ConnectionOrchestrator.instance();
+      const selections = orch.state === ConnState.CONNECTED && orch.appliedProfile() === profileId ? null
+        : ProxyPanelMembers.selectionsFor(this.settings.proxyGroupSelections, profileId);
+      const target = ProxyPanelMembers.delayTarget(model, name, this.selectedGroup, globalUrl, '', groups, selections);
+      if (target === null) { return null; }
+      return LatencyStoreBridge.recordFor(target.name,
+        new LatencyContext(profileId, this.profileRevisionFor(profileId), target.url, target.expected));
+    }
+    // A group with no current graph has no proven exit. Never borrow a result
+    // under its name or from another profile's graph.
+    if (groups.some((group): boolean => group.name === name)) { return null; }
+    const parent = groups.find((group): boolean => group.name === this.selectedGroup);
+    const url = parent !== undefined && parent.url.length > 0 ? parent.url : globalUrl;
+    const expected = parent === undefined ? '' : parent.expectedStatus;
+    return LatencyStoreBridge.recordFor(name,
+      new LatencyContext(profileId, this.profileRevisionFor(profileId), url, expected));
+  }
+
+  private pingRecord(node: ProxyNode): LatencyRecord | null {
+    return this.pingRecordForName(node.name);
+  }
+
   private pingText(node: ProxyNode): string {
-    return TunBoxPing.recordText(LatencyStoreBridge.recordFor(node.name), this.latencyRevision);
+    return TunBoxPing.recordText(this.pingRecord(node), Math.max(Date.now(), this.latencyRevision));
   }
 
   private pingColor(node: ProxyNode): ResourceColor {
-    return TunBoxPing.recordColor(LatencyStoreBridge.recordFor(node.name), this.latencyRevision);
+    return TunBoxPing.recordColor(this.pingRecord(node), Math.max(Date.now(), this.latencyRevision));
   }
 
   /**
@@ -810,8 +939,15 @@ export struct SubscriptionSection {
    * 「♻️ 自动选择」和那个被借用的真实节点会**同时实心勾选**（2026-10-30 用户报障）。
    */
   private isActiveNode(node: ProxyNode): boolean {
-    if (this.smartSelected) {
-      return false;
+    if (this.smartSelected) { return false; }
+    const parent = this.activeGroupOf(this.panelSubId);
+    if (parent !== null && ProxyPanelMembers.type(parent.groupType) === 'Selector') {
+      const core = ConnectionOrchestrator.instance().state === ConnState.CONNECTED
+        && this.coreCatalogFor(this.panelSubId) ? CoreCatalogService.current() : null;
+      const group = core === null ? null : core.findGroup(parent.name);
+      const selected = group !== null && group.now.length > 0 ? group.now
+        : ProxyPanelMembers.selected(this.settings.proxyGroupSelections, this.panelSubId, parent.name);
+      if (selected.length > 0) { return selected === node.name; }
     }
     return this.currentNodeName.length > 0 && node.name === this.currentNodeName;
   }
@@ -868,12 +1004,26 @@ export struct SubscriptionSection {
     return `${SubscriptionSummary.updateTime(sub.lastFetchedAt)}更新`;
   }
 
+  /**
+   * 卡片副标题里的节点数（2026-11-03 用户口径：不再出现「N 分组」）。
+   *
+   * 内核快照里一个真实代理都没有时，不直接下结论：provider 还没拉完时 `/proxies`
+   * 是空的，而订阅本身有节点（用户报障「本地 yaml 明明 64 个节点」），此时回落
+   * App 自己落盘的节点数。两边都是 0 就返回空串 —— 卡片只留更新时间。
+   */
   private nodeCountText(sub: Subscription): string {
-    const core = CoreCatalogService.current();
-    if (core !== null && sub.id === this.currentProfileId && this.coreCatalogFor(sub.id)) {
-      return `${CoreCatalogService.flattenNodes('rule').length} 节点`;
+    const core = this.catalogFor(sub.id);
+    if (core !== null) {
+      const coreRows: ProxyNode[] = CoreNodeBridge.toProxyNodes(ProxyPanelMembers.coreProxies(core), sub.id);
+      if (ProxyPanelMembers.proxyCount(coreRows) === 0) {
+        const localRows: ProxyNode[] = this.service.nodesOf(sub.id);
+        if (ProxyPanelMembers.proxyCount(localRows) > 0) {
+          return ProxyPanelMembers.summary(localRows);
+        }
+      }
+      return ProxyPanelMembers.summary(coreRows);
     }
-    return `${this.service.nodesOf(sub.id).length} 节点`;
+    return ProxyPanelMembers.summary(this.service.nodesOf(sub.id));
   }
 
   /** 写法与设置页同源：只改这一个字段，不整单覆盖 */
@@ -955,7 +1105,18 @@ export struct SubscriptionSection {
       const result = await this.service.refreshSubscription(sub.id);
       const ok: boolean = result.status === SubscriptionRefreshStatus.OK
         || result.status === SubscriptionRefreshStatus.NOT_MODIFIED;
-      this.toast(ok ? `✓ ${sub.name} 已刷新` : `刷新失败：${sub.name}`);
+      // 2026-11-03：本地 YAML 的 provider 地址是占位符时，刷新是「成功」的（原文没变），
+      // 但一个节点都没进来。只弹「已刷新」会让用户以为应用坏了，这里把 provider 原因带上。
+      const providerIssue: string = result.diagnostics.providerFailedCount > 0
+        ? result.diagnostics.providerFailureReasons
+        : '';
+      const advice: string = result.advice.length > 0 ? result.advice : providerIssue;
+      if (ok && advice.length > 0) {
+        const brief: string = advice.length > 88 ? `${advice.substring(0, 88)}…` : advice;
+        this.toast(`${sub.name} 已刷新，但节点未加载：${brief}`, 4000);
+      } else {
+        this.toast(ok ? `✓ ${sub.name} 已刷新` : `刷新失败：${sub.name}`);
+      }
     } catch (e) {
       AppLogger.warn(TAG, `refresh failed: ${AppLogger.errText(e)}`);
       this.toast('刷新失败，请重试');
@@ -981,16 +1142,27 @@ export struct SubscriptionSection {
     this.testingIds = this.testingIds.concat([subId]);
     try {
       const context: Context = getContext(this) as Context;
-      const progress = await BackgroundLatencyService.testSubscription(context, subId);
+      const groupName = this.showPanel && this.panelSubId === subId ? this.selectedGroup : '';
+      const progress = await BackgroundLatencyService.testSubscription(context, subId, null, groupName);
       if (progress === null) {
         this.toast('测速未执行，请稍后重试');
         return;
       }
-      this.toast('✓ 测速完成');
+      if (progress.message.length > 0) { this.toast(progress.message); return; }
+      if (progress.total === 0 || progress.finished === 0) {
+        this.toast('测速未执行：没有可测速目标或批次已取消');
+        return;
+      }
+      this.toast(progress.measured > 0
+        ? `测速完成：${progress.measured} 成功，${progress.timeout} 超时，${progress.failed} 失败`
+          + (progress.skipped > 0 ? `，${progress.skipped} 跳过（节点未加载或策略无出口）` : '')
+          + (progress.cancelled > 0 ? `，${progress.cancelled} 未完成` : '')
+        : `未测得有效延迟：${progress.timeout} 超时，${progress.failed} 失败，${progress.cancelled} 未完成（取消或未取得内核响应）`);
     } catch (e) {
       AppLogger.warn(TAG, `latency test failed: ${AppLogger.errText(e)}`);
       this.toast('测速失败，请重试');
     } finally {
+      this.profileRevisions.set(subId, ProfileRepository.revisionOf(subId));
       this.testingIds = this.testingIds.filter((x: string): boolean => x !== subId);
       this.latencyRevision = this.latencyRevision + 1;
     }
@@ -1120,19 +1292,21 @@ export struct SubscriptionSection {
     }
   }
 
-  /**
-   * 「转换」模式：分享链接 / 非 Clash 订阅正文 → 本地 Clash 配置 → 加入订阅列表。
-   * 与设置页原「订阅转换」同一套实现（ProfileConfigMerger + SubConverter），
-   * 只是输出目标固定为订阅列表，不再落外部文件。
-   */
-  private async importFromConvert(text: string): Promise<void> {
+  /** 同一份转换结果可直接导入，或经系统保存器导出为本机 YAML 文件。 */
+  private async importFromConvert(text: string, exportFile: boolean = false): Promise<void> {
+    if (this.converting) { return; }
     const raw: string = text.trim();
     if (raw.length === 0) {
       this.toast('请粘贴分享链接或订阅内容');
       return;
     }
+    if (raw.length > ImportFilePolicy.YAML_MAX_BYTES) {
+      this.toast(ImportFilePolicy.tooLarge('订阅内容', ImportFilePolicy.YAML_MAX_BYTES));
+      return;
+    }
+    this.converting = true;
     try {
-      let body: string = raw;
+      let body: string = text;
       const lower: string = raw.toLowerCase();
       if (lower.startsWith('http://') || lower.startsWith('https://')) {
         const loaded: AppSettings = await SettingsService.load();
@@ -1145,32 +1319,61 @@ export struct SubscriptionSection {
         return;
       }
       let yaml: string = body;
-      let count: number = 0;
-      if (ProfileConfigMerger.isKernelLoadableConfig(body)) {
-        count = ProfileConfigMerger.merge('a: 1', body).profileProxyItems;
-      } else {
+      if (!ProfileConfigMerger.isKernelLoadableConfig(body)) {
         const converted = SubConverter.convert(body);
         if (!converted.ok) {
           this.toast('无法识别内容：既不是 Clash 配置，也解析不出节点链接');
           return;
         }
-        yaml = converted.proxiesYaml;
-        count = converted.count;
+        // 补齐选择组与 MATCH，让导出的链接转换结果可直接作为 Clash 配置使用。
+        yaml = ProfileConfigMerger.withSyntheticGroups(converted.proxiesYaml);
       }
+      const bytes = util.TextEncoder.create('utf-8').encodeInto(yaml);
+      const sizeError = ImportFilePolicy.validateSize(bytes.byteLength, ImportFilePolicy.YAML_MAX_BYTES, '配置文件');
+      if (sizeError.length > 0) { this.toast(sizeError); return; }
       const stat: Date = new Date();
       const fileName: string = `converted-${stat.getFullYear()}${String(stat.getMonth() + 1).padStart(2, '0')}`
         + `${String(stat.getDate()).padStart(2, '0')}-${String(stat.getHours()).padStart(2, '0')}`
-        + `${String(stat.getMinutes()).padStart(2, '0')}.yaml`;
+        + `${String(stat.getMinutes()).padStart(2, '0')}${String(stat.getSeconds()).padStart(2, '0')}.yaml`;
+      if (exportFile) {
+        const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
+        const opts = new picker.DocumentSaveOptions();
+        opts.newFileNames = [fileName];
+        opts.fileSuffixChoices = ['YAML 配置|.yaml'];
+        const uris = await docPicker.save(opts);
+        if (uris.length === 0) { return; }
+        const file = await fs.open(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        try {
+          let written: number = 0;
+          while (written < bytes.byteLength) {
+            const remaining = bytes.slice(written).buffer as ArrayBuffer;
+            const count = await fs.write(file.fd, remaining);
+            if (count <= 0 || count > remaining.byteLength) { throw new Error('文件写入未完成'); }
+            written += count;
+          }
+          await fs.fsync(file.fd);
+        } finally {
+          await fs.close(file);
+        }
+        this.toast('YAML 文件已保存到本机');
+        return;
+      }
+      const previousCount = this.service.subscriptions.length;
       const added: number = await this.service.addLocalYaml(fileName, yaml);
       if (added > 0) {
-        this.toast(`转换成功，加入 ${added || count} 个节点`);
-        this.reload();
+        this.toast(`转换成功，加入 ${added} 个节点`);
+      } else if (this.service.subscriptions.length > previousCount) {
+        // provider-only 配置可成功导入，即使尚无本地展开的叶子节点。
+        this.toast('配置已导入 TunBox，节点将在加载订阅后显示');
       } else {
-        this.toast('转换成功但没有可用节点');
+        this.toast('导入未完成，请检查订阅内容或节点数量限制');
       }
+      this.reload();
     } catch (e) {
-      AppLogger.warn(TAG, `convert import failed: ${AppLogger.errText(e)}`);
-      this.toast('转换失败，请重试');
+      AppLogger.warn(TAG, `convert ${exportFile ? 'export' : 'import'} failed: ${AppLogger.errText(e)}`);
+      this.toast(exportFile ? '转换或保存失败，请检查内容和保存位置后重试' : '转换或导入失败，请重试');
+    } finally {
+      this.converting = false;
     }
   }
 
@@ -1320,15 +1523,58 @@ export struct SubscriptionSection {
     }
   }
 
+  /** 保存成员意图后完整重启；启动阶段统一校验实际流量入口与出口。 */
+  private async selectPanelMember(parent: ProxyGroup, node: ProxyNode): Promise<void> {
+    if (this.selectingMember.length > 0 || !parent.members.includes(node.originalName || node.name)) { return; }
+    const scope = this.panelSubId;
+    if (parent.subscriptionId !== scope || node.subscriptionId !== scope) { return; }
+    this.selectingMember = node.name;
+    let savedIntent = false;
+    try {
+      const orch = ConnectionOrchestrator.instance();
+      await SettingsService.patchSettings((settings: AppSettings): void => {
+        settings.proxyGroupSelections = ProxyPanelMembers.remember(
+          settings.proxyGroupSelections, scope, parent.name, node.name);
+        settings.autoSelectMode = AutoSelectModes.MANUAL;
+        settings.preferredNodeId = ProxyPanelMembers.isGroup(node) ? '' : node.id;
+        settings.preferredNodeName = node.name;
+        settings.preferredNodeSubscriptionId = scope;
+        settings.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+          settings.preferredNodeNamesBySubscription, scope, node.name);
+      });
+      savedIntent = true;
+      const loaded = await SettingsService.load();
+      if (this.panelSubId === scope) {
+        this.settings = loaded;
+        this.smartSelected = false;
+        this.coreRevision++;
+        this.nodeRevision++;
+        this.currentNodeName = node.name;
+        this.closePanel();
+      }
+      // 先通知主页更新选择，再等待代理重启。
+      const revision: number = AppStorage.get<number>('node_switch_revision') ?? 0;
+      AppStorage.setOrCreate('node_switch_revision', revision + 1);
+      const restarted = await orch.reconnectWithNode(node, this.service, 'panel-member=' + node.name);
+      if (restarted) {
+        const ipRevision: number = AppStorage.get<number>('public_ip_revision') ?? 0;
+        AppStorage.setOrCreate('public_ip_revision', ipRevision + 1);
+      }
+      this.toast(restarted ? `已选择 ${node.name}，代理已重启` : `已保存 ${node.name}`);
+    } catch (e) {
+      AppLogger.warn(TAG, `select panel member failed: ${AppLogger.errText(e)}`);
+      this.toast(savedIntent ? '已保存选择，但代理重启失败，请重试' : '保存策略选择失败，请重试');
+    } finally { this.selectingMember = ''; }
+  }
+
   private async selectNode(node: ProxyNode): Promise<void> {
-    // /proxies 只提供名字和类型；连接仍必须回查 profile 中的真实节点以取得凭据。
+    // 静态节点优先回查本地定义；provider-only 影子没有本地凭据，但连接编排器会
+    // 复用 profile 原文并按内核成员名钉选，不能在 UI 层把它拒绝掉。
     if (CoreNodeBridge.isShadow(node)) {
       const local = this.service.nodesOf(this.panelSubId).find((candidate): boolean => candidate.name === node.name);
-      if (local === undefined) {
-        this.toast('该内核节点缺少可用凭据，请刷新订阅后重试');
-        return;
+      if (local !== undefined) {
+        node = local;
       }
-      node = local;
     }
     this.closePanel();
     if (this.settings.autoSelectMode === AutoSelectModes.AUTO) {
@@ -1354,20 +1600,22 @@ export struct SubscriptionSection {
           s.preferredNodeNamesBySubscription, node.subscriptionId, node.name);
       }
     });
+    const nodeRev: number = AppStorage.get<number>('node_switch_revision') ?? 0;
+    AppStorage.setOrCreate('node_switch_revision', nodeRev + 1);
     let restarted: boolean = false;
     try {
       restarted = await ConnectionOrchestrator.instance()
         .reconnectWithNode(node, this.service, 'home-section=' + node.id);
     } catch (e) {
       AppLogger.warn(TAG, `reconnect after pick failed: ${AppLogger.errText(e)}`);
+      this.toast('已保存选择，但代理重启失败，请重试');
+      this.reload();
+      return;
     }
-    // 通知主页刷新「启动按钮内的节点名」（2026-10-28 用户报障：选完节点要等启动才更新）
-    const nodeRev: number = AppStorage.get<number>('node_switch_revision') ?? 0;
-    AppStorage.setOrCreate('node_switch_revision', nodeRev + 1);
     if (restarted) {
       const rev: number = AppStorage.get<number>('public_ip_revision') ?? 0;
       AppStorage.setOrCreate('public_ip_revision', rev + 1);
-      this.toast(`已选择 ${node.name}，正在重连…`);
+      this.toast(`已选择 ${node.name}，代理已重启`);
     } else {
       this.toast(`已选择 ${node.name}`);
     }
@@ -1413,6 +1661,8 @@ export struct SubscriptionSection {
         .reconnectWithNode(target, this.service, 'home-section=smart:' + scopeId);
     } catch (e) {
       AppLogger.warn(TAG, `reconnect after smart pick failed: ${AppLogger.errText(e)}`);
+      this.toast('已保存自动选择，但代理重启失败，请重试');
+      return;
     }
     const nodeRev: number = AppStorage.get<number>('node_switch_revision') ?? 0;
     AppStorage.setOrCreate('node_switch_revision', nodeRev + 1);
@@ -1422,11 +1672,11 @@ export struct SubscriptionSection {
     }
     this.closePanel();
     this.reload();
-    this.toast(restarted ? '已切换自动选择，正在重连…' : '已切换自动选择，下次连接生效');
+    this.toast(restarted ? '已切换自动选择，代理已重启' : '已切换自动选择，下次连接生效');
   }
 
-  private toast(message: string): void {
-    promptAction.showToast({ message: message });
+  private toast(message: string, duration: number = 2000): void {
+    promptAction.showToast({ message: message, duration: duration });
   }
 
   // ────────────────────────── 渲染 ──────────────────────────
@@ -1514,7 +1764,9 @@ export struct SubscriptionSection {
                 .flexShrink(0)
             }
           }.width('100%')
-          Text(`${this.updateText(sub)} · ${this.nodeCountText(sub)}`)
+          Text(this.nodeCountText(sub).length > 0
+            ? `${this.updateText(sub)} · ${this.nodeCountText(sub)}`
+            : this.updateText(sub))
             .fontSize(11).fontColor(TunBoxTextColors.secondary)
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
@@ -1707,7 +1959,11 @@ export struct SubscriptionSection {
           if (this.isActiveNode(node)) {
             Circle({ width: 7, height: 7 }).fill(Color.White)
           }
-        }.width(20).height(20)
+        }
+        .width(20).height(20)
+        // 圆圈 = 显式「选为当前组成员」（组行点行同样选为成员，圆圈留着给手滑/误触兜底）
+        .onClick((): void => { this.selectAsMember(node); })
+        .accessibilityText(`选为成员：${node.name}`)
       }
     }
     .width('100%')
@@ -1719,27 +1975,126 @@ export struct SubscriptionSection {
     .alignItems(VerticalAlign.Center)
     // 长按任意节点 → 底部删除弹层（2026-10-29 用户要求）
     .gesture(LongPressGesture({ repeat: false, duration: 400 })
-      .onAction((): void => {
-        this.suppressClick = true;
-        this.openDeleteSheet(node);
-        // 长按抬手后系统还会补发一次 onClick（会把刚勾上的节点又取消掉），用一次性开关吞掉它。
-        // 必须定时自动复位（2026-10-29 真机 bug）：原来靠「下一次点击」来清标志，
-        // 但长按发生在 A 行、用户接着点 B 行，B 行那一下就被白白吃掉了（多选点不动）。
-        setTimeout((): void => { this.suppressClick = false; }, 350);
-      }))
-    .onClick((): void => {
-      if (this.suppressClick) {
-        this.suppressClick = false;
-        return;
+      .onAction((): void => { this.handleNodeLongPress(node); }))
+    .onClick((): void => { this.handleNodeTap(node); })
+  }
+
+  /**
+   * 双列模式下的紧凑单元格（2026-11-03 用户要求：节点页可切「双列 / 单列」）。
+   * 与 `NodeRow` 同源：同样的 名称 / 协议 / 延迟 / 单选圈，只是排成竖版小卡，
+   * 点击与长按直接复用 `handleNodeTap` / `handleNodeLongPress`，两列宽度各占一半。
+   * 固定高度 68vp：两列里名称行数不同也不会把整行撑歪。
+   */
+  @Builder
+  NodeCell(node: ProxyNode) {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        Text(node.name)
+          .fontSize(13).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
+          .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        // 右侧圆圈：与 NodeRow 一样，删除选择态下变勾选框（2026-10-29 语义保持不变）
+        if (this.deleteSheetOn) {
+          Stack({ alignContent: Alignment.Center }) {
+            Circle({ width: 18, height: 18 })
+              .fill(this.isDeleteChecked(node.id) ? TunBoxColors.danger : Color.Transparent)
+              .stroke(this.isDeleteChecked(node.id) ? TunBoxColors.danger : TunBoxColors.textMuted)
+              .strokeWidth(1.5)
+            if (this.isDeleteChecked(node.id)) {
+              Text('✓').fontSize(11).fontColor(Color.White).fontWeight(FontWeight.Bold)
+            }
+          }.width(18).height(18).flexShrink(0)
+        } else {
+          Stack({ alignContent: Alignment.Center }) {
+            Circle({ width: 18, height: 18 })
+              .fill(this.isActiveNode(node) ? TunBoxColors.success : Color.Transparent)
+              .stroke(this.isActiveNode(node) ? TunBoxColors.success : TunBoxColors.textMuted)
+              .strokeWidth(1.5)
+            if (this.isActiveNode(node)) {
+              Circle({ width: 6, height: 6 }).fill(Color.White)
+            }
+          }
+          .width(18).height(18).flexShrink(0)
+          .onClick((): void => { this.selectAsMember(node); })
+          .accessibilityText(`选为成员：${node.name}`)
+        }
       }
-      // 选择态下点行 = 勾选/取消勾选，不再切换节点（2026-10-29 用户要求：
-      // 「直接在节点页进行选择多个节点」）
-      if (this.deleteSheetOn) {
-        this.toggleDeleteId(node.id);
-        return;
+      .width('100%')
+      .alignItems(VerticalAlign.Top)
+
+      Row({ space: 6 }) {
+        Text(this.protoOf(node))
+          .fontSize(10).fontColor(TunBoxTextColors.muted)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        Text(this.pingText(node))
+          .fontSize(12).fontWeight(FontWeight.Bold).fontColor(this.pingColor(node))
+          .flexShrink(0)
       }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .layoutWeight(1)
+    .height(68)
+    .justifyContent(FlexAlign.SpaceBetween)
+    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+    .borderRadius(10)
+    .backgroundColor(this.deleteSheetOn
+      ? (this.isDeleteChecked(node.id) ? TunBoxColors.dangerLight : TunBoxColors.chipBg(this.themeRevision))
+      : (this.isActiveNode(node) ? TunBoxColors.successTint : TunBoxColors.chipBg(this.themeRevision)))
+    .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
+    .gesture(LongPressGesture({ repeat: false, duration: 400 })
+      .onAction((): void => { this.handleNodeLongPress(node); }))
+    .onClick((): void => { this.handleNodeTap(node); })
+  }
+
+  /**
+   * 节点行的点击行为（单列 `NodeRow` 与双列 `NodeCell` 共用，2026-11-03 抽取）。
+   *
+   * 2026-11-03 用户口径（对齐 FlClash）：**组行本身就是可选项**，点一下即把该子组
+   * 选为当前组的成员并立即回主页；不再下钻进组（ClashPlus / FlClash 都不展开小分组）。
+   * 想单独看某个组的成员，用顶部那排分组 chips 切组。
+   */
+  private handleNodeTap(node: ProxyNode): void {
+    if (this.suppressClick) {
+      this.suppressClick = false;
+      return;
+    }
+    // 选择态下点行 = 勾选/取消勾选，不再切换节点（2026-10-29 用户要求：
+    // 「直接在节点页进行选择多个节点」）
+    if (this.deleteSheetOn) {
+      if (ProxyPanelMembers.isGroup(node)) { return; }
+      this.toggleDeleteId(node.id);
+      return;
+    }
+    const parent = this.activeGroupOf(this.panelSubId);
+    // 2026-11-03（用户第二轮口径）：组行直接当成员选中，点一下就走人，不下钻。
+    if (ProxyPanelMembers.isGroup(node)) {
+      this.selectAsMember(node);
+      return;
+    }
+    if (parent !== null && ProxyPanelMembers.type(parent.groupType) === 'Selector') {
+      this.selectPanelMember(parent, node);
+    } else {
       this.selectNode(node);
-    })
+    }
+  }
+
+  /** 组行右侧圆圈：把该子组/节点选为当前组（父组）的成员。 */
+  private selectAsMember(node: ProxyNode): void {
+    const parent = this.activeGroupOf(this.panelSubId);
+    if (parent === null) { return; }
+    this.selectPanelMember(parent, node);
+  }
+
+  /** 长按行为（单列与双列共用）：先吞掉抬手后的补发 onClick，再进入删除选择态。 */
+  private handleNodeLongPress(node: ProxyNode): void {
+    this.suppressClick = true;
+    this.openDeleteSheet(node);
+    // 长按抬手后系统还会补发一次 onClick（会把刚勾上的节点又取消掉），用一次性开关吞掉它。
+    // 必须定时自动复位（2026-10-29 真机 bug）：原来靠「下一次点击」来清标志，
+    // 但长按发生在 A 行、用户接着点 B 行，B 行那一下就被白白吃掉了（多选点不动）。
+    setTimeout((): void => { this.suppressClick = false; }, 350);
   }
 
   /**
@@ -1748,6 +2103,15 @@ export struct SubscriptionSection {
    * 选择本身全在节点列表里完成，底部只留一条「取消 / 删除」操作条。
    */
   private openDeleteSheet(node: ProxyNode): void {
+    if (ProxyPanelMembers.isGroup(node)) {
+      this.toast('策略组由配置管理，不能作为节点删除');
+      return;
+    }
+    // provider-only 影子由远端 provider 管理，本地没有可删除的节点台账。
+    if (CoreNodeBridge.isShadow(node)) {
+      this.toast('该节点由远端 provider 管理，不能在本地删除');
+      return;
+    }
     if (!this.deleteSheetOn) {
       this.deleteSheetOn = true;
       this.deleteSheetIds = [node.id];
@@ -1908,6 +2272,18 @@ export struct SubscriptionSection {
           .scrollBar(BarState.Off)
           .layoutWeight(1)
 
+          // 2026-11-03 用户要求：在「按延迟」左边加一个双列 / 单列显示切换按钮。
+          // 图标表示「点一下会变成什么」：单列时显示双列图标，反之亦然。
+          Row({ space: 4 }) {
+            Image(this.gridMode ? $r('app.media.ic_view_list') : $r('app.media.ic_view_grid'))
+              .width(13).height(13).fillColor(TunBoxColors.textMuted)
+          }
+          .padding({ left: 8, right: 8, top: 6, bottom: 6 })
+          .borderRadius(TunBoxGeometry.pillRadius)
+          .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
+          .accessibilityText(this.gridMode ? '切换为单列显示' : '切换为双列显示')
+          .onClick((): void => { this.gridMode = !this.gridMode; })
+
           Row({ space: 4 }) {
             Image($r('app.media.ic_sort')).width(13).height(13).fillColor(TunBoxColors.textMuted)
             Text(this.sortByDelay ? '按延迟' : '原始')
@@ -1918,7 +2294,14 @@ export struct SubscriptionSection {
           .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
           .margin({ right: 24 })
           .accessibilityText('切换节点排序')
-          .onClick((): void => { this.sortByDelay = !this.sortByDelay; })
+          .onClick((): void => {
+            this.sortByDelay = !this.sortByDelay;
+            // FlClash 记忆排序选择：写回 AppSettings（下次进面板仍按同一口径）
+            SettingsService.patchSettings((s: AppSettings): void => {
+              s.nodeListSortMode = this.sortByDelay ? 'delay' : 'default';
+            }).catch((): void => {});
+          })
+
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
@@ -1928,10 +2311,18 @@ export struct SubscriptionSection {
 
       if (this.panelNodes().length === 0) {
         Column({ space: 6 }) {
-          Text('该分组暂无可用节点')
+          // 2026-11-03 用户报障「本地 YAML 一直 0 节点、测速说没有可用代理」：那份模板里
+          // 只有一个 `直连` + provider 占位符 url，本来就没有真实代理。空状态必须说清
+          // 是「没有代理」还是「这个组为空」，否则用户会以为功能坏了。
+          Text(this.subHasRealProxy() ? '该分组暂无可用节点' : '该订阅没有真实代理节点（0 节点）')
             .fontSize(13).fontColor(TunBoxTextColors.muted)
-          Text('换一个分组，或用卡片上的刷新按钮更新订阅')
+          Text(this.subHasRealProxy()
+            ? '换一个分组，或用卡片上的刷新按钮更新订阅'
+            : '配置里只有策略组/直连：常见原因是 proxy-providers 的订阅地址还是模板占位符，'
+              + '填好真实地址后重新导入或刷新')
             .fontSize(11).fontColor(TunBoxTextColors.muted)
+            .textAlign(TextAlign.Center)
+            .padding({ left: 32, right: 32 })
         }
         .width('100%')
         .padding({ top: 40 })
@@ -1946,11 +2337,27 @@ export struct SubscriptionSection {
               this.SmartRow()
             }
           }
-          ForEach(this.panelNodes(), (node: ProxyNode) => {
+          // 2026-11-03 用户第二轮口径（对齐 FlClash）：组行就是可选项，点一下直接选中，
+          // 不展开、不下钻，所以列表里没有「上级：xxx」这一行（ClashPlus/FlClash 都没有）。
+          ForEach(this.panelNodeRows(), (row: ProxyNode[]) => {
             ListItem() {
-              this.NodeRow(node)
+              if (this.gridMode) {
+                // 双列：一行两个紧凑单元格；节点总数为奇数时最后一行只占左半边。
+                Row({ space: 10 }) {
+                  this.NodeCell(row[0])
+                  if (row.length > 1) {
+                    this.NodeCell(row[1])
+                  } else {
+                    Blank().layoutWeight(1)
+                  }
+                }
+                .width('100%')
+                .padding({ top: 5, bottom: 5 })
+              } else {
+                this.NodeRow(row[0])
+              }
             }
-          }, (node: ProxyNode) => `${node.id}|${this.selectedGroup}|${this.latencyRevision}|${this.coreRevision}|${this.sortByDelay}|${this.nodeRevision}|${this.deleteSheetOn}|${this.isDeleteChecked(node.id)}`)
+          }, (row: ProxyNode[]): string => this.panelRowKey(row))
         }
         .width('100%')
         .layoutWeight(1)

@@ -554,8 +554,15 @@ export class SubscriptionParser {
     if (trimmed.length >= 2) {
       const first = trimmed.charAt(0);
       const last = trimmed.charAt(trimmed.length - 1);
-      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-        return trimmed.substring(1, trimmed.length - 1);
+      if (first === '"' && last === '"') {
+        // 双引号标量必须解码 YAML 转义：native `PrepareProfile`（yaml.v3）会把非 BMP
+        // 字符（emoji 国旗等）写成 `"\U0001F1ED\U0001F1F0 香港Z01"`。只剥引号不解码，
+        // 组员名就是字面量 `\U0001F1ED…`，与节点名（原文解析出真 emoji）对不上，
+        // 面板整组显示为空、测速报「没有可测试节点」（2026-11-03 ikuuu 报障）。
+        return YamlMerger.unescapeDoubleQuoted(trimmed.substring(1, trimmed.length - 1));
+      }
+      if (first === "'" && last === "'") {
+        return trimmed.substring(1, trimmed.length - 1).replace(/''/g, '\'');
       }
     }
     return trimmed;

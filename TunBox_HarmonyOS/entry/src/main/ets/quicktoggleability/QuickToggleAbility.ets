@@ -43,6 +43,7 @@ import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrat
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { ShortcutOutcomeLog, ShortcutOutcomeRecord } from '../commons/services/ShortcutOutcomeLog';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { PersistentLogStore } from '../commons/services/PersistentLogStore';
 
 const TAG = 'QuickToggleAbility';
 /** 明确「只连接」的快捷方式参数值（与 shortcuts_config.json 保持一致） */
@@ -99,6 +100,7 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   private mainWindow: window.Window | null = null;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    PersistentLogStore.init(this.context, 'quick');
     this.armLifetimeGuard();
     AppLogger.info(TAG, 'headless host created (no page loaded by design)');
     // 长时任务取消/暂停监听（进程级幂等）：按取消原因分类刷新记账，
@@ -126,6 +128,7 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   }
 
   onBackground(): void {
+    PersistentLogStore.flush();
     // 前台的窗口生命周期可能被系统提前收起；在途任务照常继续，这里只做推进。
     this.drain();
   }

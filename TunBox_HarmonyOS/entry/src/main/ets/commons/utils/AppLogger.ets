@@ -15,7 +15,13 @@ const TRIM_TO_LINES = 500;
 
 export class AppLogger {
   private static lines: string[] = [];
+  private static retainedChars: number = 0;
   private static listeners: ((line: string) => void)[] = [];
+  private static fileSink: ((line: string) => void) | null = null;
+
+  static installFileSink(sink: (line: string) => void): void {
+    AppLogger.fileSink = sink;
+  }
 
   static info(tag: string, message: string): void {
     AppLogger.log('INFO', tag, message);
@@ -63,12 +69,23 @@ export class AppLogger {
   }
 
   private static log(level: string, tag: string, message: string): void {
-    const safe = LogRedactor.redact(message);
+    // Redact before truncation, so a cut credential never escapes the matcher.
+    const safe = message.length > 65536 ? `[oversized log omitted: ${message.length} characters]`
+      : LogRedactor.redact(message).slice(0, 8192);
     const line = `${new Date().toISOString()} ${level} ${tag}: ${safe}`;
     AppLogger.lines.push(line);
+    AppLogger.retainedChars += line.length;
+    if (AppLogger.fileSink !== null) {
+      try { AppLogger.fileSink(line); } catch (_e) { /* logging cannot break callers */ }
+    }
     if (AppLogger.lines.length > MAX_FILE_LINES) {
       // 有界日志：超过上限裁剪到保留行数（对应 bounded_file_logger）
-      AppLogger.lines.splice(0, AppLogger.lines.length - TRIM_TO_LINES);
+      const removed = AppLogger.lines.splice(0, AppLogger.lines.length - TRIM_TO_LINES);
+      for (const old of removed) { AppLogger.retainedChars -= old.length; }
+    }
+    while (AppLogger.retainedChars > 512 * 1024 && AppLogger.lines.length > 1) {
+      const old = AppLogger.lines.shift();
+      if (old !== undefined) { AppLogger.retainedChars -= old.length; }
     }
     for (const l of AppLogger.listeners) {
       l(line);
@@ -102,12 +119,18 @@ export class AppLogger {
 
   static clear(): void {
     AppLogger.lines = [];
+    AppLogger.retainedChars = 0;
   }
 }
 
 /** 日志脱敏，移植自 log_redactor.dart：抹去 URL/密码/密钥类敏感字段 */
 export class LogRedactor {
   private static patterns: [RegExp, string][] = [
+    [/-----BEGIN[^\n]*PRIVATE KEY-----[\s\S]*?-----END[^\n]*PRIVATE KEY-----/g, '<private-key>'],
+    [/\b(?:https?|wss?|ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|wireguard):\/\/[^\s"'<>]+/gi, '<url>'],
+    [/\bBearer\s+[^\s,"}]+/gi, 'Bearer ***'],
+    [/("?(?:password|secret|token|api[_-]?key|authorization|private[_-]?key|uuid)"?\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,}]+)/gi, '$1***'],
+    [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>'],
     [/(password|secret|token|api[_-]?key|authorization)\s*[=:]\s*\S+/gi, '$1=***'],
     [/(ssr?:\/\/)[^\s]+/gi, '$1***'],
     [/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, '<ip>']

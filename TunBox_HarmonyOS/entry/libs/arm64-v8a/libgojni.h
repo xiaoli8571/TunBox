@@ -22,6 +22,10 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 #line 22 "cshared_main.go"
 
 #include <stdlib.h>
+#include <stdint.h>
+static int tunbox_call_socket_binder(uintptr_t callback, int fd) {
+    return ((int (*)(int))callback)(fd);
+}
 
 #line 1 "cgo-generated-wrapper"
 
@@ -83,9 +87,11 @@ extern char* TunBoxPrepareProfile(char* text);
 extern void TunBoxFreeString(char* text);
 extern void TunBoxInit(char* homeDir, char* configFile);
 extern int TunBoxStart(char* configPath, long long tunFd);
+extern void TunBoxSetSocketBinder(uintptr_t callback);
 extern long long TunBoxInitProtect();
 extern void TunBoxSetProtectResult(int ok);
 extern void TunBoxSetProtectResultForFd(long long fd, long long seq, int ok);
+extern int TunBoxUpdateNetwork(char* payload, int resetFlows);
 extern void TunBoxStop();
 extern int TunBoxIsRunning();
 extern char* TunBoxVersion();

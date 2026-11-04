@@ -408,3 +408,11 @@ $env:Path = 'C:\Program Files\Huawei\DevEco Studio\jbr\bin;' + $env:Path
 - 订阅管理页（`SubscriptionPage` / `SubscriptionManagePage`）删除，增删改全部并入主页「+」菜单式弹窗（二维码/URL/文件/转换）；`main_pages.json` 与 EntryAbility 深链同步收口；只接受 Clash 订阅，单节点链接拒绝。
 - 设置页：连接管理/测速地址/GeoIP 资产/订阅转换四项删除；新增「网络与数据」分类（IPv6 / DNS 覆写 / Smart 选点模型）。
 - 底部 dock 渐隐底删除。
+
+### 2026-11-03 全工程审查与 provider 测速修复
+
+- 主页选点立即同步偏好与通知，覆盖策略组和 provider 影子节点；在线选择回读实际父组出口。
+- 内核目录合并 provider 代理，两个测速实现使用正确的 provider healthcheck 路由；嵌套 now 追叶子、防环、旧快照/出口轮询代次保护同步补齐。
+- 组行延迟只读取当前出口；Direct 可测速，完成提示包含跳过/未完成；备份恢复保留每订阅自动更新开关和间隔。
+- 全量门禁 83 PASS / 0 FAIL / 2 SKIP；最终 `clean assembleHap` BUILD SUCCESSFUL（34 个任务实际执行），资源编号门禁 4/4 PASS。未装机、未发布。
+- 剩余 URL/profile 缓存作用域、子组 URL 继承、平面节点重连、非当前 profile 测速等差距见 [全工程审查报告](docs/FULL_CODE_REVIEW_2026-11-03.md)。

@@ -19,7 +19,7 @@
  * `LatencyController` 不认识落盘仓 ✓。
  */
 import { LatencyStore, PreferencesLatencyPersistence } from '../latency/LatencyStore';
-import { LatencyRecord, LatencyState } from './LatencyState';
+import { LatencyContext, LatencyRecord, LatencyState } from './LatencyState';
 import { LatencyLiveView } from './LatencyLiveView';
 import { AppLogger } from '../utils/AppLogger';
 
@@ -43,18 +43,18 @@ export class LatencyStoreBridge {
   //   依赖方向永远是「页面 → 本桥 → {LatencyController, LatencyStore}」。
 
   /** 读一条实时记录（null = 从没测过） */
-  static recordFor(nodeName: string): LatencyRecord | null {
-    return LatencyLiveView.recordFor(nodeName);
+  static recordFor(nodeName: string, context: LatencyContext | null = null): LatencyRecord | null {
+    return LatencyLiveView.recordFor(nodeName, context);
   }
 
   /** 读实时状态（TESTING / UNTESTED / MEASURED …） */
-  static stateFor(nodeName: string): number {
-    return LatencyLiveView.stateFor(nodeName);
+  static stateFor(nodeName: string, context: LatencyContext | null = null): number {
+    return LatencyLiveView.stateFor(nodeName, context);
   }
 
   /** 读实时延迟（null = 没有数值） */
-  static latencyFor(nodeName: string): number | null {
-    return LatencyLiveView.latencyFor(nodeName);
+  static latencyFor(nodeName: string, context: LatencyContext | null = null): number | null {
+    return LatencyLiveView.latencyFor(nodeName, context);
   }
 
   /** 写一条实时记录 */
@@ -63,23 +63,23 @@ export class LatencyStoreBridge {
   }
 
   /** 写一个延迟值（-2 = 未测） */
-  static set(nodeName: string, latency: number): void {
-    LatencyLiveView.set(nodeName, latency);
+  static set(nodeName: string, latency: number, context: LatencyContext | null = null): void {
+    LatencyLiveView.set(nodeName, latency, context);
   }
 
   /** 冷启动恢复一条结论（带失败分类 + 真实测速时间戳） */
-  static restore(nodeName: string, latency: number, failKind: string, atMs: number): void {
-    LatencyLiveView.restore(nodeName, latency, failKind, atMs);
+  static restore(nodeName: string, latency: number, failKind: string, atMs: number, context: LatencyContext | null = null): void {
+    LatencyLiveView.restore(nodeName, latency, failKind, atMs, context);
   }
 
   /** 标记「测试中」（瞬态，不落盘） */
-  static markTesting(nodeName: string, runId: number = 0): void {
-    LatencyLiveView.markTesting(nodeName, runId);
+  static markTesting(nodeName: string, runId: number = 0, context: LatencyContext | null = null): void {
+    LatencyLiveView.markTesting(nodeName, runId, context);
   }
 
   /** 只保留这些节点的结论（订阅变更时清理） */
-  static retainOnly(nodeNames: string[]): void {
-    LatencyLiveView.retainOnly(nodeNames);
+  static retainOnly(nodeNames: string[], context: LatencyContext | null = null): void {
+    LatencyLiveView.retainOnly(nodeNames, context);
   }
 
   /** 订阅实时视图变化（UI 刷新用） */
@@ -135,7 +135,10 @@ export class LatencyStoreBridge {
           // 拒绝覆盖（进程内更新 / 非判定失败）→ 不动进程内视图
           continue;
         }
-        LatencyLiveView.restore(name, rec.delayMs, rec.failKind, rec.testedAt);
+        const parts = LatencyContext.fromKey(name);
+        const context: LatencyContext | null = parts === null ? null
+          : new LatencyContext(parts[0], parts[1], parts[2], parts[3]);
+        LatencyLiveView.restore(parts === null ? name : parts[4], rec.delayMs, rec.failKind, rec.testedAt, context);
         restored.push(name);
       }
     } catch (e) {
@@ -154,15 +157,16 @@ export class LatencyStoreBridge {
    *    （否则冷启动后它会变成一颗新鲜的红「超时」）；
    *  - 非判定失败（通道没就绪 / 没排上队 / 端口可达…）→ 不落结论，沿用上次有效结论。
    */
-  static async persistConclusions(names: string[]): Promise<void> {
+  static async persistConclusions(names: string[], context: LatencyContext | null = null): Promise<void> {
     for (const name of names) {
-      const rec: LatencyRecord | null = LatencyLiveView.recordFor(name);
+      const rec: LatencyRecord | null = LatencyLiveView.recordFor(name, context);
       if (rec === null) {
         continue;
       }
+      const key = rec.context === null ? name : rec.context.key(name);
       if (rec.state === LatencyState.MEASURED || rec.state === LatencyState.OFFLINE) {
-        if (LatencyStore.applyProbeResult(name, rec.delayMs, '', rec.atMs)) {
-          await LatencyStore.persist(name);
+        if (LatencyStore.applyProbeResult(key, rec.delayMs, '', rec.atMs)) {
+          await LatencyStore.persist(key);
         }
         continue;
       }
@@ -170,8 +174,8 @@ export class LatencyStoreBridge {
         if (rec.source !== 'manual') {
           continue;
         }
-        if (LatencyStore.applyProbeResult(name, -1, rec.failKind, rec.atMs)) {
-          await LatencyStore.persist(name);
+        if (LatencyStore.applyProbeResult(key, -1, rec.failKind, rec.atMs)) {
+          await LatencyStore.persist(key);
         }
       }
     }

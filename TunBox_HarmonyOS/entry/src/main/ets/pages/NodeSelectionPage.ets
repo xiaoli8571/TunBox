@@ -2,11 +2,8 @@
  * 节点选择页 — 对齐 upstream TunBoxNodeSelectionPage + _NodeSelectionCard
  * 顶栏(返回/标题/测全部) + 订阅筛选 chips + 节点卡列表（旗帜/名称/延迟按钮/选中勾）。
  *
- * 测速唯一入口是 `LatencyEngine`：已连接时复用隧道 controller，未连接时由编排器的
- * `ensureLatencyApi()` 提供进程内无头内核；两者都不可用时引擎自己退化为**明确标注**
- * 的离线粗略通道（状态 OFFLINE，显示 `≈123ms`），绝不把通道故障写成节点超时。
- * 页面不再自己拉起第二个内核、不再自己开并发 lane、不再维护 URL 降级与看门狗
- * （旧实现真机表现为慢、成批假超时，以及"点了测速像没反应"）。
+ * 测速统一经过 BackgroundLatencyService：按订阅分批，复用当前内核或独立测速核，
+ * 结果以配置版本、URL、期望码和出口名隔离；页面只负责绘制进度。
  */
 import { router, promptAction , LengthMetrics} from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
@@ -21,14 +18,12 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
 import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
-import { ClashApiService, GroupLatencyResult } from '../commons/services/ClashApiService';
+import { ClashApiService } from '../commons/services/ClashApiService';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
-import { LatencyChannel, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
-import {
-  LATENCY_TIMEOUT_MS, LatencyEngine, LatencyProgress, LatencyRun,
-  LatencyRunOptions, GROUP_TEST_TIMEOUT_MS
-} from '../commons/services/LatencyEngine';
+import { LatencyChannel, LatencyContext, LatencyPolicy, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
+import { LatencyProgress } from '../commons/services/LatencyEngine';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
+import { FlclashLatencyService } from '../commons/flclash/FlclashLatencyService';
 import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
 // 失败分类常量**唯一真源** = 测速内核（LatencyKinds.LatencyProbeKind）——
 // 旧的 ClashApiService.LatencyFailKind 已随内核收敛删除（审计 LP04）。
@@ -44,6 +39,10 @@ import { CountryFlagIcon } from '../widgets/CountryFlagIcon';
 import {
   ConcurrentRefresh, RefreshBatchProgress, RefreshItemOutcome
 } from '../commons/services/ConcurrentRefresh';
+import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
+import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
+import { ProxyPanelMembers } from '../commons/flclash/ProxyPanelMembers';
+import { ProfileRepository } from '../commons/flclash/ProfileRepository';
 
 const TAG = 'NodeSelectionPage';
 
@@ -272,7 +271,7 @@ struct NodeSelectionPage {
   onPageHide(): void {
     this.pageActive = false;
     this.batchCancelled = true;
-    LatencyEngine.cancelCurrent();
+    if (this.latencyRunActive) { BackgroundLatencyService.cancelCurrent(); }
     this.batchTesting = false;
     this.testingName = '';
     // 轮询只在视图可见期间存在，离开必须停 —— 否则页面退到后台还在每 3s 打内核 API
@@ -310,6 +309,7 @@ struct NodeSelectionPage {
     await this.orchestrator.applyRealTunnelEndpoint(apiSecret);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
+    this.refreshLatencyScopes();
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.restoreSortState();
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
@@ -354,7 +354,9 @@ struct NodeSelectionPage {
     // 预热测速通道（真机取证 2026-10-20）：「点了测速要等几秒才开始」的根因是
     // 通道准备（未连接时要拉起 headless 测速内核）。进页面时后台做完这段准备，
     // 用户点「测全部」时通道已热 → 秒开。预热本身不发起任何探测。
-    BackgroundLatencyService.prewarmChannel(ctx).catch((): void => {});
+    this.refreshCoreBackedRows().catch((e: Object): void => {
+      AppLogger.warn(TAG, `provider node catalog warmup failed: ${AppLogger.errText(e)}`);
+    });
     // 进页面不再自动测速（用户要求）：只有用户主动点「测全部」或单节点测速才运行。
   }
 
@@ -363,8 +365,10 @@ struct NodeSelectionPage {
    * 成功率沿用 NodeLatencyRecord.recentSuccessRate() 语义；评分复用 SmartSelector.scoreOf。
    * 「冷却中」= 近期已失败且连续失败次数达到「故障切换阈值」（该节点会被自动选点视为失效）。
    */
-  private statusFor(name: string): NodeStatusView {
+  private statusFor(node: ProxyNode): NodeStatusView {
+    const name = node.name;
     const st = new NodeStatusView();
+    if (node.subscriptionId !== this.latencyProfileId) { return st; }
     const snap = this.sortSnapshot;
     if (snap === null) {
       return st;
@@ -388,10 +392,66 @@ struct NodeSelectionPage {
     return st.hasData ? `1-${st.failCount}-${st.rateLabel}` : '0';
   }
 
+  /**
+   * 节点页的显示真源。
+   *
+   * 普通订阅继续使用 App 本地节点；provider-only 配置的真实节点只会在 mihomo
+   * 加载 `proxy-providers/use` 后出现在 `/proxies`，因此把当前已生效 profile 的
+   * 内核叶子节点补成只读影子。归属戳必须逐字匹配，绝不拿旧 profile 的目录补新订阅。
+   */
+  private displayNodes(): ProxyNode[] {
+    const out: ProxyNode[] = this.subs.nodes.slice();
+    const appliedId: string = this.orchestrator.appliedProfile();
+    const profileId: string = appliedId.length > 0 ? appliedId : ProfileRepository.currentId();
+    if (profileId.length === 0 || CoreCatalogService.current() === null
+      || CoreCatalogService.profileIdOfSnapshot() !== profileId) {
+      return out;
+    }
+    const seen: Set<string> = new Set<string>();
+    for (const node of out) {
+      if (node.subscriptionId === profileId) {
+        seen.add(node.name);
+      }
+    }
+    for (const coreNode of CoreCatalogService.flattenNodes('rule')) {
+      if (seen.has(coreNode.name)) {
+        continue;
+      }
+      seen.add(coreNode.name);
+      out.push(CoreNodeBridge.toProxyNode(coreNode, profileId));
+    }
+    return out;
+  }
+
+  /** 预热/复用 mihomo 后刷新目录，使 provider-only 节点在未连接时也能进入列表。 */
+  private async refreshCoreBackedRows(): Promise<void> {
+    this.refreshLatencyScopes();
+    const ready: boolean = await this.orchestrator.prewarmLatencyChannel();
+    if (!ready || !this.pageActive) {
+      return;
+    }
+    const appliedId: string = this.orchestrator.appliedProfile();
+    const profileId: string = appliedId.length > 0 ? appliedId : ProfileRepository.currentId();
+    if (profileId.length === 0) {
+      return;
+    }
+    const model = await CoreCatalogService.refresh(this.orchestrator.api, true, profileId);
+    if (model === null || !this.pageActive) {
+      return;
+    }
+    // 本地节点表可能没有 provider 节点，选中态改由内核目录按名字确认。
+    if (this.settings.preferredNodeName.length > 0
+      && model.findNode(this.settings.preferredNodeName) !== null) {
+      this.selectedName = this.settings.preferredNodeName;
+    }
+    this.refreshSubChips();
+    this.rebuildRows();
+  }
+
   private rebuildRows(): void {
     const rows: NodeRow[] = [];
     const activeNames: string[] = [];
-    for (const n of this.subs.nodes) {
+    for (const n of this.displayNodes()) {
       activeNames.push(n.name);
       if (this.filterSubId.length > 0 && n.subscriptionId !== this.filterSubId) {
         continue;
@@ -399,11 +459,11 @@ struct NodeSelectionPage {
       const row: NodeRow = {
         node: n,
         countryCode: NodeCountryPolicy.detect(n.name).code,
-        status: this.statusFor(n.name)
+        status: this.statusFor(n)
       };
       rows.push(row);
     }
-    LatencyStoreBridge.retainOnly(activeNames);
+    LatencyStoreBridge.retainOnly(activeNames, this.latencyContext());
 
     // ── 自动选择视图 ────────────────────────────────────────────────
     // 显示内核**当前实际在用**的出口节点（来自 /connections 的 chains）。
@@ -446,7 +506,11 @@ struct NodeSelectionPage {
       }
     }
     const groupRows: ProxyGroupRow[] = [];
-    if (this.filterSubId.length > 0) {
+    // 本地 ProxyGroup 不包含 `use: provider` 在运行期注入的成员。只要当前筛选里
+    // 存在内核影子，就改用上面的扁平目录；否则会渲染出一堆空组，把节点再次藏掉。
+    const hasCoreOnlyRows: boolean = rows.some((row: NodeRow): boolean =>
+      row.isSmart !== true && CoreNodeBridge.isShadow(row.node));
+    if (this.filterSubId.length > 0 && !hasCoreOnlyRows) {
       for (const group of this.subs.groupsOf(this.filterSubId)) {
         const groupNodes: NodeRow[] = [];
         for (const node of this.subs.expandProxyGroup(group)) {
@@ -478,31 +542,23 @@ struct NodeSelectionPage {
       (rows.length > 0 && rows[0].isSmart === true) ? rows[0] : undefined;
     const sortable: NodeRow[] = smartRow !== undefined ? rows.slice(1) : rows;
 
-    // 排序：按持久化的测速快照恢复顺序（auto/manual），无数据则保持订阅原始顺序
+    // Sort the actual rows. A name-indexed Map would drop one of two profiles'
+    // same-name nodes; measurements are looked up with each row's full context.
     let ordered: NodeRow[] = sortable;
-    if (this.sortMode !== NodeSortModes.DEFAULT) {
-      const snap = this.sortSnapshot;
-      if (snap !== null) {
-        const names: string[] = [];
-        for (const r of sortable) {
-          names.push(r.node.name);
-        }
-        const order = snap.orderedNames(names);
-        if (order.length > 0) {
-          const byName = new Map<string, NodeRow>();
-          for (const r of sortable) {
-            byName.set(r.node.name, r);
-          }
-          const reordered: NodeRow[] = [];
-          for (const name of order) {
-            const r = byName.get(name);
-            if (r !== undefined) {
-              reordered.push(r);
-            }
-          }
-          ordered = reordered;
-        }
+    if (this.sortMode === NodeSortModes.AUTO) {
+      const records: Map<string, LatencyRecord> = new Map<string, LatencyRecord>();
+      for (const row of sortable) {
+        records.set(row.node.id, LatencyStoreBridge.recordFor(row.node.name, this.latencyContext(row.node))
+          ?? LatencyRecord.untested(row.node.name));
       }
+      ordered = sortable.slice().sort((left: NodeRow, right: NodeRow): number =>
+        LatencyPolicy.compare(records.get(left.node.id) as LatencyRecord, records.get(right.node.id) as LatencyRecord));
+    } else if (this.sortMode === NodeSortModes.MANUAL && this.sortSnapshot !== null) {
+      const order = this.sortSnapshot.order;
+      ordered = sortable.slice().sort((left: NodeRow, right: NodeRow): number => {
+        const a = order.indexOf(left.node.name); const b = order.indexOf(right.node.name);
+        return (a < 0 ? order.length : a) - (b < 0 ? order.length : b);
+      });
     }
     this.nodes = smartRow !== undefined ? [smartRow].concat(ordered) : ordered;
   }
@@ -704,7 +760,7 @@ struct NodeSelectionPage {
     const row: NodeRow = {
       node: node,
       countryCode: '',
-      status: this.statusFor(node.name),
+      status: this.statusFor(node),
       isSmart: true
     };
     return row;
@@ -749,7 +805,8 @@ struct NodeSelectionPage {
     }
     try {
       const selections = JSON.parse(this.settings.proxyGroupSelections) as Record<string, string>;
-      const value = selections[this.groupKey(parent)];
+      const value = ProxyPanelMembers.selected(this.settings.proxyGroupSelections, parent.subscriptionId, parent.name)
+        || selections[this.groupKey(parent)];
       return typeof value === 'string' ? value : '';
     } catch (_) {
       return '';
@@ -770,7 +827,7 @@ struct NodeSelectionPage {
     return {
       node: node,
       countryCode: NodeCountryPolicy.detect(node.name).code,
-      status: this.statusFor(node.name)
+      status: this.statusFor(node)
     };
   }
 
@@ -802,6 +859,7 @@ struct NodeSelectionPage {
    */
   private restoreSortState(): void {
     const snap = NodeSortSnapshot.fromJsonText(this.settings.nodeSortSnapshot);
+    if (snap !== null) { snap.retainScope(this.latencyContext().key('')); }
     const mode = NodeSortModes.normalize(this.settings.nodeSortMode);
     if (snap === null || (mode === NodeSortModes.AUTO && !snap.hasLatencyData())
       || (mode === NodeSortModes.MANUAL && snap.order.length === 0)) {
@@ -910,6 +968,8 @@ struct NodeSelectionPage {
           }
         },
         (): boolean => !this.refreshing);
+      // provider 内容可能由内核刚刚重新拉取；刷新 App 表后同步刷新 `/proxies` 目录。
+      await this.refreshCoreBackedRows();
       this.rebuildRows();
       const reasons: string[] = [];
       for (const item of summary.outcomes) {
@@ -1005,84 +1065,95 @@ struct NodeSelectionPage {
    *   `effectiveTestUrl`（commons/latency/LatencyProbe）—— 它同时负责
    *   「两个历史 http 默认值单向升级到 https」与「非法值回落默认 https」。
    */
+  private latencyProfileId: string = '';
+  private latencyRevisions: Map<string, string> = new Map<string, string>();
+  private latencyRunActive: boolean = false;
+
+  private refreshLatencyScopes(): void {
+    this.latencyProfileId = ProfileRepository.currentId();
+    this.latencyRevisions.clear();
+    for (const sub of this.subs.subscriptions) {
+      this.latencyRevisions.set(sub.id, ProfileRepository.revisionOf(sub.id));
+    }
+    if (!this.latencyRevisions.has(this.latencyProfileId)) {
+      this.latencyRevisions.set(this.latencyProfileId, ProfileRepository.revisionOf(this.latencyProfileId));
+    }
+  }
+
+  private latencyContext(node: ProxyNode | null = null): LatencyContext {
+    const id = node !== null && node.subscriptionId.length > 0 ? node.subscriptionId : this.latencyProfileId;
+    return new LatencyContext(id, this.latencyRevisions.get(id) ?? '', this.testUrlForLatency());
+  }
+
   private testUrlForLatency(): string {
     return effectiveTestUrl(this.settings);
   }
 
-  /**
-   * 跑一批测速。
-   *
-   * 与旧实现的根本差别：并发、超时、取消、失败分类、URL 选择全部归引擎，
-   * 页面只负责「给一串节点 + 把进度画出来」。落盘由调用方决定（见
-   * commitLatencySnapshot）：显式「测全部」才写排序快照，进页面的静默补测只填数字。
-   *
-   * @param list 目标节点
-   * @param force true=全部重测（用户主动点），false=只补缺失/过期（进页面自动补）
-   * @param driveHeader 是否用本批进度驱动顶栏（批量 true / 单节点 false）
-   */
+  /** Run profile subsets serially through the shared latency service. Each
+   * subset has its own core, cancellation owner and measurement identity. */
   private async runLatency(list: ProxyNode[], force: boolean,
     driveHeader: boolean): Promise<LatencyProgress | null> {
-    if (list.length === 0) {
-      return null;
-    }
+    if (list.length === 0 || BackgroundLatencyService.isRunning()) { return null; }
+    this.refreshLatencyScopes();
     this.batchCancelled = false;
-    // 逐节点路径不涉及组测的 504 语义：每轮重置，避免上一轮的「全部超时」残留。
-    if (driveHeader) {
-      // 立刻进入「进度 + 取消」态：取通道本身可能要等（未连接时要拉起进程内无头内核），
-      // 这段等待必须有可见反馈，否则用户会以为点了没反应。
-      this.batchTesting = true;
-      this.latencyTotal = list.length;
-      this.latencyDone = 0;
-      this.latencyCoreUnavailable = false;
-    }
-    // 通道由编排器决定：已连接 → 隧道 controller；未连接 → 进程内无头内核；
-    // 都没有 → null，引擎据此走**明确标注**的离线粗略通道（状态 OFFLINE，显示 ≈ms）。
-    // 这里绝不因为 api === null 就放弃调用 —— 那会让"没连 VPN 时点测速毫无反应"。
-    let api: ClashApiService | null = null;
+    this.latencyRunActive = true;
     this.latencyPreparing = true;
-    try {
-      api = await this.orchestrator.ensureLatencyApi();
-    } finally {
-      this.latencyPreparing = false;
+    if (driveHeader) {
+      this.batchTesting = true; this.latencyTotal = list.length; this.latencyDone = 0;
     }
-    if (this.batchCancelled) {
-      // 用户在这段等待里已经点了取消/离开了页面：别再起批次
-      if (driveHeader) {
-        this.batchTesting = false;
+    const progress = new LatencyProgress();
+    progress.total = list.length; progress.running = true;
+    const byProfile: Map<string, string[]> = new Map<string, string[]>();
+    for (const node of list) {
+      const old = LatencyStoreBridge.recordFor(node.name, this.latencyContext(node));
+      if (!force && old !== null && old.hasValue() && old.channel === LatencyChannel.CORE
+        && !LatencyPolicy.isStale(old, Date.now())) {
+        progress.skipped++; progress.finished++; continue;
       }
-      return null;
+      const id = node.subscriptionId || this.latencyProfileId;
+      const names = byProfile.get(id) ?? [];
+      if (!names.includes(node.name)) { names.push(node.name); }
+      byProfile.set(id, names);
     }
-    const opts = new LatencyRunOptions();
-    opts.force = force;
-    opts.timeoutMs = LATENCY_TIMEOUT_MS;
-    // 来源：用户主动点（force=true，含单节点手测与「测全部」）= manual，失败保持
-    // 红色「超时」；进页面自动补测（force=false）= auto，失败显示中性「未测」。
-    opts.source = force ? 'manual' : 'auto';
-    // 结果不需要在这里手动处理：LatencyEngine 自己写 LatencyController，页面的
-    // latencyListener 已经在 200ms 合并窗口里 bump latencyTick 触发重排/重绘。
-    opts.onResult = null;
-    opts.onProgress = (p: LatencyProgress): void => {
-      this.applyProgress(p, driveHeader);
-    };
-    const run: LatencyRun = LatencyEngine.start(api, list, this.testUrlForLatency(), opts);
+    let timer: number = -1;
     try {
-      return await run.run();
-    } catch (e) {
-      AppLogger.warn(TAG, `latency run failed: ${AppLogger.errText(e)}`);
-      return null;
+      const context = getContext(this) as Context;
+      for (const batch of byProfile) {
+        if (this.batchCancelled) { break; }
+        timer = UnifiedScheduler.every((): void => {
+          const current = FlclashLatencyService.currentProgress();
+          if (driveHeader && current !== null && current.running) {
+            this.latencyDone = progress.finished + current.started;
+          }
+        }, 200);
+        const result = await BackgroundLatencyService.testNodes(context, batch[0], batch[1],
+          (): void => { this.latencyPreparing = false; }, force ? 'manual' : 'auto');
+        UnifiedScheduler.clear(timer); timer = -1;
+        if (result === null) {
+          progress.cancelled += batch[1].length;
+          progress.message = '另一个测速批次正在运行，请稍后重试';
+          break;
+        }
+        progress.finished += result.finished;
+        progress.measured += result.measured; progress.timeout += result.timeout;
+        progress.failed += result.failed; progress.cancelled += result.cancelled;
+        progress.skipped += result.skipped;
+        if (result.message.length > 0) {
+          progress.message = result.message;
+          if (result.total === 0) { progress.cancelled += batch[1].length; }
+        }
+        this.applyProgress(progress, driveHeader);
+      }
+      if (this.batchCancelled) {
+        progress.cancelled = Math.max(progress.cancelled, progress.total - progress.finished);
+      }
+      return progress;
     } finally {
-      // 引擎是单航班：必须在收尾时释放，否则残留引用会让 isRunning() 永远为真，
-      // 之后每次测速都走 cancelCurrent() 直接作废。
-      LatencyEngine.release(run);
-      // 被打断（取消/离页）或通道不可用的节点，引擎不会为它发布任何记录，那条记录
-      // 会永远停在 TESTING —— 行上就是一个永不停止的转圈。这不是节点结论，收回 `--`。
-      this.clearTestingMarks(list);
+      if (timer >= 0) { UnifiedScheduler.clear(timer); }
+      progress.running = false;
+      this.latencyRunActive = false; this.latencyPreparing = false;
+      if (driveHeader) { this.batchTesting = false; }
       LatencyStoreBridge.flushNow();
-      // 组级诊断（同因全败 → 折叠成一条）：本批结束后重算，
-      // 新批次没有同因失败时自动收起。
-      if (driveHeader) {
-        this.batchTesting = false;
-      }
     }
   }
 
@@ -1096,10 +1167,11 @@ struct NodeSelectionPage {
     try {
       // force=true：用户明确点了这一行就一定要重测，绝不拿缓存糊弄（旧实现用
       // 「5 分钟内的缓存」直接返回 toast，用户点了像没反应）。
-      await this.runLatency([node], true, false);
-      // 新真源：单节点手测的结论也落进 LatencyStore（字段级）——
-      // 冷启动恢复只认它，否则这次手测的结论重启后就没了。
-      await LatencyStoreBridge.persistConclusions([node.name]);
+      const result = await this.runLatency([node], true, false);
+      if (this.pageActive && result !== null && result.message.length > 0) {
+        promptAction.showToast({ message: result.message });
+      }
+      // The shared service persists each result with its exact test context.
     } finally {
       this.testingName = '';
     }
@@ -1113,7 +1185,7 @@ struct NodeSelectionPage {
    * 让用户以为点坏了的提示。已有批次在跑就直接让位（引擎是单航班）。
    */
   private async autoTestMissing(): Promise<void> {
-    if (LatencyEngine.isRunning()) {
+    if (BackgroundLatencyService.isRunning()) {
       return;
     }
     // ── 频率闸门 ────────────────────────────────────────────────────
@@ -1156,15 +1228,18 @@ struct NodeSelectionPage {
   private async commitLatencySnapshot(tested: ProxyNode[]): Promise<void> {
     const collected: NodeLatencyRecord[] = [];
     for (const node of tested) {
-      const rec = LatencyStoreBridge.recordFor(node.name);
+      if (node.subscriptionId !== this.latencyProfileId) { continue; }
+      const rec = LatencyStoreBridge.recordFor(node.name, this.latencyContext(node));
       collected.push(rec === null
         ? this.untestedPersistRecord(node.name) : this.toPersistRecord(rec));
     }
     const allNames: string[] = [];
     for (const n of this.subs.nodes) {
-      allNames.push(n.name);
+      if (n.subscriptionId === this.latencyProfileId) { allNames.push(n.name); }
     }
+    if (this.sortSnapshot !== null) { this.sortSnapshot.retainScope(this.latencyContext().key('')); }
     this.sortSnapshot = NodeSortSnapshot.buildAuto(Date.now(), collected, this.sortSnapshot, allNames);
+    this.sortSnapshot.scope = this.latencyContext().key('');
     this.sortMode = NodeSortModes.AUTO;
     // 状态徽标来自快照，重建行才会刷新
     this.rebuildRows();
@@ -1173,9 +1248,9 @@ struct NodeSelectionPage {
     // 是 LatencyStore —— 两者不再互相整单覆盖（审计 F2/F4）。
     const names: string[] = [];
     for (const node of tested) {
-      names.push(node.name);
+      if (node.subscriptionId === this.latencyProfileId) { names.push(node.name); }
     }
-    await LatencyStoreBridge.persistConclusions(names);
+    await LatencyStoreBridge.persistConclusions(names, this.latencyContext());
   }
 
   /** 无记录 = 本次没得出节点结论：保持「未测」，交给 buildAuto 沿用旧结论 */
@@ -1240,12 +1315,8 @@ struct NodeSelectionPage {
    * 可能包含引擎没跑到的节点（比如批次开始前就被取消），多清一次是幂等的，
    * 而漏清的代价是行上永久转圈。
    */
-  private clearTestingMarks(names: ProxyNode[]): void {
-    for (const node of names) {
-      if (LatencyStoreBridge.stateFor(node.name) === LatencyState.TESTING) {
-        LatencyStoreBridge.set(node.name, -2);
-      }
-    }
+  private clearTestingMarks(_nodes: ProxyNode[]): void {
+    // Session cleanup owns the exact runId and scope; pages must not clear another run.
   }
 
   // ── 批量多选：状态流转与小工具（2026-10-20）────────────────────────────
@@ -1358,16 +1429,9 @@ struct NodeSelectionPage {
     });
   }
 
-  /**
-   * 「测全部」—— 统一走 LatencyEngine（逐节点 `/proxies/{name}/delay`，客户端在途 8）。
-   *
-   * 2026-10-21：这里原本走内核侧组测速（一次调用由内核并发测全组）。
-   * 但该端点只在本页实现，而本页自 0.4.x 起没有任何导航入口（点不到）→ 死路径，
-   * 且会与订阅页闪电测速形成两套口径（超时判定 / 失败分类不同源）。
-   * 现已删除组测速实现，与主路径共用同一引擎。要恢复内核侧组测速，先给它一个真实入口。
-   */
+  /** Explicit test of the visible flat list, including inactive subscriptions. */
   private async testAll(): Promise<void> {
-    if (this.batchTesting || LatencyEngine.isRunning()) {
+    if (this.batchTesting || BackgroundLatencyService.isRunning()) {
       promptAction.showToast({ message: '测速进行中' });
       return;
     }
@@ -1387,14 +1451,6 @@ struct NodeSelectionPage {
       }
       return;
     }
-    if (progress.coreUnavailable) {
-      // 通道不可用批的结论无效：节点已恢复未测，不能报普通「测速完成」
-      if (this.pageActive) {
-        promptAction.showToast({ message: '通道不可用，本轮测速结果无效，节点已恢复未测' });
-      }
-      AppLogger.warn(TAG, 'latency batch aborted: core unavailable, results voided');
-      return;
-    }
     await this.commitLatencySnapshot(list);
     await this.persistSortState();
     // 组级诊断：整组同因全败 → 折叠成一条诊断条（不铺 N 条同色红条）
@@ -1406,31 +1462,49 @@ struct NodeSelectionPage {
         promptAction.showToast({ message: '没有可测速的节点：测速内核未就绪，请稍后重试' });
         return;
       }
-      promptAction.showToast({ message: '✓ 测速完成' });
+      const message = progress.message.length > 0 ? progress.message
+        : (progress.cancelled > 0 ? '部分测速未完成，未取得响应的目标已保留上次结果'
+          : (progress.skipped > 0 ? '部分节点未加载，已完成其余节点测速'
+            : (progress.measured > 0 ? '✓ 测速完成' : '未测得有效延迟，请检查节点或测速地址')));
+      promptAction.showToast({ message: message });
     }
   }
 
   private async selectStrategy(parent: ProxyGroup, strategy: ProxyGroup): Promise<void> {
-    let selections: Record<string, string> = {};
-    if (this.settings.proxyGroupSelections.length > 0) {
-      try {
-        selections = JSON.parse(this.settings.proxyGroupSelections) as Record<string, string>;
-      } catch (_) {
-        selections = {};
+    if (parent.subscriptionId !== strategy.subscriptionId || !parent.members.includes(strategy.name)) { return; }
+    const scope = strategy.subscriptionId;
+    const intent = new ProxyNode();
+    intent.id = 'core:' + strategy.name;
+    intent.name = strategy.name;
+    intent.originalName = strategy.name;
+    intent.subscriptionId = scope;
+    try {
+      await SettingsService.patchSettings((s: AppSettings): void => {
+        s.proxyGroupSelections = ProxyPanelMembers.remember(s.proxyGroupSelections, scope, parent.name, strategy.name);
+        s.autoSelectMode = AutoSelectModes.MANUAL;
+        s.preferredNodeId = intent.id;
+        s.preferredNodeName = intent.name;
+        s.preferredNodeSubscriptionId = scope;
+        s.preferredNodeNamesBySubscription = AppSettings.rememberPreferredNodeName(
+          s.preferredNodeNamesBySubscription, scope, strategy.name);
+      });
+      this.settings = await SettingsService.load();
+      this.autoSelectMode = AutoSelectModes.MANUAL;
+      this.selectedName = strategy.name;
+      this.latencyTick++;
+      const revision = AppStorage.get<number>('node_switch_revision') ?? 0;
+      AppStorage.setOrCreate('node_switch_revision', revision + 1);
+      const didRestart = await this.orchestrator.reconnectWithNode(intent, this.subs, 'proxyGroup=' + strategy.name);
+      if (didRestart) {
+        const ipRevision = AppStorage.get<number>('public_ip_revision') ?? 0;
+        AppStorage.setOrCreate('public_ip_revision', ipRevision + 1);
       }
+      promptAction.showToast({ message: didRestart
+        ? `已选择 ${strategy.name}，代理已重启` : `已保存 ${strategy.name}` });
+    } catch (e) {
+      AppLogger.warn(TAG, `select strategy failed: ${AppLogger.errText(e)}`);
+      promptAction.showToast({ message: '切换策略失败，请重试' });
     }
-    selections[this.groupKey(parent)] = strategy.name;
-    this.settings.proxyGroupSelections = JSON.stringify(selections);
-    // 字段级写：整单覆盖会把别的写者刚写进去的字段盖回旧值（审计 F2）
-    await SettingsService.patchSettings((s: AppSettings): void => {
-      s.proxyGroupSelections = JSON.stringify(selections);
-    });
-    // bump @State 计数让 ForEach 键变化，立即刷新组头摘要与策略行选中标记。
-    this.latencyTick = this.latencyTick + 1;
-    const didRestart = await this.orchestrator.restartIfConnected('proxyGroup=' + strategy.name);
-    promptAction.showToast({
-      message: didRestart ? `已选择 ${strategy.name}，正在自动重连…` : `已选择 ${strategy.name}，下次连接生效`
-    });
   }
 
   private async selectNode(node: ProxyNode): Promise<void> {
@@ -1488,7 +1562,7 @@ struct NodeSelectionPage {
       }
       this.selectedName = ClashConfigGenerator.SMART_GROUP_NAME;
       promptAction.showToast({
-        message: didRestart ? '已启用内核智能选点，正在自动重连…' : '已启用内核智能选点，下次连接生效'
+        message: didRestart ? '已启用内核智能选点，代理已重启' : '已启用内核智能选点，下次连接生效'
       });
       return;
     }
@@ -1512,6 +1586,7 @@ struct NodeSelectionPage {
     this.selectedName = node.name;
     // 字段级写：只改偏好三件套（id/名字快照/所属订阅）
     await SettingsService.patchSettings((s: AppSettings): void => {
+      s.autoSelectMode = AutoSelectModes.MANUAL;
       s.preferredNodeId = node.id;
       s.preferredNodeName = node.name;
       s.preferredNodeSubscriptionId = node.subscriptionId;
@@ -1521,14 +1596,23 @@ struct NodeSelectionPage {
     });
     // 节点切换始终执行完整重连。Mihomo controller 返回 2xx 只能证明请求被接受，
     // 不能证明现有连接已迁移到新节点；此前因此错误提示“未重建隧道”，但流量仍走旧节点。
-    const didRestart = await this.orchestrator.reconnectWithNode(node, this.subs, 'preferredNode=' + node.id);
+    const nodeRevision = AppStorage.get<number>('node_switch_revision') ?? 0;
+    AppStorage.setOrCreate('node_switch_revision', nodeRevision + 1);
+    let didRestart: boolean = false;
+    try {
+      didRestart = await this.orchestrator.reconnectWithNode(node, this.subs, 'preferredNode=' + node.id);
+    } catch (e) {
+      AppLogger.warn(TAG, `reconnect after node pick failed: ${AppLogger.errText(e)}`);
+      promptAction.showToast({ message: '已保存选择，但代理重启失败，请重试' });
+      return;
+    }
     // 通知仍驻留在导航栈中的主页：重连完成后重新查询出口公网 IP，不能继续显示旧 @State 缓存。
     if (didRestart) {
       const revision = AppStorage.get<number>('public_ip_revision') ?? 0;
       AppStorage.setOrCreate('public_ip_revision', revision + 1);
     }
     promptAction.showToast({
-      message: didRestart ? `已选择 ${node.name}，正在自动重连…` : `已选择 ${node.name}，下次连接生效`
+      message: didRestart ? `已选择 ${node.name}，代理已重启` : `已选择 ${node.name}，下次连接生效`
     });
   }
 
@@ -1913,7 +1997,7 @@ struct NodeSelectionPage {
               }
               // 合成行不可删除：它不在订阅里，DELETE 会拿一个不存在的 id 去删。
               .gesture(LongPressGesture().onAction(() => {
-                if (row.isSmart === true) {
+                if (row.isSmart === true || CoreNodeBridge.isShadow(row.node)) {
                   return;
                 }
                 // 长按进入批量多选（2026-10-20）
@@ -2091,16 +2175,16 @@ struct NodeSelectionPage {
             // 延迟徽标：五态可区分（未测 `--` / 测试中转圈 / 实测 ms / 离线粗略 ≈ms / 超时·失败）。
             // 旧实现把「没测过」「失败」「超时」一律画成「超时」，这是本页最大的可信度问题。
             Row({ space: 2 }) {
-              if (LatencyStoreBridge.stateFor(row.node.name) === LatencyState.TESTING) {
+              if (LatencyStoreBridge.stateFor(row.node.name, this.latencyContext(row.node)) === LatencyState.TESTING) {
                 LoadingProgress()
                   .width(16)
                   .height(16)
                   .color(Ui.primary)
               } else {
-                Text(LatencyStyle.recordText(LatencyStoreBridge.recordFor(row.node.name), Date.now()))
+                Text(LatencyStyle.recordText(LatencyStoreBridge.recordFor(row.node.name, this.latencyContext(row.node)), Date.now()))
                   .fontSize(14)
                   .fontWeight(FontWeight.Bold)
-                  .fontColor(LatencyStyle.recordColor(LatencyStoreBridge.recordFor(row.node.name), Date.now()))
+                  .fontColor(LatencyStyle.recordColor(LatencyStoreBridge.recordFor(row.node.name, this.latencyContext(row.node)), Date.now()))
               }
               Image($r('app.media.ic_refresh'))
                 .width(14).height(14)

@@ -1,3 +1,4 @@
+#include <network/netmanager/net_connection.h>
 #include "napi/native_api.h"
 #include "hilog/log.h"
 #include "libgojni.h"
@@ -10,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
@@ -31,6 +33,7 @@ using StopFn = decltype(&TunBoxStop);
 using AliveFn = decltype(&TunBoxIsRunning);
 using VersionFn = decltype(&TunBoxVersion);
 using LastErrorFn = decltype(&TunBoxLastError);
+using UpdateNetworkFn = decltype(&TunBoxUpdateNetwork);
 
 static std::mutex g_core_mutex;
 static void *g_core_handle = nullptr;
@@ -43,6 +46,7 @@ static StopFn g_stop = nullptr;
 static AliveFn g_alive = nullptr;
 static VersionFn g_version = nullptr;
 static LastErrorFn g_last_error = nullptr;
+static UpdateNetworkFn g_update_network = nullptr;
 static std::atomic<int> g_tun_fd{-1};
 static std::atomic<int> g_protect_read_fd{-1};
 static std::atomic<bool> g_running{false};
@@ -72,7 +76,7 @@ static bool loadCore()
         return g_init != nullptr && g_start != nullptr && g_init_protect != nullptr &&
             g_set_protect_result != nullptr && g_set_protect_result_for_fd != nullptr &&
             g_stop != nullptr && g_alive != nullptr &&
-            g_version != nullptr && g_last_error != nullptr;
+            g_version != nullptr && g_last_error != nullptr && g_update_network != nullptr;
     }
 
     void *handle = dlopen(CORE_LIB_PATH, RTLD_NOW | RTLD_LOCAL);
@@ -92,10 +96,11 @@ static bool loadCore()
     AliveFn alive = reinterpret_cast<AliveFn>(dlsym(handle, "TunBoxIsRunning"));
     VersionFn version = reinterpret_cast<VersionFn>(dlsym(handle, "TunBoxVersion"));
     LastErrorFn lastError = reinterpret_cast<LastErrorFn>(dlsym(handle, "TunBoxLastError"));
+    UpdateNetworkFn updateNetwork = reinterpret_cast<UpdateNetworkFn>(dlsym(handle, "TunBoxUpdateNetwork"));
 
     if (init == nullptr || start == nullptr || initProtect == nullptr || setProtectResult == nullptr ||
         setProtectResultForFd == nullptr ||
-        stop == nullptr || alive == nullptr || version == nullptr || lastError == nullptr) {
+        stop == nullptr || alive == nullptr || version == nullptr || lastError == nullptr || updateNetwork == nullptr) {
         OH_LOG_Print(LOG_APP, LOG_ERROR, 0, NAPI_LOG_TAG, "core library ABI validation failed");
         dlclose(handle);
         return false;
@@ -112,6 +117,7 @@ static bool loadCore()
     g_alive = alive;
     g_version = version;
     g_last_error = lastError;
+    g_update_network = updateNetwork;
     g_core_handle = handle;
     return true;
 }
@@ -167,6 +173,63 @@ static void CompleteProfile(napi_env env, napi_status status, void *data)
     napi_resolve_deferred(env, work->deferred, result);
     napi_delete_async_work(env, work->work);
     delete work;
+}
+
+struct NetworkWork {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string payload;
+    bool resetFlows = false;
+    bool ok = false;
+};
+
+static void ExecuteNetwork(napi_env env, void *data)
+{
+    auto *work = static_cast<NetworkWork *>(data);
+    if (!loadCore()) { return; }
+    auto update = reinterpret_cast<int (*)(char *, int)>(dlsym(g_core_handle, "TunBoxUpdateNetwork"));
+    if (update != nullptr) {
+        work->ok = update(const_cast<char *>(work->payload.c_str()), work->resetFlows ? 1 : 0) == 1;
+    }
+}
+
+static void CompleteNetwork(napi_env env, napi_status status, void *data)
+{
+    auto *work = static_cast<NetworkWork *>(data);
+    napi_value result;
+    napi_get_boolean(env, status == napi_ok && work->ok, &result);
+    napi_resolve_deferred(env, work->deferred, result);
+    napi_delete_async_work(env, work->work);
+    delete work;
+}
+
+static napi_value UpdateNetwork(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string payload;
+    bool resetFlows = false;
+    if (argc != 2 || !getConfigPath(env, argv[0], payload) ||
+        napi_get_value_bool(env, argv[1], &resetFlows) != napi_ok) {
+        napi_throw_error(env, nullptr, "Invalid network snapshot");
+        return nullptr;
+    }
+    auto *work = new NetworkWork();
+    work->payload = payload;
+    work->resetFlows = resetFlows;
+    napi_value promise, name;
+    napi_create_promise(env, &work->deferred, &promise);
+    napi_create_string_utf8(env, "UpdateNetwork", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_async_work(env, nullptr, name, ExecuteNetwork, CompleteNetwork, work, &work->work) != napi_ok ||
+        napi_queue_async_work(env, work->work) != napi_ok) {
+        napi_value result;
+        napi_get_boolean(env, false, &result);
+        napi_resolve_deferred(env, work->deferred, result);
+        if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
+        delete work;
+    }
+    return promise;
 }
 
 static napi_value PrepareProfile(napi_env env, napi_callback_info info)
@@ -511,12 +574,58 @@ static napi_value AttachTunFd(napi_env env, napi_callback_info info)
     return result;
 }
 
+// Used only by a headless core in the UI process. Never fall back to the VPN
+// route if a physical network disappears or binding is rejected.
+static std::atomic<int32_t> g_physical_net_id{-1};
+static int BindPhysicalSocket(int fd)
+{
+    const int32_t netId = g_physical_net_id.load();
+    if (netId <= 0) { return -1; }
+    NetConn_NetHandle handle{};
+    handle.netId = netId;
+    return OH_NetConn_BindSocket(fd, &handle);
+}
+
+static bool CanBindPhysicalNetwork(int32_t netId)
+{
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) { return false; }
+    NetConn_NetHandle handle{};
+    handle.netId = netId;
+    const int result = OH_NetConn_BindSocket(fd, &handle);
+    close(fd);
+    return result == 0;
+}
+
+static napi_value SetPhysicalNetId(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    int32_t netId = -1;
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    bool ok = argc == 1 && napi_get_value_int32(env, argv[0], &netId) == napi_ok && loadCore();
+    auto setBinder = ok ? reinterpret_cast<void (*)(uintptr_t)>(dlsym(g_core_handle, "TunBoxSetSocketBinder")) : nullptr;
+    ok = ok && setBinder != nullptr;
+    // Detect an unavailable network/binding permission before a batch begins;
+    // otherwise every proxy would receive a misleading URLTest failure.
+    if (ok && netId > 0) { ok = CanBindPhysicalNetwork(netId); }
+    if (ok) {
+        g_physical_net_id.store(netId);
+        setBinder(reinterpret_cast<uintptr_t>(&BindPhysicalSocket));
+    }
+    napi_value result;
+    napi_get_boolean(env, ok, &result);
+    return result;
+}
+
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor desc[] = {
+        {"setPhysicalNetId", nullptr, SetPhysicalNetId, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startCore", nullptr, StartCore, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"prepareProfile", nullptr, PrepareProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"updateNetwork", nullptr, UpdateNetwork, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initProtect", nullptr, InitProtect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"readProtectSocketFd", nullptr, ReadProtectSocketFd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setProtectResult", nullptr, SetProtectResult, nullptr, nullptr, nullptr, napi_default, nullptr},

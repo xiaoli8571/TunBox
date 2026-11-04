@@ -128,7 +128,7 @@ eq('net.bearer.wifi=1', Net.BEARER_WIFI, 1);
 eq('net.bearer.bluetooth=2', Net.BEARER_BLUETOOTH, 2);
 eq('net.bearer.ethernet=3', Net.BEARER_ETHERNET, 3);
 eq('net.bearer.vpn=4', Net.BEARER_VPN, 4);
-eq('net.debounce.default', Net.NET_DEBOUNCE_MS, 1500);
+eq('net.debounce.default', Net.NET_DEBOUNCE_MS, 200);
 
 eq('normalize.noDefaultNet([])', Net.normalizeNetType([], false), Net.NetTypes.NONE);
 eq('normalize.noDefaultNet([wifi])', Net.normalizeNetType([Net.BEARER_WIFI], false), Net.NetTypes.NONE);
@@ -181,13 +181,12 @@ ok('shouldEmit.customWindow(299/300)', Net.shouldEmit('wifi', 'cellular', 299, 3
   eq('watcher.inside.window.no.emit', w.generation(), 1);
   eq('watcher.inside.window.type.unchanged', w.networkType(), Net.NetTypes.WIFI);
 
-  now = 1500;
-  w.feedForTest(Net.NetTypes.CELLULAR);
-  eq('watcher.window.reached.emit', w.generation(), 2);
+  await new Promise(resolve => setTimeout(resolve, 1550));
+  eq('watcher.trailing.emit-without-extra-event', w.generation(), 2);
   eq('watcher.window.reached.type', w.networkType(), Net.NetTypes.CELLULAR);
 
   w.feedForTest(Net.NetTypes.NONE);
-  eq('watcher.none.inside.window', w.generation(), 2);
+  eq('watcher.none.immediate', w.generation(), 3);
   now = 3100;
   w.feedForTest(Net.NetTypes.NONE);
   eq('watcher.none.after.window', w.generation(), 3);
@@ -197,7 +196,7 @@ ok('shouldEmit.customWindow(299/300)', Net.shouldEmit('wifi', 'cellular', 299, 3
   eq('watcher.seen[1]', seen[1], Net.NetTypes.CELLULAR);
   eq('watcher.seen[2]', seen[2], Net.NetTypes.NONE);
   ok('watcher.generation.monotonic', gens[0] === 1 && gens[1] === 2 && gens[2] === 3);
-  eq('watcher.negative.debounce.fallsback', new Net.NetworkStateWatcher(-1).debounceWindowMs(), 1500);
+  eq('watcher.negative.debounce.fallsback', new Net.NetworkStateWatcher(-1).debounceWindowMs(), 200);
 }
 {
   const w = new Net.NetworkStateWatcher(0, () => 100);

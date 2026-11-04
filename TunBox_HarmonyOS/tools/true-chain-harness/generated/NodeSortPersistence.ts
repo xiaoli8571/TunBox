@@ -93,6 +93,7 @@ export class NodeLatencyRecord {
 
 /** 测速快照（持久化 JSON 形状，显式类满足 arkts-no-untyped-obj-literals） */
 export class NodeSortSnapshotJson {
+  scope: string = "";
   /** 测速完成时间戳（毫秒） */
   testedAt: number = 0;
   /** 排序模式（通常为 auto） */
@@ -105,6 +106,13 @@ export class NodeSortSnapshotJson {
 
 /** 排序快照 + 纯函数排序逻辑（可单测，不依赖 UI 与 Preferences） */
 export class NodeSortSnapshot {
+  scope: string = "";
+
+  /** Unscoped old latency data cannot acquire provenance during an upgrade. */
+  retainScope(scope: string): void {
+    if (this.scope !== scope) { this.records = []; this.testedAt = 0; }
+    this.scope = scope;
+  }
   /** 测速完成时间戳（毫秒） */
   testedAt: number = 0;
   mode: string = NodeSortModes.DEFAULT;
@@ -200,6 +208,7 @@ export class NodeSortSnapshot {
   /** 序列化（供 AppSettings.nodeSortSnapshot 落盘） */
   toJson(): NodeSortSnapshotJson {
     const j = new NodeSortSnapshotJson();
+    j.scope = this.scope;
     j.testedAt = this.testedAt;
     j.mode = NodeSortModes.normalize(this.mode);
     j.records = this.records;
@@ -226,6 +235,7 @@ export class NodeSortSnapshot {
       return null;
     }
     const snap = new NodeSortSnapshot();
+    snap.scope = typeof j.scope === 'string' ? j.scope : '';
     snap.testedAt = typeof j.testedAt === 'number' ? j.testedAt : 0;
     snap.mode = NodeSortModes.normalize(j.mode);
     const recs: NodeLatencyRecord[] = [];
@@ -267,6 +277,7 @@ export class NodeSortSnapshot {
   static buildAuto(testedAt: number, results: NodeLatencyRecord[],
     previous: NodeSortSnapshot | null, keepNames: string[] | null = null): NodeSortSnapshot {
     const snap = new NodeSortSnapshot();
+    snap.scope = previous === null ? '' : previous.scope;
     snap.testedAt = testedAt;
     snap.mode = NodeSortModes.AUTO;
     const merged: NodeLatencyRecord[] = [];

@@ -22,11 +22,13 @@ import { Want } from '@kit.AbilityKit';
 import { SubscriptionUpdateScheduler } from '../commons/services/SubscriptionUpdateScheduler';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { PersistentLogStore } from '../commons/services/PersistentLogStore';
 
 const TAG = 'SubscriptionWorkAbility';
 
 export default class SubscriptionWorkAbility extends WorkSchedulerExtensionAbility {
   onWorkStart(work: workScheduler.WorkInfo): void {
+    PersistentLogStore.init(this.context, 'work');
     AppLogger.info(TAG, `onWorkStart: workId=${work?.workId}`);
     this.runRefresh(this.context);
   }
@@ -43,7 +45,7 @@ export default class SubscriptionWorkAbility extends WorkSchedulerExtensionAbili
         + `${r.skippedReason}`);
     } catch (e) {
       AppLogger.warn(TAG, `work refresh failed: ${AppLogger.errText(e)}`);
-    }
+    } finally { PersistentLogStore.flush(); }
   }
 
   onWorkStop(work: workScheduler.WorkInfo): void {

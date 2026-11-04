@@ -16,12 +16,14 @@ export class NetTypes {
   static readonly UNKNOWN: string = 'unknown';
 }
 
-/** Wi-Fi/以太网基线 MTU；蜂窝链路降 MTU 降低分片/PMTUD 黑洞风险。 */
-export const BASE_MTU: number = 1400;
-export const CELLULAR_MTU: number = 1360;
+/** Unified conservative TUN MTU. Switching bearer must never require a TUN rebuild. */
+export const BASE_MTU: number = 1360;
+export const CELLULAR_MTU: number = BASE_MTU;
+/** Reset consecutive failure budgets only after a full minute of healthy probes. */
+export const RECOVERY_STABLE_MS: number = 60000;
 /** 内核热恢复最大次数，超过升级为一次 TUN 重建。 */
 export const MAX_CORE_RECOVERY_ATTEMPTS: number = 3;
-/** 单会话 TUN 重建上限（防重建风暴）。 */
+/** 连续故障窗口的 TUN 重建上限；稳定运行一分钟后重置。 */
 export const MAX_TUNNEL_REBUILDS: number = 2;
 /** 恢复退避基准与上限（ms）。 */
 export const RECOVERY_BASE_DELAY_MS: number = 1000;
@@ -29,9 +31,9 @@ export const RECOVERY_MAX_DELAY_MS: number = 8000;
 export const REBUILD_BASE_DELAY_MS: number = 1500;
 export const REBUILD_MAX_DELAY_MS: number = 8000;
 
-/** 按物理承载选择 MTU。蜂窝 → 1360，其余（含未知/以太网/无网）→ 1400 基线。 */
-export function mtuForNetType(netType: string): number {
-  return netType === NetTypes.CELLULAR ? CELLULAR_MTU : BASE_MTU;
+/** Kept as a compatibility API; the effective MTU no longer depends on bearer. */
+export function mtuForNetType(_netType: string): number {
+  return BASE_MTU;
 }
 
 /** 纯函数：第 attempt 次（从 0 起）内核恢复的退避延迟，指数增长并封顶。 */

@@ -86,10 +86,8 @@ const args = [
   '-p', 'module=entry@default',
   '-p', 'product=default',
   '-p', 'requiredDeviceType=tablet',
-  'assembleHap',
-  '--analyze=normal',
-  '--parallel',
-  '--incremental'
+  'clean', 'assembleHap',
+  '--no-daemon'
 ];
 
 /**
@@ -138,7 +136,13 @@ function ok(cond, label) {
 
 ok(compiled, 'CompileArkTS 任务执行到（无 ArkTS 编译错误）');
 ok(arktsErrors.length === 0, `无 ArkTS 编译错误${arktsErrors.length ? '：' + arktsErrors.slice(0, 5).join(' | ') : ''}`);
-ok(buildOk, 'assembleHap 整体成功（含签名打包）');
+ok(buildOk, 'clean assembleHap 整体成功（含签名打包）');
+if (buildOk) {
+  const resources = spawnSync(process.execPath, [path.join(here, 'verify-ui-resource-bindings.mjs')],
+    { cwd: root, env, encoding: 'utf8' });
+  console.log((resources.stdout || '') + (resources.stderr || ''));
+  ok(resources.status === 0 && !/SKIP|skipped/i.test(resources.stdout || ''), '构建后 UI 资源绑定检查通过（未跳过）');
+}
 
 if (!buildOk) {
   console.log('');

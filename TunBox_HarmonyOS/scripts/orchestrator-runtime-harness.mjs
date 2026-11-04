@@ -209,6 +209,10 @@ export function harness() {
     chmodPrivate() {},
     TaskProgressUpdater: { updateLive() { h.liveUpdates++; } }
   });
+  Object.assign(context, load('commons/latency/LatencyKinds.ets',
+    '({ LatencyProbeKind, LatencyStrategy, LatencyTimeout })', context));
+  Object.assign(context, load('commons/latency/LatencyTestUrl.ets', '({ LatencyTestUrl })', context));
+  Object.assign(context, load('commons/services/LatencyState.ets', '({ LatencyContext })', context));
   Object.assign(context, load('commons/services/TunnelAuthority.ets',
     '({ resolveAuthority, parseExtensionStatus, deriveUiPhase })', context));
   Object.assign(context, load('commons/services/RuntimeFilePolicy.ets', '({ heartbeatAgeFromText })', context));

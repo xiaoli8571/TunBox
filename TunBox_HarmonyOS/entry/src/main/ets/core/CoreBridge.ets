@@ -15,6 +15,7 @@ const TAG = 'CoreBridge';
 const CORE_LIB = 'libgojni.so';
 /** NAPI 原生模块显式接口（.so 无类型声明，避免 arkts-no-any-unknown） */
 interface NativeCoreModule {
+  setPhysicalNetId(netId: number): boolean;
   attachTunFd(fd: number, mtu: number): boolean;
   initProtect(): number;
   readProtectSocketFd(): number[];
@@ -22,6 +23,7 @@ interface NativeCoreModule {
   setProtectResultForFd(fd: number, seq: number, ok: boolean): void;
   startCore(configPath: string, tunFd: number): Promise<boolean>;
   stopCore(): Promise<void>;
+  updateNetwork(dnsJson: string, resetFlows: boolean): Promise<boolean>;
   prepareProfile(text: string): Promise<string>;
   isCoreAlive(): boolean;
   coreVersion(): string;
@@ -51,6 +53,10 @@ export class CoreBridgeImpl {
       throw new Error('内核未返回有效订阅');
     }
     return yaml;
+  }
+
+  setPhysicalNetId(netId: number): boolean {
+    return this.ensureLoaded() && nativeModule.setPhysicalNetId(netId);
   }
 
   private ensureLoaded(): boolean {
@@ -140,6 +146,11 @@ export class CoreBridgeImpl {
       }
     }
     await nativeModule.stopCore();
+  }
+
+  /** Runs in a native worker; socket protect callbacks stay responsive. */
+  async updateNetwork(dnsServers: string[], resetFlows: boolean): Promise<boolean> {
+    return nativeModule.updateNetwork(JSON.stringify(dnsServers), resetFlows);
   }
 
   async isCoreAlive(): Promise<boolean> {

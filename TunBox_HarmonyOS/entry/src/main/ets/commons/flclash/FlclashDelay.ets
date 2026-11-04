@@ -130,16 +130,24 @@ export class DelayTarget {
   testUrl: string = FLCLASH_DELAY_URL;
   /** 去重键 = delayTestKey(testUrl, proxyName) */
   key: string = '';
+  /** 期望状态码（组的 `expected-status`，空串 = 内核默认 204） */
+  expected: string = '';
+  /** Empty for static proxies; provider-owned proxies have a separate REST route. */
+  providerName: string = '';
 
-  constructor(proxyName: string = '', testUrl: string = FLCLASH_DELAY_URL, key: string = '') {
+  constructor(proxyName: string = '', testUrl: string = FLCLASH_DELAY_URL, key: string = '',
+    expected: string = '', providerName: string = '') {
     this.proxyName = proxyName;
     this.testUrl = testUrl.length > 0 ? testUrl : FLCLASH_DELAY_URL;
     this.key = key.length > 0 ? key : delayTestKey(this.testUrl, proxyName);
+    this.expected = expected;
+    this.providerName = providerName;
   }
 }
 
 /** 一条测速结论（仅在三态之一成立时才产生） */
 export class DelayResult {
+  key: string = '';
   /** 被测出口名 */
   proxyName: string = '';
   /** 本次使用的测速 URL */
@@ -689,7 +697,7 @@ export class FlclashDelayRun {
     if (state.cancelled) {
       return Promise.resolve();
     }
-    const url: string = this.delayUrl(target.proxyName, target.testUrl);
+    const url: string = this.delayUrl(target.proxyName, target.testUrl, target.expected, target.providerName);
     let handle: DelayRequestHandle;
     try {
       // 传输层自带的超时与守护同值：谁先到都等价于「不作结论」
@@ -784,6 +792,7 @@ export class FlclashDelayRun {
       return null;
     }
     const result = new DelayResult();
+    result.key = target.key;
     result.proxyName = target.proxyName;
     result.testUrl = target.testUrl;
     result.httpCode = reply.responseCode;
@@ -816,14 +825,18 @@ export class FlclashDelayRun {
     }
   }
 
-  private delayUrl(proxyName: string, testUrl: string): string {
+  private delayUrl(proxyName: string, testUrl: string, expected: string = '', providerName: string = ''): string {
     let base: string = this.baseUrl;
     while (base.length > 0 && base.charAt(base.length - 1) === '/') {
       base = base.substring(0, base.length - 1);
     }
     const name: string = encodeURIComponent(proxyName);
     const url: string = encodeURIComponent(testUrl);
-    return `${base}/proxies/${name}/delay?url=${url}&timeout=${this.policy.timeoutMs}`;
+    const tail: string = expected.length > 0 ? `&expected=${encodeURIComponent(expected)}` : '';
+    const path: string = providerName.length > 0
+      ? `/providers/proxies/${encodeURIComponent(providerName)}/${name}/healthcheck`
+      : `/proxies/${name}/delay`;
+    return `${base}${path}?url=${url}&timeout=${this.policy.timeoutMs}${tail}`;
   }
 
   private authHeaders(): Record<string, string> {

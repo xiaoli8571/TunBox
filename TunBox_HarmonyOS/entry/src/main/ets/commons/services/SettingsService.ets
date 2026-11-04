@@ -101,6 +101,7 @@ class NodeSortLatencyEntry {
 
 /** 测速结论分片（latency / failKind / 手动顺序 / 批次时间戳） */
 class NodeSortLatencyShard {
+  scope: string = '';
   testedAt: number = 0;
   mode: string = NodeSortModes.DEFAULT;
   order: string[] = [];
@@ -116,6 +117,7 @@ class NodeSortStatsEntry {
 
 /** 记账分片（failCount / lastOk） */
 class NodeSortStatsShard {
+  scope: string = '';
   records: NodeSortStatsEntry[] = [];
 }
 
@@ -278,6 +280,7 @@ export class SettingsService {
     const shard = new NodeSortLatencyShard();
     const snap = NodeSortSnapshot.fromJsonText(text);
     if (snap !== null) {
+      shard.scope = snap.scope;
       shard.testedAt = snap.testedAt;
       shard.mode = NodeSortModes.normalize(snap.mode);
       shard.order = snap.order.slice();
@@ -300,6 +303,7 @@ export class SettingsService {
     const shard = new NodeSortStatsShard();
     const snap = NodeSortSnapshot.fromJsonText(text);
     if (snap !== null) {
+      shard.scope = snap.scope;
       for (const r of snap.records) {
         const entry = new NodeSortStatsEntry();
         entry.name = r.name;
@@ -317,10 +321,10 @@ export class SettingsService {
    * 合并规则：测速结论取自「测速结论分片」，记账取自「记账分片」，
    * 同一个节点的两半拼成一条记录。
    */
-  static async loadNodeSortSnapshot(): Promise<string> {
+  static async loadNodeSortSnapshot(scope: string = ''): Promise<string> {
     const shards = await SettingsService.readShards();
     if (shards.latency.records.length > 0 || shards.stats.records.length > 0) {
-      return SettingsService.mergeShards(shards);
+      return SettingsService.mergeShards(shards, scope);
     }
     // 旧装机：整单 JSON 里还留着 nodeSortSnapshot → 迁移一次到分片 key。
     // 迁移后整单里的那份不再被信任（否则它又是一份真源）。
@@ -353,6 +357,7 @@ export class SettingsService {
       try {
         const j = JSON.parse(rawLatency) as NodeSortLatencyShard;
         if (j !== null && typeof j === 'object') {
+          shards.latency.scope = typeof j.scope === 'string' ? j.scope : '';
           shards.latency.testedAt = typeof j.testedAt === 'number' ? j.testedAt : 0;
           shards.latency.mode = NodeSortModes.normalize(j.mode);
           if (Array.isArray(j.order)) {
@@ -384,6 +389,7 @@ export class SettingsService {
       try {
         const j = JSON.parse(rawStats) as NodeSortStatsShard;
         if (j !== null && typeof j === 'object' && Array.isArray(j.records)) {
+          shards.stats.scope = typeof j.scope === 'string' ? j.scope : '';
           for (const r of j.records) {
             if (r === null || r === undefined || typeof r.name !== 'string' || r.name.length === 0) {
               continue;
@@ -403,17 +409,20 @@ export class SettingsService {
   }
 
   /** 两个分片 → 旧形状的快照 JSON（读点零改动） */
-  private static mergeShards(shards: NodeSortShards): string {
+  private static mergeShards(shards: NodeSortShards, scope: string = ''): string {
     const snap = new NodeSortSnapshot();
-    snap.testedAt = shards.latency.testedAt;
+    snap.scope = scope.length > 0 ? scope : shards.latency.scope;
+    const latency = shards.latency.scope === snap.scope ? shards.latency.records : [];
+    const stats = shards.stats.scope === snap.scope ? shards.stats.records : [];
+    snap.testedAt = shards.latency.scope === snap.scope ? shards.latency.testedAt : 0;
     snap.mode = shards.latency.mode;
     snap.order = shards.latency.order.slice();
     const statsByName = new Map<string, NodeSortStatsEntry>();
-    for (const s of shards.stats.records) {
+    for (const s of stats) {
       statsByName.set(s.name, s);
     }
     const seen = new Set<string>();
-    for (const l of shards.latency.records) {
+    for (const l of latency) {
       seen.add(l.name);
       const rec = new NodeLatencyRecord();
       rec.name = l.name;
@@ -427,7 +436,7 @@ export class SettingsService {
       snap.records.push(rec);
     }
     // 只有记账、没有测速结论的节点也要出现在视图里（记账先于测速发生）。
-    for (const s of shards.stats.records) {
+    for (const s of stats) {
       if (seen.has(s.name)) {
         continue;
       }
@@ -463,8 +472,9 @@ export class SettingsService {
       return;
     }
     const shards = await SettingsService.readShards();
-    if (carried.testedAt > shards.latency.testedAt) {
+    if (carried.scope === shards.latency.scope && carried.testedAt > shards.latency.testedAt) {
       const shard = new NodeSortLatencyShard();
+      shard.scope = carried.scope;
       shard.testedAt = carried.testedAt;
       shard.mode = NodeSortModes.normalize(carried.mode);
       shard.order = carried.order.slice();
@@ -477,6 +487,7 @@ export class SettingsService {
       }
       await SettingsService.putShard(KEY_NODE_SORT_LATENCY, JSON.stringify(shard));
     }
+    if (shards.stats.scope !== carried.scope) { return; }
     const changed = SettingsService.changedStatsEntries(shards.stats, carried);
     if (changed.length > 0) {
       for (const entry of changed) {

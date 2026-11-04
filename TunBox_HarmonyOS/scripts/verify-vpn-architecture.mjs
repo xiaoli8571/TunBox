@@ -115,11 +115,11 @@ try {
 }
 
 // ── VpnRecoveryPolicy: MTU 动态按承载 ────────────────────────────────────
-eq('mtu.wifi', RP.mtuForNetType('wifi'), 1400);
-eq('mtu.ethernet', RP.mtuForNetType('ethernet'), 1400);
+eq('mtu.wifi', RP.mtuForNetType('wifi'), 1360);
+eq('mtu.ethernet', RP.mtuForNetType('ethernet'), 1360);
 eq('mtu.cellular', RP.mtuForNetType('cellular'), 1360);
-eq('mtu.none.baseline', RP.mtuForNetType('none'), 1400);
-eq('mtu.unknown.baseline', RP.mtuForNetType('unknown'), 1400);
+eq('mtu.none.baseline', RP.mtuForNetType('none'), 1360);
+eq('mtu.unknown.baseline', RP.mtuForNetType('unknown'), 1360);
 
 // ── VpnRecoveryPolicy: 退避封顶（弱网重连风暴抑制）───────────────────────
 eq('recover.delay0', RP.coreRecoveryDelayMs(0), 1000);
@@ -382,10 +382,10 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // IPv6 探针：redir-host 下 AAAA 来自真实上游 ⇒ 「拿不到」就是真故障，
   // 只保留 pass / fail 两条分支，不再按旧开关把已知限制记成 skip。
   const probeSrc = readFileSync(join(svcDir, 'OrchestratorHealthProbes.ets'), 'utf8');
-  has('probe.ipv6-pass-real-aaaa', probeSrc, "'IPv6 双栈生效（AAAA 解析正常）'");
+  has('probe.ipv6-pass-dns-only', probeSrc, "'IPv6 DNS 可返回 AAAA（不代表出口已验证）'");
   ok('probe.ipv6-no-override-branch', !probeSrc.includes('isDnsOverrideEnabled'));
   ok('probe.ipv6-no-known-limitation-skip', !probeSrc.includes('这是已知限制，不是故障'));
-  has('probe.ipv6-no-restart-repair', probeSrc, "'当前网络/运营商未提供 IPv6");
+  has('probe.ipv6-no-restart-repair', probeSrc, "'检查最终 DNS 模式与假 IPv6 池");
   notHas('probe.ipv6-no-restart-tunnel-repair', probeSrc,
     "'请重启隧道；仍失败则检查上游 DNS 是否屏蔽 AAAA', 'restart-clash-api'");
   // ── smart 组在编排层的接线 ──────────────────────────────────────────────
@@ -549,7 +549,7 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     has('latency.flclash-timeout-3000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 3000');
     has('latency.flclash-url-gstatic', flcDelay, 'https://www.gstatic.com/generate_204');
     has('latency.group-test-from-page', readFileSync(join(etsRoot, 'components/SubscriptionSection.ets'), 'utf8'),
-      'BackgroundLatencyService.testSubscription(context, subId)');
+      'BackgroundLatencyService.testSubscription(context, subId, null, groupName)');
     const nodePage = readFileSync(join(etsRoot, 'pages/NodeSelectionPage.ets'), 'utf8');
     notHas('latency.dead-page-no-group-test', nodePage, 'testGroupDetailedResult');
   }

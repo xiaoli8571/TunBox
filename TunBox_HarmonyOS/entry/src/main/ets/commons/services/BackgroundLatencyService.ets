@@ -18,21 +18,47 @@
  *  - 通道不可用时**不写任何节点结论**。
  */
 import { AppLogger } from '../utils/AppLogger';
-import { ConnectionOrchestrator } from './ConnectionOrchestrator';
+import { ConnState, ConnectionOrchestrator } from './ConnectionOrchestrator';
 import { LatencyLiveView } from './LatencyLiveView';
+import { LatencyContext } from './LatencyState';
+import { LatencyStoreBridge } from './LatencyStoreBridge';
+import { IsolatedLatencyCore, IsolatedLatencyPorts } from './IsolatedLatencyCore';
+import { CoreCatalog } from '../flclash/CoreCatalog';
+import { DelayTarget } from '../flclash/FlclashDelay';
 import { LatencyEngine, LatencyProgress } from './LatencyEngine';
 import { ClashApiService } from './ClashApiService';
 import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
+import { ProxyGroup } from '../models/ProxyGroup';
 import { SettingsService } from './SettingsService';
 import { SubscriptionService } from './SubscriptionService';
 import { effectiveTestUrl } from '../latency/LatencyProbe';
 import { CoreCatalogService } from '../flclash/CoreCatalogService';
+import { ProfileRepository } from '../flclash/ProfileRepository';
+import { DelayPlan, ProxyPanelMembers } from '../flclash/ProxyPanelMembers';
+import { ClashConfigGenerator } from './ClashConfigGenerator';
 import { FlclashLatencyProgress, FlclashLatencyService } from '../flclash/FlclashLatencyService';
 
 const TAG = 'BackgroundLatency';
 
 export class BackgroundLatencyService {
+  private static preparing: boolean = false;
+  private static generation: number = 0;
+
+  static isRunning(): boolean {
+    return BackgroundLatencyService.preparing || FlclashLatencyService.isRunning() || LatencyEngine.isRunning();
+  }
+
+  static cancelCurrent(): void {
+    BackgroundLatencyService.generation++;
+    FlclashLatencyService.cancelCurrent();
+  }
+
+  /** Flat lists may span profiles. Every subset uses its own actual core context. */
+  static async testNodes(context: Context, profileId: string, names: string[],
+    onReady: (() => void) | null = null, source: string = 'manual'): Promise<LatencyProgress | null> {
+    return BackgroundLatencyService.execute(context, profileId, onReady, '', names, source);
+  }
   /**
    * 冷启动静默测速 —— **已按 FlClash 撤销**。
    *
@@ -50,8 +76,8 @@ export class BackgroundLatencyService {
 
   /** 订阅刷新后测该订阅节点（FlClash 无自动测速；保留为显式调用入口） */
   static async testSubscription(context: Context, subscriptionId: string,
-    onChannelReady: (() => void) | null = null): Promise<LatencyProgress | null> {
-    return await BackgroundLatencyService.execute(context, subscriptionId, onChannelReady);
+    onChannelReady: (() => void) | null = null, groupName: string = ''): Promise<LatencyProgress | null> {
+    return await BackgroundLatencyService.execute(context, subscriptionId, onChannelReady, groupName);
   }
 
   /**
@@ -73,7 +99,7 @@ export class BackgroundLatencyService {
 
   /** 兼容旧调用点：手动测速优先（新引擎单航班，新批自然抢占旧批） */
   static beginManualPriority(): void {
-    FlclashLatencyService.cancelCurrent();
+    BackgroundLatencyService.cancelCurrent();
   }
 
   static endManualPriority(_context: Context): void {
@@ -95,7 +121,7 @@ export class BackgroundLatencyService {
    * 进度字段与旧 `LatencyProgress` 保持兼容（页面不用改）。
    */
   static async runKernelGroupTest(api: ClashApiService, nodes: ProxyNode[], url: string,
-    _source: string): Promise<LatencyProgress> {
+    _source: string, expected: string = ''): Promise<LatencyProgress> {
     const progress = new LatencyProgress();
     progress.total = nodes.length;
     progress.running = true;
@@ -120,12 +146,12 @@ export class BackgroundLatencyService {
       }
     }
     progress.total = names.length;
-    await BackgroundLatencyService.runWithCatalog(api, names, url, progress);
+    await BackgroundLatencyService.runWithCatalog(api, names, url, expected, progress);
     return progress;
   }
 
   /** 用内核目录里的节点名跑一批（FlClash 的节点名就是内核名）。 */
-  static async runNames(api: ClashApiService, names: string[], url: string,
+  static async runNames(api: ClashApiService, names: string[], url: string, expected: string,
     onChannelReady: (() => void) | null = null): Promise<LatencyProgress> {
     const progress = new LatencyProgress();
     progress.total = names.length;
@@ -137,12 +163,12 @@ export class BackgroundLatencyService {
     if (onChannelReady !== null) {
       onChannelReady();
     }
-    await BackgroundLatencyService.runWithCatalog(api, names, url, progress);
+    await BackgroundLatencyService.runWithCatalog(api, names, url, expected, progress);
     return progress;
   }
 
   private static async runWithCatalog(api: ClashApiService, names: string[], url: string,
-    progress: LatencyProgress): Promise<void> {
+    expected: string, progress: LatencyProgress): Promise<void> {
     // 跨引擎互斥（2026-10-24 P1 修复）：手动组测直调本方法（不走 execute 的双检），
     // 与 LatencyEngine 批次重叠时两引擎合计 64 在途打同一个内核 API（栈内并发 ~8），
     // 互相制造假超时 + runId 清标交叉。Flclash 自身的旧批允许被新批抢占（start 内
@@ -153,8 +179,13 @@ export class BackgroundLatencyService {
       AppLogger.info(TAG, 'kernel group test skipped: LatencyEngine batch in flight');
       return;
     }
-    const session = FlclashLatencyService.start(api, names, url, 'manual', null);
+    const profileId = ProfileRepository.currentId();
+    const revision = ProfileRepository.revisionOf(profileId);
+    const session = FlclashLatencyService.start(api, names, url, 'manual', null, expected,
+      new LatencyContext(profileId, revision, url, expected), (): boolean =>
+        profileId === ProfileRepository.currentId() && revision === ProfileRepository.revisionOf(profileId));
     const summary: FlclashLatencyProgress = await session.wait();
+    progress.total = summary.total;
     progress.finished = summary.started;
     progress.measured = summary.measured;
     progress.timeout = summary.timeout;
@@ -173,64 +204,118 @@ export class BackgroundLatencyService {
    * @param subscriptionId null = 当前 profile 的全部节点
    */
   private static async execute(context: Context, subscriptionId: string | null,
-    onChannelReady: (() => void) | null = null): Promise<LatencyProgress | null> {
-    if (LatencyEngine.isRunning() || FlclashLatencyService.isRunning()) {
-      AppLogger.info(TAG, 'silent batch skipped: a latency run is already in flight');
+    onChannelReady: (() => void) | null = null, groupName: string = '',
+    names: string[] | null = null, source: string = 'manual'): Promise<LatencyProgress | null> {
+    if (BackgroundLatencyService.preparing || LatencyEngine.isRunning() || FlclashLatencyService.isRunning()) {
       return null;
     }
+    BackgroundLatencyService.preparing = true;
+    const generation = ++BackgroundLatencyService.generation;
+    let isolated = false;
+    let ownsIsolated = false;
     try {
       const orchestrator = ConnectionOrchestrator.instance();
       orchestrator.init(context);
       await SettingsService.init(context);
       const subs = SubscriptionService.instance();
       await subs.init(context);
-      if (subs.subscriptions.length === 0) {
-        return null;
-      }
-      // 【2026-10-24 体验修复】冷启动自动重连/prewarm 正在准备通道的头几秒，
-      // 用户点测速会撞上「通道未就绪」被立即拒绝（真机取证：17:53:46 被拒、
-      // 17:53:52 隧道就绪、17:54:34 手动批正常——中间只差几秒）。改为短暂
-      // 等待重试：通道就绪后正常开测，而不是让用户自己掐时间再点一次。
-      // 9s 窗口足够覆盖隧道建立（connect timing ~2-5s）；负缓存/内核真起不来
-      // 的场景重试也无害，到点如实报错。
-      let api: ClashApiService | null = null;
-      const channelDeadline = Date.now() + 9000;
-      while (Date.now() < channelDeadline) {
-        api = await orchestrator.ensureLatencyApi(true);
-        if (api !== null) {
-          break;
-        }
-        if (LatencyEngine.isRunning() || FlclashLatencyService.isRunning()) {
-          // 等待期间真有批次开始了（另一个入口先到）：直接让行退出
-          AppLogger.info(TAG, 'delay batch skipped: another run started while waiting for channel');
-          return null;
-        }
-        await new Promise<void>((resolve) => setTimeout(() => resolve(), 1500));
-      }
-      if (api === null) {
-        AppLogger.warn(TAG, 'delay batch skipped: kernel channel unavailable');
-        throw new Error('测速通道未就绪（代理连接建立中或测速内核未启动），请稍后重试');
-      }
-      // 节点名来自内核目录（FlClash 同构：App 不持有节点清单）
-      const model = await CoreCatalogService.refresh(api, true);
-      if (model === null) {
-        AppLogger.warn(TAG, 'delay batch skipped: /proxies unavailable');
-        return null;
-      }
+      const profileId = subscriptionId ?? ProfileRepository.currentId();
+      if (profileId.length === 0 || !subs.subscriptions.some((sub): boolean => sub.id === profileId)) { return null; }
+      const revision = ProfileRepository.revisionOf(profileId);
       const settings = await SettingsService.load();
+      isolated = profileId !== ProfileRepository.currentId()
+        || (orchestrator.state === ConnState.CONNECTED && orchestrator.appliedProfile() !== profileId);
+      const current = (): boolean => generation === BackgroundLatencyService.generation
+        && revision === ProfileRepository.revisionOf(profileId)
+        && subs.subscriptions.some((sub): boolean => sub.id === profileId)
+        && (isolated ? IsolatedLatencyCore.networkCurrent()
+          : profileId === ProfileRepository.currentId() && profileId === orchestrator.appliedProfile());
+      let api: ClashApiService | null = null;
+      if (isolated) {
+        api = await IsolatedLatencyCore.open(context,
+          async (ports: IsolatedLatencyPorts, secret: string): Promise<string> =>
+            orchestrator.buildIsolatedLatencyYaml(profileId, settings,
+              ports.apiPort, ports.mixedPort, ports.dnsPort, secret));
+        ownsIsolated = true;
+
+      } else {
+        const deadline = Date.now() + 9000;
+        while (Date.now() < deadline) {
+          api = await orchestrator.ensureLatencyApi(true);
+          if (api !== null) { break; }
+          await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+        }
+      }
+      if (api === null) { throw new Error('测速通道未就绪，请稍后重试'); }
+      if (!current()) { throw new Error('订阅或网络已变化，请重新测速'); }
+      if (isolated || orchestrator.state !== ConnState.CONNECTED) {
+        await CoreCatalogService.restoreGroupSelections(api, profileId, settings.proxyGroupSelections, current);
+      }
+      const json = isolated ? await api.proxiesJson() : null;
+      const model = isolated ? (json === null ? null : CoreCatalog.parse(json))
+        : await CoreCatalogService.refresh(api, true, profileId, current);
+      if (model === null || !current()) { throw new Error('无法获取该订阅的内核节点目录，请稍后重试'); }
+      CoreCatalogService.rememberProfile(profileId, revision, model);
+      const groups = subs.groupsOf(profileId);
+      const selectedGroup = groupName || (groups.length > 0 ? groups[0].name : '');
       const url = BackgroundLatencyService.resolveTestUrl(settings);
-      const nodes = CoreCatalogService.flattenNodes(settings.proxyMode);
-      const names: string[] = [];
-      for (const node of nodes) {
-        names.push(node.name);
+      const plan = names === null ? ProxyPanelMembers.delayPlan(model, selectedGroup,
+        ClashConfigGenerator.SMART_GROUP_NAME, url, '', groups) : new DelayPlan();
+      if (names !== null) {
+        const seen: Set<string> = new Set<string>();
+        for (const name of names) {
+          const target = ProxyPanelMembers.delayTarget(model, name, '', url, '', groups);
+          if (target === null) { plan.skipped++; continue; }
+          if (seen.has(target.key())) { continue; }
+          seen.add(target.key()); plan.targets.push(target); plan.names.push(target.name);
+        }
       }
-      if (subscriptionId !== null && names.length === 0) {
-        return null;
+      const progress = new LatencyProgress();
+      progress.skipped = plan.skipped;
+      if (plan.targets.length === 0) {
+        progress.message = plan.skipped > 0
+          ? `该分组有 ${plan.skipped} 个成员未加载或没有可用出口，请稍后重试`
+          : '该分组没有可测速的成员';
+        return progress;
       }
-      return await BackgroundLatencyService.runNames(api, names, url, onChannelReady);
-    } catch (e) {
-      AppLogger.warn(TAG, `silent batch failed: ${AppLogger.errText(e)}`);
-      return null;
+      const targets: DelayTarget[] = [];
+      for (const target of plan.targets) {
+        targets.push(new DelayTarget(target.name, target.url, '', target.expected, api.providerForProxy(target.name)));
+      }
+      if (LatencyEngine.isRunning() || FlclashLatencyService.isRunning()) { return null; }
+      if (onChannelReady !== null) { onChannelReady(); }
+      const scope = new LatencyContext(profileId, revision, url);
+      const session = FlclashLatencyService.startTargets(api, targets, source, scope, current);
+      const summary = await session.wait();
+      progress.total = summary.total;
+      progress.finished = summary.started;
+      progress.measured = summary.measured;
+      progress.timeout = summary.timeout;
+      progress.failed = summary.failed;
+      progress.cancelled = summary.cancelled;
+      progress.channel = 'core';
+      if (!current()) {
+        progress.message = '订阅或网络已变化，本次测速已取消，请重试';
+        return progress;
+      }
+      await LatencyStoreBridge.ensureStore(context);
+      for (const target of targets) {
+        const targetScope = new LatencyContext(profileId, revision, target.testUrl, target.expected);
+        await LatencyStoreBridge.persistConclusions([target.proxyName], targetScope);
+      }
+      if (summary.cancelled > 0 && summary.measured + summary.timeout + summary.failed === 0) {
+        progress.message = `测速未完成：${summary.cancelled} 个目标没有取得内核响应，已保留上次结果`;
+      }
+      LatencyLiveView.flushNow();
+      return progress;
+    } catch (error) {
+      AppLogger.warn(TAG, `delay batch failed: ${AppLogger.errText(error)}`);
+      const progress = new LatencyProgress();
+      progress.message = AppLogger.errText(error);
+      return progress;
+    } finally {
+      if (ownsIsolated) { await IsolatedLatencyCore.close(); }
+      BackgroundLatencyService.preparing = false;
     }
   }
 }

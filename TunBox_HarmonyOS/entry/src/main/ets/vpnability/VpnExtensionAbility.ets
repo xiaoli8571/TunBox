@@ -21,7 +21,7 @@
  *
  * DNS 接管（2026-10-21 起无开关）：生成器恒写 `dns.enable: true` + `tun.dns-hijack: any:53`，
  * 本层恒把 VpnConfig.dnsAddresses 指向 TUN sentinel（DNS_SERVERS）。设置页的
- * 「DNS 覆写」开关已删除 —— 只留一个恒真的事实，没有可漂移的第二决策点。
+ * 「DNS 覆写」开关只选配置来源，不关闭接管；实际标志仍从最终 YAML 读取。
  *
  * ⚠ 2026-10-21 真机取证（改前缀后重测 /proc/net/ipv6_route）：
  *   · `VpnConfig.routes` 里的 v6 条目仍被平台静默丢弃（`::/0` 的三种写法、`fc00::/71`
@@ -35,7 +35,7 @@
  *     池的 gateway = masked+1 = `fdfe:dcba:9876::1`，正是下面的 TUN_ADDRESS_V6。
  *     ipv6 关时生成器不写 range6 ⇒ 内核 AAAA 恒空，与只装 v4 的 TUN 一致。
  *
- * 隧道存续期间本进程是**网络与恢复的权威**：订阅网络切换、按承载动态调 MTU、
+ * 隧道存续期间本进程是**网络与恢复的权威**：订阅物理网络快照、保持统一 MTU、轻量刷新 DNS/旧连接、
  * 内核崩溃后就地热恢复（必要时升级一次 TUN 重建）、以事件驱动写入 vpn_status.json
  * 供其他进程只读还原真实状态。
  *
@@ -45,7 +45,9 @@
  * 守护承担；本文件只负责隧道数据面与其内部自愈。
  */
 import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
-import { hidebug } from '@kit.PerformanceAnalysisKit';
+import { taskpool } from '@kit.ArkTS';
+import { sampleProcessPss } from '../commons/services/MemorySampler';
+import { PersistentLogStore } from '../commons/services/PersistentLogStore';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { ReconnectReason } from '../commons/services/ConnectionEvents';
 import { common } from '@kit.AbilityKit';
@@ -55,10 +57,10 @@ import { util } from '@kit.ArkTS';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { coreBridge } from '../core/CoreBridge';
 import { AppLogger } from '../commons/utils/AppLogger';
-import { NetworkStateListener, NetworkStateWatcher, NetTypes } from '../commons/services/NetworkStateWatcher';
+import { NetworkSnapshot, NetworkStateListener, NetworkStateWatcher, NetTypes } from '../commons/services/NetworkStateWatcher';
 import {
   mtuForNetType, coreRecoveryDelayMs, tunnelRebuildDelayMs,
-  MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS, friendlyVpnStartError
+  BASE_MTU, RECOVERY_STABLE_MS, MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS, friendlyVpnStartError
 } from '../commons/services/VpnRecoveryPolicy';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { AbilityConstant } from '@kit.AbilityKit';
@@ -66,7 +68,7 @@ import { AppRoutingModes, AppRoutingPolicy, AppRoutingRuntime } from '../commons
 import { SettingsService } from '../commons/services/SettingsService';
 
 const TAG = 'VpnExtensionAbility';
-const VPN_MTU = 1400;
+const VPN_MTU = BASE_MTU;
 /** TUN 地址/前缀与 bridge/bridge.go 的 Inet4Address 严格一致（对齐 NekoBox 实测格式） */
 const TUN_ADDRESS = '172.19.0.1';
 const TUN_PREFIX = 30;
@@ -111,13 +113,10 @@ const LAUNCH_EPOCH_FILE = 'vpn_launch_epoch.txt';
 const START_PARAMS_MAX_AGE_MS = 180000;
 /** 兼容旧 UI 的事件状态快照文件，不再周期性写入。 */
 /**
- * 进程内存采样文件（2026-10-28）：内核跑在**本扩展进程**里，所以本进程的
- * VmRSS 就是「内核进程内存占用」。App 侧 `/memory` 端点实测会 Operation timeout
- * （真机日志 code=2300028），因此由扩展进程自己采样写盘，UI 优先读 /memory、
- * 失败再回落到这个文件。
+ * 扩展进程的 PSS+SwapPss（KiB）与采样时间。UI 只读新鲜样本，禁止混用 /memory 的 RSS。
  */
-const MEM_FILE = 'vpn_mem_kb.txt';
-const MEM_TMP_FILE = 'vpn_mem_kb.txt.tmp';
+const MEM_FILE = 'vpn_mem.json';
+const MEM_TMP_FILE = 'vpn_mem.json.tmp';
 /** 内存采样周期（ms）：比心跳慢，避免高频 stat 拖慢 ArkTS 线程 */
 const MEM_SAMPLE_MS = 5000;
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
@@ -178,7 +177,7 @@ class StageOutcome {
 export class VpnRuntimeStatus {
   /** running | recovering | leak-blocked | stopped | failed */
   public phase: string = 'running';
-  /** 当前 TUN 使用的 MTU（按物理承载动态）。 */
+  /** 当前 TUN 已提交的 MTU（统一保守值）。 */
   public mtu: number = VPN_MTU;
   /** 归一化物理网络类型。 */
   public netType: string = NetTypes.UNKNOWN;
@@ -243,6 +242,15 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   /** 最近一次物理网络类型与事件代数，用于去重和恢复编排。 */
   private lastNetworkType: string = NetTypes.UNKNOWN;
   private lastNetworkGeneration: number = 0;
+  private latestNetwork: NetworkSnapshot = new NetworkSnapshot();
+  private appliedNetwork: NetworkSnapshot | null = null;
+  private pendingNetwork: NetworkSnapshot | null = null;
+  private networkUpdateFlight: Promise<void> | null = null;
+  private networkUpdateTimer: number = -1;
+  private networkUpdateAttempts: number = 0;
+  private stableSince: number = 0;
+  private resetFlowsPending: boolean = false;
+  private networkReady: boolean = false;
   /** Core 存活监控与有界恢复状态。 */
   private coreMonitorTimer: number = -1;
   /** 存活租约独立刷新定时器（与内核探针解耦，见 LEASE_REFRESH_MS 注释）。 */
@@ -251,6 +259,9 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private memTimer: number = -1;
   private memSampleWarned: boolean = false;
   private memSampleLogged: boolean = false;
+  private memSampleBusy: boolean = false;
+  private protectFailureCount: number = 0;
+  private memoryStopFlight: Promise<void> | null = null;
   /** 连续判定"内核已死"的次数（累计到 CORE_DEATH_CONFIRMATIONS 才动手）。 */
   private coreDeathStrikes: number = 0;
   private recoveryTimer: number = -1;
@@ -266,7 +277,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private recoveryAttempts: number = 0;
   private recoveryRunning: boolean = false;
   private networkAvailable: boolean = true;
-  /** 当前实际 MTU，由网络类型决定并同时传给 TUN 与 native bridge。 */
+  /** 已提交 MTU：仅建立 TUN 时设置，切网不得提前改变它。 */
   private activeMtu: number = VPN_MTU;
   /** 当前会话的 VpnConfig，MTU 变化触发隧道重建时复用其余字段。 */
   private tunConfig: vpnExtension.VpnConfig | null = null;
@@ -916,7 +927,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private drainProtectRequests(): void {
     // Rebuild publishes the candidate only after startCore succeeds; while start is
     // pending the candidate must still serve protect, otherwise Go's 800ms receipt
-    // budget expires and dials fail open during the gap.
+    // budget expires and safe outbound dials are rejected during the gap.
     const connection = this.connection !== null ? this.connection : this.protectCandidate;
     if (connection === null) {
       // 无连接的窗口（重入/清理间隙）：直接退到上限，避免固定 10ms 空转唤醒
@@ -932,17 +943,25 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       }
       drained += 1;
       const seq: number = request[1];
-      // protect 失败(fd 已关闭/复用等)也要回执: Go 侧收到回执(含 false)立即放行拨号。
-      connection.protect(fd).then(() => {
-        coreBridge.setProtectResultForFd(fd, seq, true);
-      }).catch(() => {
-        coreBridge.setProtectResultForFd(fd, seq, false);
-      });
+      // Both synchronous API throws and Promise rejections must acknowledge failure.
+      try {
+        connection.protect(fd).then(() => {
+          coreBridge.setProtectResultForFd(fd, seq, true);
+        }).catch((e: Error): void => this.reportProtectFailure(fd, seq, e));
+      } catch (e) { this.reportProtectFailure(fd, seq, e); }
     }
     // 有请求 → 回底线（活跃期保持低延迟）；空闲 → 指数退避到上限
     this.protectPollDelayMs = drained > 0
       ? PROTECT_POLL_BASE_MS
       : Math.min(this.protectPollDelayMs * 2, PROTECT_POLL_MAX_MS);
+  }
+
+  private reportProtectFailure(fd: number, seq: number, e: Object): void {
+    try { coreBridge.setProtectResultForFd(fd, seq, false); } catch (_e) { /* Go timeout still rejects */ }
+    this.protectFailureCount++;
+    if (this.protectFailureCount === 1 || this.protectFailureCount % 100 === 0) {
+      AppLogger.warn(TAG, `socket protect rejected fd=${fd} seq=${seq} total=${this.protectFailureCount}: ${AppLogger.errText(e)}`);
+    }
   }
 
   private stopProtectMonitor(): void {
@@ -952,50 +971,94 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     }
   }
 
-  /** 根据物理承载选择保守 MTU：委托给可离线验证的纯策略函数（单一真值源）。 */
+  /** Shared MTU policy (currently 1360 on every physical bearer). */
   private mtuForNetwork(netType: string): number {
     return mtuForNetType(netType);
   }
 
-  /** Extension 进程内处理网络变化，不依赖 UI 进程。 */
-  onNetworkTypeChanged(netType: string, generation: number): void {
-    if (generation <= this.lastNetworkGeneration) {
-      return;
-    }
-    const previous = this.lastNetworkType;
+  /** Extension is the sole executor. A bearer switch never changes the committed MTU. */
+  onNetworkTypeChanged(netType: string, generation: number, snapshot?: NetworkSnapshot): void {
+    if (generation <= this.lastNetworkGeneration || this.stopped) { return; }
+    const next = snapshot === undefined ? new NetworkSnapshot() : snapshot.copy();
+    next.netType = netType;
     this.lastNetworkGeneration = generation;
     this.lastNetworkType = netType;
-    this.networkAvailable = netType !== NetTypes.NONE;
-    const nextMtu = this.mtuForNetwork(netType);
-    AppLogger.info(TAG, `extension network changed: ${previous} -> ${netType}, mtu=${nextMtu}`);
+    this.latestNetwork = next;
+    this.networkAvailable = netType !== NetTypes.NONE && netType !== NetTypes.UNKNOWN;
+    this.stableSince = 0;
+    this.pendingNetwork = next.copy();
+    this.networkUpdateAttempts = 0;
+    if (this.networkUpdateTimer >= 0) { clearTimeout(this.networkUpdateTimer); this.networkUpdateTimer = -1; }
     if (!this.networkAvailable) {
-      // 断网：保持 TUN 与默认路由（Kill Switch），内核无法拨出即天然阻断泄漏；
-      // 取消恢复编排，等待网络恢复事件。
+      this.resetFlowsPending = true;
       this.cancelRecovery();
       this.writeStatus('leak-blocked', this.coreAliveGuess(), 'network-lost');
       return;
     }
-    if (this.connection === null) {
+    this.flushNetworkUpdate();
+  }
+
+  /** Busy lifecycle work retains the newest pending snapshot; its finally path drains it. */
+  private flushNetworkUpdate(): void {
+    if (this.stopped || this.cleanupPromise !== null || !this.networkReady || !this.networkAvailable || this.connection === null
+      || this.recoveryRunning || this.recoveryTimer >= 0 || this.rebuilding || this.networkUpdateFlight !== null
+      || this.networkUpdateTimer >= 0 || this.pendingNetwork === null) { return; }
+    const next = this.pendingNetwork;
+    this.pendingNetwork = null;
+    const generation = this.lifecycleGeneration;
+    const previous = this.appliedNetwork;
+    const resetFlows = this.resetFlowsPending || (previous !== null && previous.identity() !== next.identity());
+    const dnsChanged = previous === null || previous.dnsServers.join(',') !== next.dnsServers.join(',');
+    if (!resetFlows && !dnsChanged) {
+      this.appliedNetwork = next;
+      this.writeStatus('running', true, 'network-metadata-updated');
       return;
     }
-    if (nextMtu !== this.activeMtu && this.tunnelRebuilds < MAX_TUNNEL_REBUILDS) {
-      // MTU 变化必须重建 TUN 才能生效：这是唯一必要的重建，其余情况只做内核热恢复。
-      this.activeMtu = nextMtu;
-      this.scheduleTunnelRebuild('mtu-change');
-    } else {
-      // 走到这里要么 MTU 没变，要么重建预算已封顶。**两种情况都不能动 activeMtu**：
-      // 平台 TUN 的 MTU 只能随重建改变，而 ensureConfigMtu 会按 activeMtu 改写内核
-      // YAML。旧实现在这里无条件 activeMtu = nextMtu，于是热恢复路径（也调
-      // ensureConfigMtu）会得到「配置 1360 / TUN 仍 1400」——正是 onCreate 里
-      // 「内核 MTU 必须与 VpnConfig.mtu 一致」不变量的反面：内核按 1400 出包、
-      // 平台 TUN 只收 1360，大包全丢 → 同样是「断网」。
-      if (nextMtu !== this.activeMtu) {
-        AppLogger.warn(TAG, `mtu ${this.activeMtu}->${nextMtu} deferred: rebuild budget `
-          + `exhausted (${this.tunnelRebuilds}/${MAX_TUNNEL_REBUILDS}), keeping TUN and `
-          + `config consistent at ${this.activeMtu}`);
+    this.networkUpdateFlight = this.applyNetworkUpdate(next, resetFlows, generation).finally((): void => {
+      this.networkUpdateFlight = null;
+      this.flushNetworkUpdate();
+    });
+  }
+
+  private async applyNetworkUpdate(next: NetworkSnapshot, resetFlows: boolean, generation: number): Promise<void> {
+    try {
+      const ok = await coreBridge.updateNetwork(next.dnsServers, resetFlows);
+      if (generation !== this.lifecycleGeneration || this.stopped) { return; }
+      if (!ok) { throw new Error('native network update unavailable'); }
+      this.appliedNetwork = next;
+      if (this.latestNetwork.fingerprint() === next.fingerprint() && this.networkAvailable) {
+        this.resetFlowsPending = false;
       }
-      if (previous === NetTypes.NONE || previous !== netType) {
-        this.scheduleCoreRecovery(ReconnectReason.NETWORK_CHANGED);
+      this.networkUpdateAttempts = 0;
+      if (this.networkAvailable) { this.writeStatus('running', true, 'network-updated'); }
+    } catch (e) {
+      if (generation !== this.lifecycleGeneration || this.stopped) { return; }
+      if (this.pendingNetwork !== null && this.pendingNetwork.fingerprint() !== next.fingerprint()) {
+        this.networkUpdateAttempts = 0;
+        return; // obsolete failure must not discard or back off a newer observation
+      }
+      if (this.pendingNetwork === null) { this.pendingNetwork = next; }
+      this.networkUpdateAttempts++;
+      AppLogger.warn(TAG, 'network update failed: ' + AppLogger.errText(e));
+      if (this.networkUpdateAttempts <= MAX_CORE_RECOVERY_ATTEMPTS) {
+        this.networkUpdateTimer = setTimeout((): void => {
+          this.networkUpdateTimer = -1;
+          this.flushNetworkUpdate();
+        }, coreRecoveryDelayMs(this.networkUpdateAttempts - 1));
+      } else {
+        // No restart merely because DNS changed: first require evidence that Core died.
+        const alive = await coreBridge.isCoreAlive();
+        if (generation !== this.lifecycleGeneration || this.stopped) { return; }
+        if (!alive) {
+          this.scheduleCoreRecovery(ReconnectReason.CORE_NOT_ALIVE);
+          // Retain snapshot; recoverCore finally drains it after the Core is ready.
+        } else {
+          this.writeStatus('running', true, 'network-update-retry-pending');
+          this.networkUpdateTimer = setTimeout((): void => {
+            this.networkUpdateTimer = -1;
+            this.flushNetworkUpdate();
+          }, 8000); // bounded retry rate; never turn a transient refresh error into a lost update
+        }
       }
     }
   }
@@ -1010,6 +1073,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     if (this.stopped || this.cleanupPromise !== null || this.recoveryRunning || this.rebuilding || this.rebuildTimer >= 0 || this.tunnelRebuilds >= MAX_TUNNEL_REBUILDS) {
       return;
     }
+    this.stableSince = 0;
     const delay = tunnelRebuildDelayMs(this.tunnelRebuilds);
     this.tunnelRebuilds = this.tunnelRebuilds + 1;
     this.rebuilding = true;
@@ -1020,6 +1084,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.rebuildFlight = this.rebuildTunnel(reason).finally((): void => {
         this.rebuilding = false;
         this.rebuildFlight = null;
+        this.flushNetworkUpdate();
       });
     }, delay);
   }
@@ -1125,12 +1190,17 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     this.networkWatcher.start(this.context);
     this.lastNetworkType = this.networkWatcher.networkType();
     this.lastNetworkGeneration = this.networkWatcher.generation();
-    this.networkAvailable = this.lastNetworkType !== NetTypes.NONE;
+    this.networkAvailable = this.lastNetworkType !== NetTypes.NONE && this.lastNetworkType !== NetTypes.UNKNOWN;
+    this.latestNetwork = this.networkWatcher.snapshot();
+    this.pendingNetwork = this.latestNetwork.copy();
     this.activeMtu = this.mtuForNetwork(this.lastNetworkType);
   }
 
   private stopNetworkAuthority(): void {
     this.cancelRecovery();
+    if (this.networkUpdateTimer >= 0) { clearTimeout(this.networkUpdateTimer); this.networkUpdateTimer = -1; }
+    this.pendingNetwork = null;
+    this.appliedNetwork = null;
     if (this.networkWatcher !== null) {
       this.networkWatcher.stop();
       this.networkWatcher = null;
@@ -1162,8 +1232,17 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
         }
         if (alive) {
           this.coreDeathStrikes = 0;
+          if (this.recoveryTimer >= 0) { clearTimeout(this.recoveryTimer); this.recoveryTimer = -1; }
+          const now = Date.now();
+          if (this.stableSince === 0) { this.stableSince = now; }
+          if (now - this.stableSince >= RECOVERY_STABLE_MS) {
+            this.recoveryAttempts = 0;
+            this.tunnelRebuilds = 0;
+          }
+          if (this.pendingNetwork !== null) { this.flushNetworkUpdate(); }
           return;
         }
+        this.stableSince = 0;
         this.coreDeathStrikes = this.coreDeathStrikes + 1;
         if (this.coreDeathStrikes < CORE_DEATH_CONFIRMATIONS) {
           // 首次判死只记账、不动手，也**不**动心跳文件（心跳只表示扩展进程存活）。
@@ -1204,7 +1283,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
    * 活着的，此时心跳必须继续刷新，否则 UI 会误以为扩展死了而拆隧道。
    */
   /**
-   * 进程内存采样：读 `/proc/self/status` 的 VmRSS 写 `vpn_mem_kb.txt`（原子替换）。
+   * 进程内存采样：taskpool 读取 PSS，原子替换带时间戳的 JSON。
    *
    * 与租约定时器**分离**：租约回调必须极轻（历史事故：回调里做原生调用把 ArkTS
    * 线程阻塞 → 心跳停更 → UI 判死拆隧道）。这里单独 5s 一次，失败只记一次日志。
@@ -1227,15 +1306,18 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     }
   }
 
-  private touchMemorySample(): void {
-    if (this.heartbeatDir.length === 0) {
+  private async touchMemorySample(): Promise<void> {
+    if (this.heartbeatDir.length === 0 || this.memSampleBusy || this.stopped) {
       return;
     }
+    this.memSampleBusy = true;
+    const generation = this.lifecycleGeneration;
     try {
       // 2026-10-28：鸿蒙沙箱的 /proc/self/status 被裁剪（实测拿不到 VmRSS 行），
       // 改用系统 API `hidebug.getPss()`（Pss+SwapPss，单位 KB）。
       // 内核就跑在本扩展进程里，所以这个值就是「内核进程内存占用」。
-      const kb: number = Number(hidebug.getPss());
+      const kb: number = await taskpool.execute(sampleProcessPss) as number;
+      if (generation !== this.lifecycleGeneration || this.stopped) { return; }
       if (!Number.isFinite(kb) || kb <= 0) {
         if (!this.memSampleWarned) {
           this.memSampleWarned = true;
@@ -1251,17 +1333,18 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       const tmp = `${this.heartbeatDir}/${MEM_TMP_FILE}`;
       const hb = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       try {
-        fs.writeSync(hb.fd, `${kb}`);
+        fs.writeSync(hb.fd, JSON.stringify({ sampledAt: Date.now(), pssKb: kb }));
       } finally {
         fs.closeSync(hb);
       }
       fs.renameSync(tmp, target);
+      AppLogger.info(TAG, `resource pssKb=${kb} sampledAt=${Date.now()}`);
     } catch (e) {
       if (!this.memSampleWarned) {
         this.memSampleWarned = true;
         AppLogger.warn(TAG, `memory sample failed: ${AppLogger.errText(e)}`);
       }
-    }
+    } finally { this.memSampleBusy = false; }
   }
 
   private startLeaseTimer(): void {
@@ -1298,7 +1381,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       clearTimeout(this.rebuildTimer);
       this.rebuildTimer = -1;
     }
-    this.rebuilding = false;
+    if (this.rebuildFlight === null) { this.rebuilding = false; }
   }
 
   /** 有界指数退避恢复，只重启 Core，保持 VPN/TUN 与 Kill Switch 路由不被拆除。 */
@@ -1331,6 +1414,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     const current = (): boolean => generation === this.lifecycleGeneration && this.connection === connection
       && this.platformTunFd === tunFd && this.cleanupPromise === null && !this.rebuilding;
     this.recoveryRunning = true;
+    this.stableSince = 0;
     let retry = false;
     this.stopCoreMonitor();
     this.stopProtectMonitor();
@@ -1375,6 +1459,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.recoveryRunning = false;
       if (current()) {
         this.startCoreMonitor();
+        this.flushNetworkUpdate();
         // Schedule only after releasing recoveryRunning; otherwise retries are dropped.
         if (retry && this.networkAvailable) {
           if (this.recoveryAttempts >= MAX_CORE_RECOVERY_ATTEMPTS && this.tunnelRebuilds < MAX_TUNNEL_REBUILDS) {
@@ -1400,6 +1485,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
 
   private async cleanupResourcesInternal(): Promise<void> {
     this.stopped = true;
+    this.networkReady = false;
     this.lifecycleGeneration++;
     const connection = this.connection;
     this.connection = null;
@@ -1424,6 +1510,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     // Wait for obsolete native starts before the final stop; never race a new session.
     if (this.rebuildFlight !== null) { await this.rebuildFlight; }
     if (this.recoveryFlight !== null) { await this.recoveryFlight; }
+    if (this.networkUpdateFlight !== null) { await this.networkUpdateFlight; }
     this.protectCandidate = null;
     // 临时测速配置随扩展退出删除（无头测速无 TUN，配置不会被内核长期需要）
     this.removePrivateConfig(false);
@@ -1443,6 +1530,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   }
 
   async onCreate(want: Want): Promise<void> {
+    PersistentLogStore.init(this.context, 'vpn');
     if (this.cleanupPromise !== null) { await this.cleanupPromise; }
     this.stopped = false;
     this.lifecycleGeneration++;
@@ -1578,7 +1666,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
 
     // TUN 参数既要跟「设置页 IPv6 开关」一致，又要跟**内核实际加载的那份 YAML**一致。
     // YAML 是唯一真源（readTunFlagsFromConfig），所以这里不再从 want 收开关。
-    // MTU 按当前物理承载动态取值（蜂窝链路降低分片风险，Wi-Fi/以太网 1400）。
+    // Unified MTU from the same policy as the generated YAML; switching networks never rebuilds TUN.
     this.activeMtu = this.mtuForNetwork(this.lastNetworkType);
     const tunFlags = this.readTunFlagsFromConfig(configPath);
     // DNS 接管：与 YAML 的 `dns.enable` 同源（readTunFlagsFromConfig 读回）。
@@ -1640,7 +1728,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       AppLogger.info(TAG, 'initProtect ok');
       this.startProtectMonitor();
 
-      // 内核 gvisor 的 MTU 必须与 VpnConfig.mtu 一致：启动前把配置里的 tun.mtu 对齐。
+      // 内核用户态栈的 MTU 必须与 VpnConfig.mtu 一致：启动前把配置里的 tun.mtu 对齐。
       this.ensureConfigMtu();
       // startCore 在线程池执行，ArkTS 事件循环持续处理 Protect 请求。
       const ok = await this.startCoreWithTimeout(configPath);
@@ -1651,7 +1739,9 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       }
       this.reportStartOk(configPath);
       this.publishStateSnapshot(configPath);
+      this.networkReady = true;
       this.startCoreMonitor();
+      this.flushNetworkUpdate();
     } catch (e) {
       const msg = AppLogger.errText(e);
       const err = e as BusinessError;
@@ -1696,22 +1786,50 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   /**
    * 内存压力自适应降级（P2，对标 iOS 50MB 上限的 oomKiller 自救）：
    * - MEMORY_LEVEL_MODERATE：记日志（观察点，不动隧道）；
-   * - MEMORY_LEVEL_CRITICAL：写 warn 日志 + 经 writeStatus 把 memCritical 信号
-   *   推到 UI 进程（detail 通道），UI 侧据此提示用户。不在扩展内主动断连接：
-   *   mihomo 自带 gvisor 内存回收，主动断栈的收益 < 恢复成本。
+   * - MEMORY_LEVEL_CRITICAL：留存原因、停止 VPN、清除自动连接意图，防止恢复风暴。
+   *   这是系统严重内存压力回调，不是根据固定 PSS 阈值误杀大规则配置。
    */
   onMemoryLevel(level: number): void {
     if (level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_CRITICAL) {
-      AppLogger.warn(TAG, 'memory pressure CRITICAL in vpn extension; notifying UI');
-      this.writeStatus(this.connection !== null ? 'recovering' : 'failed',
-        this.connection !== null, 'memCritical: 内存压力临界，隧道可能被系统回收');
+      if (this.memoryStopFlight !== null || this.stopped) { return; }
+      AppLogger.error(TAG, 'memory pressure CRITICAL; stopping VPN and disabling automatic recovery');
+      this.memoryStopFlight = this.stopForMemoryPressure().catch((e: Error): void => {
+        AppLogger.error(TAG, `memory pressure cleanup failed: ${AppLogger.errText(e)}`);
+      }).finally((): void => { this.memoryStopFlight = null; PersistentLogStore.flush(); });
     } else if (level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_MODERATE) {
       AppLogger.info(TAG, 'memory pressure MODERATE in vpn extension');
     }
   }
 
+  private async stopForMemoryPressure(): Promise<void> {
+    const expectedGeneration = this.lifecycleGeneration + 1;
+    // Preserve the reason outside transient tunnel markers (which cleanup removes).
+    try {
+      const f = fs.openSync(`${this.context.filesDir}/diagnostics/memory-pressure.json`,
+        fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try { fs.writeSync(f.fd, JSON.stringify({ sampledAt: Date.now(), reason: 'system-memory-critical' })); }
+      finally { fs.closeSync(f); }
+    } catch (_e) { /* persistent app log is the fallback */ }
+    const cleanup = this.cleanupResources(); // synchronously cancels timers/recovery first
+    try {
+      await SettingsService.init(this.context);
+      const snap = await SettingsService.loadSnapshot();
+      if (this.lifecycleGeneration === expectedGeneration && this.stopped) {
+        snap.desiredConnected = false;
+        snap.phase = 'failed';
+        snap.sessionGeneration += 1;
+        snap.savedAt = Date.now();
+        await SettingsService.saveSnapshot(snap);
+      }
+    } finally { await cleanup; }
+    if (this.lifecycleGeneration === expectedGeneration && this.stopped) {
+      this.writeStatus('failed', false, 'memCritical: 系统内存严重不足，已停止 VPN，请手动重新连接');
+    }
+  }
+
   onDestroy(): void {
     AppLogger.info(TAG, 'vpn onDestroy');
+    PersistentLogStore.flush();
     this.cleanupResources().catch((e: Error) => {
       AppLogger.warn(TAG, `vpn onDestroy cleanup failed: ${AppLogger.errText(e)}`);
     });

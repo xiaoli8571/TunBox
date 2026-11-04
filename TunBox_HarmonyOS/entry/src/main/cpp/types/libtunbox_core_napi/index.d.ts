@@ -12,8 +12,13 @@ export const setProtectResult: (ok: boolean) => void;
 /** 按 seq 回传 protect 结果，精确唤醒对应拨号协程。 */
 export const setProtectResultForFd: (fd: number, seq: number, ok: boolean) => void;
 export const stopCore: () => Promise<void>;
+/** Physical DNS refresh and optional stale-flow reset; never rebuilds the TUN. */
+export const updateNetwork: (dnsJson: string, resetFlows: boolean) => Promise<boolean>;
 export const prepareProfile: (text: string) => Promise<string>;
 export const isCoreAlive: () => boolean;
 export const coreVersion: () => string;
 export const lastError: () => string;
 export const attachTunFd: (fd: number, mtu: number) => boolean;
+
+/** Bind headless core sockets to a physical network (UI process only). */
+export const setPhysicalNetId: (netId: number) => boolean;

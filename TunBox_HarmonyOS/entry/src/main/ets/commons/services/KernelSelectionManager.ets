@@ -17,6 +17,7 @@ export class KernelSelectionManager {
   private target: ConnectionTarget | null = null;
   /** 查询互斥：避免 /proxies 轮询堆积。 */
   private polling: boolean = false;
+  private revision: number = 0;
 
   /** 最近一次确认过的出口；null = 尚未确认过任何出口。 */
   current(): ConnectionTarget | null {
@@ -40,10 +41,12 @@ export class KernelSelectionManager {
 
   /** 记录一次已确认的出口（连接成功 / 内核回报）。 */
   set(target: ConnectionTarget): void {
+    this.revision++;
     this.target = target;
   }
 
   clear(): void {
+    this.revision++;
     this.target = null;
   }
 
@@ -65,15 +68,17 @@ export class KernelSelectionManager {
    * 返回 null 表示「没有新事实」，调用方不需要刷新 UI。
    */
   async syncFromKernel(api: ClashApiService | null, groupName: string,
-    profileId: string = ''): Promise<ConnectionTarget | null> {
+    profileId: string = '', current: () => boolean = (): boolean => true): Promise<ConnectionTarget | null> {
     if (api === null || this.polling) { return null; }
+    const revision = this.revision;
     this.polling = true;
     try {
       const sel = await api.readKernelSelection(groupName);
-      if (sel === null || !sel.nowIsLeaf) { return null; }
-      if (this.target !== null && this.target.nodeName === sel.now) { return null; }
-      this.target = new ConnectionTarget(sel.group, sel.now, ConnectionTargetSource.KERNEL,
-        profileId, Date.now());
+      if (sel === null || !sel.nowIsLeaf || revision !== this.revision || !current()) { return null; }
+      if (this.target !== null && this.target.nodeName === sel.now && this.target.groupName === sel.group
+        && this.target.profileId === profileId) { return null; }
+      this.set(new ConnectionTarget(sel.group, sel.now, ConnectionTargetSource.KERNEL,
+        profileId, Date.now()));
       return this.target;
     } finally {
       this.polling = false;

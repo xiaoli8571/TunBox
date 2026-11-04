@@ -19,6 +19,7 @@
 import { ClashApiService } from '../services/ClashApiService';
 import { AppLogger } from '../utils/AppLogger';
 import { CoreCatalog, CoreCatalogModel, CoreGroup, CoreNode } from './CoreCatalog';
+import { ProxyPanelMembers } from './ProxyPanelMembers';
 
 const TAG = 'CoreCatalogService';
 /** 快照有效期：小于这个间隔的重复请求直接复用（避免页面切换风暴） */
@@ -39,11 +40,30 @@ export function isBuiltinPolicy(name: string): boolean {
   return BUILTIN_POLICIES.includes(name);
 }
 
+class ProfileCatalogSnapshot {
+  revision: string = '';
+  model: CoreCatalogModel = new CoreCatalogModel();
+}
+
 export class CoreCatalogService {
   private static model: CoreCatalogModel | null = null;
+  private static profiles: Map<string, ProfileCatalogSnapshot> = new Map<string, ProfileCatalogSnapshot>();
+
+  static rememberProfile(profileId: string, revision: string, model: CoreCatalogModel): void {
+    const snapshot = new ProfileCatalogSnapshot();
+    snapshot.revision = revision;
+    snapshot.model = model;
+    CoreCatalogService.profiles.set(profileId, snapshot);
+  }
+
+  static forProfile(profileId: string, revision: string): CoreCatalogModel | null {
+    const snapshot = CoreCatalogService.profiles.get(profileId);
+    return snapshot !== undefined && snapshot.revision === revision ? snapshot.model : null;
+  }
   private static fetchedAt: number = 0;
   private static profileId: string = '';
   private static lastError: string = '';
+  private static revision: number = 0;
 
   /** 最近一次成功的快照；从未成功过返回 null。 */
   static current(): CoreCatalogModel | null {
@@ -63,6 +83,8 @@ export class CoreCatalogService {
   }
 
   static clear(): void {
+    CoreCatalogService.revision++;
+    CoreCatalogService.profiles.clear();
     CoreCatalogService.model = null;
     CoreCatalogService.fetchedAt = 0;
     CoreCatalogService.profileId = '';
@@ -73,7 +95,8 @@ export class CoreCatalogService {
    * 返回 null = 本次刷新失败（保留旧快照）。
    */
   static async refresh(api: ClashApiService | null, force: boolean = false,
-    profileId: string = ''): Promise<CoreCatalogModel | null> {
+    profileId: string = '', current: () => boolean = (): boolean => true): Promise<CoreCatalogModel | null> {
+    if (!current()) { return null; }
     if (api === null) {
       CoreCatalogService.lastError = 'core unavailable';
       return null;
@@ -83,16 +106,18 @@ export class CoreCatalogService {
       && now - CoreCatalogService.fetchedAt < SNAPSHOT_TTL_MS) {
       return CoreCatalogService.model;
     }
+    const revision = ++CoreCatalogService.revision;
     const json = await api.proxiesJson();
+    if (!current() || revision !== CoreCatalogService.revision) { return null; }
     if (json === null) {
       CoreCatalogService.lastError = 'GET /proxies failed';
-      return CoreCatalogService.model;
+      return null;
     }
     const parsed = CoreCatalog.parse(json);
     if (parsed === null) {
       CoreCatalogService.lastError = 'parse /proxies failed';
       AppLogger.warn(TAG, 'parse /proxies failed');
-      return CoreCatalogService.model;
+      return null;
     }
     CoreCatalogService.model = parsed;
     // 空 profileId（选点后刷 now、后台测速等强制刷新）**不得**抹掉归属戳：
@@ -172,6 +197,37 @@ export class CoreCatalogService {
       return group.name;
     }
     return fallback;
+  }
+
+  /** Restore scoped direct-member choices after startup's leaf pinning. YAML profile
+   * merge can replace generated groups, so reordering generated YAML alone is insufficient. */
+  static async restoreGroupSelections(api: ClashApiService, profileId: string, raw: string,
+    current: () => boolean = (): boolean => true): Promise<number> {
+    const values = ProxyPanelMembers.selections(raw);
+    const prefix = `${profileId}\u0000`;
+    const keys = Object.keys(values).filter((key: string): boolean => key.startsWith(prefix));
+    if (profileId.length === 0 || keys.length === 0 || !current()) { return 0; }
+    let applied = 0;
+    const deadline = Date.now() + 4000;
+    try {
+      const json = await api.proxiesJson();
+      const model = json === null ? null : CoreCatalog.parse(json);
+      if (model === null || !current()) { return 0; }
+      for (const key of keys) {
+        if (!current() || Date.now() >= deadline) { break; }
+        const groupName = key.substring(prefix.length);
+        const group = model.findGroup(groupName);
+        const member = values[key];
+        if (group === null || group.type !== 'Selector' || member === groupName
+          || !group.all.some((node: CoreNode): boolean => node.name === member)) { continue; }
+        if (group.now === member || await api.selectProxyInGroup(groupName, member)) { applied++; }
+      }
+    } catch (e) {
+      // A stale saved choice or an unavailable controller cannot become a new
+      // unbounded startup retry/failure phase. The kernel keeps its current policy.
+      AppLogger.warn(TAG, `restore group selections incomplete: ${AppLogger.errText(e)}`);
+    }
+    return applied;
   }
 
   /**

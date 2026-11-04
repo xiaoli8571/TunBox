@@ -337,7 +337,7 @@ check('SOURCE pure policy has no SDK or model dependencies', () => {
 });
 check('SOURCE restart prevalidates before disconnect and failure cannot be reported as none', () => {
   const restart = orchestrator.slice(orchestrator.indexOf('  async restartIfConnected('), orchestrator.indexOf('  async applyProxyMode('));
-  assert.ok(restart.indexOf('AppRoutingPolicy.runtime(') < restart.indexOf('await this.disconnect()'));
+  assert.ok(restart.indexOf('AppRoutingPolicy.runtime(') < restart.indexOf('this.disconnect(true)'));
   assert.match(restart, /if \(!ok\) \{\s*throw new Error/);
 });
 check('SOURCE direct connect routing failure preserves old tunnel and avoids repair/failover', () => {

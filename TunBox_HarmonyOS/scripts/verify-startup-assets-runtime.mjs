@@ -213,7 +213,8 @@ const { ProxyNode } = await import(generated('ProxyNode'));
 const { ClashConfigGenerator } = await import(generated('ClashConfigGenerator'));
 const { ProfileConfigMerger } = await import(generated('ProfileConfigMerger'));
 const sandbox = vm.createContext({ AppSettings: settingsModule.AppSettings, AutoSelectModes: settingsModule.AutoSelectModes,
-  ProxyNode, ClashConfigGenerator, ProfileConfigMerger, AppLogger: logger,
+  ProxyNode, ClashConfigGenerator, ProfileConfigMerger,
+  BASE_MTU: (await import(generated('VpnRecoveryPolicy'))).BASE_MTU, AppLogger: logger,
   DoHResolver: { async refreshStale() {}, async resolveMany() { return {}; } }, Math, Map, Set });
 const runtime = load(fs.readFileSync(path.join(ets, 'commons/config/RuntimeConfigBuilder.ets'), 'utf8'),
   'RuntimeConfigProfile,RuntimeConfigBuilder,RuntimeConfigMode', sandbox);

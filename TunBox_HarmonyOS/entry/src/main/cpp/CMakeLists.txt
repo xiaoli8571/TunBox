@@ -21,4 +21,4 @@ find_library(hilog-lib hilog_ndk.z)
 find_library(libnapi-lib libace_napi.z.so)
 
 target_link_options(tunbox_core_napi PRIVATE -Wl,--no-as-needed)
-target_link_libraries(tunbox_core_napi PUBLIC ${hilog-lib} ${libnapi-lib} gojni)
+target_link_libraries(tunbox_core_napi PUBLIC ${hilog-lib} ${libnapi-lib} gojni libnet_connection.so)

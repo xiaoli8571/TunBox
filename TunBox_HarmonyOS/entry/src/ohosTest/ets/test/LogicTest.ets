@@ -10,7 +10,7 @@ import {
   shouldExecuteDisconnect, shouldSuppressConnect
 } from '../../../main/ets/commons/services/TunnelAuthority';
 import { LatencyStyle, NodeDisplay } from '../../../main/ets/theme/UiTokens';
-import { LatencyController } from '../../../main/ets/commons/services/LatencyController';
+import { LatencyLiveView } from '../../../main/ets/commons/services/LatencyLiveView';
 import {
   NodeSortSnapshot, NodeSortModes, NodeLatencyRecord, NodeProtocolPolicy
 } from '../../../main/ets/commons/services/NodeSortPersistence';
@@ -253,17 +253,17 @@ export default function logicTest() {
     });
 
     it('latency_controller_retain_only_reclaims_stale_nodes', 0, () => {
-      LatencyController.clearAll();
-      LatencyController.set('active-a', 31);
-      LatencyController.set('stale-b', 92);
-      LatencyController.set('active-c', -1);
+      LatencyLiveView.clearAll();
+      LatencyLiveView.set('active-a', 31);
+      LatencyLiveView.set('stale-b', 92);
+      LatencyLiveView.set('active-c', -1);
 
-      LatencyController.retainOnly(['active-a', 'active-c']);
+      LatencyLiveView.retainOnly(['active-a', 'active-c']);
 
-      expect(LatencyController.latencyFor('active-a')).assertEqual(31);
-      expect(LatencyController.latencyFor('active-c')).assertEqual(-1);
-      expect(LatencyController.latencyFor('stale-b')).assertNull();
-      LatencyController.clearAll();
+      expect(LatencyLiveView.latencyFor('active-a')).assertEqual(31);
+      expect(LatencyLiveView.latencyFor('active-c')).assertEqual(-1);
+      expect(LatencyLiveView.latencyFor('stale-b')).assertNull();
+      LatencyLiveView.clearAll();
     });
 
     it('yaml_merger_dedupe_and_name_preserve', 0, () => {
@@ -926,7 +926,7 @@ export default function logicTest() {
     });
 
     // ── NetworkStateWatcher：去抖 + generation 单调递增 + 回调隔离 ──
-    it('net_type_debounce_and_generation_monotonic', 0, () => {
+    it('net_type_debounce_and_generation_monotonic', 0, async () => {
       let now = 0;
       const watcher = new NetworkStateWatcher(1500, (): number => now);
       const seen: string[] = [];
@@ -955,14 +955,13 @@ export default function logicTest() {
       expect(watcher.networkType()).assertEqual(NetTypes.WIFI);
 
       // 达窗口 → 上报，代数 +1
-      now = 1500;
-      watcher.feedForTest(NetTypes.CELLULAR);
+      await new Promise<void>((resolve): void => { setTimeout(resolve, 1550); });
       expect(watcher.generation()).assertEqual(2);
       expect(watcher.networkType()).assertEqual(NetTypes.CELLULAR);
 
-      // 由 wifi 切到 none 同样受去抖保护
+      // Loss is immediate; restoration is always delivered at the trailing edge.
       watcher.feedForTest(NetTypes.NONE);
-      expect(watcher.generation()).assertEqual(2);
+      expect(watcher.generation()).assertEqual(3);
       now = 3100;
       watcher.feedForTest(NetTypes.NONE);
       expect(watcher.generation()).assertEqual(3);
