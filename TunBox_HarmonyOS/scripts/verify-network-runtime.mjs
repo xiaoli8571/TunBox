@@ -143,7 +143,7 @@ await test('network update cannot run before Core startup completes',async()=>{
   await flush();assert.equal(h.calls.length,0);e.networkReady=true;e.flushNetworkUpdate();await flush();assert.equal(h.calls.length,1);
 });
 const h=setup();load('commons/services/YamlMerger.ets','YamlMerger',h);
-const {ProfileConfigMerger:M}=load('commons/flclash/ProfileConfigMerger.ets','ProfileConfigMerger',h);
+const {ProfileConfigMerger:M}=load('commons/tunbox/ProfileConfigMerger.ets','ProfileConfigMerger',h);
 await test('final contract restores missing IPv6 pool without replacing subscription DNS',()=>{
   const yaml='ipv6: true\ntun:\n  mtu: 9000\n  enable: true\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  ipv6: true\n  nameserver: [https://example.com/dns-query]\n';
   const out=M.enforceTunnelContract(yaml,1360,true);

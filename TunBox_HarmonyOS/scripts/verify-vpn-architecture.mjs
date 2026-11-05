@@ -312,7 +312,7 @@ const extSrc = readFileSync(join(etsRoot, 'vpnability', 'VpnExtensionAbility.ets
   // 可能出现 `ipv6: "true"` / `ipv6: yes`；旧正则对它们一律返回 false ⇒ TUN 静默
   // 退回「IPv4-only」，而内核仍按 YAML 开着双栈 —— 正是本文件头部警告的
   // 「TUN 与内核不一致」。
-  has('ext.tun-flags-ipv6-tolerant', extSrc, "readTopLevelBool(text, 'ipv6')");
+  has('ext.tun-flags-ipv6-tolerant', extSrc, "readTopLevelBoolAny(text, 'ipv6')");
   has('ext.mtu-from-active', extSrc, 'mtu: this.activeMtu');
   has('ext.attachTun-activeMtu', extSrc, 'attachTun(tunFd, this.activeMtu)');
   has('ext.uses-policy', extSrc, "from '../commons/services/VpnRecoveryPolicy'");
@@ -391,13 +391,11 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   // ── smart 组在编排层的接线 ──────────────────────────────────────────────
   has('orch.smart.model-ready-check', orchSrc, 'private isSmartModelReady()');
   has('orch.smart.magic-tree', orchSrc, '0x74 && b[1] === 0x72');
-  // 内置 rawfile 铺盘是首选路径：纯联网下载在国内基本不可用
-  // （jsdelivr 取不到 release 附件 → 404；更可用的 gh-proxy 限速严重）
-  has('orch.smart.seed-from-rawfile', orchSrc, 'private seedSmartModelFromRawfile()');
-  has('orch.smart.rawfile-api', orchSrc, "getRawFileContentSync('Model.bin')");
-  has('orch.smart.seed-first', orchSrc,
-    'this.seedSmartModelFromRawfile() || this.isSmartModelReady()');
-  has('orch.smart.background-download', orchSrc, 'downloadSmartModelInBackground(source');
+  // 2026-11-05 用户要求：不随包内置，仅设置页手动安装。
+  notHas('orch.smart.no-rawfile-seed', orchSrc, 'seedSmartModelFromRawfile');
+  notHas('orch.smart.no-model-rawfile-api', orchSrc, "getRawFileContentSync('Model.bin')");
+  notHas('orch.smart.no-background-download', orchSrc, 'downloadSmartModelInBackground');
+  has('orch.smart.manual-provenance', orchSrc, 'if (!fs.accessSync(`${path}.manual`))');
   // ── 2026-10-22 真机回归：订阅页「自动选择」入口必须跟着模型文件实时显隐 ──────
   // 旧实现：build 里直接调 isSmartModelAvailable()（方法调用，不读任何状态）⇒
   // ArkUI 不把这个分支登记成依赖，用户在设置里删掉 Model.bin、回到订阅页，
@@ -409,17 +407,15 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     has('sub.smart.state-visible', subSecSrc, '@State private smartVisible: boolean = false;');
     has('sub.smart.state-selected', subSecSrc, '@State private smartSelected: boolean = false;');
     has('sub.smart.recomputed', subSecSrc,
-      'ready = ConnectionOrchestrator.instance().ensureSmartModelReady();');
-    has('sub.smart.visible-recomputed', subSecSrc, 'this.smartVisible = ready && nodeCount >= 2;');
+      'ConnectionOrchestrator.instance().smartAvailableFor(scope, this.service)');
+    has('sub.smart.visible-recomputed', subSecSrc, 'this.smartVisible = available;');
     has('sub.smart.row-gated-by-state', subSecSrc, 'if (this.smartVisible && !this.deleteSheetOn) {');
     has('sub.smart.recompute-on-open', subSecSrc, 'this.refreshSmartEntry();');
     // 删除与下载成功都必须 bump 信号（只删不装 / 只装不删 都会让入口状态停在旧值）
     const seqBumps = orchSrc.match(/setOrCreate<number>\('smart_model_seq'/g) ?? [];
     ok('orch.smart.mutations-bump-seq', seqBumps.length >= 2, `${seqBumps.length} 处`);
   }
-  // 模型准备必须与 autoSelectMode 解耦：默认就是 manual，只在 auto 下准备
-  // 会让用户切到 auto 后还要再多等一轮连接
-  has('orch.smart.prep-any-mode', orchSrc, 'if (!smartReady) {');
+  has('orch.smart.manual-update-only', orchSrc, 'ok = await this.downloadSmartModelAsset(source);');
   // smart 组只由 auto 模式启用 —— 决策已收口到唯一生成入口的 decideRuntimeOptions()。
   has('orch.smart.gated-by-auto', builderSrc,
     'settings.autoSelectMode === AutoSelectModes.AUTO && profile.smartModelReady');
@@ -431,7 +427,7 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   has('orch.smart.select-group', orchSrc, 'ClashConfigGenerator.SMART_GROUP_NAME');
   // UI 入口：smart 组只在内核配置里，而节点列表页的数据源是**订阅**（subs.nodes），
   // 所以不补一个合成行，用户在「全部节点」里永远看不到它。
-  has('orch.smart.ui-ready-api', orchSrc, 'ensureSmartModelReady()');
+  has('orch.smart.ui-ready-api', orchSrc, 'isSmartModelAvailable()');
   has('page.smart.row-id', pageSrc, "const SMART_ROW_ID = '__smart_group__'");
   // 合成行带作用域参数（2026-10-30）：空串 = 全部视图的全局入口，
   // 订阅 id = 该订阅自己的入口（smart 池按 groupSelected 收窄）。
@@ -539,14 +535,14 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
     scan(join(etsRoot, 'pages'));
     ok('latency.group-endpoint-not-hand-built-in-pages', hits.length === 0, `hits=${JSON.stringify(hits)}`);
     // 2026-10-22（用户要求「测速完全按 FlClash」）：组测速**不再**调
-    // `GET /group/{name}/delay`，改为组内节点**逐个**走 FlclashLatencyService（32 并发）。
-    // 唯一实现 = FlclashLatencyService.start（BackgroundLatencyService 只是薄适配层）。
+    // `GET /group/{name}/delay`，改为组内节点**逐个**走 TunBoxLatencyService（32 并发）。
+    // 唯一实现 = TunBoxLatencyService.start（BackgroundLatencyService 只是薄适配层）。
     const bgSrc = readFileSync(join(svcDir, 'BackgroundLatencyService.ets'), 'utf8');
-    has('latency.group-test-single-entry', bgSrc, 'FlclashLatencyService.start(');
+    has('latency.group-test-single-entry', bgSrc, 'TunBoxLatencyService.start(');
     notHas('latency.no-kernel-group-endpoint', bgSrc, 'testGroupDetailedResult(');
-    const flcDelay = readFileSync(join(etsRoot, 'commons/flclash/FlclashDelay.ets'), 'utf8');
-    has('latency.flclash-concurrency-32', flcDelay, 'FLCLASH_DELAY_CONCURRENCY: number = 32');
-    has('latency.flclash-timeout-3000', flcDelay, 'FLCLASH_DELAY_TIMEOUT_MS: number = 3000');
+    const flcDelay = readFileSync(join(etsRoot, 'commons/tunbox/TunBoxDelay.ets'), 'utf8');
+    has('latency.flclash-concurrency-32', flcDelay, 'TUNBOX_DELAY_CONCURRENCY: number = 32');
+    has('latency.flclash-timeout-5000', flcDelay, 'TUNBOX_DELAY_TIMEOUT_MS: number = 5000');
     has('latency.flclash-url-gstatic', flcDelay, 'https://www.gstatic.com/generate_204');
     has('latency.group-test-from-page', readFileSync(join(etsRoot, 'components/SubscriptionSection.ets'), 'utf8'),
       'BackgroundLatencyService.testSubscription(context, subId, null, groupName)');
@@ -565,7 +561,10 @@ const settingsSrc = readFileSync(join(etsRoot, 'commons', 'models', 'AppSettings
   }
   {
     const subPage = readFileSync(join(etsRoot, 'components/SubscriptionSection.ets'), 'utf8');
-    has('subs.file-yaml-only', subPage, "opts.fileSuffixFilters = ['.yaml', '.yml'];");
+    // 2026-11-04 用户重新定义唯一边界（不得因省事造成导入异常）：扩展名不再充当判定，
+    // 内容由 ProfileRepository.validateAndStore（FlClash validateProfile 同款）决定。
+    has('subs.import-content-decides', subPage,
+      "opts.fileSuffixFilters = ['.yaml', '.yml', '.txt', '.conf'];");
     // 扫码只收 HTTP(S) 链接，然后复用 applyAdd —— 单节点分享链接在那里被 isNodeUri 拦下
     has('subs.qr-https-only', subPage, "if (!(lower.startsWith('https://') || lower.startsWith('http://'))) {");
     has('subs.qr-rejects-node-uri', subPage, "this.toast('二维码里应是 Clash 订阅链接');");
@@ -684,7 +683,7 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
 
   const quickSrc = readFileSync(join(etsRoot, 'quicktoggleability', 'QuickToggleAbility.ets'), 'utf8');
   has('heal.guardian-selfheals', quickSrc, 'but intent still on; self-healing');
-  has('heal.guardian-bounded', quickSrc, 'private scheduleHealRetry(reason: string)');
+  has('heal.guardian-shares-budget', quickSrc, 'ConnectionOrchestrator.instance().restoreKilledSession(this.context)');
 }
 
 // ── DNS 防泄露（2026-10）───────────────────────────────────────────────
@@ -800,7 +799,7 @@ notHas('nsel.rules-entry-removed', nselSrc, 'openNetworkRules');
   // 没有旧隧道就别再白等 400ms。
   has('perf.conditional-extension-grace', orchSrc, 'skip 400ms extension-exit grace');
   // Model.bin 的 9.3MB 同步读写只在真的要用 smart 组时才付。
-  has('perf.smart-seed-only-in-auto', orchSrc, 'autoMode && this.seedSmartModelFromRawfile()');
+  notHas('perf.smart-no-seeding', orchSrc, 'seedSmartModelFromRawfile');
   // dropReasonFor 是本文件最贵的判定，一次 generate 只能算一遍。
   has('perf.drop-reason-memoized', genSrc, 'const dropReasons: Map<ProxyNode, string>');
   has('perf.drop-reason-reused', genSrc, 'ClashConfigGenerator.countDroppedNodes(allNodes, dropReasons)');

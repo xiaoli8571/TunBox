@@ -1,42 +1,23 @@
 /**
- * 订阅拉取策略：UA 协商
- * 移植自 upstream: packages/tunbox_shared/lib/services/subscription_fetch_policy.dart
- *
- * UA 顺序（必须一致）：TunBox → Clash Verge → v2rayN → Shadowrocket。
- * 每次降级重试都在 HTTP 403/406 或空结果时触发。
+ * 订阅取回：单一 User-Agent、一次请求、原始响应交给内核校验。
+ * 流程参考 FlClash v0.9.3 request.dart；TLS 栈与其 Dart HttpClient 不同。
  */
-import { http, connection } from '@kit.NetworkKit';
+import { connection } from '@kit.NetworkKit';
 import { AppProxyRoute } from './AppProxyRoute';
 import { url, util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 import { AppInfo } from '../utils/AppInfo';
 import { LocalSubConverter } from './LocalSubConverter';
 import { HttpBodyCodec } from '../subscription/HttpBodyCodec';
+import { coreBridge } from '../../core/CoreBridge';
+import { SettingsService } from './SettingsService';
 
 const TAG = 'SubscriptionFetchPolicy';
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_FIELD_LENGTH = 4096;
-const MAX_NODE_COUNT = 2000;
 const MAX_REDIRECTS = 5;
-/**
- * 传输层失败的重试预算。
- *
- * 实测背景（2026-09-19 真机 + PC 对照）：ikuuu 面板本身完全健康 ——
- * 单条 A 记录（无多 IP）、ZeroSSL 证书有效、UA 无关、PC 上 11/11 稳定 200；
- * 但设备上偶发 `code=2300060 Invalid SSL peer certificate` / 连接重置，过一会儿又自愈。
- * 即故障在**设备到面板的网络路径**上（中间设备干扰/阻断呈概率性），
- * 面板、解析层、证书都不是原因。
- *
- * 概率性干扰下「换一条新连接」有机会绕过，所以值得重试；
- * 而 UA 链的用途是内容协商、不是可达性，拿它当重试手段会让一次被阻断的域名
- * 要用户干等 5 × 15s = 75s。
- * 这里用**时间预算**封顶：一次超时已吃掉 15s，预算即耗尽、不再重试；
- * 只有快速失败（RST / TLS 拒绝 / DNS 失败，通常 <1s）才真正重试。
- * 因此最坏总时长仍约等于一次超时 + 少量退避，不会退回 75s。
- */
-const TRANSPORT_RETRY_MAX = 3;
-const TRANSPORT_RETRY_BUDGET_MS = 20000;
-const TRANSPORT_RETRY_BACKOFF_MS = 700;
+// FlClash 的取回层没有传输层重试（`lib/common/request.dart`：一次请求，失败即抛）。
+// 随 UA 链一并删除，避免再出现"我方自造行为"。
 
 /**
  * UA 顺序：优先 Clash 系 UA 让面板直接返回 Clash YAML（vmess/vless/trojan 字段最完整），
@@ -58,13 +39,38 @@ const TRANSPORT_RETRY_BACKOFF_MS = 700;
  * 改成返回 base64 链接列表（多一条解析分支的差异），而 clash-verge 语义与解析层
  * 的 YAML 主路径完全一致。
  */
-export const UA_CHAIN: string[] = [
-  'clash-verge/v2.4.2',
-  'clash.meta/v1.19.32',
-  'TunBox/' + AppInfo.version(),
-  'v2rayN/6.23',
-  'Shadowrocket/2077'
-];
+/**
+ * User-Agent —— 照抄 FlClash `lib/common/package.dart` 的 `packageInfo.ua`：
+ *   `<AppName>/v<version> clash-verge Platform/<os>`
+ *
+ * FlClash 只有**一个** UA（配置里可被 globalUa 覆盖），源码里没有 UA 链。
+ * 真机取证（2026-11-04，dp3.config-sync.com，同一 URL / 同一 IP）：
+ *   PC: curl -A clash-verge/v2.4.2 直连 → 200（34,727 字节真实配置）
+ *   设备: app.log 五连 `HTTP 403`，把 UA 换成链里任意一个结果相同
+ * 即 UA 轮换对这类拦截无效，它是自造行为，已按 FlClash 删除。
+ */
+export function tunboxUserAgent(): string {
+  return `TunBox/v${AppInfo.version()} clash-verge Platform/OpenHarmony`;
+}
+
+/**
+ * FlClash `globalState.ua` 同构：配置文件里写了 `globalUa` 就用它，否则用包 UA。
+ * AppSettings 加该字段后自动生效；字段未加时恒走 tunboxUserAgent()（无凭据风险）。
+ */
+export async function resolveUserAgent(): Promise<string> {
+  try {
+    const settings = await SettingsService.load();
+    const holder: Object = settings;
+    const record = holder as Record<string, Object>;
+    const globalUa = record['globalUa'];
+    if (typeof globalUa === 'string' && globalUa.trim().length > 0) {
+      return globalUa.trim();
+    }
+  } catch (e) {
+    AppLogger.warn(TAG, `read globalUa failed: ${AppLogger.errText(e)}`);
+  }
+  return tunboxUserAgent();
+}
 
 export class SubscriptionUserInfo {
   uploadBytes: number = -1;
@@ -157,10 +163,16 @@ export class SubscriptionFetchError extends Error {
     this.httpStatus = httpStatus;
   }
 
-  /** 面板限流/拒绝访问 */
+  /**
+   * 面板限流/拒绝访问。
+   *
+   * 只有 429 是「限流」。403 是**明确的拒绝**（Cloudflare 机器人判定、token 失效、
+   * 面板封禁），FlClash 也把它当普通 bad response（`request.dart` 的
+   * `DioExceptionType.badResponse`），不叫限流 —— 把 403 说成「请稍后重试」
+   * 会把人引向错误方向。
+   */
   isRateLimited(): boolean {
-    return this.kind === SubscriptionFetchErrorKind.HTTP
-      && (this.httpStatus === 429 || this.httpStatus === 403);
+    return this.kind === SubscriptionFetchErrorKind.HTTP && this.httpStatus === 429;
   }
 }
 
@@ -174,7 +186,9 @@ export class SubscriptionFetchPolicy {
    *   的增量刷新语义）。
    */
   static async fetch(urlStr: string, headerName: string, headerValue: string,
-    allowInsecureHttp: boolean, etag: string = ''): Promise<SubscriptionFetchResult> {
+    etag: string = ''): Promise<SubscriptionFetchResult> {
+    // headerName/headerValue 仅为旧调用方兼容保留，FlClash 无此能力：**不透传**。
+    // 唯一允许的鉴权是 URL userinfo → Authorization: Basic（见 authTarget）。
     // 本地转换订阅（`http://127.0.0.1:65530/localsub/<id>.yaml`）：由应用内渲染，
     // **不联网、不占端口**。必须在地址校验之前分流 —— 它是 loopback，公网守卫会拒。
     if (LocalSubConverter.isLocalUrl(urlStr)) {
@@ -182,7 +196,7 @@ export class SubscriptionFetchPolicy {
       const rendered = LocalSubConverter.render(id);
       if (!rendered.ok) {
         throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-          `本地转换订阅不可用：${rendered.reason}`);
+          `local converter unavailable: ${rendered.reason}`);
       }
       const local = new SubscriptionFetchResult();
       local.body = rendered.yaml;
@@ -195,156 +209,75 @@ export class SubscriptionFetchPolicy {
     // 必须在地址校验**之前**剥：校验规则不允许 authority 里出现 '@'。
     const auth = SubscriptionFetchPolicy.authTarget(urlStr);
     const fetchUrl = auth.url;
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(fetchUrl, allowInsecureHttp)) {
-      // 明文 http 单独给可行动提示：它现在是「默认禁用」而不是「地址非法」。
-      if (!allowInsecureHttp && fetchUrl.toLowerCase().startsWith('http://')) {
-        throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-          '该订阅是明文 HTTP 链接：默认已禁用。请改用机场提供的 https 链接，'
-            + '或在「设置 → 允许明文 HTTP 订阅」中显式打开');
-      }
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(fetchUrl)) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-        '订阅地址无效：仅允许公开 HTTP/HTTPS 地址');
+        'invalid subscription URL: only public http/https addresses allowed');
     }
-    const customHeader = headerName.length > 0 && headerValue.length > 0;
     const attempts: string[] = [];
-    // 整条 UA 链里出现过的 HTTP 状态码（用于区分限流与其它错误；优先保留 429/403）
+    // 一次请求的失败归类（FlClash 取回层没有重试，因此只保留首个失败原因）
     let rateLimitStatus = 0;
     let lastHttpStatus = 0;
-    // 首个传输层失败（无 HTTP 状态）的原始消息，用于生成可读原因
     let transportMessage = '';
     let transportAttempts = 0;
-    const transportStartedAt = Date.now();
-    // 用尽预算/次数后才真正收束；否则同一 UA 重试（换连接 = 可能落到另一个 IP）
-    let transportExhausted = false;
-    let uaIndex = 0;
-    while (uaIndex < UA_CHAIN.length) {
-      const ua = customHeader ? headerValue : UA_CHAIN[uaIndex];
-      // setAppHttpProxy 成功只表示代理配置已提交，mixed-port 可能仍在启动。
-      // 先等本地端口真正响应，避免首个请求撞在内核启动窗口里。
-      if (AppProxyRoute.activePort() > 0 && !AppProxyRoute.isReady()) {
-        await AppProxyRoute.waitUntilReady(4000);
+    // ── FlClash 同构：单次请求 ─────────────────────────────────────
+    // FlClash 的 `Request` 只用**一个** UA（`package.dart` 的 `packageInfo.ua`，
+    // 可被配置里的 globalUa 覆盖），失败即失败（`lib/common/request.dart`），
+    // 没有 UA 链，也没有传输层重试。我方此前自造的 UA 链已被真机证伪：
+    // 同一 URL、同一 IP、同一 UA，PC 得 200 而设备得 403，换 UA 对结果没有任何影响。
+    const ua = await resolveUserAgent();
+    // 上游在启动时显式走 mixed-port。Go 不读取 setAppHttpProxy，必须跨 NAPI 接线。
+    // 本项目使用 uTLS；不能把其 ClientHello 称为 Dart HttpClient 的相同指纹。
+    try {
+      const native = await coreBridge.fetchText(fetchUrl, ua, auth.header,
+        AppProxyRoute.isReady() ? AppProxyRoute.activePort() : 0);
+      const result = new SubscriptionFetchResult();
+      result.body = native.body;
+      result.etag = native.etag;
+      result.userInfo = SubscriptionFetchPolicy.parseUserInfo(native.userInfo);
+      result.disposition = native.disposition;
+      // FlClash 同构：不设最小长度闸门 —— 短 body 也交给 validateAndStore 让原生
+      // 解析器判定（R5 前禁文本闸）。空 body 由 CoreBridge 以 EMPTY_RESPONSE 区分。
+      AppLogger.info(TAG, `subscription fetched via core (${result.body.length} bytes)`);
+      return result;
+    } catch (e) {
+      const msg = AppLogger.errText(e);
+      AppLogger.warn(TAG, `subscription fetch failed: ${msg}`);
+      attempts.push(msg);
+      if (msg.includes('内核未返回内容') || msg.includes('empty')) {
+        throw new SubscriptionFetchError(SubscriptionFetchErrorKind.EMPTY_RESPONSE,
+          `empty response (${SubscriptionFetchPolicy.redactUrl(urlStr)})`);
       }
-      try {
-        const headers: Record<string, string> = {};
-        if (customHeader && SubscriptionFetchPolicy.maySendCustomHeader(urlStr, headerName)) {
-          headers[headerName] = ua;
-        } else {
-          headers['User-Agent'] = ua;
-        }
-        if (etag.length > 0) {
-          headers['If-None-Match'] = etag;
-        }
-        if (auth.header.length > 0) {
-          headers['Authorization'] = auth.header;
-        }
-        const result = await SubscriptionFetchPolicy.requestWithRedirectValidation(
-          fetchUrl, headers, allowInsecureHttp, 0);
-        if (result.notModified) {
-          // 304：内容未变。与「响应为空」是完全不同的语义，必须原样返回给调用方，
-          // 绝不能落到下面的 EMPTY_RESPONSE 分支（那会把「没变化」报成「拉取失败」）。
-          AppLogger.info(TAG, 'subscription not modified (304), reusing cached nodes');
-          return result;
-        }
-        const trimmedLen = result.body.trim().length;
-        if (trimmedLen > 0) {
-          // 极短响应（<16 字节，典型是 `null` / `""` / `0`）说明面板按 UA 或
-          // 凭证回了拒绝体，不是订阅内容 —— 继续换下一个 UA，别把它当成功。
-          if (trimmedLen < 16) {
-            AppLogger.warn(TAG, `subscription body too short (${trimmedLen} bytes): `
-              + `${result.body.trim().substring(0, 32)} — trying next UA`);
-            attempts.push(`响应过短(${trimmedLen}字节)`);
-          } else {
-            AppLogger.info(TAG, `subscription fetched (${result.body.length} bytes)`);
-            return result;
-          }
-        } else {
-          attempts.push('响应为空');
-        }
-      } catch (e) {
-        const msg = AppLogger.errText(e);
-        AppLogger.warn(TAG, `subscription fetch attempt failed: ${msg}`);
-        attempts.push(msg);
-        const status = SubscriptionFetchPolicy.extractHttpStatus(e, msg);
-        if (status === 429 || status === 403) {
-          if (rateLimitStatus !== 429) {
-            rateLimitStatus = status;
-          }
-        } else if (status > 0) {
-          lastHttpStatus = status;
-        } else {
-          // 传输层失败（DNS/连接/TLS/超时，拿不到任何 HTTP 状态）。
-          //
-          // UA 链的用途是**内容协商**（同一个 200 因 UA 不同而返回 YAML 或链接列表），
-          // 它修不好「这个域名根本连不上」。此前这里继续把剩下 4 个 UA 跑完，
-          // 每个都要吃满 connectTimeout，实测一次被阻断的域名要用户干等
-          // 5 × 15s = 75s 才拿到结论。
-          //
-          // 但「换 UA 无用」不等于「重试无用」：设备到面板的路径存在**概率性**干扰
-          // （ikuuu 实测：面板健康、PC 稳定 200，设备端偶发 TLS/RST 后自愈），
-          // 换一条新连接有机会绕过。所以先在同一 UA 上重试，用**时间预算**封顶 ——
-          // 快速失败（RST/TLS/DNS）能真正重试几次，而一次 15s 超时就会耗尽预算、
-          // 立即收束，不会退回 75s。
-          transportAttempts = transportAttempts + 1;
-          if (transportMessage.length === 0) {
-            transportMessage = msg;
-          }
-          const elapsed = Date.now() - transportStartedAt;
-          const canRetry = transportAttempts < TRANSPORT_RETRY_MAX
-            && elapsed < TRANSPORT_RETRY_BUDGET_MS;
-          if (canRetry) {
-            AppLogger.info(TAG, `transport failure ${transportAttempts}/${TRANSPORT_RETRY_MAX}, `
-              + `retrying same UA after ${TRANSPORT_RETRY_BACKOFF_MS}ms (elapsed ${elapsed}ms)`);
-            // 直连失败时，隧道可能刚好完成启动。等待一次 mixed-port 就绪，
-            // 下一次请求会自动切换到代理；若仍未就绪则保持直连。
-            if (AppProxyRoute.activePort() > 0 && !AppProxyRoute.isReady()) {
-              await AppProxyRoute.waitUntilReady(3000);
-            }
-            await SubscriptionFetchPolicy.delay(TRANSPORT_RETRY_BACKOFF_MS);
-            // uaIndex 不自增 → 重试同一个 UA
-            continue;
-          }
-          transportExhausted = true;
-          break;
-        }
-      }
-      uaIndex = uaIndex + 1;
-    }
-    // 重试会让同一条消息重复入列，摘要按「去重后的前 2 条」展示，避免噪声
-    const uniqueAttempts: string[] = [];
-    for (const item of attempts) {
-      if (!uniqueAttempts.includes(item)) {
-        uniqueAttempts.push(item);
+      const status = SubscriptionFetchPolicy.extractHttpStatus(e, msg);
+      if (status === 429) {
+        rateLimitStatus = status;
+      } else if (status > 0) {
+        // 403 等明确拒绝走这里：如实报 HTTP 状态，不再冒充「限流」。
+        lastHttpStatus = status;
+      } else {
+        transportAttempts = 1;
+        transportMessage = msg;
       }
     }
-    const summary = uniqueAttempts.slice(0, 2).join(' / ');
-    if (attempts.length > 0 && attempts.every((item: string) => item === '响应为空')) {
-      throw new SubscriptionFetchError(SubscriptionFetchErrorKind.EMPTY_RESPONSE,
-        `订阅响应为空（${SubscriptionFetchPolicy.redactUrl(urlStr)}）`);
-    }
+    // FlClash 同构：错误原文透出（rethrow 语义），中文只在 UI 层映射。
+    // kind/httpStatus 保留供调用方分类；message 保留原生原始文本（日志用）。
+    const rawMessage = transportMessage.length > 0 ? transportMessage
+      : (attempts.length > 0 ? attempts[0] : 'fetch failed');
     if (rateLimitStatus > 0) {
-      // 全 UA 链都拿到 429/403：面板限流/拒绝，而不是地址或网络问题
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-        `面板限流或拒绝访问（HTTP ${rateLimitStatus}，${UA_CHAIN.length} 个 UA 全部失败，`
-        + `请稍后重试或更换订阅链接）：${summary}`, rateLimitStatus);
+        rawMessage, rateLimitStatus);
     }
-    if (attempts.some((item: string) => item.startsWith('HTTP '))) {
+    if (lastHttpStatus > 0) {
       throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP,
-        `订阅 HTTP 请求失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`,
-        lastHttpStatus);
+        rawMessage, lastHttpStatus);
     }
-    if (attempts.some((item: string) => item.includes('解码失败'))) {
-      throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
-        `订阅响应解码失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+    if (attempts.length > 0 && attempts.every((item: string) => item === 'empty response')) {
+      throw new SubscriptionFetchError(SubscriptionFetchErrorKind.EMPTY_RESPONSE,
+        rawMessage);
     }
-    // 网络失败：message 保留原始错误码（日志用），advice 给出人话 + 下一步（UI 用）
     const err = new SubscriptionFetchError(SubscriptionFetchErrorKind.NETWORK,
-      `订阅拉取失败（${SubscriptionFetchPolicy.redactUrl(urlStr)}）：${summary}`);
+      rawMessage);
     err.transportFailure = transportAttempts > 0;
     err.advice = SubscriptionFetchPolicy.transportAdvice(transportMessage, urlStr);
-    if (transportAttempts > 1) {
-      // 让用户知道「不是没试」：多次重试仍失败，通常说明该域名在当前网络确实不可达
-      err.advice += `（已自动重试 ${transportAttempts} 次仍失败）`;
-    }
     throw err;
   }
 
@@ -387,26 +320,22 @@ export class SubscriptionFetchPolicy {
       cause = 'unreachable';
     }
 
+    // FlClash 同构：本层只给英文底层建议（日志/诊断用），中文在 UI 映射层产生（§5.6）。
     let advice = '';
     if (cause === 'dns') {
-      advice = '无法解析该订阅地址的域名。请检查地址是否写错，或更换 DNS/网络后重试。';
+      advice = 'Cannot resolve the subscription hostname. Check the URL or change DNS/network.';
     } else if (cause === 'timeout') {
-      advice = '连接该订阅地址超时。若它在浏览器/电脑客户端也要挂代理才能打开，'
-        + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+      advice = 'Connection to the subscription host timed out. If it needs a proxy to open, connect VPN first.';
     } else if (cause === 'reset') {
-      advice = '连接该订阅地址时被重置（常见于域名被阻断）。若它在浏览器/电脑客户端也要挂代理才能打开，'
-        + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+      advice = 'Connection was reset by the peer (common for blocked domains). Connect VPN first if needed.';
     } else if (cause === 'tls') {
-      advice = '与该订阅地址的 TLS 握手失败（证书校验未通过，或连接被中间设备干扰）。'
-        + '若它在浏览器/电脑客户端也要挂代理才能打开，请先连接 VPN 后重试；'
-        + '也可能是该面板证书本身异常，可稍后再试。';
+      advice = 'TLS handshake failed (certificate check or a middlebox). Retry later or via VPN.';
     } else if (cause === 'reserved') {
-      advice = '该订阅地址被判定为内网或保留地址，已按安全策略拒绝。请确认地址是否为公开域名。';
+      advice = 'Target is a private/reserved address and was rejected. Confirm it is a public hostname.';
     } else if (cause === 'toolarge') {
-      advice = '该订阅响应体超过大小限制（8 MiB），已拒绝。请确认地址指向的是订阅而不是网页。';
+      advice = 'Subscription body exceeded the size limit (8 MiB). Confirm the URL is a subscription, not a page.';
     } else {
-      advice = '无法连接到该订阅地址。若它在浏览器/电脑客户端也要挂代理才能打开，'
-        + '请先连接 VPN 后重试；或改用可直连的订阅地址。';
+      advice = 'Cannot reach the subscription host. If it needs a proxy, connect VPN first.';
     }
     return advice;
   }
@@ -424,116 +353,17 @@ export class SubscriptionFetchPolicy {
     return Number.isInteger(code) ? code : 0;
   }
 
-  private static async requestWithRedirectValidation(urlStr: string, headers: Record<string, string>,
-    allowInsecureHttp: boolean, redirectCount: number): Promise<SubscriptionFetchResult> {
-    if (redirectCount > MAX_REDIRECTS) {
-      throw new Error('订阅重定向次数超限');
-    }
-    await SubscriptionFetchPolicy.validateResolvedTarget(urlStr, allowInsecureHttp);
-    const req = http.createHttp();
-    try {
-      const resp = await req.request(urlStr, {
-        method: http.RequestMethod.GET,
-        header: headers,
-        connectTimeout: 15000,
-        readTimeout: 20000,
-        usingCache: false,
-        // 隧道已连接时走本地 mixed 端口（被墙面板/明文拦截才能刷新），
-        // 断开或 mixed-port 尚未就绪时 false → 直连；就绪后才经隧道请求
-        usingProxy: AppProxyRoute.isReady(),
-        expectDataType: http.HttpDataType.ARRAY_BUFFER,
-        maxRedirects: 0
-      });
-      if (resp.responseCode >= 300 && resp.responseCode < 400) {
-        const location = SubscriptionFetchPolicy.headerValue(resp.header, 'location');
-        if (location.length === 0) {
-          throw new Error(`HTTP ${resp.responseCode} 重定向缺少 Location`);
-        }
-        const nextUrl = SubscriptionFetchPolicy.resolveRedirectUrl(urlStr, location);
-        return SubscriptionFetchPolicy.requestWithRedirectValidation(
-          nextUrl, SubscriptionFetchPolicy.redirectHeaders(headers, urlStr, nextUrl),
-          allowInsecureHttp, redirectCount + 1);
-      }
-      if (resp.responseCode === 304) {
-        // 条件请求命中：内容未变，无响应体。etag 原样回传（服务端可能刷新了 ETag）。
-        const notModified = new SubscriptionFetchResult();
-        notModified.notModified = true;
-        notModified.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
-        notModified.userInfo = SubscriptionFetchPolicy.parseUserInfo(
-          SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
-        notModified.disposition = SubscriptionFetchPolicy.headerValue(resp.header, 'content-disposition');
-        return notModified;
-      }
-      if (resp.responseCode !== 200) {
-        throw new SubscriptionFetchError(SubscriptionFetchErrorKind.HTTP, `HTTP ${resp.responseCode}`);
-      }
-      let bytes = 0;
-      let body = '';
-      if (resp.result instanceof ArrayBuffer) {
-        const raw = new Uint8Array(resp.result);
-        bytes = raw.length;
-        if (!SubscriptionFetchPolicy.isResponseSizeAllowed(bytes)) {
-          throw new Error('订阅响应体超过 8 MiB 限制');
-        }
-        // ── FlClash 同构（`lib/common/request.dart` 的 `decompressUnlabeled`）──
-        // 部分机场发的是**没有 Content-Encoding 头**的 gzip/zlib 流（内核读不了，
-        // 按 UTF-8 解码会变乱码）。按魔数识别并解压，与 FlClash 一致。
-        let payload: Uint8Array = raw;
-        if (HttpBodyCodec.looksCompressed(raw)) {
-          try {
-            payload = HttpBodyCodec.decompress(raw);
-          } catch (e) {
-            throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
-              `订阅响应解压失败（gzip/zlib 流损坏）：${AppLogger.errText(e)}`);
-          }
-          if (!SubscriptionFetchPolicy.isResponseSizeAllowed(payload.length)) {
-            throw new Error('订阅响应体解压后超过 8 MiB 限制');
-          }
-        }
-        try {
-          body = util.TextDecoder.create('utf-8').decodeToString(payload);
-        } catch (e) {
-          throw new SubscriptionFetchError(SubscriptionFetchErrorKind.DECODE,
-            `响应 UTF-8 解码失败：${AppLogger.errText(e)}`);
-        }
-      } else if (typeof resp.result === 'string') {
-        body = resp.result as string;
-        bytes = body.length;
-        if (!SubscriptionFetchPolicy.isResponseSizeAllowed(bytes)) {
-          throw new Error('订阅响应体超过 8 MiB 限制');
-        }
-      }
-      const out = new SubscriptionFetchResult();
-      out.body = body.trim();
-      out.userInfo = SubscriptionFetchPolicy.parseUserInfo(
-        SubscriptionFetchPolicy.headerValue(resp.header, 'subscription-userinfo'));
-      out.etag = SubscriptionFetchPolicy.responseEtag(resp.header);
-      out.disposition = SubscriptionFetchPolicy.headerValue(resp.header, 'content-disposition');
-      return out;
-    } finally {
-      req.destroy();
-    }
-  }
-
   /**
    * 取响应的 ETag 作为条件请求凭据；服务端只给 Last-Modified 时退而用后者
    * （两者都是合法的 If-None-Match 值来源）。
    */
-  private static responseEtag(header: Object): string {
-    const etag = SubscriptionFetchPolicy.headerValue(header, 'etag');
-    if (etag.length > 0) {
-      return etag;
-    }
-    return SubscriptionFetchPolicy.headerValue(header, 'last-modified');
-  }
-
-  private static async validateResolvedTarget(urlStr: string, allowInsecureHttp: boolean): Promise<void> {
+  private static async validateResolvedTarget(urlStr: string): Promise<void> {
     if (LocalSubConverter.isLocalUrl(urlStr)) {
       // 本地转换订阅不会走到这里（fetch() 已提前分流），保留分支只为防御未来新入口
       return;
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr, allowInsecureHttp)) {
-      throw new Error('订阅目标不是允许的公开地址');
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(urlStr)) {
+      throw new Error('subscription target is not an allowed public address');
     }
     const parsed = url.URL.parseURL(urlStr);
     const host = SubscriptionFetchPolicy.extractHost(parsed.host);
@@ -564,22 +394,6 @@ export class SubscriptionFetchPolicy {
     }
   }
 
-  private static headerValue(header: Object, name: string): string {
-    const values = JSON.parse(JSON.stringify(header)) as Record<string, Object>;
-    for (const key of Object.keys(values)) {
-      if (key.toLowerCase() === name.toLowerCase()) {
-        const value = values[key];
-        if (typeof value === 'string') {
-          return value as string;
-        }
-        if (Array.isArray(value) && value.length > 0) {
-          return String(value[0]);
-        }
-      }
-    }
-    return '';
-  }
-
   static parseUserInfo(value: string): SubscriptionUserInfo {
     const out = new SubscriptionUserInfo();
     for (const item of value.split(';')) {
@@ -598,20 +412,6 @@ export class SubscriptionFetchPolicy {
       else if (key === 'expire') out.expireAt = numberValue * 1000;
     }
     return out;
-  }
-
-  private static resolveRedirectUrl(currentUrl: string, location: string): string {
-    if (location.startsWith('https://') || location.startsWith('http://')) {
-      return location;
-    }
-    const parsed = url.URL.parseURL(currentUrl);
-    const origin = `${parsed.protocol}//${parsed.host}`;
-    if (location.startsWith('/')) {
-      return origin + location;
-    }
-    const slash = parsed.pathname.lastIndexOf('/');
-    const base = slash >= 0 ? parsed.pathname.substring(0, slash + 1) : '/';
-    return origin + base + location;
   }
 
   /**
@@ -647,10 +447,10 @@ export class SubscriptionFetchPolicy {
     if (userinfo.length === 0 || hostPart.length === 0) {
       return out;
     }
-    const colon = userinfo.indexOf(':');
-    const user = SubscriptionFetchPolicy.percentDecode(colon >= 0 ? userinfo.substring(0, colon) : userinfo);
-    const password = colon >= 0 ? SubscriptionFetchPolicy.percentDecode(userinfo.substring(colon + 1)) : '';
-    const text = `${user}:${password}`;
+    // Match downloadTarget in FlClash v0.9.3: decode each colon-separated
+    // component, preserving malformed components and a username without ':'.
+    const text = userinfo.split(':').map((part: string): string =>
+      SubscriptionFetchPolicy.percentDecode(part)).join(':');
     const bytes = util.TextEncoder.create('utf-8').encodeInto(text);
     out.header = `Basic ${new util.Base64Helper().encodeToStringSync(bytes)}`;
     out.url = urlStr.substring(0, authorityStart) + hostPart + urlStr.substring(authorityEnd);
@@ -720,32 +520,10 @@ export class SubscriptionFetchPolicy {
     return plain.trim();
   }
 
-  /** 百分号解码（只处理 `%XX`，其余按字节透传后统一按 UTF-8 还原） */
+  /** Strict UTF-8 component decoding; malformed escapes retain the whole component. */
   private static percentDecode(value: string): string {
-    if (value.indexOf('%') < 0) {
-      return value;
-    }
-    const bytes: number[] = [];
-    let i = 0;
-    while (i < value.length) {
-      const ch = value.charAt(i);
-      if (ch === '%' && i + 2 < value.length) {
-        const code = Number.parseInt(value.substring(i + 1, i + 3), 16);
-        if (!Number.isNaN(code)) {
-          bytes.push(code & 0xff);
-          i = i + 3;
-          continue;
-        }
-      }
-      bytes.push(value.charCodeAt(i) & 0xff);
-      i = i + 1;
-    }
     try {
-      const buffer = new Uint8Array(bytes.length);
-      for (let k = 0; k < bytes.length; k++) {
-        buffer[k] = bytes[k];
-      }
-      return util.TextDecoder.create('utf-8').decodeToString(buffer);
+      return decodeURIComponent(value);
     } catch (e) {
       return value;
     }
@@ -758,22 +536,6 @@ export class SubscriptionFetchPolicy {
     } catch (e) {
       return '';
     }
-  }
-
-  private static redirectHeaders(headers: Record<string, string>, fromUrl: string,
-    nextUrl: string): Record<string, string> {
-    const out: Record<string, string> = {};
-    const crossHost = SubscriptionFetchPolicy.hostOf(nextUrl) !== SubscriptionFetchPolicy.hostOf(fromUrl);
-    for (const key of Object.keys(headers)) {
-      // 跨主机重定向不许转发 Authorization（Basic 凭据只属于原面板）
-      if (crossHost && key.toLowerCase() === 'authorization') {
-        continue;
-      }
-      if (SubscriptionFetchPolicy.maySendCustomHeader(nextUrl, key)) {
-        out[key] = headers[key];
-      }
-    }
-    return out;
   }
 
   private static extractHost(authority: string): string {
@@ -902,12 +664,12 @@ export class SubscriptionFetchPolicy {
     return (groups[0] & 0xffc0) === 0xfc00;
   }
 
+  /**
+   * FlClash 同构：无自定义 header 功能 —— 唯一放行的 header 是 userinfo 派生的
+   * Authorization: Basic（见 authTarget）。任意 headerValue 透传已删。
+   */
   static maySendCustomHeader(urlStr: string, headerName: string): boolean {
-    const lowerName = headerName.toLowerCase();
-    if (lowerName === 'user-agent') {
-      return true;
-    }
-    return urlStr.toLowerCase().startsWith('https://');
+    return false;
   }
 
   static isResponseSizeAllowed(size: number): boolean {
@@ -916,10 +678,6 @@ export class SubscriptionFetchPolicy {
 
   static isFieldLengthAllowed(value: string): boolean {
     return value.length <= MAX_FIELD_LENGTH;
-  }
-
-  static isNodeCountAllowed(count: number): boolean {
-    return count >= 0 && count <= MAX_NODE_COUNT;
   }
 
   /** URL 脱敏（只保留 host），配合 log_redactor */
@@ -933,9 +691,13 @@ export class SubscriptionFetchPolicy {
     }
   }
 
-  /** 订阅 URL 合法性：允许公开 HTTP/HTTPS 地址。 */
-  static isValidSubscriptionUrl(urlStr: string, allowInsecureHttp: boolean = false): boolean {
-    // 本地转换订阅由应用内渲染（不发网络请求），不受「仅公开地址 / 明文 http 禁用」约束
+  /**
+   * 订阅 URL 合法性：仅公开 HTTPS 地址。
+   * FlClash 取回层无 http 放行开关（allowInsecureHttp 自创策略已删）：http/https
+   * 都按原样放行；私网/回环/保留地址守卫保留（本仓既有安全闸）。
+   */
+  static isValidSubscriptionUrl(urlStr: string): boolean {
+    // 本地转换订阅由应用内渲染（不发网络请求），不受「仅公开地址」约束
     if (LocalSubConverter.isLocalUrl(urlStr)) {
       return LocalSubConverter.idOf(urlStr).length > 0;
     }
@@ -944,7 +706,7 @@ export class SubscriptionFetchPolicy {
     const target = SubscriptionFetchPolicy.authTarget(urlStr).url;
     const lower = target.toLowerCase();
     if (target.length === 0 || target.length > 8192
-      || (!lower.startsWith('https://') && !(allowInsecureHttp && lower.startsWith('http://')))
+      || (!lower.startsWith('https://') && !lower.startsWith('http://'))
       || target.includes('\n') || target.includes('\r') || target.includes('\t')) {
       return false;
     }
@@ -952,7 +714,9 @@ export class SubscriptionFetchPolicy {
       const parsed = url.URL.parseURL(target);
       const proto = parsed.protocol.replace(/:/g, '').toLowerCase();
       let authority = parsed.host.toLowerCase();
-      if ((proto !== 'https' && !(allowInsecureHttp && proto === 'http'))
+      // FlClash 固定上游无 allowInsecureHttp 闸（§5.1）：http/https 都放行，
+      // 私网/回环/保留地址仍由下方守卫拦下（这条守卫是本仓既有安全闸，保留）。
+      if ((proto !== 'https' && proto !== 'http')
         || authority.length === 0 || authority.includes('@')) {
         return false;
       }

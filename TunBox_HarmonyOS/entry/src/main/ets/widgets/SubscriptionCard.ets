@@ -26,7 +26,7 @@ export struct SubscriptionCard {
           Text(this.sub.name)
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
-            .fontColor(Ui.textPrimary)
+            .fontColor(Ui.textPrimaryFor(this.themeRevision))
             .layoutWeight(1)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -34,8 +34,8 @@ export struct SubscriptionCard {
             Text('当前')
               .fontSize(11)
               .fontWeight(FontWeight.Medium)
-              .fontColor(Ui.primary)
-              .backgroundColor(Ui.primaryBlueFill)
+              .fontColor(Ui.primaryFor(this.themeRevision))
+              .backgroundColor(Ui.primaryBlueFillFor(this.themeRevision))
               .borderRadius(100)
               .padding({ left: 10, right: 10, top: 3, bottom: 3 })
           }
@@ -44,7 +44,7 @@ export struct SubscriptionCard {
 
         Text(this.sub.url)
           .fontSize(12)
-          .fontColor(Ui.textTertiary)
+          .fontColor(Ui.textTertiaryFor(this.themeRevision))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
@@ -52,12 +52,12 @@ export struct SubscriptionCard {
         Row({ space: 8 }) {
           Text(`节点 ${this.sub.nodeCount}`)
             .fontSize(12)
-            .fontColor(Ui.textSecondary)
+            .fontColor(Ui.textSecondaryFor(this.themeRevision))
           Blank()
           Text('刷新')
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
-            .fontColor(Ui.primary)
+            .fontColor(Ui.primaryFor(this.themeRevision))
             .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .borderRadius(10)
             .padding({ left: 12, right: 12, top: 6, bottom: 6 })
@@ -65,7 +65,7 @@ export struct SubscriptionCard {
           Text('编辑')
             .fontSize(12)
             .fontWeight(FontWeight.Medium)
-            .fontColor(Ui.textSecondary)
+            .fontColor(Ui.textSecondaryFor(this.themeRevision))
             .backgroundColor(Ui.surfaceMuted(this.themeRevision))
             .borderRadius(10)
             .padding({ left: 12, right: 12, top: 6, bottom: 6 })
@@ -86,7 +86,7 @@ export struct SubscriptionCard {
       .borderRadius(18)
       .backgroundColor(Ui.surface(this.themeRevision))
       .borderWidth(this.active ? 1.5 : 1)
-      .borderColor(this.active ? Ui.primary : Ui.glassEdge(this.themeRevision))
+      .borderColor(this.active ? Ui.primaryFor(this.themeRevision) : Ui.glassEdge(this.themeRevision))
     }
   }
 }

@@ -33,22 +33,23 @@ const { NodeSortSnapshot: Sort } = load('commons/services/NodeSortPersistence.et
 load('commons/models/ProxyNode.ets', 'ProxyNode,ProxyNodeType');
 load('commons/models/ProxyGroup.ets', 'ProxyGroup');
 load('commons/models/AppSettings.ets', 'AppSettings');
-load('commons/flclash/CoreNodeBridge.ets', 'CoreNodeBridge');
-const { CoreCatalog: Catalog } = load('commons/flclash/CoreCatalog.ets', 'CoreCatalog,CoreCatalogModel');
-const { ProxyPanelMembers: PanelPolicy } = load('commons/flclash/ProxyPanelMembers.ets', 'ProxyPanelMembers,DelayPlan');
-const { CoreCatalogService: Catalogs } = load('commons/flclash/CoreCatalogService.ets', 'CoreCatalogService');
-const { DelayTarget, DelayHttpReply, DelayRequestHandle, FlclashDelayRun, FlclashDelayPolicy } =
-  load('commons/flclash/FlclashDelay.ets', 'DelayTarget,DelayHttpReply,DelayRequestHandle,FlclashDelayRun,FlclashDelayPolicy,FLCLASH_DELAY_TIMED_OUT,FLCLASH_DELAY_FAILED,FLCLASH_DELAY_URL');
+load('commons/tunbox/CoreNodeBridge.ets', 'CoreNodeBridge');
+const { CoreCatalog: Catalog } = load('commons/tunbox/CoreCatalog.ets', 'CoreCatalog,CoreCatalogModel');
+const { ProxyPanelMembers: PanelPolicy } = load('commons/tunbox/ProxyPanelMembers.ets', 'ProxyPanelMembers,DelayPlan');
+const { CoreCatalogService: Catalogs } = load('commons/tunbox/CoreCatalogService.ets', 'CoreCatalogService');
+const { DelayTarget, DelayHttpReply, DelayRequestHandle, TunBoxDelayRun, TunBoxDelayPolicy } =
+  load('commons/tunbox/TunBoxDelay.ets', 'DelayResult,DelayTarget,DelayHttpReply,DelayRequestHandle,TunBoxDelayRun,TunBoxDelayPolicy,TUNBOX_DELAY_TIMED_OUT,TUNBOX_DELAY_FAILED,TUNBOX_DELAY_URL');
 let response = () => Promise.resolve(new DelayHttpReply(200, '{"delay":35}'));
 const urls = [];
-ctx.FlclashDelayRun = class extends FlclashDelayRun {
+ctx.TunBoxDelayRun = class extends TunBoxDelayRun {
   constructor(base, secret) {
     super(base, secret, { send(url) { urls.push(url); return new DelayRequestHandle(response(url), () => {}); } },
-      new FlclashDelayPolicy(64, 3000, 20));
+      new TunBoxDelayPolicy(64, 3000, 20));
   }
 };
-const { FlclashLatencyService: Service } = load('commons/flclash/FlclashLatencyService.ets', 'FlclashLatencyService');
-const api = { endpointBase: () => 'http://127.0.0.1:9090', endpointSecret: () => '', providerForProxy: () => '' };
+const { TunBoxLatencyService: Service } = load('commons/tunbox/TunBoxLatencyService.ets', 'TunBoxLatencyService');
+const api = { endpointBase: () => 'http://127.0.0.1:9090', endpointSecret: () => '', providerForProxy: () => '',
+  async healthProbe(){return false;} };
 const a = new Scope('A', 'revision-1', 'https://test.example/a', '204');
 const b = new Scope('B', 'revision-1', 'https://test.example/a', '204');
 function measured(scope, name, delay, at = 100) {
@@ -56,6 +57,12 @@ function measured(scope, name, delay, at = 100) {
 }
 let passed = 0;
 async function test(name, run) { await run(); passed++; console.log('PASS ' + name); }
+
+await test('node dial failures, DNS failures and legacy failures render consistently as timeout', () => {
+  for(const kind of ['timeout','network_unreachable','dns_unresolved','failed']) {
+    assert.equal(Store.describe(kind,-1,1000,1001).text,'超时');
+  }
+});
 
 await test('profile, content revision, URL and expected status are independent identities', () => {
   View.clearAll(); measured(a, '香港01', 31);
@@ -141,21 +148,21 @@ const groups = [
   {name: 'Z', url: '', expectedStatus: ''}
 ];
 const plan = PanelPolicy.delayPlan(model, 'ROOT', 'smart', 'https://test.example/global', '', groups);
-await test('nested groups inherit policy independently and deduplicate URL/status/exit together', () => {
+await test('nested groups inherit URL independently and ignore health-check status like FlClash delay', () => {
   assert.equal(plan.targets.length, 3); assert.equal(plan.skipped, 0);
   assert.deepEqual(Array.from(plan.targets, t => [t.name, t.url, t.expected]), [
-    ['same', groups[1].url, '204'], ['same', groups[2].url, '200-299'], ['same', groups[0].url, '200-299']
+    ['same', groups[1].url, ''], ['same', groups[2].url, ''], ['same', groups[0].url, '']
   ]);
   const duplicate = PanelPolicy.delayPlan(model, 'ROOT', 'smart', '', '', groups.map(g => ({...g, url: 'https://test.example/one', expectedStatus: '204'})));
   assert.equal(duplicate.targets.length, 1);
 });
 await test('the real adapter probes the same exit under multiple URLs and keeps each result', async () => {
   urls.length = 0;
-  response = url => Promise.resolve(new DelayHttpReply(200, JSON.stringify({delay: new URL(url).searchParams.get('expected') === '204' ? 20 : 50})));
+  response = url => Promise.resolve(new DelayHttpReply(200, JSON.stringify({delay: new URL(url).searchParams.get('url') === groups[1].url ? 20 : 50})));
   const targets = plan.targets.map(t => new DelayTarget(t.name, t.url, '', t.expected));
   const result = await Service.startTargets(api, targets, 'manual', a).wait();
   assert.equal(result.total, 3); assert.equal(result.measured, 3); assert.equal(urls.length, 3);
-  for (const target of plan.targets) assert.equal(View.latencyFor('same', new Scope('A', a.revision, target.url, target.expected)), target.expected === '204' ? 20 : 50);
+  for (const target of plan.targets) assert.equal(View.latencyFor('same', new Scope('A', a.revision, target.url, target.expected)), target.url === groups[1].url ? 20 : 50);
 });
 await test('real production group-row lookup reads its current exit and matching policy', () => {
   const source = read('components/SubscriptionSection.ets');
@@ -173,6 +180,7 @@ await test('a transport hang preserves previous results and never invents a node
   measured(a, 'previous', 12, 1000); response = () => new Promise(() => {});
   const result = await Service.start(api, ['previous', 'new'], a.testUrl, 'manual', null, a.expected, a).wait();
   assert.equal(result.cancelled, 2); assert.equal(result.timeout, 0);
+  assert.equal(result.wasCancelled, false);
   assert.equal(View.latencyFor('previous', a), 12); assert.equal(View.stateFor('new', a), State.UNTESTED);
   assert.equal(View.recordFor('new', a).failKind, 'core_not_ready');
 });
@@ -180,6 +188,28 @@ await test('a genuine kernel 504 remains an explicit timeout verdict', async () 
   response = () => Promise.resolve(new DelayHttpReply(504, '{"message":"Timeout"}'));
   const result = await Service.start(api, ['timeout'], a.testUrl, 'manual', null, a.expected, a).wait();
   assert.equal(result.timeout, 1); assert.equal(View.stateFor('timeout', a), State.TIMEOUT);
+});
+await test('a healthy controller cannot turn a missing individual reply into a node timeout', async () => {
+  measured(a, 'missing-old', 28, 1000);
+  response = url => Promise.resolve(new DelayHttpReply(url.includes('/missing/') ? 0 : 200,
+    url.includes('/missing/') ? '' : '{"delay":17}'));
+  const healthy = {...api,async healthProbe(){return true;}};
+  const result = await Service.start(healthy,['ok','missing'],a.testUrl,'manual',null,a.expected,a).wait();
+  assert.equal(result.measured,1);assert.equal(result.timeout,0);assert.equal(result.cancelled,1);
+  assert.equal(View.stateFor('missing',a),State.UNTESTED);
+  response = () => Promise.resolve(new DelayHttpReply(0, ''));
+  await Service.start(healthy,['missing-old'],a.testUrl,'manual',null,a.expected,a).wait();
+  assert.equal(View.latencyFor('missing-old',a),28);
+});
+await test('cancellation before a late reply cannot overwrite previous node results', async () => {
+  const gate = deferred(), entered = deferred();
+  measured(a,'cancel-final',28,1000);
+  response = () => { entered.resolve(); return gate.promise; };
+  const session = Service.start(api,
+    ['cancel-final'],a.testUrl,'manual',null,a.expected,a);
+  await entered.promise;session.cancel();gate.resolve(new DelayHttpReply(504,''));
+  assert.equal((await session.wait()).wasCancelled,true);
+  await Promise.resolve();assert.equal(View.latencyFor('cancel-final',a),28);
 });
 await test('cancelling an old scope cannot clear a new same-name scope or another run owner', async () => {
   response = () => new Promise(() => {});
@@ -209,11 +239,16 @@ await test('inactive catalogs do not replace the active catalog and require matc
   assert.equal(Catalogs.forProfile('B', 'b1'), model); assert.equal(Catalogs.forProfile('B', 'b2'), null);
 });
 await test('isolated headless lifecycle binds physical sockets and never calls Extension/current-profile APIs', async () => {
-  const files = new Map(), events = [], copies = []; let netId = 7;
+  const files = new Map(), events = [], copies = []; let netId = 7, modelReady = false;
   ctx.connection = { NetBearType: {BEARER_VPN: 4}, getDefaultNetSync: () => ({netId}),
     getNetCapabilitiesSync: () => ({bearerTypes: [1]}) };
-  ctx.socket = {constructTCPSocketServerInstance: () => ({async listen(){}, async close(){}})};
-  ctx.fs = {accessSync: path => path.endsWith('/ruleset'), unlinkSync: path => files.delete(path),
+  ctx.socket = {
+    constructTCPSocketInstance: () => ({async connect(){throw Error('refused');}, async close(){}}),
+    constructTCPSocketServerInstance: () => ({async listen(){}, async close(){}})
+  };
+  load('commons/services/LocalPortProbe.ets','LocalPortProbe');
+  ctx.fs = {accessSync: path => path.endsWith('/ruleset') || (modelReady && path.endsWith('/Model.bin')),
+    unlinkSync: path => files.delete(path),
     listFileSync: path => path.endsWith('/nested') ? ['cached.mrs'] : ['root.mrs','nested'],
     statSync: path => ({isDirectory: () => path.endsWith('/nested')}),
     copyFileSync: (source,target) => copies.push([source,target])};
@@ -225,14 +260,23 @@ await test('isolated headless lifecycle binds physical sockets and never calls E
   ctx.ClashApiService = class {setEndpoint(port,secret){this.port=port;this.secret=secret;} async healthProbe(){return true;} };
   const {IsolatedLatencyCore: Isolated} = load('commons/services/IsolatedLatencyCore.ets','IsolatedLatencyCore,IsolatedLatencyPorts');
   const isolatedApi = await Isolated.open({cacheDir:'/private/cache'}, async ports => {
-    assert.ok(ports.apiPort >= 19090); return 'profile-B';
+    assert.ok(ports.apiPort >= 19090); modelReady = true; return 'profile-B';
   });
   assert.ok(isolatedApi.port >= 19090); assert.equal(events[0][0],'bind');
+  assert.ok(copies.some(([source,target]) => source === '/private/cache/Model.bin'
+    && target === '/private/cache/isolated-latency/Model.bin'), 'model prepared while building must be copied before core startup');
   assert.ok(copies.some(([source,target])=>source.endsWith('/ruleset/nested/cached.mrs')
     && target.endsWith('/isolated-latency/ruleset/nested/cached.mrs')),'nested rule caches are copied without touching the active cache');
   assert.equal(Isolated.networkCurrent(),true); netId = 8; assert.equal(Isolated.networkCurrent(),false);
   await Isolated.close(); assert.equal(files.size,0); assert.equal(events.at(-1)[1],-1);
   assert.equal(events.filter(e=>e[0]==='stop').length,1);
+  assert.deepEqual(events.slice(-2).map(e => e[0]), ['stop','bind']);
+  const closedEvents = events.length;
+  await Isolated.close(); assert.equal(events.length, closedEvents, 'repeated close is a no-op');
+  await assert.rejects(Isolated.open({cacheDir:'/private/cache'}, async () => { throw Error('build rejected'); }), /build rejected/);
+  assert.deepEqual(events.slice(-3).map(e => e[0]), ['bind','stop','bind']);
+  assert.equal(events.at(-1)[1], -1, 'failed preparation also releases the binding');
+  assert.equal(Isolated.busy, false);
 });
 await test('physical binding rejection is a channel error before profile loading or node probing', async () => {
   ctx.coreBridge.setPhysicalNetId=()=>false;
@@ -285,13 +329,62 @@ await test('inactive-profile execution leaves the connected profile and endpoint
   assert.equal(View.latencyFor('Bleaf',new Scope('B','B-revision','https://test.example/b')),17);
   assert.equal(Catalogs.profileIdOfSnapshot(),'A');
 });
+await test('a definitive active-channel failure returns once without retry sleeps or node verdicts', async () => {
+  let calls=0;
+  ctx.ProfileRepository = {currentId:()=> 'A',revisionOf:()=> 'a-revision'};
+  ctx.ConnectionOrchestrator = {instance:()=>({state:'disconnected',init(){},appliedProfile:()=> 'A',
+    latencyChannelError:()=> '',
+    async ensureLatencyApi(){calls++;return null;}})};
+  const {BackgroundLatencyService: Background} = load('commons/services/BackgroundLatencyService.ets','BackgroundLatencyService');
+  const original=ctx.setTimeout;
+  ctx.setTimeout=()=>{throw Error('unexpected retry sleep');};
+  try {
+    const result=await Background.testSubscription({cacheDir:'/private/cache'},'A');
+    assert.equal(calls,1);assert.match(result.message,/测速通道未就绪/);
+    assert.equal(result.total,0);assert.equal(result.failed,0);assert.equal(result.timeout,0);
+  } finally {ctx.setTimeout=original;}
+});
+await test('production background progress distinguishes partial replies from explicit cancellation', async () => {
+  ctx.ConnectionOrchestrator = {instance:()=>({appliedProfile:()=> 'A'})};
+  const {BackgroundLatencyService: Background} = load('commons/services/BackgroundLatencyService.ets','BackgroundLatencyService');
+  response = url => {
+    const name = decodeURIComponent(new URL(url).pathname.split('/')[2]);
+    return Promise.resolve(new DelayHttpReply(name === 'missing' ? 0 : name === 'timeout' ? 504 : name === 'failed' ? 503 : 200,'{"delay":19}'));
+  };
+  const progress = await Background.runNames(api,['ok','missing','timeout','failed'],a.testUrl,'');
+  assert.deepEqual([progress.measured,progress.timeout,progress.failed,progress.cancelled],[1,1,1,1]);
+  assert.equal(progress.wasCancelled,false);assert.equal(progress.message,'');
+  assert.equal(progress.completionMessage(),'测速结束：1成功，1超时，1失败，1项未取得结果，请重试');
+  assert.doesNotMatch(progress.completionMessage(),/中断|已取消/);
+  response = () => Promise.resolve(new DelayHttpReply(0,''));
+  const none = await Background.runNames(api,['missing'],a.testUrl,'');
+  assert.match(none.completionMessage(),/1项未取得结果/);assert.equal(none.wasCancelled,false);
+  response = () => new Promise(()=>{});
+  const pending = Background.runNames(api,['cancelled'],a.testUrl,'');
+  Service.cancelCurrent();
+  const cancelled = await pending;
+  assert.equal(cancelled.wasCancelled,true);assert.match(cancelled.completionMessage(),/已取消/);
+});
+await test('both UIs use the same completion formatter, with channel/profile errors retaining precedence', () => {
+  const progress = new ctx.LatencyProgress();
+  progress.total=4;progress.measured=4;
+  assert.equal(progress.completionMessage(),'测速完成：4成功，0超时');
+  progress.message='订阅或网络已变化，本次测速已取消，请重试';progress.wasCancelled=true;
+  assert.equal(progress.completionMessage(),progress.message);
+  for(const file of ['components/SubscriptionSection.ets','pages/NodeSelectionPage.ets']) {
+    assert.ok(read(file).includes('progress.completionMessage()'),file);
+  }
+  assert.ok(!read('commons/services/BackgroundLatencyService.ets').includes('测速通道已中断'));
+});
 await test('the production flat-page entry splits profiles, reads scoped results and preserves same-name rows when sorting', async () => {
   const source=read('pages/NodeSelectionPage.ets');
   const methods=['runLatency','refreshLatencyScopes','latencyContext','testUrlForLatency'].map(name=>{
     const method=source.match(new RegExp(`^  private (?:async )?${name}\\([\\s\\S]*?^  }`,'m'));
     assert.ok(method,name);return method[0];
   });
-  const sort=source.slice(source.indexOf('    // Sort the actual rows.'),source.indexOf('    this.nodes = smartRow'));
+  const sortEnd=source.indexOf('    this.nodes = ordered;');
+  assert.ok(sortEnd > source.indexOf('    // Sort the actual rows.'));
+  const sort=source.slice(source.indexOf('    // Sort the actual rows.'),sortEnd);
   const Page=vm.runInContext(stripTypeScriptTypes(`(()=>{class Page{${methods.join('\n')}\nsort(sortable){${sort}\nreturn ordered;}}return Page})()`,{mode:'transform'}),ctx);
   const calls=[];let revisionReads=0;
   ctx.ProfileRepository={currentId:()=> 'A',revisionOf:id=>{revisionReads++;return id+'-r1';}};
@@ -300,7 +393,7 @@ await test('the production flat-page entry splits profiles, reads scoped results
   ctx.BackgroundLatencyService={isRunning:()=>false,async testNodes(_context,id,names,onReady){
     calls.push([id,Array.from(names)]);onReady();
     for(const name of names) measured(new Scope(id,id+'-r1','https://test.example/flat'),name,id==='A'?13:71);
-    return {total:names.length,finished:names.length,measured:names.length,timeout:0,failed:0,cancelled:0,skipped:0,message:''};
+    return {total:names.length,finished:names.length,measured:names.length,timeout:0,failed:0,cancelled:0,wasCancelled:false,skipped:0,message:''};
   }};
   const aNode={id:'a-node',name:'same',subscriptionId:'A'},bNode={id:'b-node',name:'same',subscriptionId:'B'};
   const page=Object.assign(new Page(),{subs:{subscriptions:[{id:'A'},{id:'B'}]},latencyRevisions:new Map(),
@@ -311,6 +404,38 @@ await test('the production flat-page entry splits profiles, reads scoped results
   assert.deepEqual(Array.from(rows,row=>row.node.id),['a-node','b-node']);
   for(let i=0;i<100;i++){page.latencyContext(aNode);page.latencyContext(bNode);}
   assert.equal(revisionReads,2,'row reads and sort comparators must not read/hash profile files');
+});
+
+await test('subscription panel stays open across Smart, member and leaf selection with mutually exclusive marks', async () => {
+  const source = read('components/SubscriptionSection.ets');
+  const names = ['selectSmart','selectPanelMember','selectNode','refreshSmartEntry'];
+  const methods = names.map(name => source.match(new RegExp(`^  private (?:async )?${name}\\([\\s\\S]*?^  }`,'m'))[0]);
+  const Panel = vm.runInContext(stripTypeScriptTypes(`(()=>{class Panel{${methods.join('\n')}}return Panel})()`,{mode:'transform'}),ctx);
+  let saved = new ctx.AppSettings(); saved.autoSelectMode = ctx.AutoSelectModes?.MANUAL ?? 'manual';
+  const modes = {AUTO:'auto',MANUAL:'manual'};
+  ctx.AutoSelectModes = modes;
+  const calls = [], storage = new Map();
+  ctx.TAG='selection-test';
+  const errors=[];ctx.AppLogger={...logger,warn(_tag,message){errors.push(message);}};
+  ctx.AppStorage = {get:key=>storage.get(key),setOrCreate:(key,value)=>storage.set(key,value)};
+  ctx.SettingsService = {async patchSettings(fn){fn(saved);},async load(){return Object.assign(new ctx.AppSettings(),saved);}};
+  const orch = {async selectSmartSubscription(id){saved.autoSelectMode=modes.AUTO;saved.preferredNodeSubscriptionId=id;calls.push(['smart',id]);return false;},
+    async reconnectWithNode(node){calls.push(['member',node.name]);return false;},async smartAvailableFor(){return true;},isSmartModelAvailable(){return true;}};
+  ctx.ConnectionOrchestrator = {instance:()=>orch};
+  const panel = Object.assign(new Panel(),{panelSubId:'A',showPanel:true,selectedGroup:'ROOT',selectingMember:'',
+    settings:saved,smartSelected:false,smartVisible:true,smartRefreshRevision:0,coreRevision:0,nodeRevision:0,
+    service:{nodesOf:()=>[]},toast(){},reload(){},closePanel(){throw Error('selection closed the panel');}});
+  const node = Object.assign(new ctx.ProxyNode(),{id:'core:leaf',name:'leaf',originalName:'leaf',subscriptionId:'A',proxyType:'Shadowsocks'});
+  await panel.selectSmart();
+  assert.equal(panel.showPanel,true);assert.equal(panel.selectedGroup,'ROOT');assert.equal(panel.smartSelected,true);
+  await panel.selectPanelMember({subscriptionId:'A',name:'ROOT',members:['leaf']},node);
+  assert.deepEqual(errors,[]);
+  assert.equal(panel.showPanel,true);assert.equal(panel.smartSelected,false);assert.equal(panel.currentNodeName,'leaf');
+  assert.equal(saved.autoSelectMode,modes.MANUAL);
+  await panel.selectSmart(); await panel.selectNode(node);
+  assert.equal(panel.showPanel,true);assert.equal(panel.smartSelected,false);assert.equal(panel.selectedGroup,'ROOT');
+  assert.equal(saved.preferredNodeName,'leaf');assert.equal(saved.autoSelectMode,modes.MANUAL);
+  assert.deepEqual(calls,[['smart','A'],['member','leaf'],['smart','A'],['member','leaf']]);
 });
 
 Service.cancelCurrent(); View.clearAll(); View.flushNow();

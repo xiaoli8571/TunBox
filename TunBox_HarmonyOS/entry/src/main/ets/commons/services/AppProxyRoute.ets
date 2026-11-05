@@ -30,6 +30,7 @@ export class AppProxyRoute {
   private static appliedPort: number = -1;
   /** setAppHttpProxy 成功不代表 mixed-port 已开始监听，单独记录探针结果。 */
   private static readyPort: number = -1;
+  private static generation: number = 0;
 
   /**
    * 指向本地内核 mixed 端口。`port <= 0` 视为无效，直接返回。
@@ -41,6 +42,7 @@ export class AppProxyRoute {
     if (AppProxyRoute.appliedPort === port) {
       return;
     }
+    AppProxyRoute.generation++;
     const proxy: connection.HttpProxy = {
       host: '127.0.0.1',
       port: port,
@@ -68,6 +70,7 @@ export class AppProxyRoute {
    * 请求一律直连，不再受残留配置影响。
    */
   static clear(): void {
+    AppProxyRoute.generation++;
     if (AppProxyRoute.appliedPort < 0) {
       return;
     }
@@ -81,6 +84,8 @@ export class AppProxyRoute {
     return AppProxyRoute.appliedPort;
   }
 
+  static revision(): number { return AppProxyRoute.generation; }
+
   /** 只有本地 mixed-port 已实际响应后，订阅请求才使用代理。 */
   static isReady(): boolean {
     return AppProxyRoute.appliedPort > 0 && AppProxyRoute.readyPort === AppProxyRoute.appliedPort;
@@ -92,6 +97,7 @@ export class AppProxyRoute {
    */
   static async waitUntilReady(timeoutMs: number = 4000): Promise<boolean> {
     const port = AppProxyRoute.appliedPort;
+    const generation = AppProxyRoute.generation;
     if (port <= 0) {
       return false;
     }
@@ -99,7 +105,8 @@ export class AppProxyRoute {
       return true;
     }
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && AppProxyRoute.appliedPort === port) {
+    while (Date.now() < deadline && AppProxyRoute.appliedPort === port
+      && generation === AppProxyRoute.generation) {
       const req = http.createHttp();
       try {
         const resp = await req.request(`http://127.0.0.1:${port}/version`, {
@@ -109,6 +116,7 @@ export class AppProxyRoute {
           usingCache: false,
           usingProxy: false
         });
+        if (generation !== AppProxyRoute.generation || AppProxyRoute.appliedPort !== port) { return false; }
         AppProxyRoute.readyPort = port;
         AppLogger.info(TAG, `mixed-port ready: 127.0.0.1:${port} (HTTP ${resp.responseCode})`);
         return true;
@@ -125,6 +133,6 @@ export class AppProxyRoute {
         setTimeout(() => resolve(), 150);
       });
     }
-    return AppProxyRoute.isReady();
+    return generation === AppProxyRoute.generation && AppProxyRoute.isReady();
   }
 }

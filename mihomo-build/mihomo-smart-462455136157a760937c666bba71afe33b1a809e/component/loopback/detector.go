@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"runtime"
 	"strconv"
 
 	"github.com/metacubex/mihomo/common/callback"
@@ -17,7 +18,9 @@ import (
 var disableLoopBackDetector, _ = strconv.ParseBool(os.Getenv("DISABLE_LOOPBACK_DETECTOR"))
 
 func init() {
-	if features.CMFA {
+	// Android supplies its own loop prevention. HarmonyOS must retain this
+	// second line of defence even when built with CMFA's controller features.
+	if features.CMFA && runtime.GOOS != "openharmony" {
 		disableLoopBackDetector = true
 	}
 }

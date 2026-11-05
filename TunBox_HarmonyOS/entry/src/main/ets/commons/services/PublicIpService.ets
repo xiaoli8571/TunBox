@@ -55,6 +55,7 @@ export enum IpQueryOutcome {
 
 /** 一次查询的完整结果（内部用；对外仍是 PublicIpInfo，保持调用方零改动）。 */
 class IpQueryResult {
+  proxyPort: number = 0;
   info: PublicIpInfo = PublicIpInfo.empty();
   outcome: IpQueryOutcome = IpQueryOutcome.NETWORK;
   /** 端点标识（ip-api / ipify），用于日志。 */
@@ -125,21 +126,36 @@ export class PublicIpService {
    *
    * @param trigger 触发来源（只用于日志定位：home-bootstrap / after-connect / retry …）
    */
-  static async query(trigger: string = 'unknown'): Promise<PublicIpInfo> {
-    const first = await PublicIpService.queryPrimary(trigger);
+  static async query(trigger: string = 'unknown', requireProxy: boolean = true,
+    isCurrent: () => boolean = (): boolean => true): Promise<PublicIpInfo> {
+    const revision = AppProxyRoute.revision();
+    const port = requireProxy ? AppProxyRoute.activePort() : 0;
+    const current = (): boolean => isCurrent() && revision === AppProxyRoute.revision();
+    if (!current()) { return PublicIpInfo.empty(); }
+    if (requireProxy && (port <= 0 || !await AppProxyRoute.waitUntilReady(1500))) {
+      AppLogger.warn(TAG, `ip query deferred: trigger=${trigger} proxy channel not ready`);
+      return PublicIpInfo.empty();
+    }
+    if (!current()) { return PublicIpInfo.empty(); }
+    const first = await PublicIpService.queryPrimary(trigger, port);
+    if (!current()) { return PublicIpInfo.empty(); }
     if (first.info.ip.length > 0) {
       return first.info;
     }
     // 网络类失败才重试：限流/内网地址重试只会加剧限流，且必定同样失败。
     if (first.outcome === IpQueryOutcome.NETWORK) {
       await PublicIpService.delay(RETRY_DELAY_MS);
-      const retry = await PublicIpService.queryPrimary(`${trigger}/retry`);
+      if (!current()) { return PublicIpInfo.empty(); }
+      const retry = await PublicIpService.queryPrimary(`${trigger}/retry`, port);
+      if (!current()) { return PublicIpInfo.empty(); }
       if (retry.info.ip.length > 0) {
         return retry.info;
       }
     }
     // 备用端点：只保证「有 IP 可显示」，不带国家/城市/ISP。
-    const fallback = await PublicIpService.queryFallback(trigger);
+    if (!current()) { return PublicIpInfo.empty(); }
+    const fallback = await PublicIpService.queryFallback(trigger, port);
+    if (!current()) { return PublicIpInfo.empty(); }
     if (fallback.info.ip.length > 0) {
       return fallback.info;
     }
@@ -150,8 +166,9 @@ export class PublicIpService {
   }
 
   /** 主端点：ip-api（免费版仅 HTTP；HTTPS 是付费 pro 端点，实测 403）。 */
-  private static async queryPrimary(trigger: string): Promise<IpQueryResult> {
+  private static async queryPrimary(trigger: string, proxyPort: number): Promise<IpQueryResult> {
     const result = new IpQueryResult();
+    result.proxyPort = proxyPort;
     result.endpoint = 'ip-api';
     const t0 = Date.now();
     const req = http.createHttp();
@@ -162,7 +179,7 @@ export class PublicIpService {
         readTimeout: READ_TIMEOUT_MS,
         usingCache: false,
         // 出口 IP 必须经由隧道查询，否则拿到的是本机物理出口（或直接失败）
-        usingProxy: AppProxyRoute.isReady()
+        usingProxy: PublicIpService.proxyOption(proxyPort)
       });
       result.elapsedMs = Date.now() - t0;
       if (resp.responseCode !== 200) {
@@ -223,8 +240,9 @@ export class PublicIpService {
   }
 
   /** 备用端点：ipify（HTTPS，只返回 IP）。与桌面卡片同源，已在真机长期可用。 */
-  private static async queryFallback(trigger: string): Promise<IpQueryResult> {
+  private static async queryFallback(trigger: string, proxyPort: number): Promise<IpQueryResult> {
     const result = new IpQueryResult();
+    result.proxyPort = proxyPort;
     result.endpoint = 'ipify';
     const t0 = Date.now();
     const req = http.createHttp();
@@ -235,7 +253,7 @@ export class PublicIpService {
         readTimeout: READ_TIMEOUT_MS,
         usingCache: false,
         // 出口 IP 必须经由隧道查询，否则拿到的是本机物理出口（或直接失败）
-        usingProxy: AppProxyRoute.isReady()
+        usingProxy: PublicIpService.proxyOption(proxyPort)
       });
       result.elapsedMs = Date.now() - t0;
       if (resp.responseCode !== 200) {
@@ -306,12 +324,19 @@ export class PublicIpService {
   private static log(trigger: string, result: IpQueryResult, detail: string): void {
     const tail = detail.length > 0 ? ` ${detail}` : '';
     const line = `ip query: trigger=${trigger} endpoint=${result.endpoint} `
-      + `outcome=${result.outcome} elapsed=${result.elapsedMs}ms${tail}`;
+      + `outcome=${result.outcome} elapsed=${result.elapsedMs}ms `
+      + `route=${result.proxyPort > 0 ? 'proxy:' + result.proxyPort : 'direct'}${tail}`;
     if (result.outcome === IpQueryOutcome.OK) {
       AppLogger.info(TAG, line);
     } else {
       AppLogger.warn(TAG, line);
     }
+  }
+
+  /** 每次查询固定路由，重试/备用端点也不能随全局状态变化退回直连。 */
+  private static proxyOption(port: number): boolean | http.HttpProxy {
+    if (port <= 0) { return false; }
+    return { host: '127.0.0.1', port: port, exclusionList: [] };
   }
 
   private static delay(ms: number): Promise<void> {

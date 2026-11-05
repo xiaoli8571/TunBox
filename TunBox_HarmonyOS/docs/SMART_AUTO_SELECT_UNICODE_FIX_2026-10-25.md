@@ -88,7 +88,7 @@ proxy-groups:
 清理构建 `clean assembleHap` BUILD SUCCESSFUL。
 
 既有失败（与本修复无关，`git stash` 基线复现同样 6 项）：
-`verify-flclash-profile` / `verify-generator-fingerprint` / `verify-latency-concurrency` /
+`verify-tunbox-profile` / `verify-generator-fingerprint` / `verify-latency-concurrency` /
 `verify-latency-engine-runtime` / `verify-review-runtime` / `verify-sub-parse-fidelity`。
 
 ## 教训

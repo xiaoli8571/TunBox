@@ -1,66 +1,9 @@
 #!/usr/bin/env node
 /**
- * 测速通道预热 / 秒开 —— 结构不变量闸门（2026-10-20）
- *
- * ## 守的是什么
- *
- * 「测速通道预热 / 秒开」整改的**结构**不变量：预热必须发生在**内核启动路径**里，
- * 而不是散落在调用方；停扩展之后**只在扩展真的在跑时**才等；真实连接前必须**先拆
- * 测速核**再停 VPN 扩展；预热完必须**挂回收**，不许留下常驻内核进程。
- *
- * 这些都是「结构」而不是「数值」——所以本闸门读源码结构（方法体、子句位置），
- * 不跑真机、不连内核。
- *
- * ## 逐条锁死的断言
- *
- *   A1  ensureLatencyApi() 里**不得**有固定 1500ms 的 setTimeout 睡眠，
- *       且**必须**调用「预热等待 helper」（形如 awaitTestCoreWarmup）
- *   A2  预热常量（TEST_CORE_WARMUP_MS 之类）≥ 1000ms，且在**启动路径**
- *       （launchTestCore）里被用于登记 testCoreWarmAt
- *   A2b 预热等待 helper 内部按**剩余时间**计算（到期时刻 - Date.now()），
- *       且 setTimeout 的延迟参数就是那个变量（不是字面量常量）
- *   A2c 启动路径里不做 ≥1000ms 的真实 sleep（会把 SingleFlightTestCore 的
- *       15s 启动超时上限顶高 → 本来能成功的启动被判超时 → 白拆一次再重启）
- *   A3  launchTestCore() 里先停扩展
- *   A4  launchTestCore() 里「停扩展之后**只在扩展真的在跑时**才等」：
- *       存在 if 包裹的 setTimeout，且延迟 ≥ 400ms
- *   A5  上述条件等待的 if 条件引用了一个「扩展之前是否在跑」的布尔量
- *   A6  connect() 路径里 stopTestCore() **早于** stopVpnExtensionAbility()
- *   A7  存在公开的「预热通道」入口方法（名字含 prewarm），且它调用 ensureLatencyApi
- *   A8  预热入口（直接或其调用的方法）挂 scheduleTestCoreRecycle（不许留常驻内核）
- *   A9  BackgroundLatencyService 里有名字含 prewarm 的静态方法
- *   A10 SubscriptionPage / NodeSelectionPage 至少一个页面有预热调用
- *   A11 SubscriptionPage 有「准备…通道」的用户可见提示文案（UI 提示落地后适用）
- *   A12 resetTestCoreChannelState() 里把预热到期时刻清零
- *
- * ## 预热窗口的新设计（2026-10-20 整改后的口径）
- *
- *   预热窗口是**内核的属性**，不是调用方的固定等待：
- *     · 启动路径（launchTestCore）只**登记** `testCoreWarmAt = now + WARMUP_MS`，
- *       不 sleep（sleep 会顶高 15s 启动超时上限）；
- *     · 调用方（ensureLatencyApi）走 `awaitTestCoreWarmup()`，按
- *       `warmAt - Date.now()` 的**剩余**时间等：新鲜启动等满（与旧实现同长），
- *       复用已在服务的内核 → 窗口早已过去 → 一句都不等 → 秒开。
- *
- * ## 已知陷阱（本脚本已处理）
- *
- *   · **必须先剥注释再匹配**：这些文件里到处是解释性注释，例如 ensureLatencyApi
- *     上方就写着「等 ~1500ms 再放行」——不剥注释会命中注释造成假阳性；
- *     反过来，Lead 改完后注释里仍可能保留「1500」字样而代码里已经没有了，
- *     那会造成假阴性。故所有断言都在**剥掉注释**的视图上做。
- *   · **Windows CRLF**：读入后统一 `replace(/\r\n/g, '\n')`，否则跨行断言假阴性。
- *   · **两个视图、偏移对齐**：
- *       `code` 视图 = 剥注释 + **抹掉字符串/模板字面量内容**（结构断言用：
- *         数字、标识符、括号结构都在里面，字符串里的 `{` `}` 不会骗过花括号配对）；
- *       `lit`  视图 = 只剥注释（**保留**字符串内容，文案断言用：
- *         「准备测速通道」这种提示语必须能在字面量里找到）。
- *     两个视图长度与偏移完全一致，可以互相切片。
- *
- * 用法:
- *   node scripts/verify-latency-warmup.mjs
- *   node scripts/verify-latency-warmup.mjs --root <另一个工程根>   （负对照）
- *
- * 退出码: 0 = 全部断言通过；1 = 有断言失败
+ * 测速启动结构门禁：controller 通过本次凭证验证即可放行 TCP 测速，
+ * 不再保留旧 HTTP 连接池的固定 1 秒补偿。
+ * 保留停旧扩展、真实连接前回收测速核、空闲回收与页面反馈检查。
+ * 行为回归在 verify-latency-startup-runtime.mjs 中执行生产方法。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -401,20 +344,6 @@ const node = buildViews(nodeRaw);
 const orchConsts = collectNumericConsts(orch.code);
 const orchMethods = collectMethods(orch.code);
 
-// ── 预热相关的结构定位（A1/A2/A2b/A2c/A12 共用） ─────────────────────
-//  · 预热窗口常量：名字里带 warm 的**文件级数值常量**（如 TEST_CORE_WARMUP_MS = 1500）
-const warmConsts = [...orchConsts.entries()].filter(([k]) => /warm/i.test(k));
-//  · 预热等待 helper：名字里带 warm 且**内部真的会等**（含 setTimeout）的方法。
-//    这样 prewarmLatencyChannel 这种「只登记、不等待」的方法不会被误当成 helper。
-const warmWaitMethods = orchMethods.filter((m) =>
-  /warm/i.test(m.name) && /\bsetTimeout[ \t]*\(/.test(m.body));
-//  · 预热到期时刻字段的赋值：this.testCoreWarmAt = <表达式>;
-const WARM_AT_FIELD_RE = /(?:this\.)?([A-Za-z_$][\w$]*[Ww]armAt)[ \t]*=[ \t]*([^;]+);/g;
-//  · 「剩余时间」计算：const waitMs = warmAt - Date.now();
-const REMAINING_DIFF_RE = new RegExp(
-  '(?:const|let|var)[ \\t]+([A-Za-z_$][\\w$]*)[ \\t]*(?::[ \\t]*number[ \\t]*)?'
-  + '=[ \\t]*([A-Za-z_$][\\w$]*)[ \\t]*-[ \\t]*Date\\.now\\(\\)[ \\t]*;', 'g');
-
 console.log('===== 测速通道预热 / 秒开 —— 结构不变量闸门 =====');
 console.log(`ConnectionOrchestrator      : ${ORCH}`);
 console.log(`BackgroundLatencyService   : ${BG}`);
@@ -422,104 +351,17 @@ console.log(`NodeSelectionPage (subscription replacement): ${SUB_PAGE}`);
 console.log(`NodeSelectionPage           : ${NODE_PAGE}`);
 console.log('-----------------------------------------');
 
-// ═══════════════════════════════════════════════════════════════════════
-// A1 ensureLatencyApi() 不再有固定 1500ms 睡眠，且改为调用「预热等待 helper」
-//
-//   设计（2026-10-20 整改）：预热窗口是**内核的属性**（testCoreWarmAt），
-//   不是调用方的固定等待 ——
-//     · 启动路径只**登记**「预计何时变热」，不 sleep（sleep 会顶高
-//       SingleFlightTestCore 的 15s 启动超时上限）；
-//     · 调用方按「剩余窗口」等：新鲜启动等满（与旧实现同长），
-//       复用已在服务的内核 → 窗口早已过去 → 一句都不等 → 秒开。
-//   所以 ensureLatencyApi 里既不能有 1500 字面量，也必须有 helper 调用。
-// ═══════════════════════════════════════════════════════════════════════
-console.log('[A1] ensureLatencyApi() 无固定 1500ms 睡眠，且调用预热等待 helper');
-{
-  const m = methodBody(orch.code, /\basync[ \t]+ensureLatencyApi[ \t]*\(/);
-  ok('a1.ensureLatencyApi-found', m !== null,
-    '找不到 ConnectionOrchestrator.ensureLatencyApi()');
-  const body = m ? m.text : '';
-  const hit = /\b1500\b/.exec(body);
-  ok('a1.no-1500-sleep', m !== null && hit === null,
-    hit
-      ? `ensureLatencyApi() 方法体里仍出现 1500（偏移 ${hit.index}）`
-        + '—— 预热等待必须走 helper，不能在调用方硬睡固定窗口'
-      : '找不到 ensureLatencyApi()');
-  // 「固定的 1500ms 预热睡眠」= 一个延迟解析出来正好是 1500 的 setTimeout
-  // （字面量 1500 或指向 1500 的常量都算）。
-  const sleeps = m ? collectSetTimeouts(m.text, orchConsts) : [];
-  const badSleep = sleeps.filter((t) => t.delay === 1500);
-  ok('a1.no-1500-settimeout', m !== null && badSleep.length === 0,
-    badSleep.length > 0
-      ? `ensureLatencyApi() 里仍有延迟 1500ms 的预热睡眠（表达式: ${badSleep.map((t) => t.expr).join(', ')}）`
-      : '找不到 ensureLatencyApi()');
-  // 预热等待 helper：名字含 warm 且**内部真的会等**（含 setTimeout）。
-  const called = warmWaitMethods.filter((w) =>
-    new RegExp(`\\b${w.name}[ \\t]*\\(`).test(body));
-  ok('a1.calls-warmup-helper', m !== null && called.length > 0,
-    'ensureLatencyApi() 里没有调用「预热等待 helper」'
-    + `（形如 awaitTestCoreWarmup()；候选: ${warmWaitMethods.map((w) => w.name).join(', ') || '无'}）`);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// A2 预热常量 ≥ 1000ms，且在**启动路径**里被用于登记 testCoreWarmAt
-// ═══════════════════════════════════════════════════════════════════════
-console.log('[A2] 预热常量 ≥1000ms，并在启动路径里登记 testCoreWarmAt');
-let launchBody = '';
-{
-  const bigWarm = warmConsts.filter(([, v]) => v >= 1000);
-  ok('a2.warmup-const-ge-1000', bigWarm.length > 0,
-    '找不到 ≥1000ms 的预热常量（名字含 warm 的文件级数值常量: '
-    + `${warmConsts.map(([k, v]) => `${k}=${v}`).join(', ') || '无'}）`);
-
-  const m = methodBody(orch.code, /\bprivate[ \t]+async[ \t]+launchTestCore[ \t]*\(/);
-  ok('a2.launchTestCore-found', m !== null,
-    '找不到 ConnectionOrchestrator.launchTestCore()');
-  launchBody = m ? m.text : '';
-  const assigns = [...launchBody.matchAll(WARM_AT_FIELD_RE)];
-  const good = assigns.filter(([, , rhs]) =>
-    bigWarm.some(([name]) => rhs.includes(name)));
-  ok('a2.warm-at-registered-in-launch', m !== null && good.length > 0,
-    m === null
-      ? '找不到 launchTestCore()'
-      : 'launchTestCore() 里没有「用预热常量登记预热到期时刻」的赋值'
-        + `（期望形如 this.testCoreWarmAt = Date.now() + TEST_CORE_WARMUP_MS;；`
-        + `实测赋值: ${assigns.map((a) => a[0].trim()).join(' | ') || '无'}）`);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// A2b 预热等待 helper 必须按**剩余时间**计算
-//   helper 里要有「到期时刻 - Date.now()」的差值，并且 setTimeout 的延迟参数
-//   就是那个差值变量（不是字面量常量、不是常量名）。
-// ═══════════════════════════════════════════════════════════════════════
-console.log('[A2b] 预热等待 helper 按剩余时间计算，setTimeout 用的是那个变量');
-{
-  ok('a2b.helper-exists', warmWaitMethods.length > 0,
-    '找不到「预热等待 helper」（名字含 warm 且内部含 setTimeout 的方法，'
-    + '形如 awaitTestCoreWarmup / waitTestCoreWarmup）');
-  let diff = null;
-  for (const w of warmWaitMethods) {
-    const diffs = [...w.body.matchAll(REMAINING_DIFF_RE)]
-      .filter(([, , left]) => /warm/i.test(left));
-    if (diffs.length > 0) {
-      diff = { helper: w, resultVar: diffs[0][1], leftVar: diffs[0][2] };
-      break;
-    }
-  }
-  ok('a2b.remaining-time-calc', diff !== null,
-    '预热等待 helper 里没有「到期时刻 - Date.now()」的剩余时间计算');
-  if (diff) {
-    const timeouts = collectSetTimeouts(diff.helper.body, orchConsts);
-    const used = timeouts.filter((t) => t.expr === diff.resultVar);
-    ok('a2b.settimeout-uses-remaining-var', used.length > 0,
-      `预热等待 helper「${diff.helper.name}」的 setTimeout 延迟参数不是剩余时间变量`
-      + `「${diff.resultVar}」（实测延迟表达式: `
-      + `${timeouts.map((t) => t.expr || '<无>').join(' | ') || '无 setTimeout'}）`);
-  } else {
-    ok('a2b.settimeout-uses-remaining-var', false,
-      'A2b 上一条已失败（找不到剩余时间计算）');
-  }
-}
+// Authenticated readiness replaces fixed warm-up windows.
+const launchMethod = methodBody(orch.code, /\bprivate[ \t]+async[ \t]+launchTestCore[ \t]*\(/);
+let launchBody = launchMethod ? launchMethod.text : '';
+const channelMethod = methodBody(orch.code, /\basync[ \t]+ensureLatencyApi[ \t]*\(/);
+ok('a1.channel-has-no-sleep', channelMethod !== null
+  && !/\bsetTimeout\s*\(/.test(channelMethod.text));
+ok('a1.no-fixed-warmup', !/testCoreWarmAt|awaitTestCoreWarmup|TEST_CORE_WARMUP_MS/.test(orch.code));
+ok('a2.authenticated-readiness', launchMethod !== null
+  && /probeController\s*\(/.test(launchBody) && /probe\.secretAccepted/.test(launchBody));
+ok('a2.foreign-controller-rejected', /probe\.httpCode\s*===\s*401/.test(launchBody)
+  && /probe\.httpCode\s*===\s*403/.test(launchBody));
 
 // ═══════════════════════════════════════════════════════════════════════
 // A2c 启动路径里不做真实 sleep
@@ -689,24 +531,12 @@ console.log('[A11] NodeSelectionPage 有「准备…通道」的用户可见提�
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// A12 通道状态复位时必须清掉「预热到期时刻」
-//   不清零的话：上一次启动登记的到期时刻会被下一次复用「继承」——
-//   明明内核早就热了，却还要按旧时刻再等一次（又变成白等）。
-// ═══════════════════════════════════════════════════════════════════════
-console.log('[A12] resetTestCoreChannelState() 清零预热到期时刻');
-{
-  const m = methodBody(orch.code,
-    /^[ \t]*(?:(?:public|private|protected)[ \t]+)?(?:static[ \t]+)?(?:async[ \t]+)?resetTestCoreChannelState[ \t]*\(/m);
-  ok('a12.reset-method-found', m !== null,
-    '找不到 ConnectionOrchestrator.resetTestCoreChannelState()');
-  const body = m ? m.text : '';
-  const cleared = /(?:this\.)?([A-Za-z_$][\w$]*[Ww]armAt)[ \t]*=[ \t]*0[ \t]*;/.test(body);
-  ok('a12.warm-at-cleared', m !== null && cleared,
-    m === null
-      ? '找不到 resetTestCoreChannelState()'
-      : 'resetTestCoreChannelState() 里没有把预热到期时刻清零（形如 this.testCoreWarmAt = 0;）');
-}
+// Reset must discard the old controller credentials and stale profile stamp.
+const reset = methodBody(orch.code, /\bresetTestCoreChannelState\s*\(/);
+ok('a12.reset-clears-channel-ownership', reset !== null
+  && /this\.testCoreSecret\s*=/.test(reset.text)
+  && /this\.testCoreNodeFingerprint\s*=/.test(reset.text)
+  && /this\.api\.setEndpoint/.test(reset.text));
 
 // ── 汇总 ──────────────────────────────────────────────────────────────
 console.log('-----------------------------------------');

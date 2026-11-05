@@ -10,9 +10,16 @@ import (
 	RC "github.com/metacubex/mihomo/rules/common"
 )
 
-// PrepareProfile resolves YAML aliases in the complete document before any
-// sections are moved. It validates outbound definitions without applying a
-// configuration, opening listeners, or initializing/downloading providers.
+// PrepareProfile resolves YAML aliases in the complete document and validates
+// outbound/provider/rule references without applying a configuration, opening
+// listeners, or initializing/downloading providers.
+//
+// 2026-11-05（FlClash 全量照抄）：**合成组注入已删除**。此前本函数会在 profile
+// 只有 proxies 没有 proxy-groups 时就地补「手动选择/自动选择 + MATCH,手动选择」
+// —— 那是 App 自造的节点准入推断。FlClash 对这类 profile 的处理就是原样交给
+// mihomo（GLOBAL 组兜底、无规则时按内核自身语义路由），App 不补组、不改名、
+// 不推断。profile 文件存原文（不再经本函数归一化后落盘），本函数只剩
+// 「锚点展开 + 校验」一个职责，供 App 侧预览解析继续使用。
 func PrepareProfile(content []byte) ([]byte, error) {
 	if len(content) == 0 || len(content) > 8*1024*1024 {
 		return nil, fmt.Errorf("profile size out of range")
@@ -25,26 +32,6 @@ func PrepareProfile(content []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(raw.Proxy) == 0 && len(raw.ProxyProvider) == 0 && len(raw.ProxyGroup) == 0 {
-		return nil, fmt.Errorf("profile has no proxies, proxy-groups or proxy-providers")
-	}
-	if len(raw.ProxyGroup) == 0 && len(raw.Proxy) > 0 && len(raw.ProxyProvider) == 0 {
-		names := make([]string, 0, len(raw.Proxy))
-		for _, proxy := range raw.Proxy {
-			name, ok := proxy["name"].(string)
-			if !ok || name == "" {
-				return nil, fmt.Errorf("proxy has no name")
-			}
-			names = append(names, name)
-		}
-		document["proxy-groups"] = []map[string]any{
-			{"name": "手动选择", "type": "select", "proxies": append(append([]string{}, names...), "DIRECT")},
-			{"name": "自动选择", "type": "url-test", "interval": 300, "tolerance": 50, "proxies": names},
-		}
-		if len(raw.Rule) == 0 {
-			document["rules"] = []string{"MATCH,手动选择"}
-		}
-	}
 	normalized, err := yaml.Marshal(document)
 	if err != nil {
 		return nil, err
@@ -53,10 +40,7 @@ func PrepareProfile(content []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(raw.Proxy) > 2000 {
-		return nil, fmt.Errorf("profile exceeds 2000 static proxies")
-	}
-	proxies, _, err := parseProxies(raw)
+	proxies, _, err := parseProxiesWithMode(raw, true)
 	if err != nil {
 		return nil, err
 	}

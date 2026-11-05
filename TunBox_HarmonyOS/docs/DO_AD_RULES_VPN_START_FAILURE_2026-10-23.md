@@ -51,7 +51,7 @@ base = removeKey(base, 'rule-providers');   // ← overlay 的 hyper-adrules / r
 
 ## 3. 修复
 
-`entry/src/main/ets/commons/flclash/ProfileConfigMerger.ets`
+`entry/src/main/ets/commons/tunbox/ProfileConfigMerger.ets`
 
 - 新增 `PROVIDER_MERGE_KEYS = ['proxy-providers', 'rule-providers']`；
 - provider 段不再走「整段替换」：

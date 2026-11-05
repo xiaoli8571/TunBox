@@ -26,7 +26,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
-const src = path.join(root, 'entry/src/main/ets/commons/flclash/CoreCatalog.ets');
+const src = path.join(root, 'entry/src/main/ets/commons/tunbox/CoreCatalog.ets');
 
 let passed = 0;
 const failures = [];

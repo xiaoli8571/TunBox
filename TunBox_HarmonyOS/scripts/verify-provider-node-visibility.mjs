@@ -16,6 +16,9 @@ const nodePage = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/pages/NodeSelectionPage.ets'), 'utf8').replace(/\r\n/g, '\n');
 const section = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/components/SubscriptionSection.ets'), 'utf8').replace(/\r\n/g, '\n');
+// 2026-11-04：节点真源收口到 NodeTruth（判定点单一化），归属校验搬到了它里面。
+const nodeTruth = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/tunbox/NodeTruth.ets'), 'utf8').replace(/\r\n/g, '\n');
 
 let passed = 0;
 let failed = 0;
@@ -29,13 +32,15 @@ function check(name, condition) {
   }
 }
 
-check('节点页以本地节点为基线并合入内核目录',
+check('节点页以内核为唯一真源（NodeTruth），不再把 App 本地表当基线合并',
   nodePage.includes('private displayNodes(): ProxyNode[]')
-    && nodePage.includes('const out: ProxyNode[] = this.subs.nodes.slice();')
-    && nodePage.includes("CoreCatalogService.flattenNodes('rule')")
-    && nodePage.includes('CoreNodeBridge.toProxyNode(coreNode, profileId)'));
-check('节点页严格校验 CoreCatalog 的 profile 归属戳',
-  nodePage.includes('CoreCatalogService.profileIdOfSnapshot() !== profileId'));
+    && nodePage.includes('const truth: NodeTruthScope = NodeTruth.scope(appliedId);')
+    && nodePage.includes("NodeTruth.leaves(truth, 'rule', excluded)")
+    && nodePage.includes('CoreNodeBridge.toProxyNodes(')
+    && !nodePage.includes('this.subs.nodes.slice()'));
+check('节点页严格校验内核快照的 profile 归属',
+  nodeTruth.includes('out.snapshotProfileId === profileId')
+    && nodePage.includes('NodeTruth.appliedProfileId('));
 check('节点列表不再只遍历 subs.nodes',
   nodePage.includes('for (const n of this.displayNodes())'));
 check('provider 运行期成员不会被空的本地组视图遮住',
@@ -47,7 +52,7 @@ check('未连接时会预热内核并刷新 provider 目录',
     && nodePage.includes('CoreCatalogService.refresh(this.orchestrator.api, true, profileId)'));
 check('provider 影子节点可选中但不能本地删除',
   nodePage.includes("await this.orchestrator.reconnectWithNode(node, this.subs, 'preferredNode=' + node.id)")
-    && nodePage.includes('row.isSmart === true || CoreNodeBridge.isShadow(row.node)'));
+    && /if \(CoreNodeBridge\.isShadow\(row\.node\)\) \{\s*return;\s*\}\s*\/\/[^\n]*\n\s*this\.enterSelectMode\(row\.node\.id\)/.test(nodePage));
 check('主页面板仅在归属匹配时接受空本地表的内核节点',
   section.includes('localNodes.length === 0 && !this.coreCatalogFor(this.panelSubId)')
     && section.includes('ProxyPanelMembers.coreProxies(core)')

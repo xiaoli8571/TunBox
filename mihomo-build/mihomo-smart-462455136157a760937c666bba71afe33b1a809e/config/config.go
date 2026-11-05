@@ -897,6 +897,11 @@ func parseTLS(cfg *RawConfig) (*TLS, error) {
 }
 
 func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
+	return parseProxiesWithMode(cfg, false)
+}
+
+// Validation uses the runtime decoder and reference checks without starting Smart resources.
+func parseProxiesWithMode(cfg *RawConfig, validateOnly bool) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
 	proxies = make(map[string]C.Proxy)
 	providersMap = make(map[string]P.ProxyProvider)
 	proxiesConfig := cfg.Proxy
@@ -970,7 +975,11 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 
 	// parse proxy group
 	for idx, mapping := range groupsConfig {
-		group, err := outboundgroup.ParseProxyGroup(mapping, proxies, providersMap, AllProxies, AllProviders)
+		parseGroup := outboundgroup.ParseProxyGroup
+		if validateOnly {
+			parseGroup = outboundgroup.ParseProxyGroupForValidation
+		}
+		group, err := parseGroup(mapping, proxies, providersMap, AllProxies, AllProviders)
 		if err != nil {
 			return nil, nil, fmt.Errorf("proxy group[%d]: %w", idx, err)
 		}

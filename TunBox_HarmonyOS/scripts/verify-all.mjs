@@ -54,7 +54,7 @@ const KNOWN_BASELINE_FAILURES = {
 /** 需要额外参数的脚本：给它们准备好参数，否则它们会因为"用法错误"失败。 */
 const ARG_BUILDERS = {
   'verify-shipped-dns-fix.mjs': (hap) => (hap === null ? null : [hap]),
-  'verify-flclash-profile.mjs': (_hap, args) => (args.strict ? ['--require-mihomo'] : []),
+  'verify-tunbox-profile.mjs': (_hap, args) => (args.strict ? ['--require-mihomo'] : []),
   'verify-latency-core-v2.mjs': (_hap, args) => (args.strict ? ['--arkts'] : []),
   // 抓包路径通过环境变量由子门禁接收；缺文件仍明确 SKIP，不伪造验收数据。
   'verify-smart-active-chains.mjs': () => []

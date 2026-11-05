@@ -20,7 +20,7 @@
  *
  * 【源码层】
  *   A1  ClashConfigGenerator.generate( 在 entry/src 下**只出现一次**，且在 RuntimeConfigBuilder.ets
- *   A2  四个决策点各只有**一处**决策（useSmart / ruleProviderReady / selectedNode / useGeoip）
+ *   A2  三个运行选项各只有**一处**决策（ruleProviderReady / selectedNode / useGeoip）
  *   A3  DoHResolver.refreshStale( 全仓**只在一处**调（且在 RuntimeConfigBuilder.ets）
  *   A4  RuntimeConfigBuilder 不持有/不回写任何共享端口状态（审计 F1：测速核端口探测
  *       曾经写回 this.apiPort/mixedPort/dnsPort）
@@ -34,7 +34,7 @@
  *
  * 【负对照（闸门自证有牙）】
  *   C1  静态：人为再加一处 generate( 调用 → 静态检查必须判红
- *   C2  运行：让 test mode 走**不同的 useSmart** → 差异检查必须判红
+ *   C2  运行：让 test mode 走**不同的代理模式** → 差异检查必须判红
  *
  * 跑法：node scripts/verify-config-single-source.mjs
  * 退出码 0 = 全绿。
@@ -215,9 +215,8 @@ ok(testHits.every((h) => h.file.includes('/test/')),
   `A1c 测试模块的 generate( 调用只在测试目录（${testHits.length} 处，不计入 A1）`,
   testHits.filter((h) => !h.file.includes('/test/')).map((h) => `${h.file}:${h.line}`).join('\n       '));
 
-// A2：四个决策点各只有一处决策
+// A2：Smart 完全由 profile 声明；其余运行选项仍只有一个决策点。
 const DECISIONS = [
-  { name: 'useSmart', pattern: /const\s+useSmart\s*=/ },
   { name: 'ruleProviderReady', pattern: /const\s+ruleProviderReady\s*=/ },
   { name: 'selectedNode', pattern: /const\s+selectedNode\s*=/ },
   { name: 'useGeoip', pattern: /const\s+useGeoip\s*=/ },
@@ -321,7 +320,10 @@ transpile('commons/config/RuntimeConfigBuilder.ets', 'RuntimeConfigBuilder.ts', 
   '../services/VpnRecoveryPolicy': './VpnRecoveryPolicy.ts',
   '../utils/AppLogger': './stubs.ts',
   // 2026-10-22（FlClash 同构）：overlay + 订阅原文合并
-  '../flclash/ProfileConfigMerger': './ProfileConfigMerger.ts',
+  '../tunbox/ProfileConfigMerger': './ProfileConfigMerger.ts',
+  // 2026-11-05（FlClash 全量照抄）：map 级构建器（compose 为纯函数）+ profile 仓库
+  '../tunbox/TunBoxProfileBuilder': './TunBoxProfileBuilder.ts',
+  '../tunbox/ProfileRepository': './ProfileStore.ts',
   // 2026-10-25：smart 组注入需要测速地址真源（ND06 只有一处规则）
   '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
 });
@@ -371,6 +373,260 @@ const { RuntimeConfigBuilder, RuntimeConfigMode, RuntimeConfigProfile } =
   await import(G('RuntimeConfigBuilder.ts'));
 const { AppSettings } = await import(G('AppSettings.ts'));
 const { ProxyNode } = await import(G('ProxyNode.ts'));
+const { coreBridge } = await import(G('stubs.ts'));
+
+// ── 2.5 沙箱内核桥（2026-11-05 FlClash 全量照抄）───────────────────────────
+// 生产链路：getProfileBase（内核解析 profile 文件）+ decodeYaml（内核 YAML 解码）。
+// Node 门禁没有内核与 YAML 库 —— 这里用「受控子集」mini-YAML 解析器承接：
+// 只解析**本门禁自造的 fixture 与生成器输出**（块/流式 map+list、引号标量、数字/布尔）。
+// 超出子集的输入立即抛错（不静默）。
+function miniScalar(raw) {
+  const t = raw.trim();
+  if (t.length === 0 || t === '~' || t === 'null') return null;
+  if (t === 'true' || t === 'True' || t === 'TRUE') return true;
+  if (t === 'false' || t === 'False' || t === 'FALSE') return false;
+  if (/^-?\d+$/.test(t)) return parseInt(t, 10);
+  if (/^-?\d+\.\d+$/.test(t)) return parseFloat(t);
+  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1).replace(/''/g, "'");
+  }
+  return t;
+}
+
+function splitFlow(body) {
+  const items = [];
+  let depth = 0, quote = null, cur = '';
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote !== null) {
+      cur += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue; }
+    if (ch === '[' || ch === '{') depth++;
+    if (ch === ']' || ch === '}') depth--;
+    if (ch === ',' && depth === 0) { items.push(cur.trim()); cur = ''; continue; }
+    cur += ch;
+  }
+  if (cur.trim().length > 0) items.push(cur.trim());
+  return items;
+}
+
+function parseFlow(text) {
+  const t = text.trim();
+  if (t.startsWith('[')) {
+    if (t === '[]') return [];
+    return splitFlow(t.slice(1, -1)).map((x) => (x.startsWith('{') ? parseFlow(x) : miniScalar(x)));
+  }
+  if (t.startsWith('{')) {
+    const out = {};
+    if (t === '{}') return out;
+    for (const item of splitFlow(t.slice(1, -1))) {
+      const idx = item.indexOf(':');
+      if (idx < 0) throw new Error(`mini-yaml: flow map item missing colon: ${item}`);
+      out[miniScalar(item.slice(0, idx))] = parseFlow(item.slice(idx + 1));
+    }
+    return out;
+  }
+  return miniScalar(t);
+}
+
+function miniYamlParse(text) {
+  const lines = text.replace(/\r/g, '').split('\n')
+    .filter((l) => l.trim().length > 0 && !l.trim().startsWith('#'));
+  let i = 0;
+  const indentOf = (l) => l.length - l.trimStart().length;
+
+  function findColon(t) {
+    let quote = null;
+    for (let k = 0; k < t.length; k++) {
+      const ch = t[k];
+      if (quote !== null) { if (ch === quote) quote = null; continue; }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === ':' && (k + 1 === t.length || t[k + 1] === ' ')) return k;
+    }
+    return t.endsWith(':') ? t.length - 1 : -1;
+  }
+
+  function parseBlock(indent) {
+    if (i >= lines.length) return null;
+    if (lines[i].trimStart().startsWith('- ')) return parseList(indent);
+    return parseMap(indent);
+  }
+
+  function parseMap(indent) {
+    const out = {};
+    while (i < lines.length) {
+      const line = lines[i];
+      const ind = indentOf(line);
+      if (ind < indent) break;
+      if (ind > indent) throw new Error(`mini-yaml: bad indent: ${line}`);
+      if (line.trimStart().startsWith('- ')) break;
+      const t = line.trim();
+      const idx = findColon(t);
+      if (idx < 0) throw new Error(`mini-yaml: map line missing colon: ${t}`);
+      const key = miniScalar(t.slice(0, idx));
+      const rest = t.slice(idx + 1).trim();
+      i++;
+      if (rest.length === 0) {
+        const childIndent = i < lines.length ? indentOf(lines[i]) : indent + 2;
+        out[key] = parseBlock(childIndent > indent ? childIndent : indent + 2);
+      } else {
+        out[key] = parseFlow(rest);
+      }
+    }
+    return out;
+  }
+
+  function parseList(indent) {
+    const out = [];
+    while (i < lines.length) {
+      const line = lines[i];
+      const ind = indentOf(line);
+      if (ind < indent || !line.trimStart().startsWith('- ')) break;
+      const t = line.trim().slice(2).trim();
+      if (t.length === 0) {
+        i++;
+        out.push(parseBlock(indent + 2));
+        continue;
+      }
+      const colon = findColon(t);
+      if (colon > 0) {
+        // 「- name: x」→ 内嵌 map：把列表项行改成虚拟缩进行，交给 parseMap
+        const itemIndent = ind + 2;
+        lines[i] = ' '.repeat(itemIndent) + t;
+        out.push(parseMap(itemIndent));
+        continue;
+      }
+      out.push(parseFlow(t));
+      i++;
+    }
+    return out;
+  }
+
+  return parseBlock(0);
+}
+
+/** map → 规范 YAML 文本（差异比对与文本断言用；两边同管线，表示差异互相抵消）。 */
+function yamlNeedsQuote(v) {
+  if (v.length === 0) return true;
+  if (/^(?:true|false|null|yes|no|on|off|~)$/i.test(v)) return true;
+  if (/^[-?:,\[\]{}#&*!|>'"%@`]/.test(v)) return true;
+  if (/^(?:0x[0-9a-fA-F]+|-?\d+(?:\.\d+)?)$/.test(v)) return true;
+  if (/\s$|^\s/.test(v)) return true;
+  return false;
+}
+function yamlScalar(v) {
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (v === null || v === undefined) return 'null';
+  const s = String(v);
+  if (yamlNeedsQuote(s)) return `'${s.replace(/'/g, "''")}'`;
+  return s;
+}
+function miniYamlDump(value) {
+  const out = [];
+  function walkMapInline(obj, indent) {
+    const keys = Object.keys(obj);
+    for (const key of keys) {
+      const val = obj[key];
+      const pad = ' '.repeat(indent);
+      if (Array.isArray(val)) {
+        if (val.length === 0) { out.push(`${pad}${key}: []`); continue; }
+        const allScalar = val.every((x) => x === null || typeof x !== 'object');
+        if (allScalar) {
+          out.push(`${pad}${key}: [${val.map(yamlScalar).join(', ')}]`);
+        } else {
+          out.push(`${pad}${key}:`);
+          walkList(val, indent + 2);
+        }
+        continue;
+      }
+      if (val !== null && typeof val === 'object') {
+        if (Object.keys(val).length === 0) { out.push(`${pad}${key}: {}`); continue; }
+        out.push(`${pad}${key}:`);
+        walkMapInline(val, indent + 2);
+        continue;
+      }
+      out.push(`${pad}${key}: ${yamlScalar(val)}`);
+    }
+  }
+  function walkList(list, indent) {
+    for (const item of list) {
+      if (item !== null && typeof item === 'object') {
+        const keys = Object.keys(item);
+        const first = keys[0];
+        const headVal = item[first];
+        const pad = ' '.repeat(indent);
+        if (headVal !== null && typeof headVal === 'object') {
+          out.push(`${pad}- ${first}:`);
+          walkMapInline(headVal, indent + 2);
+        } else {
+          out.push(`${pad}- ${first}: ${yamlScalar(headVal)}`);
+        }
+        const restKeys = keys.slice(1);
+        for (const key of restKeys) {
+          const val = item[key];
+          if (Array.isArray(val)) {
+            if (val.length === 0) { out.push(`${pad}  ${key}: []`); continue; }
+            const allScalar = val.every((x) => x === null || typeof x !== 'object');
+            if (allScalar) {
+              out.push(`${pad}  ${key}: [${val.map(yamlScalar).join(', ')}]`);
+            } else {
+              out.push(`${pad}  ${key}:`);
+              walkList(val, indent + 4);
+            }
+            continue;
+          }
+          if (val !== null && typeof val === 'object') {
+            if (Object.keys(val).length === 0) { out.push(`${pad}  ${key}: {}`); continue; }
+            out.push(`${pad}  ${key}:`);
+            walkMapInline(val, indent + 4);
+            continue;
+          }
+          out.push(`${pad}  ${key}: ${yamlScalar(val)}`);
+        }
+        continue;
+      }
+      out.push(`${' '.repeat(indent)}- ${yamlScalar(item)}`);
+    }
+  }
+  if (Array.isArray(value)) {
+    walkList(value, 0);
+  } else if (value !== null && typeof value === 'object') {
+    walkMapInline(value, 0);
+  } else {
+    out.push(yamlScalar(value));
+  }
+  return `${out.join('\n')}\n`;
+}
+
+// profile 文件注册表：native fixture 按路径注册（getProfileBase 按路径取）
+const profileFileRegistry = new Map();
+coreBridge.getProfileBase = async (p) => {
+  const text = profileFileRegistry.get(p);
+  if (text === undefined) throw new Error(`sandbox: no profile registered at ${p}`);
+  const doc = miniYamlParse(text);
+  const proxies = Array.isArray(doc['proxies']) ? doc['proxies'] : [];
+  const groups = Array.isArray(doc['proxy-groups']) ? doc['proxy-groups'] : [];
+  const rules = Array.isArray(doc['rules']) ? doc['rules'].map((x) => String(x)) : [];
+  const matchRules = rules.filter((r) => r.toUpperCase().startsWith('MATCH,'));
+  return {
+    config: doc,
+    digest: 'sandbox',
+    proxies: proxies.length,
+    proxyGroups: groups.length,
+    rules: rules.length,
+    matchRules,
+  };
+};
+coreBridge.decodeYaml = async (text) => miniYamlParse(text);
+
+/** JSON dump（新构建器产物）→ 规范 YAML 文本（喂给既有文本差异机器）。 */
+function canonicalYaml(res) {
+  return miniYamlDump(JSON.parse(res.yaml));
+}
 
 // ── 3. YAML 差异检查器 ─────────────────────────────────────────────────────
 section('── 3. 运行层：同一份输入 → 两份 YAML ──');
@@ -588,7 +844,8 @@ ok(tunnelRes.apiPort !== testRes.apiPort && tunnelRes.mixedPort !== testRes.mixe
 // 决策共享：两份配置必须用同一个节点
 ok(tunnelRes.options.selectedNodeName === testRes.options.selectedNodeName,
   `B4 两种 mode 共享同一个 selectedNode（${tunnelRes.options.selectedNodeName}）`);
-ok(tunnelRes.options.useSmart === testRes.options.useSmart, 'B4b 两种 mode 共享同一个 useSmart 决策');
+ok(tunnelRes.options.useSmart === false && testRes.options.useSmart === false,
+  'B4b 两种 mode 均不以 App 选项合成 Smart 策略');
 ok(tunnelRes.options.ruleProviderReady === testRes.options.ruleProviderReady,
   'B4c 两种 mode 共享同一个 ruleProviderReady 决策');
 ok(tunnelRes.options.useGeoip === testRes.options.useGeoip, 'B4d 两种 mode 共享同一个 useGeoip 决策');
@@ -599,6 +856,90 @@ adOffProfile.settings.hyperAdRulesEnabled = false;
 const adOffRes = await RuntimeConfigBuilder.buildRuntimeConfig(adOffProfile, RuntimeConfigMode.TUNNEL);
 ok(adOffRes.options.adRulesOn === false && adOffRes.options.ruleProviderReady === false,
   'B4e 去广告开关关闭时 ruleProviderReady 必须为 false（含 adRulesOn 闸门）');
+
+// Native documents must retain semantics, not merely match two generated copies.
+// 2026-11-05（FlClash 全量照抄）：native fixture 走新链路 —— profile 文件经内核
+// getProfileBase 解析（沙箱由 mini-yaml 注册表承接），产物为 JSON dump，
+// 断言前统一转回规范 YAML 文本喂给同一套差异机器。
+const nativeProfile = makeProfile({ ...baseOpts, mixedPort: 27890, apiPort: 29090, dnsPort: 21053, apiSecret: 'native' });
+nativeProfile.settings.autoSelectMode = 'manual';
+nativeProfile.settings.hyperAdRulesEnabled = false;
+nativeProfile.selectedNodeName = 'Taiwan';
+nativeProfile.profileId = 'native-fixture';
+const nativeYamlFixture = `mixed-port: 1234
+external-controller: 0.0.0.0:1235
+secret: imported-secret
+global-client-fingerprint: chrome
+keep-alive-interval: 17
+geodata-loader: standard
+profile: {store-selected: true, store-fake-ip: true}
+hosts:
+  node.example: 192.0.2.42
+sniffer:
+  enable: false
+dns:
+  enable: true
+  listen: 0.0.0.0:53
+  enhanced-mode: fake-ip
+  nameserver:
+    - https://private.example/dns-query
+  nameserver-policy:
+    '+.node.example': https://split.example/dns-query
+proxies:
+  - name: Direct
+    type: direct
+  - name: TW
+    type: socks5
+    server: node.example
+    port: 1080
+proxy-groups:
+  - name: Root
+    type: select
+    proxies: [Taiwan, Direct]
+  - name: Taiwan
+    type: select
+    proxies: [TW]
+rules:
+  - DOMAIN,example.cn,Root
+  - MATCH,Root
+`;
+nativeProfile.profileYaml = nativeYamlFixture;
+const { ProfileStore } = await import(G('ProfileStore.ts'));
+profileFileRegistry.set(ProfileStore.pathOf(nativeProfile.profileId), nativeYamlFixture);
+for (const override of [false, true]) {
+  nativeProfile.settings.dnsOverrideEnabled = override;
+  const nativeTunnelRes = await RuntimeConfigBuilder.buildRuntimeConfig(nativeProfile, RuntimeConfigMode.TUNNEL);
+  const nativeTestRes = await RuntimeConfigBuilder.buildRuntimeConfig(nativeProfile, RuntimeConfigMode.TEST);
+  const nativeTunnel = canonicalYaml(nativeTunnelRes);
+  const nativeTestYaml = canonicalYaml(nativeTestRes);
+  if (process.env.TUNBOX_CSS_DEBUG === '1') {
+    console.log(`---- native tunnel yaml (override=${override}) ----`);
+    console.log(nativeTunnel);
+  }
+  ok(nativeTunnelRes.options.selectedNodeName === 'Taiwan' && nativeTunnelRes.effectiveNodeName === 'Taiwan',
+    `native DNS override=${override}: group intent is never replaced by a static node`);
+  // FlClash patch 语义下的保留断言（2026-11-05 终版 = FlClash main 原样）：
+  //   · profile general 键（global-client-fingerprint/geodata-loader/hosts）原样；
+  //   · keep-alive-interval 由 FlClash patch 强制为 30（profile 的 17 被覆盖 —— FlClash
+  //     main 同款：rawConfig['keep-alive-interval'] = patch 值）；
+  //   · store-selected 强制 false（FlClash）；
+  //   · profile dns 启用 → 订阅 dns 原样（listen 0.0.0.0:53 / 私有上游 / split policy 全保留；
+  //     FlClash main 无「应用 DNS 整段接管」模式，dnsOverrideEnabled 不再参与）；
+  //   · sniffer：overlay 键级合并，应用键胜（FlClash mergeSnifferOverride 语义）。
+  for (const snippet of ['global-client-fingerprint: chrome', 'keep-alive-interval: 30', 'geodata-loader: standard',
+    'store-selected: false', 'store-fake-ip: true', 'node.example: 192.0.2.42',
+    'listen: 0.0.0.0:53',
+    'https://private.example/dns-query', 'https://split.example/dns-query',
+    'force-dns-mapping: true']) {
+    ok(nativeTunnel.includes(snippet), `native DNS override=${override}: retain ${snippet.replaceAll('\n', ' ')}`);
+  }
+  ok(!nativeTunnel.includes('GEOIP,CN,DIRECT') && !nativeTunnel.includes('DOMAIN-SUFFIX,cn,DIRECT'),
+    `native DNS override=${override}: generated domestic rules cannot preempt profile rules`);
+  ok(!nativeTunnel.includes('imported-secret') && !nativeTunnel.includes('mixed-port: 1234'),
+    `native DNS override=${override}: application retains listener ownership`);
+  ok(violationsOf(diffYaml(nativeTunnel, nativeTestYaml)).length === 0,
+    `native DNS override=${override}: tunnel and test retain the same native behavior`);
+}
 
 // ── 4. 负对照（闸门自证有牙）──────────────────────────────────────────────
 section('── 4. 负对照：分叉必须被判红 ──');
@@ -620,23 +961,23 @@ for (const f of fakeFiles) {
 ok(fakeCount === 2 && fakeCount !== 1,
   'C1 静态负对照：两处 generate( 调用被判定为「不是唯一入口」');
 
-// C2 运行：让 test mode 走不同的 useSmart → 差异检查必须判红
+// C2 运行：故意让测速核使用不同代理模式，检查器必须识别非监听器差异。
 const forkedProfile = makeProfile({
   ...baseOpts,
-  smartModelReady: false, // ← 故意让测速核侧的决策与隧道侧不同
   mixedPort: 17890,
   apiPort: 19090,
   dnsPort: 11053,
   apiSecret: 'test-secret',
 });
+forkedProfile.settings.proxyMode = 'global';
 const forkedTest = await RuntimeConfigBuilder.buildRuntimeConfig(forkedProfile, RuntimeConfigMode.TEST);
 const forkedDiffs = diffYaml(tunnelRes.yaml, forkedTest.yaml);
 const forkedViolations = violationsOf(forkedDiffs);
 ok(forkedViolations.length > 0,
-  'C2 运行负对照：useSmart 分叉被差异检查判红（越界键非空）',
+  'C2 运行负对照：代理模式分叉被差异检查判红（越界键非空）',
   forkedViolations.length === 0 ? '分叉没有被抓到 —— 闸门无牙' : '');
-ok(forkedDiffs.some((d) => d.key === 'proxy-groups' || d.key.startsWith('proxy-groups.')),
-  'C2b useSmart 分叉确实体现在 proxy-groups 段（说明负对照造出了真分叉）',
+ok(forkedViolations.some((d) => d.key === 'mode'),
+  'C2b 模式差异确实被列为禁止分叉的键',
   `实际差异键：${forkedDiffs.map((d) => d.key).join(', ')}`);
 
 // ── 汇总 ──────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -217,6 +218,41 @@ func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[strin
 // Proxies return all proxies
 func Proxies() map[string]C.Proxy {
 	return proxies
+}
+
+// AllProxies is the controller's live catalog, including loaded provider nodes.
+// Copy the config maps under the lock; never add dynamic nodes to the forwarding
+// map. Static names win, then providers in stable name order (also used by JSON).
+func AllProxies() map[string]C.Proxy {
+	configMux.RLock()
+	all := make(map[string]C.Proxy, len(proxies))
+	for name, proxy := range proxies {
+		all[name] = proxy
+	}
+	sets := make(map[string]P.ProxyProvider, len(providers))
+	for name, provider := range providers {
+		sets[name] = provider
+	}
+	configMux.RUnlock()
+	names := make([]string, 0, len(sets))
+	for name := range sets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if sets[name] == nil {
+			continue
+		}
+		for _, proxy := range sets[name].Proxies() {
+			if proxy == nil {
+				continue
+			}
+			if _, exists := all[proxy.Name()]; !exists {
+				all[proxy.Name()] = proxy
+			}
+		}
+	}
+	return all
 }
 
 // Providers return all compatible providers
@@ -702,7 +738,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 					}
 				}
 
-				if ! smart {
+				if !smart {
 					metadata.SmartTarget = ""
 				} else {
 					metadata.SmartBlock = "normal"

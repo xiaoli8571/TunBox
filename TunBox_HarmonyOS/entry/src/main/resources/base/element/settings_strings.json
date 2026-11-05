@@ -31,10 +31,7 @@
     { "name": "settings_health_enable_desc", "value": "检查链路状态，并在允许范围内执行有限的自动修复。" },
     { "name": "settings_health_repair_steps_label", "value": "自动修复最多步数" },
     { "name": "settings_health_repair_steps_desc", "value": "每次自检后的修复上限，可设置 0–3 步；0 表示只检查不修复。" },
-    { "name": "settings_about_title", "value": "关于与隐私" },
-    { "name": "settings_version_label", "value": "版本" },
-    { "name": "settings_privacy_policy_row", "value": "查看隐私政策" },
-    { "name": "settings_privacy_policy_desc", "value": "内容来自华为应用市场隐私声明托管服务，与首次启动的隐私弹窗一致。" },
-    { "name": "settings_privacy_unavailable", "value": "未能获取隐私政策链接，请使用已关联隐私托管的正式安装包" }
+    { "name": "settings_about_title", "value": "关于" },
+    { "name": "settings_version_label", "value": "版本" }
   ]
 }

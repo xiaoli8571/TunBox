@@ -140,6 +140,15 @@ export function shouldResetRecovery(coreAlive: boolean, netType: string): boolea
  * stopVpnExtensionAbility 只能停本应用 —— 第三方应用**无权限**挤掉其他 App 的 VPN，
  * 唯一正确行为是把 2203002 翻译成人话引导用户先断开对方。
  */
+export function isNonRetryableStartupError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return message.indexOf('配置校验未通过') >= 0 || message.indexOf('parse config') >= 0
+    || message.indexOf('没有可用节点') >= 0 || message.indexOf('节点配置无效') >= 0
+    || message.indexOf('另一个 VPN') >= 0 || message.indexOf('隧道参数') >= 0
+    || message.indexOf('授权') >= 0 || lower.indexOf('permission') >= 0
+    || message.indexOf('应用分流') >= 0;
+}
+
 export function friendlyVpnStartError(code: number, rawMessage: string): string {
   if (code === 2203002) {
     return '无法建立 VPN：系统上已有另一个 VPN 连接在用。请先在对方应用（或 设置→网络→VPN）'
@@ -196,10 +205,7 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
   // 内核启动期联网下载阻塞（rule-provider / MMDB 本地文件缺失）：5.5.7 起生成配置时
   // 会先检查本地文件并在缺失时降级，同时后台补齐，正常不再触发本分支。
   if (rawMessage.indexOf('内核启动超时') >= 0 || rawMessage.indexOf('测速内核启动超时') >= 0) {
-    return '内核启动卡在联网下载（配置引用的规则集/数据库文件缺失时，内核会在启动阶段'
-      + '同步拉取，导致长时间无响应）。5.5.7 起已改为缺失即降级、后台补齐，'
-      + '请等 10 秒后再点一次连接，即可正常启动并在下次连接启用完整规则。原始错误: '
-      + rawMessage;
+    return '内核未在规定时间内就绪，请重试；如反复出现，请导出诊断日志。详情：' + rawMessage;
   }
   const detail: string = (rawMessage.length > 0 && rawMessage !== '[object Object]')
     ? rawMessage : '无详细信息（请到「日志」页查看完整堆栈）';

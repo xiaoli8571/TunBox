@@ -11,7 +11,9 @@ import { LatencyTestUrl } from '../latency/LatencyTestUrl';
  *   → VpnExtensionAbility：create() 得到 TUN fd → coreBridge.attachTun + startCore
  *   → 本编排器轮询 Clash API 就绪 → selectNode → CONNECTED
  */
-import { vpnExtension, http, webSocket, socket, connection } from '@kit.NetworkKit';
+import { vpnExtension, http, webSocket, connection } from '@kit.NetworkKit';
+import { LocalPortProbe } from './LocalPortProbe';
+import { isNonRetryableStartupError } from './VpnRecoveryPolicy';
 import { UnifiedScheduler } from './UnifiedScheduler';
 import type Want from '@ohos.app.ability.Want';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -24,8 +26,9 @@ import { ClashApiService, KernelGroupSelection, TrafficSnapshot } from './ClashA
 import { KernelSelectionManager } from './KernelSelectionManager';
 import { ConnectionEvents, ConnEvent, ConnListener, ReconnectReason } from './ConnectionEvents';
 import { ConnectionTarget, ConnectionTargetSource, RuntimeConfigBuilder, RuntimeConfigMode, RuntimeConfigProfile } from '../config/RuntimeConfigBuilder';
+import { ProfileOverrideStore } from './ProfileOverrideStore';
 import { ClashConfigGenerator } from './ClashConfigGenerator';
-import { ProxyPanelMembers } from '../flclash/ProxyPanelMembers';
+import { ProxyPanelMembers } from '../tunbox/ProxyPanelMembers';
 import { ProxyGroup } from '../models/ProxyGroup';
 import { ConfigValidator } from './ConfigValidator';
 import { DoHResolver } from './DoHResolver';
@@ -65,9 +68,10 @@ import { AppDiagnostics } from '../models/PublicIpInfo';
 import { AppProxyRoute } from './AppProxyRoute';
 import { AppLogger } from '../utils/AppLogger';
 // FlClash 同构：当前 Profile 原文（配置基底）
-import { ProfileRepository } from '../flclash/ProfileRepository';
-import { CoreCatalogService } from '../flclash/CoreCatalogService';
-import { CoreNodeBridge } from '../flclash/CoreNodeBridge';
+import { ProfileRepository } from '../tunbox/ProfileRepository';
+import { TunBoxProfileBuilder } from '../tunbox/TunBoxProfileBuilder';
+import { CoreCatalogService } from '../tunbox/CoreCatalogService';
+import { CoreNodeBridge } from '../tunbox/CoreNodeBridge';
 
 // 状态枚举已抽到零依赖叶子模块（避免 stateMachine ↔ orchestrator 循环依赖）；
 // 这里再导出，保持既有 `import { ConnState } from '.../ConnectionOrchestrator'` 不变。
@@ -276,20 +280,6 @@ const TEST_CORE_STOP_ATTEMPTS = 2;
 const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
 /** 测速内核启动失败后的负缓存冷却：避免每次测速都白等一次 15~20s 启动超时 */
 const TEST_CORE_NEGATIVE_COOLDOWN_MS = 45000;
-/**
- * 测速内核「预热」时长（毫秒）。
- *
- * 背景（真机取证 2026-10-17）：headless 内核 ready 后 controller API 仍是冷的
- * （首批连接/凭证初始化未完成），立刻放行整批并发会把 API 打到
- * Operation timeout（code=2300028，整批中止）。
- *
- * 口径（2026-10-20 整改）：这个窗口是**内核的属性**，不是调用方的固定等待。
- * 旧实现在 ensureLatencyApi 里无条件睡 1500ms —— **复用路径**（内核已经在服务）
- * 也要白等这 1.5s，这正是「点了测速，等几秒钟才开始测速」的直接来源之一。
- * 现在内核就绪时登记「预计变热时刻」（testCoreWarmAt），调用方只等到那一刻：
- * 复用路径窗口早已过去 → 一句都不等 → 秒开。
- */
-const TEST_CORE_WARMUP_MS = 1000;
 /**
  * 预热/测速内核的空闲回收窗口（毫秒）。
  *
@@ -543,6 +533,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private healthRepairCache: string[] = [];
   private healthRunning: boolean = false;
   private coreLossHandling: boolean = false;
+  private restoreTask: Promise<string> | null = null;
+  /** 异常退出后的恢复链；失败回滚只清运行资源，保留持久连接意图。 */
+  private automaticRecoveryActive: boolean = false;
   /** 连续「非存活」观测票数（累计到 CORE_DEATH_CONFIRMATIONS 才升级为内核死亡）。 */
   private coreDeathStrikes: number = 0;
   private coreDeathFirstAt: number = 0;
@@ -626,6 +619,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   requestDisconnect(preserveRestart: boolean = false): void {
+    this.automaticRecoveryActive = false;
     if (!preserveRestart) {
       this.restartRevision++;
       this.restarting = false;
@@ -724,20 +718,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /**
    * 进程被杀 / 回前台时的状态自愈入口。
    *
-   * 只接管现有会话，不自动拉起 VPN。租约过期时先检查认证 controller；证据不足
-   * 也不改写用户意图。真正失联交给已有监控的有限确认/修复，或用户主动连接。
-   *
-   * 判定链（任一命中即不动）：
-   *  1. 磁盘上没有"用户想连"的意图 → 用户从未连过，或已明确断开
-   *  2. 意图相位是 failed/disconnecting/disconnected → 上次确实没连成/已结束
-   *  3. 隧道其实还活着（心跳新鲜）→ 不打断正常会话，仅复用真实状态
-   *  4. 本进程已有连接在途（CONNECTING/RECOVERING）→ 让在途流程自己走完
-   *  5. 以上都不是 → 运行态尚未确认，保留意图，等待监控复核或用户操作。
-   *     打开页面本身不应清除会话意图，更不应启动/拆除隧道。
-   *
-   * 返回判定原因字符串供日志观察；页面可 await 以同步完成状态接管。
+   * 先接管仍存活的会话；无租约且认证接口失联时，恢复上次未结束的连接。
+   * 冷启动/前台/快捷宿主共用单航班与同一退避预算。失败/手动断开的快照不复活。
    */
   async restoreKilledSession(context: Context): Promise<string> {
+    if (this.restoreTask !== null) { return this.restoreTask; }
+    const task = this.restoreKilledSessionExclusive(context);
+    this.restoreTask = task;
+    try { return await task; } finally {
+      if (this.restoreTask === task) { this.restoreTask = null; }
+    }
+  }
+
+  private async restoreKilledSessionExclusive(context: Context): Promise<string> {
+    const seq = this.connectSeq;
     try {
       await SettingsService.init(context);
       this.init(context);
@@ -749,15 +743,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, `restore skipped: snapshot phase=${snap.phase}`);
         return `phase-${snap.phase}`;
       }
-      const seq = this.connectSeq;
+      if (seq !== this.connectSeq || this.disconnectRequested) { return 'session-changed'; }
       if (this.state === ConnState.CONNECTING || this.state === ConnState.RECOVERING
         || this.state === ConnState.DISCONNECTING) {
         return 'operation-in-flight';
       }
       const authority = await this.authorityState();
-      if (authority.connected) {
+      if (authority.connected && await this.restoreTunnelController(snap, true)) {
         // UI 进程重建只接管仍在运行的会话，不调用 connect()，不刷新 startedAt。
-        await this.restoreTunnelController(snap, false);
         if (seq !== this.connectSeq || this.disconnectRequested
           || !await this.isCurrentSession(snap.sessionGeneration)) {
           return 'session-changed';
@@ -768,14 +761,35 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         this.lastNodeName = snap.nodeName;
         this.lastSubs = SubscriptionService.instance();
         this.lastNode = this.lastSubs.nodes.find((node: ProxyNode): boolean => node.name === snap.nodeName) ?? null;
+        if (this.state === ConnState.DISCONNECTED || this.state === ConnState.ERROR) {
+          this.setState(ConnState.RECOVERING);
+        }
         this.setState(ConnState.CONNECTED);
         if (changedSession || this.monitorTimer < 0) { this.startMonitors(); }
         this.notify();
         return 'already-connected';
       }
-      AppLogger.warn(TAG, `foreground inspection: runtime unconfirmed (${authority.reason}); `
-        + 'preserve session intent; no connect/disconnect from opening the app');
-      return 'runtime-unconfirmed';
+      if (seq !== this.connectSeq || this.disconnectRequested
+        || !await this.isCurrentSession(snap.sessionGeneration)) { return 'session-changed'; }
+      // 已有监控必须先完成间隔确认，避免唤醒后瞬时探测失败就拆正常隧道。
+      if (this.state === ConnState.CONNECTED && this.monitorTimer >= 0) { return 'runtime-unconfirmed'; }
+      const subs = SubscriptionService.instance();
+      await subs.init(context);
+      await this.restoreTunnelController(snap, false, false);
+      if (seq !== this.connectSeq || this.disconnectRequested
+        || !await this.isCurrentSession(snap.sessionGeneration)) { return 'session-changed'; }
+      this.lastSubs = subs;
+      this.lastNodeName = snap.nodeName;
+      this.lastNode = this.findNodeByName(subs, snap.nodeName);
+      if (this.lastNode === null) { return 'no-recovery-target'; }
+      this.sessionGeneration = snap.sessionGeneration;
+      this.startedAt = snap.startedAt;
+      this.automaticRecoveryActive = true;
+      this.setState(ConnState.RECOVERING);
+      this.notify();
+      await this.reconnectManager().requestAsync(ReconnectReason.CORE_KILLED_BY_SYSTEM);
+      AppLogger.info(TAG, 'lost runtime with active intent; bounded recovery scheduled');
+      return 'recovery-scheduled';
     } catch (e) {
       AppLogger.warn(TAG, `self-heal error: ${AppLogger.errText(e)}`);
       return 'error';
@@ -851,7 +865,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /** 恢复真实隧道的 controller；只读本机配置头，凭据仍只从 AssetStore 获取。 */
-  private async restoreTunnelController(snapshot: ConnectionSnapshot, verifyResponse: boolean): Promise<boolean> {
+  private async restoreTunnelController(snapshot: ConnectionSnapshot, verifyResponse: boolean,
+    applyRoute: boolean = true): Promise<boolean> {
     if (this.context === null || !snapshot.desiredConnected
       || (snapshot.phase !== 'connected' && snapshot.phase !== 'recovering')
       || this.state === ConnState.CONNECTING || this.state === ConnState.DISCONNECTING
@@ -888,7 +903,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       this.apiSecret = secret;
       this.api.setEndpoint(port, secret);
-      await this.activateAppHttpProxy('restore');
+      if (applyRoute) { await this.activateAppHttpProxy('restore'); }
       if (seq !== this.connectSeq || this.disconnectRequested
         || !await this.isCurrentSession(snapshot.sessionGeneration)) {
         return false;
@@ -945,6 +960,53 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** User node/group changes always rebuild the proxy session (2026-11-03 requirement). */
   async reconnectWithNode(node: ProxyNode, subs: SubscriptionService, reason: string): Promise<boolean> {
     return this.restartWithSelection(node, subs, reason);
+  }
+
+  private smartAvailability: Map<string, boolean> = new Map<string, boolean>();
+
+  async smartAvailableFor(subId: string, subs: SubscriptionService): Promise<boolean> {
+    if (!this.isSmartModelAvailable() || subId.length === 0) { return false; }
+    if (ProfileRepository.exists(subId)) {
+      const key = subId + ':' + ProfileRepository.revisionOf(subId);
+      const cached = this.smartAvailability.get(key);
+      if (cached !== undefined) { return cached; }
+      try {
+        const base = await coreBridge.getProfileBase(ProfileRepository.pathOf(subId));
+        const available = TunBoxProfileBuilder.smartAvailable(base.config);
+        if (this.smartAvailability.size > 30) { this.smartAvailability.clear(); }
+        this.smartAvailability.set(key, available);
+        return available;
+      } catch (e) { return false; }
+    }
+    return subs.nodesOf(subId).filter((node: ProxyNode): boolean =>
+      node.name !== 'DIRECT' && node.name !== 'REJECT').length >= 2;
+  }
+
+  async selectSmartSubscription(subId: string, subs: SubscriptionService): Promise<boolean> {
+    if (!await this.smartAvailableFor(subId, subs)) { throw new Error('请先更新 Smart 模型，并确认本订阅有可用节点'); }
+    if (ProfileRepository.currentId() !== subId) { await ProfileRepository.setCurrent(subId); }
+    const target = subs.nodesOf(subId).find((node: ProxyNode): boolean =>
+      node.name !== 'DIRECT' && node.name !== 'REJECT') ?? new ProxyNode();
+    if (target.id.length === 0) {
+      target.id = `profile:${subId}`;
+      target.name = '订阅默认出口';
+      target.subscriptionId = subId;
+    }
+    await SettingsService.patchSettings((settings: AppSettings): void => {
+      settings.autoSelectMode = AutoSelectModes.AUTO;
+      settings.preferredNodeSubscriptionId = subId;
+      settings.selectedSubscriptionId = subId;
+      settings.preferredNodeId = target.id.startsWith('profile:') ? '' : target.id;
+      settings.preferredNodeName = target.id.startsWith('profile:') ? '' : target.name;
+    });
+    const revision = AppStorage.get<number>('node_switch_revision') ?? 0;
+    AppStorage.setOrCreate('node_switch_revision', revision + 1);
+    const restarted = await this.reconnectWithNode(target, subs, 'smart-subscription');
+    if (restarted) {
+      const ipRevision = AppStorage.get<number>('public_ip_revision') ?? 0;
+      AppStorage.setOrCreate('public_ip_revision', ipRevision + 1);
+    }
+    return restarted;
   }
 
   /** Settings restarts preserve the saved strategy intent, including provider-only groups. */
@@ -1062,6 +1124,19 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       await coreBridge.prepareProfile(candidate);
     } catch (e) {
       throw new Error(`配置校验未通过：最终配置未通过内核检查（${AppLogger.errText(e)}）。已保留原配置`);
+    }
+    // 检查最终合并后的策略（包括 profile override），三种执行面共用。
+    // Smart 的 LightGBM 是可选项；不根据旧 App AUTO 或模型存在来改写策略。
+    const config = await coreBridge.decodeYaml(candidate);
+    const groups = config['proxy-groups'] as Record<string, Object>[];
+    if (Array.isArray(groups) && groups.some((group: Record<string, Object>): boolean => {
+      const enabled = group['uselightgbm'];
+      // 原生 group decoder 也接受非零整数布尔；字符串由上面的内核校验拒绝。
+      return group['type'] === 'smart' && (enabled === true || (typeof enabled === 'number' && enabled !== 0));
+    })) {
+      if (!this.isSmartModelAvailable()) {
+        throw new Error('Smart 分组需要模型，请先到设置手动更新 Smart 选点模型；下载失败时请先使用普通节点启动代理，再次更新。已保留原配置');
+      }
     }
     return candidate;
   }
@@ -1252,12 +1327,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 热重载会重置 select 组；选点确认前不能提交新的 Profile 身份或磁盘基准。
       const pinned = (hotEffectiveName === target.name && target.id.startsWith('profile:'))
-        || await this.api.selectNode(hotEffectiveName);
+        || await this.api.selectNode(hotEffectiveName, this.kernelSelection.groupName());
       if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
       if (!pinned) {
         const restored = await this.api.reloadFromPath(rollbackPath);
         if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
-        if (restored) { await this.api.selectNode(this.lastNodeName); }
+        if (restored) { await this.api.selectNode(this.lastNodeName, this.kernelSelection.groupName()); }
         AppLogger.warn(TAG, `[hot-reload] selection failed; rollback accepted=${restored}`);
         return false;
       }
@@ -1593,6 +1668,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.info(TAG, '[reconnect] network lost; wait for recovery (no reconnect)');
         return;
       }
+      if (this.automaticRecoveryActive && !this.disconnectRequested && this.isPhysicalNetType(netType)) {
+        this.reconnectManager().request(ReconnectReason.NETWORK_RESTORED);
+        return;
+      }
       if (!this.isPhysicalNetType(netType) || !this.isPhysicalNetType(prev)) {
         AppLogger.info(TAG, `[reconnect] ignore non-physical transition ${prev} -> ${netType}`);
         return;
@@ -1647,7 +1726,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         this.notify();
       };
       host.onGiveUp = (message: string): void => {
-        this.lastError = message;
+        const generation = this.sessionGeneration;
+        this.automaticRecoveryActive = false;
+        this.setState(ConnState.DISCONNECTED);
+        this.lastError = this.lastError.length > 0 ? `自动恢复失败，已停止重试：${this.lastError}` : message;
+        this.updateSessionSnapshot(generation, true, 'failed', this.lastNodeName, 0)
+          .catch((e: Object): void => AppLogger.warn(TAG, `recovery stop snapshot failed: ${AppLogger.errText(e)}`));
         this.notify();
       };
       manager = new ReconnectManager(host, RECONNECT_BASE_MS, RECONNECT_MAX_MS,
@@ -1664,6 +1748,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * （`connectSeq` 变了 ⇒ 本次尝试已被新事务取代，旧链路必须停，绝不排重试）。
    */
   private async runReconnectAttempt(reason: string): Promise<ReconnectAttemptOutcome> {
+    const seq = this.connectSeq;
+    const snapshot = await SettingsService.loadSnapshot();
+    if (seq !== this.connectSeq || this.disconnectRequested || !snapshot.desiredConnected
+      || snapshot.sessionGeneration !== this.sessionGeneration) { return ReconnectAttemptOutcome.SUPERSEDED; }
+    // 退避期间扩展可能已恢复。再认证一次，避免重复启动把活隧道拆掉。
+    const authority = await this.authorityState();
+    const responsive = await this.api.healthProbe();
+    if (seq !== this.connectSeq || this.disconnectRequested
+      || !await this.isCurrentSession(snapshot.sessionGeneration)) { return ReconnectAttemptOutcome.SUPERSEDED; }
+    if (responsive && authority.connected) {
+      this.automaticRecoveryActive = false;
+      this.setState(ConnState.CONNECTED);
+      this.startMonitors();
+      this.notify();
+      return ReconnectAttemptOutcome.SUCCESS;
+    }
     const subs = this.lastSubs;
     if (subs === null || this.lastNodeName.length === 0) {
       AppLogger.warn(TAG, '[reconnect] no previous endpoint; abort');
@@ -1675,6 +1775,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return ReconnectAttemptOutcome.FAILED;
     }
     const attemptSeq = this.connectSeq + 1;
+    this.automaticRecoveryActive = true;
     const ok = await this.connect(node, subs);
     if (attemptSeq !== this.connectSeq) {
       // 期间又开了新事务（用户手动连接 / 切订阅）⇒ 本次尝试的结论无效。
@@ -1683,22 +1784,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (ok) {
       return ReconnectAttemptOutcome.SUCCESS;
     }
+    if (!this.disconnectRequested && isNonRetryableStartupError(this.lastError)) {
+      return ReconnectAttemptOutcome.STOPPED;
+    }
     return this.disconnectRequested ? ReconnectAttemptOutcome.SUPERSEDED
       : ReconnectAttemptOutcome.FAILED;
   }
 
-  /** 用户连接意图（进程内状态优先，否则读持久化快照） */
+  /** 始终读持久化意图，避免另一 Ability 已停止后仍凭进程内 RECOVERING 复活。 */
   private async isUserIntentConnected(): Promise<boolean> {
     if (this.disconnectRequested) {
       return false;
     }
-    if (this.state === ConnState.CONNECTED || this.state === ConnState.CONNECTING
-      || this.state === ConnState.RECOVERING) {
-      return true;
-    }
     try {
       const snap = await SettingsService.loadSnapshot();
-      return snap.desiredConnected;
+      return snap.desiredConnected && (snap.phase === 'connecting'
+        || snap.phase === 'connected' || snap.phase === 'recovering');
     } catch (e) {
       return false;
     }
@@ -1757,6 +1858,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * @returns 最终是否恢复为已连接
    */
   private async runHealthSelfCheckAndRepair(reason: string): Promise<boolean> {
+    const seq = this.connectSeq;
+    const primaryError = this.lastError;
     if (this.healthRunning) {
       AppLogger.info(TAG, `[health] already running; skip (${reason})`);
       return this.state === ConnState.CONNECTED;
@@ -1771,10 +1874,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.info(TAG, `[health] disabled by settings; skip (${reason})`);
       return false;
     }
+    if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
     this.healthRunning = true;
     try {
       AppLogger.info(TAG, `[health] self-check start (reason=${reason})`);
       const report = await runLinkHealthCheck(new OrchestratorHealthProbes(this));
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
       this.healthReport = report;
       const summary = summarize(report);
       this.healthSummaryCache = summary;
@@ -1791,6 +1896,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           break;
         }
         const r = await this.executeRepair(step, reconnectUsed);
+        if (seq !== this.connectSeq || this.disconnectRequested) {
+          return this.state === ConnState.CONNECTED && !this.disconnectRequested;
+        }
         if (r.usedReconnect) {
           reconnectUsed = true;
         }
@@ -1803,21 +1911,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
       // 修复后重新自检一次
       const report2 = await runLinkHealthCheck(new OrchestratorHealthProbes(this));
+      if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
       this.healthReport = report2;
       const summary2 = summarize(report2);
       this.healthSummaryCache = summary2;
       AppLogger.info(TAG, `[health] recheck overall=${summary2.overall} pass=${summary2.passCount} fail=${summary2.failCount} skip=${summary2.skipCount}`);
       this.notify();
-      if (summary2.isOk()) {
-        return true;
-      }
       if (this.state === ConnState.CONNECTED) {
         AppLogger.info(TAG, '[health] degraded but connected; treat as recovered');
         return true;
       }
-      this.lastError = summary2.failCount > 0
+      const diagnosticError = summary2.failCount > 0
         ? `链路自检未通过（${summary2.firstFailLabel}：${summary2.firstFailDetail}）`
         : '链路自检未通过（存在无法判定项），已停止自动重试';
+      // 诊断是补充证据，不能用心跳/下游失败覆盖最早的配置、授权或启动错误。
+      this.lastError = primaryError.length > 0 ? primaryError : diagnosticError;
+      AppLogger.warn(TAG, `[health] diagnostic: ${diagnosticError}; primary=${primaryError}`);
       AppLogger.warn(TAG, `[health] still broken after repair: ${this.lastError}`);
       return false;
     } catch (e) {
@@ -1929,8 +2038,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     this.inRepairConnect = true;
     try {
-      await this.disconnect();
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), 600));
+      // connectExclusive 已负责停旧扩展；不要把修复当成用户断开，更不能在
+      // disconnect→sleep 之间忽略用户的新停止操作。
       return await this.connect(node, subs);
     } catch (e) {
       AppLogger.warn(TAG, `[health] repairReconnect failed: ${AppLogger.errText(e)}`);
@@ -1946,62 +2055,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   private async handleCoreLossAsync(): Promise<void> {
-    if (this.coreLossHandling) {
-      return;
-    }
+    if (this.coreLossHandling || this.disconnectRequested) { return; }
     this.coreLossHandling = true;
+    const seq = this.connectSeq;
     try {
-      let healthEnabled = true;
-      try {
-        const s = await SettingsService.load();
-        healthEnabled = s.healthCheckEnabled;
-      } catch (e) {
-        healthEnabled = true;
-      }
-      if (healthEnabled) {
-        // 集成点②：内核已死 → 先自检 → 有限修复 → 复核
-        const recovered = await this.runHealthSelfCheckAndRepair('core-death');
-        if (recovered) {
-          AppLogger.info(TAG, '[health] core restored');
-          return;
-        }
-        // 2026-10-19 保活整改：进程被系统 LowMemoryKill 回收是**外部事件**，
-        // 不是用户意图。原实现自愈失败后直接落 DISCONNECTED 并放弃，导致
-        // 被杀一次就永久断线、必须用户手动重进 App（真机取证：11 分钟内被杀
-        // 3 次，每次都要手动恢复）。这里改为交给既有退避重连：用户意图仍为
-        // "连接"时按指数退避重试，只有 intent=disconnected 或重试耗尽才放弃。
-        if (this.disconnectRequested) {
-          this.setState(ConnState.DISCONNECTED);
-          if (this.lastError.length === 0) {
-            this.lastError = '内核已死，链路自检与有限修复未能恢复，已停止自动重试';
-          }
-          this.notify();
-          return;
-        }
-        AppLogger.warn(TAG, '[health] repair failed after core-death; '
-          + 'escalating to bounded backoff reconnect (external kill is not user intent)');
-        // 保留 lastError 供 UI 提示，但状态保持 RECOVERING，避免 UI 闪成"已断开"
-        if (this.lastError.length === 0) {
-          this.lastError = '内核已被系统回收，正在自动重连…';
-        }
-        this.setState(ConnState.RECOVERING);
-        this.notify();
-        this.reconnectManager().request(ReconnectReason.CORE_KILLED_BY_SYSTEM);
-        return;
-      }
-      // 自检被关闭：退回既有有界恢复策略（最多 2 次）
-      AppLogger.info(TAG, '[health] disabled; fallback to legacy bounded recovery');
-      if (this.recoveryAttempts < 2 && this.lastSubs !== null) {
-        this.recoveryAttempts = this.recoveryAttempts + 1;
-        const node = this.findNodeByName(this.lastSubs, this.lastNodeName);
-        if (node !== null) {
-          await this.connect(node, this.lastSubs);
-          return;
-        }
-      }
-      this.setState(ConnState.DISCONNECTED);
-      this.lastError = '内核异常退出，自动恢复失败，请手动重连';
+      const snapshot = await SettingsService.loadSnapshot();
+      if (seq !== this.connectSeq || this.disconnectRequested || !snapshot.desiredConnected
+        || snapshot.sessionGeneration !== this.sessionGeneration) { return; }
+      // 监控已用心跳、认证 API 和间隔投票确认失联。直接进入统一恢复预算，
+      // 无需先跑 DNS/出口等依赖已退出内核的探针，也不以健康检查开关控制自愈。
+      this.automaticRecoveryActive = true;
+      this.setState(ConnState.RECOVERING);
+      this.lastError = '代理进程无响应，正在自动恢复';
       this.notify();
+      await this.reconnectManager().requestAsync(ReconnectReason.CORE_KILLED_BY_SYSTEM);
+    } catch (e) {
+      AppLogger.warn(TAG, `core loss recovery failed: ${AppLogger.errText(e)}`);
     } finally {
       this.coreLossHandling = false;
     }
@@ -2175,8 +2244,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.info(TAG, `[failover] disabled by settings; skip (${trigger})`);
       return false;
     }
-    if (settings.autoSelectMode !== AutoSelectModes.AUTO) {
+    if (settings.autoSelectMode !== AutoSelectModes.AUTO || !this.isSmartModelAvailable()) {
       AppLogger.info(TAG, `[failover] autoSelectMode=manual (用户固定节点); skip (${trigger})`);
+      return false;
+    }
+    if (this.isSmartModelAvailable() && settings.preferredNodeSubscriptionId === this.appliedProfile()) {
       return false;
     }
     if (this.state === ConnState.CONNECTING) {
@@ -2256,17 +2328,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 展示用「当前连接节点」名称 —— **主页启动按钮与订阅页顶部概览卡共用这一个方法**，
    * 两处显示必然是同一节点（2026-10-25 用户要求：接口完全一致，不许各写一套）。
    *
-   * 取值顺序（2026-10-27 架构收口：**内核真源优先**）：
-   *   ① 自动模式且 smart 模型就位 → 「♻️ 自动选择」（出口由内核挑，名字不固定）
-   *   ② `KernelSelectionManager` 记录的当前出口（本次/上次真实出口，连接期间由 refreshExitFromKernel
-   *      持续与内核对齐）→ 用它。**这是唯一有资格代表"当前节点"的来源。**
-   *   ③ preferredNodeId 在当前订阅内命中 → 该节点名（偏好缓存：仅未连接且无出口时）
-   *   ④ fallbackConnectionNode() → 当前订阅第一个可用真实节点
-   *   ⑤ '' → 当前订阅确实没有可用节点，由调用方给可行动文案
-   *
-   * 为什么 ② 不再限定 `state === CONNECTED`：用户在内核里换了出口（通知栏/组内自动
-   * 切换/另一个入口），而偏好没同步时，只有内核真源能反映事实。旧实现以连接状态分叉
-   * 或只读偏好，才会出现「UI 香港、实际新加坡」。
+   * 在线时以当前 profile 的内核出口为准；未取得在线出口时读当前订阅保存的选择意图。
+   * Smart 意图显示「♻️ 自动选择」，其启动候选不作为手动选择展示。
+   * 手动意图依次查已保存组/节点、provider 目录和本地偏好，最后取可用节点兜底。
    */
   /** 订阅连接事件（状态/流量/出口）。返回 token，页面 aboutToDisappear 时退订。 */
   subscribeConnEvents(listener: ConnListener): number {
@@ -2333,9 +2397,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   /** @deprecated 用 getCurrentNodeName()；保留只为兼容既有调用点。 */
   displayNodeName(preferredNodeId: string, autoSelectMode: string): string {
-    if (autoSelectMode === AutoSelectModes.AUTO && this.ensureSmartModelReady()) {
-      return ClashConfigGenerator.SMART_GROUP_NAME;
-    }
     // ① 已连接：**只认内核真源**（连接期间由 refreshExitFromKernel 与 /proxies 对齐）。
     //    「界面显示香港、实际走新加坡」从显示层消失的关键一步（2026-10-27 架构收口）：
     //    已连接时 preferredNode* 无权决定「当前是什么节点」。
@@ -2352,6 +2413,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       return liveName;
     }
     const peeked = SettingsService.peek();
+    // Smart 保存的 preferredNode 只是启动候选，不能把它显示成用户的手动选择。
+    // 未取得当前配置的在线出口时先展示已保存的选择意图；在线真出口仍由上面的分支优先返回。
+    if (autoSelectMode === AutoSelectModes.AUTO && this.isSmartModelAvailable() && peeked !== null
+      && peeked.preferredNodeSubscriptionId === ProfileRepository.currentId()) {
+      return ClashConfigGenerator.SMART_GROUP_NAME;
+    }
     const preferredName: string = peeked !== null ? peeked.preferredNodeName : '';
     if (this.state !== ConnState.CONNECTED && peeked !== null
       && peeked.preferredNodeSubscriptionId === ProfileRepository.currentId()
@@ -2434,15 +2501,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const parsed = JSON.parse(json) as Record<string, Object>;
       const table = parsed['proxies'] as Record<string, Object>;
       if (table === undefined || table === null) { return ''; }
-      // 入口优先级：PROXY → GLOBAL → smart 组直连（2026-10-25 真机：自动模式下
-      // 订阅页拿不到内核真相，兜底直接读 smart 组自身的 now）。
+      // 入口优先级：PROXY → GLOBAL（smart 组兜底已删除，R6/§5.4）。
       const hasProxy = table['PROXY'] !== undefined;
       const hasGlobal = table['GLOBAL'] !== undefined;
-      if (!hasProxy && !hasGlobal && table[ClashConfigGenerator.SMART_GROUP_NAME] === undefined) {
-        AppLogger.info(TAG, 'resolveLiveNodeName: no PROXY/GLOBAL/smart group in table');
+      if (!hasProxy && !hasGlobal) {
+        AppLogger.info(TAG, 'resolveLiveNodeName: no PROXY/GLOBAL group in table');
         return '';
       }
-      const name = hasProxy ? 'PROXY' : (hasGlobal ? 'GLOBAL' : ClashConfigGenerator.SMART_GROUP_NAME);
+      const name = hasProxy ? 'PROXY' : 'GLOBAL';
       let cursor = name;
       for (let depth = 0; depth < 3; depth++) {
         const entry = table[cursor] as Record<string, Object>;
@@ -2489,12 +2555,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   async isIntentConsistent(): Promise<boolean> {
     const desired = await this.isDesiredConnected();
-    const alive = this.isCoreAliveByHeartbeat() || this.readStartOk();
+    const alive = this.isCoreAliveByHeartbeat() || (desired && await this.checkClashApiReachable());
     return desired === alive;
   }
 
   startErrorText(): string {
-    return this.readStartError();
+    return this.lastError.length > 0 ? this.lastError : this.readStartError();
   }
 
   isIpv6Enabled(): boolean {
@@ -2799,11 +2865,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * 不写回共享字段，审计 F1）。客户端 setEndpoint 必须用这个端口。
    */
   private testCoreApiPort: number = 0;
-  /**
-   * 测速内核「预计变热」的时间戳（ms）。0 = 无预热窗口（不是测速核）。
-   * 内核刚就绪时设成 now + TEST_CORE_WARMUP_MS；复用时窗口早已过去 → 不等待。
-   */
-  private testCoreWarmAt: number = 0;
   /** 单航班状态机：并发启动只生效一次，超时可取消，启停不互损 */
   private testCoreFlight: SingleFlightTestCore | null = null;
   /**
@@ -2923,12 +2984,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         const ready = await this.ensureTestCore(subs, await this.lastSettingsForLatency(), manual);
         if (ready) {
           AppLogger.info(TAG, 'latency channel: headless test core ready');
-          // 预热等待（2026-10-20 整改）：不再是「无条件睡 1500ms」，
-          // 而是「等到这个内核真正变热的时刻」。
-          //  - 新鲜启动：预热窗口刚开 → 等满剩余窗口（与旧实现同长，总耗时不变）；
-          //  - 复用已在服务的内核：窗口早已过去 → **不等待 → 秒开**。
-          // 旧实现那句无条件 1500ms 正是「点了测速要等一秒半才开始」的直接来源之一。
-          await this.awaitTestCoreWarmup();
+          // 本次 controller 已通过真实凭证验证；TCP 测速无需旧 HTTP 连接池的固定预热补偿。
           // 每一次取通道都把回收窗口往后推 90s：否则「进页面预热」挂的那次回收
           // 可能在用户随后发起的一批测速**进行中**触发 → 把正在服务的测速核停掉，
           // 整批中止。回收窗口应当从「最后一次使用」起算。
@@ -2946,32 +3002,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return null;
   }
 
-  /**
-   * 等到「测速内核真正变热」为止。
-   *
-   * 背景：headless 内核 ready 后 controller API 仍是冷的（首批连接/凭证初始化
-   * 未完成），立刻放行整批并发会把 API 打到 Operation timeout（真机取证
-   * 2026-10-17：code=2300028，整批中止）。所以内核刚起来后有一个**预热窗口**。
-   *
-   * 关键设计（2026-10-20）：预热窗口是**内核的属性**（testCoreWarmAt），
-   * 不是调用方的固定等待：
-   *  - 复用已在服务的内核 → 窗口早已过去 → 一句都不等 → **秒开**；
-   *  - 新鲜启动 → 等满剩余窗口（与旧实现同长）。
-   * 旧实现是在 ensureLatencyApi 里无条件睡 1500ms，复用路径也在白等 ——
-   * 这正是用户反馈「点了测速要等几秒才开始」的直接来源之一。
-   */
-  private async awaitTestCoreWarmup(): Promise<void> {
-    const warmAt = this.testCoreWarmAt;
-    if (warmAt <= 0) {
-      return;
-    }
-    const waitMs = warmAt - Date.now();
-    if (waitMs <= 0) {
-      return;
-    }
-    await new Promise<void>((resolve) => setTimeout(() => resolve(), waitMs));
-    AppLogger.info(TAG, `latency channel: test core warm-up wait ${waitMs}ms`);
-  }
 
   /**
    * 预热测速通道（**不发起任何探测**，只让内核进入可服务状态）。
@@ -3206,6 +3236,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   /** 本次航班的输入（启动时才读取，避免并发覆盖） */
   private testCoreSubs: SubscriptionService | null = null;
   private testCoreSettings: AppSettings | null = null;
+  private testCoreStartError: string = '';
+
+  latencyChannelError(): string {
+    return this.testCoreStartError;
+  }
 
   /** 内核日志流（/logs WebSocket）：测速诊断用，随 teardown 释放 */
   private coreLogSocket: webSocket.WebSocket | null = null;
@@ -3300,6 +3335,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   /** 真正的启动动作（由状态机单次调用） */
   private async launchTestCore(): Promise<boolean> {
+    this.testCoreStartError = '';
     const subs = this.testCoreSubs;
     const settings = this.testCoreSettings;
     if (this.context === null || subs === null || settings === null) {
@@ -3314,9 +3350,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         // hosts 的**唯一来源**是 RuntimeConfigBuilder.resolveSharedHosts（审计 F10 / ND11）：
         // 隧道与测速核共用同一次 DoH 解析 ⇒ 同一域名在两份 YAML 里钉到同一个 IP，
         // 不会再出现「同一节点隧道里能用、测速核里 pin 不上」。
-        const testPriority: string[] = subs.nodes.length > 0 && subs.nodes[0].server.length > 0
-          ? [subs.nodes[0].server] : [];
-        hosts = await RuntimeConfigBuilder.resolveSharedHosts(subs.nodes, testPriority);
+        const profileNodes = ProfileRepository.exists(ProfileRepository.currentId()) ? [] : ProfileRepository.currentId().length > 0
+          ? subs.nodesOf(ProfileRepository.currentId()) : subs.nodes;
+        const testPriority: string[] = profileNodes.length > 0 && profileNodes[0].server.length > 0
+          ? [profileNodes[0].server] : [];
+        hosts = await RuntimeConfigBuilder.resolveSharedHosts(profileNodes, testPriority);
       } catch (e) {
         AppLogger.warn(TAG, `test-core DoH pre-resolve failed: ${AppLogger.errText(e)}`);
       }
@@ -3325,7 +3363,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 域名直接复用（lastProxyHosts）。隧道里能连上的节点，测速核必须也能连上 ——
       // 两边各自解析 = 同一节点在两条路径上表现不同（真机 2026-10-20：DoH 在当前
       // 网络不通时测速核 pin 不到 → 运行期回退明文 DNS → 全部 503 失败）。
-      const sharedHostKeys: string[] = Object.keys(this.lastProxyHosts);
+      const sharedHostKeys: string[] = ProfileRepository.exists(ProfileRepository.currentId())
+        ? [] : Object.keys(this.lastProxyHosts);
       for (const k of sharedHostKeys) {
         if (hosts[k] === undefined) {
           hosts[k] = this.lastProxyHosts[k];
@@ -3348,7 +3387,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 写回会让隧道 YAML 里的端口与客户端 setEndpoint 用的端口对不上。
       const testPorts = await this.pickPorts(this.apiPort);
       if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
-      // 测速核不启用 smart 组：它只做延迟探测，多一层内核选点会让测速结果失真
+      // 测速核保留 profile 的真实策略组（含 Smart），不合成自动选择组。
       // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
       // 唯一配置生成入口：测速核与隧道共用同一份事实与同一处决策，
       // 选中的节点也一致（审计 F6：旧实现测速核写死 subs.nodes[0]）。
@@ -3366,19 +3405,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const preparedConfig = await this.prepareConfigYaml(yaml, 'test-core');
       if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
       privateFs.writePrivate(configPath, preparedConfig);
+      const extWasRunning: boolean = this.isCoreAliveByHeartbeat() || this.readStartOk();
       this.clearStartError();
       const stopWant: Want = {
         bundleName: 'com.tunbox.client',
         abilityName: 'VpnExtensionAbility'
       };
       // 停旧扩展。**只在扩展确实在跑时**才等它真正退出：
-      // stop 抛错 = 本来就没跑（未运行属正常），此时固定 600ms 是纯白等 ——
-      // 对齐 connect() 的既有优化（no live tunnel → skip exit grace）。
-      // 真机证据：冷启动后第一次测速（从未连接过）白白多付 600ms。
-      let extWasRunning: boolean = false;
+      // stop 在没有扩展时也可能返回成功，不能据此强加 600ms 等待。
+      // 用停机前的心跳/启动标记判断是否真的需要退出宽限期。
       try {
         await vpnExtension.stopVpnExtensionAbility(stopWant);
-        extWasRunning = true;
       } catch (e) {
         // 未运行属正常
       }
@@ -3411,23 +3448,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (extErr.length > 0) {
           throw new Error(`测速内核启动失败: ${extErr}`);
         }
-        if (this.readStartOk() && await this.api.healthProbe()) {
+        const probe = this.readStartOk() ? await this.api.probeController(1000) : null;
+        if (probe !== null && probe.reachable && (probe.httpCode === 401 || probe.httpCode === 403)) {
+          throw new Error(`测速端口 ${this.testCoreApiPort} 已被其他内核占用，请重试`);
+        }
+        if (probe !== null && probe.secretAccepted) {
           if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
           AppLogger.info(TAG, 'headless test core ready');
           this.confirmProfileApplied('test-core');
           // 挂载内核日志流: 拨号失败的真实原因(DNS/握手/路由)只在内核日志里,
           // API 的 503 响应体是固定文案。转发进 AppLogger → hilog 可远程排查。
           this.startCoreLogStream(this.testCoreSecret);
-          // 预热窗口：ready ≠ 可服务，controller 还要把首批连接/凭证初始化完
-          // （见 TEST_CORE_WARMUP_MS 注释）。
-          //
-          // 这里**只登记「预计何时变热」，不真的睡**：把 1.5s 塞进启动 Promise
-          // 会顶高 SingleFlightTestCore 的 15s 超时上限（慢 DoH + 慢就绪时
-          // 本来能成功的启动会突然被判超时 → 白拆一次再重启）。
-          // 真正等待放在 ensureLatencyApi（awaitTestCoreWarmup）：
-          //  - 新鲜启动 → 等满剩余预热窗口（与旧实现同长，总耗时不变）；
-          //  - 复用已在服务的内核 → 窗口早已过去 → **不等待 → 秒开**。
-          this.testCoreWarmAt = Date.now() + TEST_CORE_WARMUP_MS;
           return true;
         }
         readinessDelayMs = nextReadinessDelayMs(readinessDelayMs);
@@ -3443,7 +3474,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       throw new Error('测速内核就绪超时(20s)');
     } catch (e) {
-      AppLogger.warn(TAG, `ensureTestCore failed: ${AppLogger.errText(e)}`);
+      this.testCoreStartError = AppLogger.errText(e);
+      AppLogger.warn(TAG, `ensureTestCore failed: ${this.testCoreStartError}`);
       return false;
     }
   }
@@ -3497,7 +3529,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.api.setEndpoint(this.apiPort, '');
     this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
-    this.testCoreWarmAt = 0;
     this.testCoreNodeFingerprint = '';
     this.invalidateStateProbeCache();
     this.clearTestCoreArtifacts();
@@ -3632,7 +3663,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
   /**
    * 「测速是否在跑」探针注册表（引擎侧注册，避免静态循环依赖：
-   * LatencyEngine/FlclashLatencyService 都依赖本类，本类不能反向 import 它们）。
+   * LatencyEngine/TunBoxLatencyService 都依赖本类，本类不能反向 import 它们）。
    * 回收定时器到点时若任一探针报忙，本轮回收顺延——否则 600 节点的批
    * （引擎预算 ~138s）会在第 90s 被自己停核，剩余节点成片盖章超时。
    */
@@ -3679,21 +3710,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /** TCP 探测 127.0.0.1 端口是否空闲：listen 成功即可用，占用/异常都视为不可用。 */
+  /** 同时检查已有监听和独占绑定，避开独立测速进程残留的 controller。 */
   private static async portIsFree(port: number): Promise<boolean> {
-    const server = socket.constructTCPSocketServerInstance();
-    try {
-      await server.listen({ address: '127.0.0.1', port: port, family: 1 });
-      return true;
-    } catch (e) {
-      return false;
-    } finally {
-      try {
-        await server.close();
-      } catch (e) {
-        // 探测失败时 close 也可能失败，忽略
-      }
-    }
+    return LocalPortProbe.isFree(port);
   }
 
   /**
@@ -3701,7 +3720,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    *
    * 隧道与测速核**共用同一份事实**（节点集 / 设置 / 代理组 / 订阅规则 / DoH 快照 /
    * 三个就绪标志），差异只有 mode 决定的 tun.enable、端口与 secret。
-   * 决策（useSmart / ruleProviderReady / selectedNode / useGeoip）全部在
+   * 决策（ruleProviderReady / selectedNode / useGeoip）全部在
    * RuntimeConfigBuilder.decideRuntimeOptions 一处做（审计 F5 / F6 / F11）。
    */
   /**
@@ -3756,7 +3775,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     const ports = new RuntimePorts();
     ports.apiPort = apiPort; ports.mixedPort = mixedPort; ports.dnsPort = dnsPort;
     const subs = SubscriptionService.instance();
-    const hosts = await RuntimeConfigBuilder.resolveSharedHosts(subs.nodesOf(profileId), []);
+    const hosts: Record<string, string> = {};
     const profile = await this.hydrateAndBuildProfile(subs, settings, '', ports, secret, hosts,
       this.isSmartModelReady(), this.isGeoipReady(), this.isRuleProviderReady(), profileId);
     const result = await RuntimeConfigBuilder.buildRuntimeConfig(profile, RuntimeConfigMode.TEST);
@@ -3813,16 +3832,28 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (profileId.length > 0) {
       const sourceYaml = ProfileRepository.read(profileId);
       if (isolatedProfileId.length === 0) { this.pendingProfileRevision = ProfileRepository.fingerprint(sourceYaml); }
+      profile.profileId = profileId;
       profile.profileYaml = sourceYaml.length > 0 ? await ProfileRepository.prepare(sourceYaml) : '';
       if (profile.profileYaml.length === 0) {
         // 文件读不出来（被删/写盘中断）：**不要**把它当配置基底，也不要把
         // applied 记成它 —— 否则界面会认为内核里是这份 profile，
         // 实际跑的是「全部订阅合并」的兜底配置（节点全串）。
-        AppLogger.warn(TAG, `profile ${profileId} exists but empty; falling back to full overlay`);
-        profileId = '';
+        throw new Error('当前订阅的配置文件无法读取，请重新导入或更新该订阅');
       }
+      // Native profiles are independent documents, never overlays of every
+      // enabled subscription. DNS/provider names from another profile can make
+      // otherwise valid nodes fail or bind to the wrong provider.
+      profile.nodes = subs.nodesOf(profileId);
+      profile.proxyGroups = subs.groupsOf(profileId);
+      profile.subscriptionRules = [];
+      profile.subscriptionRuleProviders = '';
+      profile.subscriptionDnsUpstreams = [];
+      profile.subscriptionDnsPolicies = [];
     }
     if (isolatedProfileId.length === 0) { this.pendingProfileId = profileId; }
+    // 每 profile 覆盖层：与 FlClash Profile.overrides 同语义（只作用于本 profile）。
+    // 未初始化/没有覆盖时返回空串，builder 回落全局 yamlOverride。
+    profile.overrideYaml = ProfileOverrideStore.effective(profileId, '');
     AppLogger.info(TAG, `profile base: id=${profileId.length > 0 ? profileId : '<none>'} `
       + `bytes=${profile.profileYaml.length} exists=${profileId.length > 0 ? ProfileRepository.exists(profileId) : false}`);
     return profile;
@@ -3860,8 +3891,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return picked;
       }
     }
-    AppLogger.warn(TAG, 'all port candidate sets busy; keeping current ports');
-    return picked;
+    throw new Error('本地内核端口均被占用，请关闭其他代理后重试');
   }
 
   /**
@@ -3917,8 +3947,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.failedConnectSeq !== seq) { return false; }
     // 修复可能再次调用 disconnect/connect，必须在资源队列释放后执行。
     const configRejected = this.lastError.indexOf('配置校验未通过') >= 0;
-    const nested = this.inRepairConnect || this.failoverRunning;
-    if (!configRejected && !nested && !this.healthRunning) {
+    const nested = this.inRepairConnect || this.failoverRunning || this.automaticRecoveryActive;
+    if (!configRejected && !isNonRetryableStartupError(this.lastError) && !nested && !this.healthRunning) {
       const recovered = await this.runHealthSelfCheckAndRepair('connect-failed');
       if (recovered) { return true; }
       if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
@@ -4003,6 +4033,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
 
     const stateBeforeConnect: ConnState = this.state;
+    AppProxyRoute.clear();
     this.setState(ConnState.CONNECTING);
     this.lastError = '';
     this.lastSubs = subs;
@@ -4219,7 +4250,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // （注意：DoHResolver 内部对短 TTL 域名不再 pin，那部分见该文件头注释。）
       try {
         // 同上：hosts 唯一来源 = RuntimeConfigBuilder.resolveSharedHosts（ND11）。
-        proxyHosts = await RuntimeConfigBuilder.resolveSharedHosts(subs.nodes, priorityDomains);
+        const resolutionNodes = ProfileRepository.exists(ProfileRepository.currentId()) ? []
+          : (target.subscriptionId.length > 0 ? subs.nodesOf(target.subscriptionId) : subs.nodes);
+        proxyHosts = await RuntimeConfigBuilder.resolveSharedHosts(resolutionNodes, priorityDomains);
         const tunnelReport = DoHResolver.lastReport;
         this.lastProxyHostAttempted = tunnelReport.queried.concat(tunnelReport.failed);
         this.lastProxyHostResolved = tunnelReport.resolved.slice(0);
@@ -4230,7 +4263,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 域名清单来自唯一实现（RuntimeConfigBuilder.proxyServerDomains）——
       // 隧道与测速核用的是同一份清单，不能各算各的。
-      const serverDomains: string[] = RuntimeConfigBuilder.proxyServerDomains(subs.nodes);
+      const serverDomains: string[] = ProfileRepository.exists(ProfileRepository.currentId()) ? []
+        : RuntimeConfigBuilder.proxyServerDomains(subs.nodes);
       AppLogger.info(TAG, `DoH pinned ${Object.keys(proxyHosts).length}/${serverDomains.length} proxy servers`);
       const unpinnedDomains: string[] = [];
       for (const d of serverDomains) {
@@ -4249,36 +4283,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // DoH 只发 HTTPS 查询），串行等于白等两段。
       await portsTask;
       if (seq !== this.connectSeq || this.disconnectRequested) {
-        await this.disconnectInternal(intentGeneration);
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
         return false;
       }
       tPrelaunch = Date.now() - connectT0;
-      // ── 内核 smart 组（自动选择）────────────────────────────────────────
-      // 只有「用户选了自动模式」且「Model.bin 已就绪」才声明 type: smart。
-      // 模型缺失时若仍声明，内核 GetModel() 会在启动路径同步下载 github 上的
-      // Model.bin（实测阻塞 90.1s），与坑 24/40 同类；这里直接降级回
-      // 应用侧 SmartSelector 选点，行为与换核前一致。
-      //
-      // 但**模型下载不能只在 auto 模式下做**：默认模式就是 manual（用户开箱即是），
-      // 若只在 auto 下载，用户切到 auto 时还要再等一轮连接才拿得到模型。
-      // 所以在任一模式下、只要模型没就绪就先补齐，切模式时即可立刻生效。
-      //
-      // 性能：seedSmartModelFromRawfile 会同步读+写 9.3MB（rawfile → cacheDir）。
-      // manual（默认模式）根本不会用到 smart 组，却要为这份用不上的拷贝付出
-      // 几百毫秒主线程 I/O —— 因此只在**真的要声明 smart 组**（auto 模式）时才播种。
-      // manual 模式下模型就绪与否由后台下载保证，下次切到 auto 即刻可用。
-      const autoMode = settings.autoSelectMode === AutoSelectModes.AUTO;
-      const smartReady = (autoMode && this.seedSmartModelFromRawfile()) || this.isSmartModelReady();
-      if (!smartReady) {
-        // 用户口径（2026-10-22）：**不再在连接/启动代理后自动下载 Model.bin**。
-        // 理由：模型 9.3MB，绝大多数用户用不到自动优选；后台下载既占流量，又让
-        // 「没模型时不显示自动选择」这条 UI 规则永远不成立（一连接就偷偷补上了）。
-        // 需要模型的用户在启动代理后由内核侧更新，UI 上已写明这句话。
-        AppLogger.info(TAG, 'smart model missing; auto-download disabled by policy');
-      }
-      // 保持字面量表达：架构自检（scripts/verify-vpn-architecture.mjs 的
-      // orch.smart.gated-by-auto）就是靠这段文本锁定"smart 组只由 auto 模式启用"，
-      // 换成中间变量会让这道闸门失效。
+      // Smart 由订阅最终策略声明；prepareConfigYaml 按实际 uselightgbm
+      // 只查询手动安装状态；启动过程绝不补盘或下载模型。
+      const smartReady = this.isSmartModelReady();
       const configGenT0 = Date.now();
       // 凭据回填收敛在 hydrateAndBuildProfile（生成配置的唯一入口）。
       // 唯一配置生成入口：隧道与测速核共用同一份事实与同一处决策。
@@ -4305,7 +4316,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const effectiveNode: ProxyNode | null =
         (tunnelProfile.nodes ?? []).find((n: ProxyNode): boolean => n.name === effectiveName) ?? null;
       const pinNode: ProxyNode = effectiveNode !== null ? effectiveNode : target;
-      if (effectiveName !== target.name && !built.pinMatched
+      if (built.smartGroupName.length === 0 && effectiveName !== target.name && !built.pinMatched
         && settings.autoSelectMode === AutoSelectModes.AUTO) {
         AppLogger.warn(TAG, `pin target "${target.name}" missing from final PROXY group; `
           + `pinning "${effectiveName}" instead`);
@@ -4325,10 +4336,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         } catch (e) {
           AppLogger.warn(TAG, `self-heal preferred node failed: ${AppLogger.errText(e)}`);
         }
-      }
-      if (settings.autoSelectMode === AutoSelectModes.AUTO && !built.options.useSmart) {
-        AppLogger.info(TAG, 'auto mode but Model.bin not ready; using app-side selection '
-          + '(smart group disabled this session; downloading in background)');
       }
       AppLogger.info(TAG, `config generated: ${Date.now() - configGenT0}ms (${yaml.length} bytes)`);
       // 登记「隧道配置对应哪个节点集」：测速取通道前用它判断隧道配置是否过期
@@ -4356,7 +4363,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 重新读盘既多一次 IO 也可能读到被并发改写的版本。
       const preparedConfig = await this.prepareConfigYaml(yaml, 'main');
       if (seq !== this.connectSeq || this.disconnectRequested) {
-        await this.disconnectInternal(intentGeneration);
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
         return false;
       }
       privateFs.writePrivate(stagedConfigPath, preparedConfig);
@@ -4456,7 +4463,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       try {
       while (Date.now() < deadline) {
         if (seq !== this.connectSeq) {
-          await this.disconnectInternal(intentGeneration);
+          await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
           return false;
         }
         // 1) 失败信号优先：扩展进程回写的错误
@@ -4577,12 +4584,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       //   用户的要求是「任何场景都不能出现启动代理不可用」，所以宁可保留 0.3.3 的
       //   宽松语义：钉选失败 = 内核按配置里 PROXY 组首个成员（=本次目标节点）走，
       //   这正是我们生成 YAML 时 unshift 保证的顺序。读回日志用于事后定位。
-      const pinSmartGroup = built.options.useSmart && settings.autoSelectMode === AutoSelectModes.AUTO
-        // 生成器写的是带引号形式（`- name: "♻️ 自动选择"`）；旧检查不带引号永远匹配
-        // 不上 → 自动模式一直在钉选用户手动节点（2026-10-25 真机实证「没有去优选」）。
-        && yaml.includes(`name: "${ClashConfigGenerator.SMART_GROUP_NAME}"`);
+      // smart 组钉选已删除（R6，§5.4）：FlClash 固定上游无 smart 组注入，
+      // 自动模式不再把出口钉到「自动选择」组，按用户所选精确名钉选。
       const startupGroupName: string = settings.proxyMode === 'global' ? 'GLOBAL' : built.ruleGroupName;
-      const pinTargetName: string = pinSmartGroup ? ClashConfigGenerator.SMART_GROUP_NAME : effectiveName;
+      const pinTargetName: string = effectiveName;
       // A provider-only profile can start with its own default group policy.
       // Explicit user picks must be confirmed through the actual group graph.
       // 只有「目标本来就是 profile 伪节点且没有被改名」时才跳过钉选。
@@ -4607,7 +4612,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         && seq === this.connectSeq && !this.disconnectRequested;
       // Restore inner selectors before applying the current explicit intent.
       // Replaying them after a global leaf pin can restore a conflicting parent.
-      if (!pinSmartGroup) {
+      // smart 组钉选已删除（R6/§5.4）：这里不再有 pinSmartGroup 前置条件。
+      {
         await CoreCatalogService.restoreGroupSelections(this.api, attempt.profileId,
           settings.proxyGroupSelections, selectionCurrent);
       }
@@ -4621,7 +4627,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       let userPickValid: boolean = false;
       // PUT 必须发**内核里的真实名字**（App 侧名字可能与内核对不上，差 emoji/空格）。
       let kernelPickName: string = '';
-      if (kernelSel !== null && !pinSmartGroup) {
+      if (kernelSel !== null) {
         kernelPickName = RuntimeConfigBuilder.kernelLeafFor(kernelSel.leafMembers,
           intentLive ? target.name : effectiveName);
         userPickValid = kernelPickName.length > 0;
@@ -4629,10 +4635,21 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       let finalNodeName: string = effectiveName;
       let fallbackNode: ProxyNode | null = null;
       let pinned: boolean = false;
-      const explicitPick: boolean = !pinSmartGroup && settings.autoSelectMode !== AutoSelectModes.AUTO
+      if (built.smartGroupName.length > 0) {
+        pinned = await this.api.selectNodeInGroup(startupGroupName, built.smartGroupName, selectionCurrent,
+          Math.max(0, PIN_PHASE_BUDGET_MS - (Date.now() - pinT0)));
+        if (!selectionCurrent()) { return false; }
+        if (!pinned) { throw new Error('智能选择未生效，请检查本订阅的节点或 provider 是否已加载'); }
+        const confirmed = await this.api.readKernelSelection(startupGroupName);
+        if (!selectionCurrent()) { return false; }
+        if (confirmed === null || (!confirmed.nowIsLeaf && !confirmed.dynamic)) { throw new Error('智能选择没有可用候选节点'); }
+        finalNodeName = confirmed.now;
+        AppLogger.info(TAG, `smart selected: group="${built.smartGroupName}" parent="${startupGroupName}"`);
+      }
+      const explicitPick: boolean = (settings.autoSelectMode !== AutoSelectModes.AUTO || !this.isSmartModelAvailable())
         && !target.id.startsWith('profile:');
-      const profileDefault: boolean = !pinSmartGroup && target.id.startsWith('profile:');
-      if (explicitPick || profileDefault) {
+      const profileDefault: boolean = target.id.startsWith('profile:');
+      if (!pinned && (explicitPick || profileDefault)) {
         // Static YAML cannot list provider leaves. Validate the actual requested
         // group/leaf in the running kernel, without substituting Direct or an old exit.
         const requestedName: string = profileDefault ? startupGroupName
@@ -4643,13 +4660,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (!pinned) { throw new Error(`节点选择未生效：${target.name}，请检查订阅节点是否已加载`); }
         const confirmed = await this.api.readKernelSelection(startupGroupName);
         if (!selectionCurrent()) { return false; }
-        if (confirmed === null || !confirmed.nowIsLeaf) {
+        if (confirmed === null || (!confirmed.nowIsLeaf && !confirmed.dynamic)) {
           throw new Error(`节点选择未生效：${target.name}，未能确认实际出口`);
         }
         finalNodeName = confirmed.now;
       }
       if (!pinned && userPickValid) {
-        pinned = await this.api.selectNode(kernelPickName);
+        pinned = await this.api.selectNodeInGroup(startupGroupName, kernelPickName, selectionCurrent);
         if (pinned) { finalNodeName = kernelPickName; }
       }
       if (!pinned && (effectiveName === target.name && target.id.startsWith('profile:'))) {
@@ -4657,13 +4674,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       // 显式钉选（本次配置里的目标节点）优先于内核旧状态：用户刚选的必须赢。
       if (!pinned && pinTargetName.length > 0) {
-        pinned = await this.api.selectNode(pinTargetName);
+        pinned = await this.api.selectNodeInGroup(startupGroupName, pinTargetName, selectionCurrent);
         if (pinned) { finalNodeName = pinTargetName; }
       }
       // 只有**没有可用用户意图**时，才认内核既有出口（store-selected 持久化的上次选择）。
       // 有意图却因为名字差异落不下去时，诚实地用配置里的目标 + 日志，不得拿旧出口顶替。
       let adoptedByKernel: boolean = false;
-      if (!pinned && !intentLive && kernelSel !== null && !pinSmartGroup && kernelSel.nowIsLeaf) {
+      if (!pinned && !intentLive && kernelSel !== null && kernelSel.nowIsLeaf) {
         pinned = true;
         adoptedByKernel = true;
         finalNodeName = kernelSel.now;
@@ -4692,7 +4709,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
             continue;
           }
           attempted++;
-          if (await this.api.selectNode(cand.name)) {
+          if (await this.api.selectNodeInGroup(startupGroupName, cand.name, selectionCurrent)) {
             pinned = true;
             finalNodeName = cand.name;
             fallbackNode = cand;
@@ -4730,7 +4747,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         for (const delayMs of retryDelays) {
           if (Date.now() - pinT0 >= PIN_PHASE_BUDGET_MS) { break; }
           await new Promise<void>((resolve) => setTimeout((): void => resolve(), delayMs));
-          if (await this.api.selectNode(pinTargetName)) {
+          if (await this.api.selectNodeInGroup(startupGroupName, pinTargetName, selectionCurrent)) {
             pinned = true;
             break;
           }
@@ -4748,7 +4765,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         const yamlFirst: string = built.effectiveNodeName ?? '';
         if (yamlFirst.length > 0 && yamlFirst !== pinTargetName
           && Date.now() - pinT0 < PIN_PHASE_BUDGET_MS) {
-          if (await this.api.selectNode(yamlFirst)) {
+          if (await this.api.selectNodeInGroup(startupGroupName, yamlFirst, selectionCurrent)) {
             pinned = true;
             finalNodeName = yamlFirst;
             AppLogger.warn(TAG, `pin fallback: yaml-first "${yamlFirst}" accepted`);
@@ -4826,18 +4843,24 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 提交前的最后一道事务门禁：任何旧事务/用户停止都在这里出局。
       if (!attempt.checkpoint(this.attempts.currentGeneration()) || seq !== this.connectSeq
         || this.disconnectRequested) {
-        await this.disconnectInternal(intentGeneration);
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
         return false; // 已被更新的连接请求/用户停止取代
       }
 
       // 连接成功事件会同步通知数据页；必须先把 App HTTP 请求接入 mixed-port 并探测就绪，
       // 否则订阅方在事件回调里立刻查询出口 IP 时，usingProxy 会是 false，绕过代理。
       await this.activateAppHttpProxy('connect');
+      if (!attempt.checkpoint(this.attempts.currentGeneration()) || seq !== this.connectSeq
+        || this.disconnectRequested || !await this.isCurrentSession(intentGeneration)) {
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
+        return false;
+      }
       this.runtimeProxyMode = settings.proxyMode;
       this.setState(ConnState.CONNECTED);
       attempt.complete();
       this.startedAt = Date.now();
       this.recoveryAttempts = 0;
+      this.automaticRecoveryActive = false;
       this.startMonitors();
       this.clearStartError(); // 连接成功，清掉启动标记文件
       // 内核已接受本次配置 ⇒ 才把暂存文件提升为**正式配置**（2026-10-22 冷启动口径）：
@@ -4863,7 +4886,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(finalNodeName);
       if (seq !== this.connectSeq || this.disconnectRequested) {
-        await this.disconnectInternal(intentGeneration);
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
         return false;
       }
       // 通知权限**每次连接都复核**（用户可能刚在系统设置里打开/关闭；只在未授予
@@ -4898,12 +4921,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (e) {
       const errorMessage = AppLogger.errText(e);
       try {
-        await this.disconnectInternal(intentGeneration);
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
       } catch (cleanupError) {
         AppLogger.warn(TAG, `connect rollback failed: ${AppLogger.errText(cleanupError)}`);
       }
       if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
-      this.setState(ConnState.DISCONNECTED);
+      this.setState(this.automaticRecoveryActive ? ConnState.RECOVERING : ConnState.DISCONNECTED);
       this.startedAt = 0;
       this.ipv6Active = false;
       this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
@@ -5227,7 +5250,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * **同步联网下载** `https://github.com/vernesong/mihomo/releases/.../Model.bin`，
    * 国内直连不可达 → 实测在 config.Parse 阶段阻塞 **90.1s** 后才软失败降级
    * （比 MMDB 温和：不 hard fail，但连接已经卡到用户以为挂死）。
-   * 所以只有文件真正就绪时才允许生成 `type: smart` 组。
+   * 最终配置声明 `type: smart` 且 `uselightgbm: true` 时须在启动前准备模型。
+   * Smart 未开启 LightGBM 时不依赖该文件。
    *
    * 魔数：LightGBM 文本模型首 4 字节为 "tree"。
    */
@@ -5238,6 +5262,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     const path = `${this.context.cacheDir}/Model.bin`;
     let file: fs.File | null = null;
     try {
+      // 旧版自动铺盘不等于用户选择安装；仅设置页手动更新成功才写入该标记。
+      if (!fs.accessSync(`${path}.manual`)) { return false; }
       // 模型 9.3MB；小于 1MB 必为截断/错误页
       if (fs.statSync(path).size < 1024 * 1024) {
         return false;
@@ -5263,85 +5289,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /**
-   * 从 HAP 内置 rawfile 把 `Model.bin` 铺到内核 home（首选路径）。
-   *
-   * 为什么内置而不是纯联网下载：实测国内直连可达的 github 镜像里，
-   * `testingcf.jsdelivr.net/gh/vernesong/mihomo@LightGBM-Model/Model.bin` **404**
-   * （`LightGBM-Model` 是 release tag，不是仓库 ref，jsdelivr 取不到 release 附件），
-   * `ghfast.top` / `gh.llkk.cc` / `github.moeyy.xyz` 直接连不通，
-   * 只有 `gh-proxy.com` / `ghproxy.net` 可用但**限速严重**（120s 只下到 5.9MB / 9.3MB）。
-   * 也就是说纯下载路径在真机上大概率失败 —— 而失败的表现就是「自动选择一直不出现」。
-   * 内置后本地拷贝即可，无网络依赖、离线可用、首次连接就能生效。
-   *
-   * @returns 是否已就绪（铺好或本来就在）
-   */
-  private seedSmartModelFromRawfile(): boolean {
-    if (this.context === null) {
-      return false;
-    }
-    if (this.isSmartModelReady()) {
-      return true;
-    }
-    const dst = `${this.context.cacheDir}/Model.bin`;
-    let file: fs.File | null = null;
-    try {
-      const bytes: Uint8Array = this.context.resourceManager.getRawFileContentSync('Model.bin');
-      if (bytes.byteLength < 1024 * 1024) {
-        AppLogger.warn(TAG, `bundled Model.bin too small (${bytes.byteLength} bytes); ignoring`);
-        return false;
-      }
-      // 魔数 "tree"：坏文件比没文件更糟 —— 内核会删掉它再联网重下（90s 阻塞）
-      if (!(bytes[0] === 0x74 && bytes[1] === 0x72 && bytes[2] === 0x65 && bytes[3] === 0x65)) {
-        AppLogger.warn(TAG, 'bundled Model.bin has wrong magic; ignoring');
-        return false;
-      }
-      file = fs.openSync(dst, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      // fs.writeSync 只吃 ArrayBuffer。若 Uint8Array 是某个更大 buffer 的视图，
-      // 直接传 .buffer 会把多余字节一起写进去 → 必须按 byteOffset/byteLength 取准。
-      const ab: ArrayBuffer = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
-        ? bytes.buffer as ArrayBuffer
-        : bytes.slice().buffer as ArrayBuffer;
-      fs.writeSync(file.fd, ab);
-      AppLogger.info(TAG, `Model.bin seeded from bundle (${bytes.byteLength} bytes); smart group enabled`);
-      return true;
-    } catch (e) {
-      AppLogger.warn(TAG, `seed Model.bin from bundle failed: ${e}`);
-      return false;
-    } finally {
-      if (file !== null) {
-        try {
-          fs.closeSync(file);
-        } catch (e) {
-          // ignore
-        }
-      }
-    }
-  }
-
-  /**
-   * UI 入口：确保内置模型已铺盘，并返回内核 smart 组当前是否可用。
-   *
-   * 节点列表页用它决定是否展示「♻️ 自动选择」入口。这里顺带触发一次铺盘，
-   * 否则用户**首次打开节点列表（还没连过）时看不到该入口** ——
-   * 铺盘是本地拷贝，代价可以忽略，且只成功一次。
-   */
-  ensureSmartModelReady(): boolean {
-    return this.seedSmartModelFromRawfile() || this.isSmartModelReady();
-  }
 
   /**
    * 纯查询：内核 smart 选点模型是否已就位（`cacheDir/Model.bin` 非空且魔数正确）。
    *
-   * 与 ensureSmartModelReady 的区别：**绝不播种、绝不下载、不碰网络**。
-   * 订阅页用它决定要不要渲染「自动选择 · 内核智能优选」入口 —— 用户明确要求
-   * 没有模型时把这块隐藏，所以这个判断必须是零副作用的。
+   * 只有用户手动更新成功且本地模型有效时可用。绝不铺盘、下载或碰网络。
    */
   isSmartModelAvailable(): boolean {
     return this.isSmartModelReady();
   }
 
-  /** 后台下载 LightGBM 模型到内核 home（照搬 geoip 的多镜像 + 校验模式） */
+  /** 仅设置页手动更新允许下载模型；启动、测速和页面查询均不得触发。 */
   private smartModelDownloading: boolean = false;
 
   /** 是否有 Model.bin 下载在飞行中（设置页据此区分「正在下」与「下载失败」） */
@@ -5349,7 +5307,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.smartModelDownloading;
   }
 
-  /** 等待型 Model.bin 下载（仅内置 rawfile 铺盘失败时的兜底路径） */
+  /** 设置页显式触发，校验、原子替换成功后才标记为手动安装。 */
   private async downloadSmartModelAsset(source: string): Promise<boolean> {
     if (this.smartModelDownloading || this.context === null) {
       return false;
@@ -5359,24 +5317,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const dest = `${this.context.cacheDir}/Model.bin`;
       // LightGBM 文本模型魔数 "tree"；体积必须够（9.3MB）。
       // 同 geoip 的理由：坏文件比没有文件更糟 —— 内核会删掉它再联网重下。
-      return await this.downloadAsset(MODEL_MIRRORS, dest, 1024 * 1024,
+      const ok = await this.downloadAsset(MODEL_MIRRORS, dest, 1024 * 1024,
         (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferMagicOk(buf,
           [0x74, 0x72, 0x65, 0x65]), source, 'Model.bin');
+      if (ok) { privateFs.writePrivate(`${dest}.manual`, 'manual-v1'); }
+      return ok && this.isSmartModelReady();
     } finally {
       this.smartModelDownloading = false;
     }
   }
 
-  private downloadSmartModelInBackground(source: string = 'auto'): void {
-    this.downloadSmartModelAsset(source).then((ok: boolean): void => {
-      if (!ok) {
-        AppLogger.warn(TAG, 'Model.bin download failed from all mirrors; '
-          + 'smart group stays disabled (bundled copy also unavailable?)');
-      }
-    }).catch((e: Object): void => {
-      AppLogger.warn(TAG, `Model.bin download task error: ${e}`);
-    });
-  }
 
   /**
    * 去广告规则集是否**可用**（存在 + 体积下限 + zstd 魔数）。
@@ -5626,7 +5576,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     out.push(item('geoip', 'GeoIP 数据库', 'GEOIP,CN 直连分流与 DNS fallback 依赖', geoip,
       this.isGeoipReady()));
     out.push(item('model', 'Smart 选点模型', 'LightGBM 自动选点依赖（需手动更新）', model,
-      this.ensureSmartModelReady()));
+      this.isSmartModelAvailable()));
     return out;
   }
 
@@ -5647,7 +5597,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 后台任务正持有下载锁时，downloadSmartModelAsset 会立刻返回 false，
       // 旧实现把它报成「全部下载源均失败」—— 与事实相反（正在下）。
       if (this.smartModelDownloading) {
-        return '模型正在后台下载，请稍候再看状态';
+        return '模型正在更新，请稍候再看状态';
       }
       ok = await this.downloadSmartModelAsset(source);
     } else if (id === 'ruleset') {
@@ -5667,7 +5617,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const seq = AppStorage.get<number>('smart_model_seq');
       AppStorage.setOrCreate<number>('smart_model_seq', (seq ?? 0) + 1);
     }
-    return ok ? '' : '全部下载源均失败，请稍后重试或切换下载源';
+    return ok ? '' : (id === 'model'
+      ? '模型下载失败，请先使用普通节点启动代理，再点击更新重试'
+      : '全部下载源均失败，请稍后重试或切换下载源');
   }
 
   /**
@@ -5687,12 +5639,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     try {
       if (id === 'model') {
+        if (this.state !== ConnState.DISCONNECTED) { return '删除模型前请先断开代理'; }
+        if (this.smartModelDownloading) { return '模型正在更新，请稍后再删除'; }
         const path = `${this.context.cacheDir}/Model.bin`;
-        try {
-          fs.unlinkSync(path);
-        } catch (e) {
-          // 文件本来就不存在：按成功处理
-        }
+        if (fs.accessSync(path)) { fs.unlinkSync(path); }
+        if (fs.accessSync(`${path}.manual`)) { fs.unlinkSync(`${path}.manual`); }
         // 通知所有页面重算「自动选择」是否该显示
         const seq = AppStorage.get<number>('smart_model_seq');
         AppStorage.setOrCreate<number>('smart_model_seq', (seq === undefined ? 0 : seq) + 1);
@@ -5780,7 +5731,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    *        的意图抹掉 —— 那会让后台自愈误判为"用户已断开"而不再复活隧道。
    *        隧道拆除本身不受影响，始终照常执行。
    */
-  private async disconnectInternal(expectedGeneration: number = 0): Promise<void> {
+  private async disconnectInternal(expectedGeneration: number = 0, preserveIntent: boolean = false): Promise<void> {
     this.invalidateStateProbeCache();
     this.stopMonitors();
     // 隧道要没了：立刻撤销 App 级 HTTP 代理，否则后续请求全打到空端口
@@ -5793,7 +5744,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         AppLogger.warn(TAG, `test core stop during disconnect failed: ${AppLogger.errText(e)}`);
       }
     }
-    await this.clearSessionIntent(expectedGeneration);
+    if (preserveIntent && expectedGeneration > 0) {
+      await this.updateSessionSnapshot(expectedGeneration, true, 'recovering', this.lastNodeName, 0);
+    } else {
+      await this.clearSessionIntent(expectedGeneration);
+    }
     // 内核一停，它的累计计数器就没了：先把当前增量补记并落盘，否则这段流量永久丢失。
     this.flushTrafficAccounting();
     try {

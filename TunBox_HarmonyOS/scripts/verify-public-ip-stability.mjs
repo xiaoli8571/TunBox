@@ -357,8 +357,10 @@ console.log('[A3] 连接成功后先作废在飞查询再重查（两个入口�
       `要求 invalidatePublicIpQueries() 出现在 refreshPublicIp('${trigger}') 之前`
       + `（inv=${invIdx}, refresh=${refIdx}）`);
   }
-  checkOrder('a3.toggle-invalidate-before-refresh', 'private async toggleConnection(', 'after-connect');
-  checkOrder('a3.start-invalidate-before-refresh', 'private async startConnectionIfNeeded(', 'after-connect-shortcut');
+  // 2026-11-04 两个用户入口共用同一启动事务；行为测试另覆盖立即反馈与真实就绪后查询。
+  checkOrder('a3.shared-invalidate-before-refresh', 'private async completeConnectionStart(', 'after-connect');
+  ok('a3.toggle-shares-start', methodBody(home, 'private async toggleConnection(')?.text.includes('this.startConnectionIfNeeded()'));
+  ok('a3.start-shares-completion', methodBody(home, 'private async startConnectionIfNeeded(')?.text.includes('this.completeConnectionStart(request)'));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -510,10 +512,8 @@ console.log('[A6] 所有 refreshPublicIp( 调用点都传了 trigger');
   //
   // 断言改为**按名校验**而非数数：数量阈值会在触发点被合并/改名时静默失真，
   // 按名则能直接指出漏的是哪一个。
-  const REQUIRED_TRIGGERS = [
-    'node-switched', 'reconnect-recover', 'after-connect-shortcut',
-    'after-disconnect', 'after-connect', 'after-mode-change'
-  ];
+  // 快捷方式与按钮合并为 after-connect；断开后不再为不可见的出口 IP 发直连请求。
+  const REQUIRED_TRIGGERS = ['node-switched', 'reconnect-recover', 'after-connect', 'after-mode-change'];
   const foundTriggers = callSites
     .map((c) => {
       const q = c.rawArgs.match(/^'([^']*)'/) || c.rawArgs.match(/^"([^"]*)"/);

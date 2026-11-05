@@ -15,7 +15,7 @@
  *   [D] 「裸节点表」必须被补上分流骨架（select/url-test 组 + MATCH）
  *
  * 做法：SubConverter.ets 是零依赖纯类，直接复制成 .ts 用 Node 的
- * type-stripping 跑（与 verify-flclash-profile.mjs 同一套手法）。
+ * type-stripping 跑（与 verify-tunbox-profile.mjs 同一套手法）。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -38,7 +38,7 @@ const root = path.join(here, '..');
 const genDir = path.join(root, 'tools', 'true-chain-harness', 'generated');
 const G = (name) => pathToFileURL(path.join(genDir, name)).href;
 
-// harness 的 .ts 产物（与 verify-flclash-profile.mjs 同一套真源转换）。
+// harness 的 .ts 产物（与 verify-tunbox-profile.mjs 同一套真源转换）。
 // **每次都跑 prepare**：只判文件是否存在会让「改了 .ets 但忘了重新生成」的旧产物
 // 通过闸门（本轮就踩过：gate 读到旧 SubConverter.ts，误报 insecure 没修）。
 {
@@ -125,25 +125,16 @@ for (const [param, link] of INSECURE_CASES) {
   check('[C] insecure=1 生效', /skip-cert-verify:\s*true/.test(out.proxiesYaml));
 }
 
-// ── [D] 裸节点表 → 自动补分流骨架 ───────────────────────────────────
+// ── [D] 裸节点表：FlClash 照抄 —— 不再合成组，原文交内核（GLOBAL 兜底）────────
 {
-  const bare = 'proxies:\n  - name: N1\n    type: trojan\n    server: 1.1.1.1\n    port: 443\n    password: p\n';
-  const withGroups = ProfileConfigMerger.withSyntheticGroups(bare);
-  check('[D] 补出 proxy-groups', withGroups.includes('proxy-groups:'));
-  check('[D] 含 手动选择 组', withGroups.includes('name: 手动选择'));
-  check('[D] 含 自动选择 组', withGroups.includes('name: 自动选择'));
-  check('[D] 含 MATCH 规则', /MATCH,手动选择/.test(withGroups));
-  check('[D] 节点被组引用', withGroups.includes("- 'N1'"));
-
-  const full = bare + 'proxy-groups:\n  - name: X\n    type: select\n    proxies: [N1]\nrules:\n  - MATCH,X\n';
-  check('[D] 已有组/规则时不介入',
-    ProfileConfigMerger.withSyntheticGroups(full) === full);
-
-  // 真实链路：裸表 + overlay 合并后，规则里必须存在 MATCH 且目标可达
-  const overlay = 'a: 1\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,PROXY\n';
-  const merged = ProfileConfigMerger.merge(overlay, bare);
-  check('[D] merge 成功', merged.error === '', merged.error);
-  check('[D] 合并结果含 MATCH,手动选择', /MATCH,手动选择/.test(merged.yaml));
+  const mergerSrc = fs.readFileSync(path.join(root, 'entry/src/main/ets/commons/tunbox/ProfileConfigMerger.ets'), 'utf8');
+  // 2026-11-05（任务3）：withSyntheticGroups 已删 —— 裸节点 profile 不再补
+  // 「手动选择/自动选择 + MATCH」合成组（自造准入推断；FlClash 对裸表 profile
+  // 的处理就是原样交内核，GLOBAL 组兜底、无规则时按内核语义路由）。
+  check('[D] 合成组已删除（源码不再含 withSyntheticGroups）',
+    !mergerSrc.includes('withSyntheticGroups'));
+  check('[D] merge 文本层已退场（compose 取代）',
+    !mergerSrc.includes('static merge('));
 }
 
 console.log(`\n分享链接转换闸门：${passed + failed} 项，PASSED=${passed} FAILED=${failed}`);

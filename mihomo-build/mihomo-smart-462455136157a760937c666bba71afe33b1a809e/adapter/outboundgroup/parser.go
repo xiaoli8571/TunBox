@@ -46,6 +46,17 @@ type GroupCommonOption struct {
 }
 
 func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string) (ProxyGroup, error) {
+	return parseProxyGroup(config, proxyMap, providersMap, AllProxies, AllProviders, false)
+}
+
+// ParseProxyGroupForValidation checks the same options and references as runtime
+// construction, but never opens Smart stores, starts tasks, or downloads assets.
+// The returned group is for validation only and must not be used for traffic.
+func ParseProxyGroupForValidation(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string) (ProxyGroup, error) {
+	return parseProxyGroup(config, proxyMap, providersMap, AllProxies, AllProviders, true)
+}
+
+func parseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, providersMap map[string]P.ProxyProvider, AllProxies []string, AllProviders []string, validateOnly bool) (ProxyGroup, error) {
 	decoder := structure.NewDecoder(structure.Option{TagName: "group", WeaklyTypedInput: true})
 
 	groupOption := GroupCommonOption{
@@ -221,7 +232,7 @@ func ParseProxyGroup(config map[string]any, proxyMap map[string]C.Proxy, provide
 		if err != nil {
 			return nil, err
 		}
-		return NewSmart(groupOption, opt, emptyFallback, providers)
+		return newSmart(groupOption, opt, emptyFallback, providers, !validateOnly)
 	default:
 		return nil, fmt.Errorf("%w: %s", errType, groupOption.Type)
 	}

@@ -16,7 +16,7 @@
  * 退出码 0 = 全通。
  *
  * 相关文件（三者一起才是完整的证据链）：
- *   entry/src/main/ets/commons/flclash/SubConverter.ets   被测的 ArkTS 移植
+ *   entry/src/main/ets/commons/tunbox/SubConverter.ets   被测的 ArkTS 移植
  *   scripts/fixtures/subconverter-cases.json              46 个用例（明文/base64/畸形/回归）
  *   scripts/fixtures/subconverter-golden.json             Go 真实现的输出（对拍基准）
  *   scripts/fixtures/golden-gen/main.go                   golden 的生成器（改了用例才需要重跑，用法见文件头）
@@ -76,7 +76,7 @@ function normalizeUA(v) {
 }
 
 // ── 加载 .ets（Node 的类型剥离只认 .ts/.mts，先复制影子） ──────────────────
-const etsPath = path.join(root, 'entry/src/main/ets/commons/flclash/SubConverter.ets');
+const etsPath = path.join(root, 'entry/src/main/ets/commons/tunbox/SubConverter.ets');
 if (!fs.existsSync(etsPath)) {
   console.log(`  ❌ 找不到 ${etsPath}`);
   process.exit(1);
@@ -99,7 +99,7 @@ if (!SubConverter) {
 fs.rmSync(shadowDir, { recursive: true, force: true });
 
 console.log('SubConverter 对拍门禁（ArkTS 移植 vs mihomo convert.ConvertsV2Ray）');
-console.log(`源码：entry/src/main/ets/commons/flclash/SubConverter.ets`);
+console.log(`源码：entry/src/main/ets/commons/tunbox/SubConverter.ets`);
 
 // ────────────────────────────────────────────────────────────────────────────
 // [1] 与 Go golden 逐字段对拍

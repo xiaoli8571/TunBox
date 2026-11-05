@@ -47,7 +47,6 @@ const ctx = vm.createContext({ console, Date, JSON, Map, Set, Number, Object, Ar
   AppLogger: { info() {}, warn() {}, errText: String }, TAG: 'ProxyPanelRegression',
   ConnState: { CONNECTED: 'connected', CONNECTING: 'connecting' },
   AutoSelectModes: { MANUAL: 'manual', AUTO: 'auto' },
-  ClashConfigGenerator: { SMART_GROUP_NAME: smart },
   ConnectionOrchestrator: { instance() { return orch; } },
   getContext() { return {}; }, effectiveTestUrl() { return 'https://example.test/204'; },
   AppStorage: { get(key) { return storage.get(key); }, setOrCreate(key, value) { storage.set(key, value); } },
@@ -67,13 +66,13 @@ load('commons/latency/LatencyTestUrl.ets', 'LatencyTestUrl');
 load('commons/models/AppSettings.ets', 'AppSettings');
 load('commons/latency/LatencyKinds.ets', 'LatencyProbeKind,LatencyStrategy,LatencyTimeout');
 load('commons/services/LatencyState.ets', 'LatencyContext');
-load('commons/flclash/FlclashDelay.ets', 'DelayTarget');
+load('commons/tunbox/TunBoxDelay.ets', 'DelayTarget');
 ctx.LatencyStoreBridge = { async ensureStore() {}, async persistConclusions() {}, recordFor() {return null;} };
 const { SubscriptionParser } = load('commons/services/SubscriptionParser.ets', 'SubscriptionParser');
-load('commons/flclash/CoreCatalog.ets', 'CoreCatalog,CoreCatalogModel,CoreGroup,CoreNode');
-load('commons/flclash/CoreNodeBridge.ets', 'CoreNodeBridge');
-const { ProxyPanelMembers: Policy } = load('commons/flclash/ProxyPanelMembers.ets', 'ProxyPanelMembers');
-const { CoreCatalogService: Catalog } = load('commons/flclash/CoreCatalogService.ets', 'CoreCatalogService');
+load('commons/tunbox/CoreCatalog.ets', 'CoreCatalog,CoreCatalogModel,CoreGroup,CoreNode');
+load('commons/tunbox/CoreNodeBridge.ets', 'CoreNodeBridge');
+const { ProxyPanelMembers: Policy } = load('commons/tunbox/ProxyPanelMembers.ets', 'ProxyPanelMembers');
+const { CoreCatalogService: Catalog } = load('commons/tunbox/CoreCatalogService.ets', 'CoreCatalogService');
 const progressSource = read('commons/services/LatencyEngine.ets').match(/^export class LatencyProgress \{[\s\S]*?^}/m)[0];
 ctx.LatencyProgress = vm.runInContext(stripTypeScriptTypes(`(()=>{${progressSource.replace('export ', '')}; return LatencyProgress})()`, {mode: 'transform'}), ctx);
 const { BackgroundLatencyService: Background } = load('commons/services/BackgroundLatencyService.ets', 'BackgroundLatencyService');
@@ -100,7 +99,7 @@ const direct = Object.assign(new ProxyNode(), { id: 'local-direct', subscription
 function panel(nodes = [direct]) {
   const p = new Panel();
   Object.assign(p, { panelSubId: scope, currentProfileId: scope, selectedGroup: parent.name,
-    smartSelected: false, sortByDelay: true, selectingMember: '', coreRevision: 0, nodeRevision: 0,
+    sortByDelay: true, selectingMember: '', coreRevision: 0, nodeRevision: 0,
     profileRevisions: new Map([[scope,'r1']]), settings, currentNodeName: '', service: { nodesOf() { return nodes; }, groupsOf(id) { return groups.filter(g => g.subscriptionId === id); } },
     toast(text) { toasts.push(text); }, selectNode() { throw Error('strategy incorrectly sent to node reconnect'); }
   }); return p;
@@ -131,11 +130,11 @@ await test('upgrade repairs existing anchor-damaged groups from the prepared pro
   assert.equal(await service.rebuildGroupsFromCacheIfMissing(), false);
   const imported = serviceSource.slice(serviceSource.indexOf('  async addLocalYaml('));
   assert.ok(imported.includes('BodyDispatch.classify(ProfileRepository.read(sub.id))'));
-  const remote = serviceSource.slice(serviceSource.indexOf('const profileValidation = await ProfileRepository.validateAndStore'), serviceSource.indexOf('private async appendProviderNodes'));
+  const remote = serviceSource.slice(serviceSource.indexOf('const profileValidation = await ProfileRepository.validateAndStore'), serviceSource.indexOf('const profileReady = ProfileRepository.exists'));
   assert.ok(remote.includes('BodyDispatch.classify(ProfileRepository.read(sub.id))'));
   const local = serviceSource.slice(serviceSource.indexOf('private async refreshLocalSubscription'), serviceSource.indexOf('  async addLocalYaml('));
   assert.ok(local.indexOf('ProfileRepository.read(id)') < local.indexOf('RawSubscriptionStore.readRaw(id)'));
-  assert.equal((serviceSource.match(/ProxyProviderParser.parse\((?:localDispatch|dispatch).body\)/g) || []).length, 3);
+  assert.equal((serviceSource.match(/ProxyProviderParser.parse\((?:localDispatch|dispatch).body\)/g) || []).length, 0, 'provider App-side fetch removed (FlClash copy: kernel fetches providers)');
 });
 await test('offline panel preserves exact direct-member order and strategy types', () => {
   state = 'disconnected'; Catalog.clear();
@@ -178,7 +177,7 @@ await test('offline selection is scoped, persistent and does not start a VPN or 
   assert.equal(settings.preferredNodeName, member.name);
   assert.equal(p.currentNodeName, member.name);
   assert.ok(storage.get('node_switch_revision') > 0, 'home receives the same change without a page switch');
-  assert.equal(p.isActiveNode(member), true); p.smartSelected = true; assert.equal(p.isActiveNode(member), false);
+  assert.equal(p.isActiveNode(member), true);
 });
 await test('connected selection saves the exact parent then fully restarts with the child intent', async () => {
   state = 'connected'; payload = corePayload(); accept = true; puts.length = 0;
@@ -226,11 +225,67 @@ await test('saved choices restore after restart; foreign, stale and read-only gr
 await test('bad persisted JSON cannot break rendering or selection', () => {
   for (const bad of ['', 'null', '[]', 'bad', '"string"', '{"x":42}']) assert.equal(Object.keys(Policy.selections(bad)).length, 0);
 });
-await test('the synthetic Smart entry is not duplicated and grid/list behavior is retained', () => {
-  const g = Object.assign(new ProxyGroup(), { subscriptionId: scope, name: 'root', members: [smart, 'DIRECT'] });
-  const child = Object.assign(new ProxyGroup(), { subscriptionId: scope, name: smart, groupType: 'smart' });
-  assert.deepEqual(Array.from(Policy.fromLocal(g, [child], [], smart), n => n.name), ['DIRECT']);
+await test('restoring from the fetched catalog avoids another directory request and updates planning choices', async () => {
+  payload = corePayload(); puts.length = 0;
+  const model = ctx.CoreCatalog.parse(JSON.stringify(payload));
+  const raw = Policy.remember('', scope, parent.name, parent.members[1]);
+  const noRead = {async proxiesJson(){throw Error('duplicate directory request');},
+    selectProxyInGroup: api.selectProxyInGroup};
+  assert.equal(await Catalog.restoreGroupSelections(noRead, scope, raw, () => true, model),1);
+  assert.deepEqual(puts,[[parent.name,parent.members[1]]]);
+  assert.equal(model.findGroup(parent.name).now,parent.members[1]);
+  assert.equal(model.byName[parent.name].now,parent.members[1]);
+});
+await test('real Smart and URLTest groups keep their name, selection and delay target without synthetic duplicates', async () => {
+  state = 'disconnected'; Catalog.clear();
+  const previousSettings = settings;
+  settings = {...settings, proxyGroupSelections: ''};
+  try {
+  for (const type of ['smart', 'url-test']) {
+    const g = Object.assign(new ProxyGroup(), { subscriptionId: scope, name: 'root', members: [smart, 'DIRECT'] });
+    const child = Object.assign(new ProxyGroup(), { subscriptionId: scope, name: smart, groupType: type, members: ['DIRECT'] });
+    const p = panel([]);
+    p.selectedGroup = g.name;
+    p.service.groupsOf = () => [g, child];
+    settings.proxyGroupSelections = ''; p.settings = settings;
+    assert.deepEqual(Array.from(p.groupsOf(scope), group => group.name), ['root', smart]);
+    const members = p.panelNodes();
+    assert.deepEqual(Array.from(members, n => n.name), [smart, 'DIRECT']);
+    await p.selectPanelMember(g, members[0]);
+    assert.equal(Policy.selected(settings.proxyGroupSelections, scope, g.name), smart);
+    assert.equal(p.isActiveNode(members[0]), true);
+    const model = ctx.CoreCatalog.parse(JSON.stringify({proxies: {
+      root: {type:'Selector', all:[smart,'DIRECT'], now:smart},
+      [smart]: {type:Policy.type(type), all:['DIRECT'], now:'DIRECT'}, DIRECT: {type:'Direct'}
+    }}));
+    assert.deepEqual(Array.from(Policy.fromCore(model.findGroup('root'), scope, ''), n => n.name), [smart, 'DIRECT']);
+    const target = Policy.delayTarget(model, smart, 'root', 'https://example.test/204');
+    assert.equal(target.name, 'DIRECT');
+    const plan = Policy.delayPlan(model, 'root', '', 'https://example.test/204');
+    assert.deepEqual(Array.from(plan.names), ['DIRECT']);
+  }
   assert.ok(source.includes('this.gridMode = !this.gridMode')); assert.ok(source.includes('this.NodeCell(row[0])'));
+  } finally { settings = previousSettings; }
+});
+await test('dynamic Smart uses its real group name and rejects empty or unusable pools', () => {
+  const model = ctx.CoreCatalog.parse(JSON.stringify({proxies: {
+    root: {type:'Selector', all:['native-smart','app-smart','leaf'], now:'native-smart'},
+    'native-smart': {type:'Smart', all:['leaf'], now:'Smart - Select'},
+    'app-smart': {type:'Smart', hidden:true, all:['leaf'], now:'Smart - Select'},
+    leaf: {type:'Vless'}, COMPATIBLE: {type:'Compatible'}, REJECT: {type:'Reject'}
+  }}));
+  assert.equal(Policy.exitOf(model,'root'),'native-smart');
+  assert.deepEqual(Array.from(Policy.delayLookupNames(model,'root')),['native-smart']);
+  assert.equal(Policy.delayTarget(model,'native-smart','root','https://example.test/204').name,'native-smart');
+  assert.deepEqual(Array.from(Policy.fromCore(model.findGroup('root'),scope,''), n=>n.name),['native-smart','leaf']);
+  for (const members of [[],['COMPATIBLE'],['REJECT'],['native-smart']]) {
+    const empty = ctx.CoreCatalog.parse(JSON.stringify({proxies: {
+      'native-smart': {type:'Smart', all:members, now:'Smart - Select'},
+      COMPATIBLE: {type:'Compatible'}, REJECT: {type:'Reject'}
+    }}));
+    assert.equal(Policy.exitOf(empty,'native-smart'),'');
+    assert.equal(Policy.delayTarget(empty,'native-smart','','https://example.test/204'),null);
+  }
 });
 await test('counts separate strategies from proxies and never print "0 节点" for group-only configs', () => {
   state = 'disconnected'; Catalog.clear();
@@ -257,7 +312,7 @@ await test('headless snapshots retain provider rows without changing declared gr
 });
 await test('group exits and Direct are testable; rejected policies are not', async () => {
   const starts = [];
-  ctx.FlclashLatencyService = { isRunning() { return false; }, startTargets(api, targets) {
+  ctx.TunBoxLatencyService = { isRunning() { return false; }, startTargets(api, targets) {
     const names=targets.map(t=>t.proxyName); starts.push(Array.from(names));
     return { async wait() { return {total: names.length, started: names.length, measured: names.length, timeout: 0, failed: 0, cancelled: 0}; } };
   } };
@@ -295,14 +350,14 @@ await test('group exits and Direct are testable; rejected policies are not', asy
   const foreign = await Background.testSubscription({}, 'profile-B');
   assert.equal(foreign, null); assert.equal(starts.length, 4);
 });
-await test('the actual panel never reports complete for empty, skipped or all-failed delay batches', async () => {
+await test('the actual panel keeps empty-batch errors and summarizes completed attempts as success or timeout', async () => {
   const p = panel(); p.testingIds = []; p.showPanel = true;
   ctx.BackgroundLatencyService = { async testSubscription() { return {total: 0, finished: 0, message: '没有可测速的代理节点'}; } };
   await p.testSub(scope, 'local'); assert.match(toasts.at(-1), /没有可测速/); assert.equal(p.testingIds.length, 0);
   ctx.BackgroundLatencyService.testSubscription = async () => ({total: 3, finished: 3, measured: 0, timeout: 1, failed: 2, cancelled: 0, message: ''});
-  await p.testSub(scope, 'local'); assert.match(toasts.at(-1), /未测得有效延迟/);
+  await p.testSub(scope, 'local'); assert.equal(toasts.at(-1), '测速完成：0成功，3超时');
   ctx.BackgroundLatencyService.testSubscription = async () => ({total: 3, finished: 3, measured: 1, timeout: 1, failed: 1, message: ''});
-  await p.testSub(scope, 'local'); assert.match(toasts.at(-1), /1 成功，1 超时，1 失败/);
+  await p.testSub(scope, 'local'); assert.equal(toasts.at(-1), '测速完成：1成功，2超时');
 });
 if (process.argv[3]) { assert.equal(groups.length, 33); assert.equal(parent.members.length, 18); console.log('PASS supplied Ymihomo: 33 groups, 18 default direct members, 17 strategy rows'); }
 console.log(`RESULT: ${passed} production panel runtime checks passed (mocked platform; not device UI verification)`);

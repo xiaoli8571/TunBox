@@ -193,26 +193,26 @@ struct ConnectionsPage {
             Text('关闭全部')
               .fontSize(13)
               .fontWeight(FontWeight.Bold)
-              .fontColor(this.entries.length > 0 ? Ui.error : Ui.textTertiary)
+              .fontColor(this.entries.length > 0 ? Ui.error : Ui.textTertiaryFor(this.themeRevision))
               .onClick(() => {
                 if (this.entries.length > 0) {
                   this.closeAll();
                 }
               })
             Text(this.refreshing ? '刷新中' : '刷新')
-              .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.primary)
+              .fontSize(13).fontWeight(FontWeight.Medium).fontColor(Ui.primaryFor(this.themeRevision))
               .onClick(() => this.refreshOnce())
           }
         }
 
         Text(`活动连接 ${this.entries.length} 条`)
-          .fontSize(12).fontColor(Ui.textTertiary).width('100%').padding({ left: 18, right: 18 })
+          .fontSize(12).fontColor(Ui.textTertiaryFor(this.themeRevision)).width('100%').padding({ left: 18, right: 18 })
 
         if (!this.reachable) {
           Column({ space: 8 }) {
-            Text('内核连接接口不可达').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+            Text('内核连接接口不可达').fontSize(15).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimaryFor(this.themeRevision))
             Text('未连接 VPN 或内核 controller 未就绪。连接成功后回到本页即可查看实时连接。')
-              .fontSize(12).fontColor(Ui.textSecondary)
+              .fontSize(12).fontColor(Ui.textSecondaryFor(this.themeRevision))
           }
           .width('100%').padding(18).margin({ left: 18, right: 18, top: 14 })
           .borderRadius(22).backgroundColor(Ui.surface(this.themeRevision))
@@ -221,9 +221,9 @@ struct ConnectionsPage {
           Blank().layoutWeight(1)
         } else if (this.entries.length === 0) {
           Column({ space: 6 }) {
-            Text('当前没有活动连接').fontSize(14).fontColor(Ui.textSecondary)
+            Text('当前没有活动连接').fontSize(14).fontColor(Ui.textSecondaryFor(this.themeRevision))
             Text('产生流量后此处会实时列出每条连接的目标、规则链与出口节点')
-              .fontSize(11).fontColor(Ui.textTertiary)
+              .fontSize(11).fontColor(Ui.textTertiaryFor(this.themeRevision))
           }
           .width('100%').padding(24).margin({ left: 18, right: 18, top: 14 })
           .borderRadius(22).backgroundColor(Ui.surface(this.themeRevision))
@@ -237,31 +237,31 @@ struct ConnectionsPage {
                   Row({ space: 8 }) {
                     Text(entry.network.toUpperCase())
                       .fontSize(10).fontWeight(FontWeight.Bold)
-                      .fontColor(entry.network === 'udp' ? Ui.warning : Ui.textBlue)
+                      .fontColor(entry.network === 'udp' ? Ui.warning : Ui.textBlueFor(this.themeRevision))
                       .padding({ left: 6, right: 6, top: 2, bottom: 2 })
                       .borderRadius(6)
                       .backgroundColor(Ui.surfaceMuted(this.themeRevision))
                     Text(this.titleOf(entry))
-                      .fontSize(13).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+                      .fontSize(13).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimaryFor(this.themeRevision))
                       .layoutWeight(1).maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
                     Text(this.formatBytes(entry.upload + entry.download))
-                      .fontSize(11).fontColor(Ui.textSecondary).fontFamily('monospace')
+                      .fontSize(11).fontColor(Ui.textSecondaryFor(this.themeRevision)).fontFamily('monospace')
                   }.width('100%')
                   if (this.chainOf(entry).length > 0) {
                     Text(this.chainOf(entry))
-                      .fontSize(11).fontColor(Ui.textSecondary).width('100%').maxLines(1)
+                      .fontSize(11).fontColor(Ui.textSecondaryFor(this.themeRevision)).width('100%').maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
                   }
                   Row({ space: 8 }) {
                     Text(entry.rule.length > 0 ? entry.rule : '无规则')
-                      .fontSize(10).fontColor(Ui.textTertiary).layoutWeight(1).maxLines(1)
+                      .fontSize(10).fontColor(Ui.textTertiaryFor(this.themeRevision)).layoutWeight(1).maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
                     Text(`↑${this.formatBytes(entry.upload)} ↓${this.formatBytes(entry.download)}`)
-                      .fontSize(10).fontColor(Ui.textTertiary).fontFamily('monospace')
+                      .fontSize(10).fontColor(Ui.textTertiaryFor(this.themeRevision)).fontFamily('monospace')
                     if (this.formatAge(entry.startMs).length > 0) {
                       Text(this.formatAge(entry.startMs))
-                        .fontSize(10).fontColor(Ui.textTertiary).fontFamily('monospace')
+                        .fontSize(10).fontColor(Ui.textTertiaryFor(this.themeRevision)).fontFamily('monospace')
                     }
                     Text('断开')
                       .fontSize(11).fontWeight(FontWeight.Bold).fontColor(Ui.error)

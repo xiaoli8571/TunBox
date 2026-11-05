@@ -76,6 +76,19 @@ export class ProxyPanelMembers {
     return count > 0 ? `${count} 节点` : '';
   }
 
+  /** Smart has no single current exit; an empty provider still is not a target. */
+  private static hasTestableMember(model: CoreCatalogModel, name: string,
+    seen: Set<string> = new Set<string>()): boolean {
+    if (seen.has(name)) { return false; }
+    seen.add(name);
+    const node = model.byName[name];
+    if (node === undefined) { return false; }
+    if (!node.isGroup) { return ProxyPanelMembers.isTestable(CoreNodeBridge.toProxyNode(node)); }
+    const group = model.findGroup(name);
+    return group !== null && group.all.some((member: CoreNode): boolean =>
+      ProxyPanelMembers.hasTestableMember(model, member.name, seen));
+  }
+
   /**
    * 组链路末端出口（FlClash `computeRealSelectedProxyState` 等价物）。
    *
@@ -91,6 +104,9 @@ export class ProxyPanelMembers {
       const node: CoreNode | undefined = model.byName[current];
       if (node === undefined || !node.isGroup) { return current; }
       const group: CoreGroup | null = model.findGroup(current);
+      if (group !== null && group.type === 'Smart' && !group.all.some((member: CoreNode): boolean => member.name === group.now)) {
+        return ProxyPanelMembers.hasTestableMember(model, group.name) ? group.name : '';
+      }
       const next: string = group !== null && group.now.length > 0 ? group.now
         : (group !== null && group.all.length > 0 ? group.all[0].name : '');
       if (next.length === 0) { return ''; }
@@ -128,20 +144,18 @@ export class ProxyPanelMembers {
   }
 
   /** Resolve policy and exit together, so UI lookup and probing cannot disagree.
-   * A child's explicitly configured URL/status overrides its ancestor's policy. */
+   * expected-status 不再继承：FlClash 取空 expected-status 范围（core/delay.go:99），
+   * 组 url 仍可覆盖默认 url。defaultExpected/expected 字段仅保留兼容，不参与测速。 */
   static delayTarget(model: CoreCatalogModel, name: string, parent: string, defaultUrl: string,
     defaultExpected: string = '', localGroups: ProxyGroup[] = [],
     selections: Map<string, string> | null = null): PanelDelayTarget | null {
     const target = new PanelDelayTarget();
     target.url = defaultUrl;
-    target.expected = defaultExpected;
     const policy = (groupName: string): void => {
       const local = localGroups.find((g: ProxyGroup): boolean => g.name === groupName);
       const core = model.findGroup(groupName);
       const url = local !== undefined ? local.url : (core === null ? '' : core.url);
-      const expected = local !== undefined ? local.expectedStatus : (core === null ? '' : core.expectedStatus);
       if (url.trim().length > 0) { target.url = url.trim(); }
-      if (expected.trim().length > 0) { target.expected = expected.trim(); }
     };
     policy(parent);
     let current = name;
@@ -158,6 +172,11 @@ export class ProxyPanelMembers {
       }
       policy(current);
       const group = model.findGroup(current);
+      if (group !== null && group.type === 'Smart' && !group.all.some((member: CoreNode): boolean => member.name === group.now)) {
+        if (!ProxyPanelMembers.hasTestableMember(model, group.name)) { return null; }
+        target.name = group.name;
+        return target;
+      }
       const saved = selections === null ? '' : selections.get(current) ?? '';
       current = group !== null && group.type === 'Selector' && saved.length > 0
         && group.all.some((member: CoreNode): boolean => member.name === saved) ? saved
@@ -203,7 +222,7 @@ export class ProxyPanelMembers {
 
   static fromCore(group: CoreGroup, profileId: string, excluded: string): ProxyNode[] {
     return CoreNodeBridge.toProxyNodes(group.all.filter((node: CoreNode): boolean =>
-      node.name !== excluded), profileId);
+      node.name !== excluded && !node.hidden), profileId);
   }
 
   static fromLocal(group: ProxyGroup, groups: ProxyGroup[], nodes: ProxyNode[], excluded: string): ProxyNode[] {

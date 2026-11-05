@@ -1,9 +1,9 @@
 /**
- * BackupPage —— 配置备份与恢复（2026-10-27 从主页右上角「备份」迁出）
+ * BackupPage —— 备份与恢复（2026-10-27 从主页右上角「备份」迁出）
  *
  * 功能与迁移前等价：导出订阅/节点/规则/设置的 .json（可选 AES-256-GCM 加密）、
  * 系统文件选择器导入、加密备份密码重试（最多 3 次）、恢复后重载设置。
- * 入口在「设置 → 关于与隐私 → 配置备份与恢复」。
+ * 入口在「设置 → 关于 → 备份与恢复」。
  */
 import { promptAction , LengthMetrics} from '@kit.ArkUI';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
@@ -37,16 +37,16 @@ struct BackupPasswordDialog {
   build() {
     Column({ space: 12 }) {
       Row({ space: 8 }) {
-        Image($r('app.media.ic_lock')).width(18).height(18).fillColor(TunBoxColors.primary)
+        Image($r('app.media.ic_lock')).width(18).height(18).fillColor(TunBoxColors.primaryFor(this.themeRevision))
         Text(this.mode === 'export' ? '设置备份密码' : '输入备份密码')
-          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+          .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).layoutWeight(1)
       }.width('100%')
       if (this.mode === 'export') {
         Text('使用 AES-256-GCM 加密备份。留空则导出明文；密码至少 4 个字符，遗忘后无法恢复。')
-          .fontSize(11.5).fontColor(TunBoxColors.textMuted).width('100%')
+          .fontSize(11.5).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
       } else {
         Text(this.attemptHint.length > 0 ? this.attemptHint : '此备份已加密，请输入导出时设置的密码。')
-          .fontSize(11.5).fontColor(TunBoxColors.textMuted).width('100%')
+          .fontSize(11.5).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
       }
       TextInput({ placeholder: this.mode === 'export' ? '密码（留空=明文备份）' : '备份密码', text: this.password })
         .type(InputType.Password)
@@ -58,7 +58,7 @@ struct BackupPasswordDialog {
       Row({ space: 10 }) {
         Button('取消')
           .layoutWeight(1).height(38).borderRadius(8)
-          .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision)).fontColor(TunBoxColors.textMuted).fontSize(13)
+          .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision)).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).fontSize(13)
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
           .onClick(() => {
             if (this.controller !== undefined) {
@@ -68,7 +68,7 @@ struct BackupPasswordDialog {
           })
         Button(this.mode === 'export' ? '确认导出' : '解密恢复')
           .layoutWeight(1).height(38).borderRadius(8)
-          .backgroundColor(TunBoxColors.primary).fontColor(Color.White).fontSize(13)
+          .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(Color.White).fontSize(13)
           .onClick(() => {
             if (this.mode === 'import' && this.password.length < 4) {
               this.attemptHint = '密码至少 4 个字符，请重新输入。';
@@ -291,12 +291,12 @@ struct BackupPage {
   @Builder
   BackupCard(title: string, desc: string, buttonLabel: string, primary: boolean, action: () => void) {
     Column({ space: 6 }) {
-      Text(title).fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).width('100%')
-      Text(desc).fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+      Text(title).fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).width('100%')
+      Text(desc).fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
       Button(buttonLabel)
         .width('100%').borderRadius(8).fontSize(12.5)
-        .backgroundColor(primary ? TunBoxColors.primary : TunBoxColors.surfaceCard(this.themeRevision))
-        .fontColor(primary ? Color.White : TunBoxColors.textPrimary)
+        .backgroundColor(primary ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.surfaceCard(this.themeRevision))
+        .fontColor(primary ? Color.White : TunBoxColors.textPrimaryFor(this.themeRevision))
         .borderWidth(primary ? 0 : 1.5)
         .borderColor(TunBoxColors.cardBorder(this.themeRevision))
         .onClick(action)
@@ -313,17 +313,17 @@ struct BackupPage {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
-        TopNavBar({ title: '配置备份与恢复', hasBack: true })
+        TopNavBar({ title: '备份与恢复', hasBack: true })
         Scroll() {
           Column({ space: 14 }) {
             Column({ space: 8 }) {
               Row({ space: 8 }) {
-                Image($r('app.media.ic_doc')).width(20).height(20).fillColor(TunBoxColors.primary)
-                Text('配置备份与恢复').fontSize(16).fontWeight(FontWeight.Bold)
-                  .fontColor(TunBoxColors.textPrimary).layoutWeight(1)
+                Image($r('app.media.ic_doc')).width(20).height(20).fillColor(TunBoxColors.primaryFor(this.themeRevision))
+                Text('备份与恢复').fontSize(16).fontWeight(FontWeight.Bold)
+                  .fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).layoutWeight(1)
               }.width('100%')
               Text('备份范围包括当前全部已导入的订阅、节点以及自定义规则配置。')
-                .fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+                .fontSize(12).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)

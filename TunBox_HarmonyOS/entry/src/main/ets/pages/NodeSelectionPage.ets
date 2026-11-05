@@ -16,14 +16,13 @@ import { Subscription } from '../commons/models/Subscription';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
-import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { ClashApiService } from '../commons/services/ClashApiService';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
 import { LatencyChannel, LatencyContext, LatencyPolicy, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import { LatencyProgress } from '../commons/services/LatencyEngine';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
-import { FlclashLatencyService } from '../commons/flclash/FlclashLatencyService';
+import { TunBoxLatencyService } from '../commons/tunbox/TunBoxLatencyService';
 import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
 // 失败分类常量**唯一真源** = 测速内核（LatencyKinds.LatencyProbeKind）——
 // 旧的 ClashApiService.LatencyFailKind 已随内核收敛删除（审计 LP04）。
@@ -39,26 +38,20 @@ import { CountryFlagIcon } from '../widgets/CountryFlagIcon';
 import {
   ConcurrentRefresh, RefreshBatchProgress, RefreshItemOutcome
 } from '../commons/services/ConcurrentRefresh';
-import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
-import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
-import { ProxyPanelMembers } from '../commons/flclash/ProxyPanelMembers';
-import { ProfileRepository } from '../commons/flclash/ProfileRepository';
+import { CoreCatalogService } from '../commons/tunbox/CoreCatalogService';
+import { CoreNodeBridge } from '../commons/tunbox/CoreNodeBridge';
+import { CoreGroup } from '../commons/tunbox/CoreCatalog';
+import { NodeTruth, NodeTruthScope } from '../commons/tunbox/NodeTruth';
+import { ProxyPanelMembers } from '../commons/tunbox/ProxyPanelMembers';
+import { ProfileRepository } from '../commons/tunbox/ProfileRepository';
 
 const TAG = 'NodeSelectionPage';
-
-/** 合成行的稳定 id（不是真实节点，仅用于列表 key 与识别选中态） */
-const SMART_ROW_ID = '__smart_group__';
 
 interface NodeRow {
   node: ProxyNode;
   countryCode: string;
   /** 综合评分/状态（来自持久化测速快照；无数据时 hasData=false） */
   status: NodeStatusView;
-  /**
-   * 合成行标记：内核 smart 组入口（♻️ 自动选择）。
-   * 不是真实节点 —— 禁止测速、禁止长按删除、禁止参与排序。
-   */
-  isSmart?: boolean;
 }
 
 /** 页面临时代理组视图。策略组与普通节点同级展示，不再维护二级展开层级。 */
@@ -106,12 +99,12 @@ struct NodeBatchDeleteDialog {
 
   build() {
     Column({ space: 14 }) {
-      Text('删除节点').fontSize(17).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      Text('删除节点').fontSize(17).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimaryFor(this.themeRevision))
       Text(`确定删除 ${this.getSummary()} 吗？这些节点在订阅刷新后不会再出现。`)
-        .fontSize(13).fontColor(Ui.textSecondary)
+        .fontSize(13).fontColor(Ui.textSecondaryFor(this.themeRevision))
       Row({ space: 12 }) {
         Button('取消')
-          .layoutWeight(1).backgroundColor(Ui.surfaceMuted(this.themeRevision)).fontColor(Ui.textSecondary)
+          .layoutWeight(1).backgroundColor(Ui.surfaceMuted(this.themeRevision)).fontColor(Ui.textSecondaryFor(this.themeRevision))
           .borderRadius(14)
           .borderWidth(1).borderColor(Ui.border)
           .onClick(() => {
@@ -144,34 +137,17 @@ struct NodeBatchDeleteDialog {
 @Component
 struct NodeSelectionPage {
   @StorageLink('theme_revision') themeRevision: number = 0;
+  @StorageLink('smart_model_seq') @Watch('refreshSmartEntry') smartModelSeq: number = 0;
+  @State smartVisible: boolean = false;
+  @State smartSelected: boolean = false;
+  @State smartSelecting: boolean = false;
+  private smartRefreshRevision: number = 0;
   @State nodes: NodeRow[] = [];
   @State groupRows: ProxyGroupRow[] = [];
-  /**
-   * 分组视图（按订阅筛选后）单独渲染的「♻️ 自动选择」行（0 或 1 个）。
-   *
-   * 分组视图的 List 只渲染 groupRows，**不渲染 this.nodes**（真机复现：
-   * 订阅下展开后看不到自动选择行）。所以合成行必须单独存一份给分组视图用。
-   * 空数组 = 当前不该展示（模型未就绪 / 该订阅不足 2 个节点）。
-   * 用数组而不是 `NodeRow | null`：ArkTS 禁止非空断言，build() 内也不能声明局部变量，
-   * 只能靠 ForEach 的元素类型完成收窄。
-   */
-  @State smartEntries: NodeRow[] = [];
   @State expandedGroupKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
-  /** 节点搜索（P1-4）：输入即过滤本页 flat 列表（含合成行），大小写不敏感 */
+  /** 节点搜索（P1-4）：输入即过滤本页 flat 列表，大小写不敏感 */
   @State searchText: string = '';
-  /**
-   * 「自动选择」视图开关。
-   *
-   * 刻意**不复用 filterSubId**：后者是订阅 id，语义是"筛出某个订阅的节点"；
-   * 自动选择是跨订阅的内核选点视图，混进同一状态会让 rebuildRows 的过滤分支
-   * 把合成行按 subscriptionId 误判。两者互斥，切换时互相清空。
-   */
-  @State smartView: boolean = false;
-  /** 内核当前实际在用的出口节点（来自 /connections 的 chains） */
-  @State smartActiveNodes: string[] = [];
-  /** 上次拉取是否通道故障（区别于"确实没有活动连接"） */
-  @State smartChannelDown: boolean = false;
   private listScroller: Scroller = new Scroller();
   @State subChips: SubChip[] = [];
   @State selectedName: string = '';
@@ -244,7 +220,6 @@ struct NodeSelectionPage {
   /** 页面切入时先完成首帧绘制，再启动设置/订阅加载，避免初始化与转场争抢 UI 线程。 */
   private pageActive: boolean = false;
   /** 自动选点模式（'manual' 手动固定 / 'auto' 自动最优），进页面从持久化读取 */
-  @State autoSelectMode: string = AutoSelectModes.MANUAL;
   private subs: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
@@ -274,8 +249,6 @@ struct NodeSelectionPage {
     if (this.latencyRunActive) { BackgroundLatencyService.cancelCurrent(); }
     this.batchTesting = false;
     this.testingName = '';
-    // 轮询只在视图可见期间存在，离开必须停 —— 否则页面退到后台还在每 3s 打内核 API
-    this.stopSmartPoll();
     if (this.latencyListenerBound) {
       LatencyStoreBridge.removeListener(this.latencyListener);
       this.latencyListenerBound = false;
@@ -310,7 +283,6 @@ struct NodeSelectionPage {
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
     this.refreshLatencyScopes();
-    this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
     this.restoreSortState();
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
     // 作用域化展示：跨订阅旧偏好不再当「已选」。
@@ -322,14 +294,8 @@ struct NodeSelectionPage {
       : (this.subs.nodes.length > 0 ? this.subs.nodes[0].name : '');
     // 异步初始化完成后统一重建筛选项，隐藏空 direct 并清理失效筛选。
     this.refreshSubChips();
-    // 进入页面自动定位到**当前出口节点**所属订阅并展开分组（用户要求）：
-    //  - 手动模式：preferredNodeId 固定的节点；
-    //  - 自动模式（内核 smart 组）：smartActiveNodes（/connections 里实际在用的
-    //    出口节点，bootstrap 时 smartActiveNodes 还没拉取，先把分组定位好，
-    //    refreshSmartActive 拉到出口节点后再补滚动）。
-    // 定位到分组后**自动展开**该分组——用户不必再手动展开看具体节点。
-    if (this.filterSubId.length === 0 && this.autoSelectMode !== AutoSelectModes.AUTO
-      && this.settings.preferredNodeId.length > 0) {
+    // 进入页面定位到用户所选节点所属订阅并展开分组。
+    if (this.filterSubId.length === 0 && this.settings.preferredNodeId.length > 0) {
       const cur = this.subs.resolveUserPreference(
         this.settings.preferredNodeId, this.settings.preferredNodeName);
       if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
@@ -393,32 +359,38 @@ struct NodeSelectionPage {
   }
 
   /**
-   * 节点页的显示真源。
+   * 节点页的显示真源（**单一真源**，2026-11-04 架构收口）。
    *
-   * 普通订阅继续使用 App 本地节点；provider-only 配置的真实节点只会在 mihomo
-   * 加载 `proxy-providers/use` 后出现在 `/proxies`，因此把当前已生效 profile 的
-   * 内核叶子节点补成只读影子。归属戳必须逐字匹配，绝不拿旧 profile 的目录补新订阅。
+   * 旧实现把内核影子节点**追加**到 App 解析表后面，同一订阅于是同时存在两份真相：
+   * 名字对不上就出现重复行，选点/测速/生成配置各读一份 → UI 显示与内核实际出口不一致。
+   * 现在按 profile 分工（见 `NodeTruth`）：
+   *   · 已应用 profile → **只**读内核目录（叶子节点，过滤删除台账）；
+   *   · 其它 profile → App 表**预览**（FlClash 无此概念，本仓保留，绝不参与当前判定）。
+   * 内核不可用时，已应用 profile 才回退 App 表——这是显式降级，不是两份合并。
    */
   private displayNodes(): ProxyNode[] {
-    const out: ProxyNode[] = this.subs.nodes.slice();
-    const appliedId: string = this.orchestrator.appliedProfile();
-    const profileId: string = appliedId.length > 0 ? appliedId : ProfileRepository.currentId();
-    if (profileId.length === 0 || CoreCatalogService.current() === null
-      || CoreCatalogService.profileIdOfSnapshot() !== profileId) {
-      return out;
-    }
-    const seen: Set<string> = new Set<string>();
-    for (const node of out) {
-      if (node.subscriptionId === profileId) {
-        seen.add(node.name);
+    const appliedId: string = NodeTruth.appliedProfileId(
+      this.orchestrator.appliedProfile(), ProfileRepository.currentId());
+    const truth: NodeTruthScope = NodeTruth.scope(appliedId);
+    const excluded: string[] = this.subs.listHiddenKeys();
+    const out: ProxyNode[] = [];
+    if (truth.kernel) {
+      for (const node of CoreNodeBridge.toProxyNodes(NodeTruth.leaves(truth, 'rule', excluded), appliedId)) {
+        out.push(node);
+      }
+    } else if (appliedId.length > 0) {
+      // 显式降级：内核不在（未连接且无测速核）或快照不属于该 profile。
+      for (const n of this.subs.nodes) {
+        if (n.subscriptionId === appliedId && !NodeTruth.hidden(n.name, excluded)) {
+          out.push(n);
+        }
       }
     }
-    for (const coreNode of CoreCatalogService.flattenNodes('rule')) {
-      if (seen.has(coreNode.name)) {
-        continue;
+    // 预览：其它订阅的 App 表（不参与当前选点/出口判定，也不与内核合并）。
+    for (const n of this.subs.nodes) {
+      if (n.subscriptionId !== appliedId) {
+        out.push(n);
       }
-      seen.add(coreNode.name);
-      out.push(CoreNodeBridge.toProxyNode(coreNode, profileId));
     }
     return out;
   }
@@ -449,6 +421,7 @@ struct NodeSelectionPage {
   }
 
   private rebuildRows(): void {
+    this.refreshSmartEntry();
     const rows: NodeRow[] = [];
     const activeNames: string[] = [];
     for (const n of this.displayNodes()) {
@@ -465,52 +438,38 @@ struct NodeSelectionPage {
     }
     LatencyStoreBridge.retainOnly(activeNames, this.latencyContext());
 
-    // ── 自动选择视图 ────────────────────────────────────────────────
-    // 显示内核**当前实际在用**的出口节点（来自 /connections 的 chains）。
-    // 置顶排序：最近有流量的排前面 —— 用户要的是"现在走哪个"，不是全量列表。
-    if (this.smartView) {
-      const byName = new Map<string, NodeRow>();
-      for (const r of rows) {
-        byName.set(r.node.name, r);
-      }
-      const picked: NodeRow[] = [];
-      for (const name of this.smartActiveNodes) {
-        const r = byName.get(name);
-        if (r !== undefined) {
-          picked.push(r);
-        }
-      }
-      this.groupRows = [];
-      this.nodes = picked;
-      return;
-    }
-
-    // ── 内核 smart 组入口（♻️ 自动选择）───────────────────────────────
-    // 该组只存在于**内核配置**里，不在订阅里，所以默认「全部节点」列表看不到它。
-    // 这里补一个合成行。所有过滤条件都必须显式处理「合成行」（isSmart）：
-    // 测速、删除、排序、多选都不能把它当真实节点。
-    this.smartEntries = [];
-    if (this.smartSelectable()) {
-      // 「全部」视图给全局入口；筛选到某个订阅时给**该订阅自己的**入口 ——
-      // 选中后重连目标取自该订阅，生成配置时 smart 池按 groupSelected 的订阅收窄，
-      // 即“只在本订阅内优先”。订阅真实节点不足 2 个时不展示（内核会退回全量池，
-      // 展示反而会让用户以为已限定在本订阅）。
-      if (this.filterSubId.length === 0) {
-        const entry = this.mkSmartRow('');
-        this.smartEntries = [entry];
-        rows.unshift(entry);
-      } else if (this.subscriptionSmartPoolSize(this.filterSubId) >= 2) {
-        const entry = this.mkSmartRow(this.filterSubId);
-        this.smartEntries = [entry];
-        rows.unshift(entry);
-      }
-    }
     const groupRows: ProxyGroupRow[] = [];
-    // 本地 ProxyGroup 不包含 `use: provider` 在运行期注入的成员。只要当前筛选里
-    // 存在内核影子，就改用上面的扁平目录；否则会渲染出一堆空组，把节点再次藏掉。
+    const hiddenKeys: string[] = this.subs.listHiddenKeys();
+    // 预览分支沿用旧守卫：当前筛选里若已出现内核影子行，就不再渲染 App 空组。
     const hasCoreOnlyRows: boolean = rows.some((row: NodeRow): boolean =>
-      row.isSmart !== true && CoreNodeBridge.isShadow(row.node));
-    if (this.filterSubId.length > 0 && !hasCoreOnlyRows) {
+      CoreNodeBridge.isShadow(row.node));
+    // ── 单一真源 / Group 语义（2026-11-04 架构收口）─────────────────────
+    // 已应用 profile：组与成员一律取内核 `all` 的**直接成员**，不递归。
+    // FlClash 面板就是「组的直接成员 + 组当前 now」；App 侧递归展开会把子组里的
+    // 节点冒充成父组成员，选择链因此与内核不一致（真机表现：选父组某节点，
+    // 内核实走子组另一个出口）。未应用 profile 仍走 App 预览分支。
+    const truth: NodeTruthScope = NodeTruth.scope(this.filterSubId);
+    if (truth.kernel) {
+      for (const coreGroup of NodeTruth.groupsFor(truth, 'rule')) {
+        const group: ProxyGroup = NodeTruth.projectGroup(truth, coreGroup);
+        const memberRows: NodeRow[] = [];
+        const strategyGroups: ProxyGroup[] = [];
+        for (const member of coreGroup.all) {
+          if (member.hidden) { continue; }
+          if (member.isGroup) {
+            const child: CoreGroup | null = NodeTruth.group(truth, member.name);
+            if (child !== null) {
+              strategyGroups.push(NodeTruth.projectGroup(truth, child));
+            }
+          } else if (member.name.length > 0 && !NodeTruth.hidden(member.name, hiddenKeys)) {
+            memberRows.push(this.mkNodeRow(CoreNodeBridge.toProxyNode(member, this.filterSubId)));
+          }
+        }
+        groupRows.push({ group: group, nodes: memberRows, memberNodes: memberRows,
+          strategyGroups: strategyGroups });
+      }
+    } else if (this.filterSubId.length > 0 && !hasCoreOnlyRows) {
+      // 预览路径（未应用 profile）：App 表是唯一可用来源，明确不参与当前选点。
       for (const group of this.subs.groupsOf(this.filterSubId)) {
         const groupNodes: NodeRow[] = [];
         for (const node of this.subs.expandProxyGroup(group)) {
@@ -522,11 +481,7 @@ struct NodeSelectionPage {
         for (const node of members.nodes) {
           memberNodes.push(this.mkNodeRow(node));
         }
-        // 「♻️ 自动选择」已由本页置顶的合成卡片（smartEntries）唯一代表。
-        // 生成配置会把它插进主选择组首位并追加组定义，若这里再当策略组渲染一遍，
-        // 展开分组后就会出现第二条「自动选择」（2026-10-30 用户报障）。按名字剔掉。
-        const strategyGroups: ProxyGroup[] = members.groups.filter(
-          (g: ProxyGroup): boolean => g.name !== ClashConfigGenerator.SMART_GROUP_NAME);
+        const strategyGroups: ProxyGroup[] = members.groups;
         groupRows.push({ group: group, nodes: groupNodes,
           memberNodes: memberNodes, strategyGroups: strategyGroups });
       }
@@ -537,10 +492,7 @@ struct NodeSelectionPage {
       validGroupKeys.add(row.group.subscriptionId + '\u0000' + row.group.name);
     }
     this.expandedGroupKeys = this.expandedGroupKeys.filter((key: string) => validGroupKeys.has(key));
-    // 合成行不参与测速排序（它没有延迟），单独摘出来最后固定置顶。
-    const smartRow: NodeRow | undefined =
-      (rows.length > 0 && rows[0].isSmart === true) ? rows[0] : undefined;
-    const sortable: NodeRow[] = smartRow !== undefined ? rows.slice(1) : rows;
+    const sortable: NodeRow[] = rows;
 
     // Sort the actual rows. A name-indexed Map would drop one of two profiles'
     // same-name nodes; measurements are looked up with each row's full context.
@@ -560,7 +512,7 @@ struct NodeSelectionPage {
         return (a < 0 ? order.length : a) - (b < 0 ? order.length : b);
       });
     }
-    this.nodes = smartRow !== undefined ? [smartRow].concat(ordered) : ordered;
+    this.nodes = ordered;
   }
 
   /** 节点搜索过滤（P1-4）：空串返回原列表；命中 node.name 小写包含 */
@@ -578,68 +530,6 @@ struct NodeSelectionPage {
     return out;
   }
 
-  /** 内核 smart 组入口当前是否应展示（模型就绪即展示，与 autoSelectMode 无关） */
-  private smartSelectable(): boolean {
-    try {
-      return this.orchestrator.ensureSmartModelReady();
-    } catch (e) {
-      return false;
-    }
-  }
-
-  /** 当前是否正走内核自动选点（自动模式 + 模型就绪） */
-  private smartEngaged(): boolean {
-    return this.settings.autoSelectMode === AutoSelectModes.AUTO && this.smartSelectable();
-  }
-
-  /** 订阅里的真实节点名（用于从 chains 里认出出口节点） */
-  private knownNodeNames(): string[] {
-    const out: string[] = [];
-    for (const n of this.subs.nodes) {
-      out.push(n.name);
-    }
-    return out;
-  }
-
-  /**
-   * 拉取内核当前实际在用的出口节点。
-   *
-   * 只做一次请求、不重试：这是「显示当前选中」的辅助信息，失败时保留上一次结果
-   * 并标记通道异常，绝不能因为它失败就去清空列表或弹错误。
-   */
-  private async refreshSmartActive(): Promise<void> {
-    if (!this.smartEngaged()) {
-      this.smartActiveNodes = [];
-      this.smartChannelDown = false;
-      this.rebuildRows();
-      return;
-    }
-    const used: string[] | null = await this.orchestrator.api.smartActiveNodes(
-      ClashConfigGenerator.SMART_GROUP_NAME, this.knownNodeNames());
-    if (used === null) {
-      this.smartChannelDown = true;
-      this.rebuildRows();
-      return;
-    }
-    this.smartChannelDown = false;
-    this.smartActiveNodes = used;
-    // **必须重建行**：UI 渲染的是 this.nodes，不是 smartActiveNodes。
-    // 漏掉这一步会让状态更新了但列表永远是空的（真机表现：自动选择分组一直没节点）。
-    // enterSmartView() 里那次 rebuildRows 发生在异步拉取之前，拿到的还是空数组。
-    this.rebuildRows();
-    // 自动模式：定位到**实际出口节点**所属订阅并展开分组（用户要求）
-    if (this.filterSubId.length === 0 && used.length > 0) {
-      const display = used[0];
-      const cur = this.subs.nodes.find((n: ProxyNode) => n.name === display) ?? null;
-      if (cur !== null && cur.subscriptionId.length > 0 && cur.subscriptionId !== 'direct'
-        && this.subs.subscriptions.some((s: Subscription) => s.id === cur.subscriptionId)) {
-        this.filterSubId = cur.subscriptionId;
-        this.rebuildRows();
-      }
-      this.expandAndScrollToNode(display);
-    }
-  }
-
   /**
    * 定位到 nodeName 所属的订阅分组（filterSubId），并把该分组**自动展开**，
    * 最后滚动到该节点行——用户不必再手动展开分组找节点。
@@ -649,17 +539,30 @@ struct NodeSelectionPage {
     if (nodeName.length === 0) {
       return;
     }
-    for (const group of this.subs.groupsOf(this.filterSubId)) {
-      const members = this.subs.groupMembersOf(group);
-      const inMembers = members.nodes.some((n: ProxyNode) => n.name === nodeName);
-      const inExpanded = this.subs.expandProxyGroup(group).some((n: ProxyNode) => n.name === nodeName);
-      if (inMembers || inExpanded) {
-        const key = this.groupKey(group);
+    // 已应用 profile 走内核组语义（直接成员 + now），不再用 App 递归展开判断归属。
+    const truth: NodeTruthScope = NodeTruth.scope(this.filterSubId);
+    if (truth.kernel) {
+      const owner: string = CoreCatalogService.groupOfNode(nodeName);
+      if (owner.length > 0) {
+        const key: string = `${this.filterSubId}\u0000${owner}`;
         if (!this.expandedGroupKeys.includes(key)) {
           this.expandedGroupKeys = this.expandedGroupKeys.concat([key]);
         }
         this.rebuildRows();
-        break;
+      }
+    } else {
+      for (const group of this.subs.groupsOf(this.filterSubId)) {
+        const members = this.subs.groupMembersOf(group);
+        const inMembers = members.nodes.some((n: ProxyNode) => n.name === nodeName);
+        const inExpanded = this.subs.expandProxyGroup(group).some((n: ProxyNode) => n.name === nodeName);
+        if (inMembers || inExpanded) {
+          const key = this.groupKey(group);
+          if (!this.expandedGroupKeys.includes(key)) {
+            this.expandedGroupKeys = this.expandedGroupKeys.concat([key]);
+          }
+          this.rebuildRows();
+          break;
+        }
       }
     }
     const idx = this.nodes.findIndex((r: NodeRow) => r.node.name === nodeName);
@@ -668,129 +571,6 @@ struct NodeSelectionPage {
         this.listScroller.scrollToIndex(idx, true);
       }, 350);
     }
-  }
-
-  /**
-   * 自动选择视图的空状态文案。
-   *
-   * 必须区分「手动模式所以压根没在自动选点」与「自动模式但暂时没流量」——
-   * 两者都表现为空列表，但原因和下一步动作完全不同。混为一谈会让用户
-   * 以为是功能坏了（这正是本轮之前的实际体验）。
-   */
-  private smartEmptyTitle(): string {
-    if (!this.smartView) {
-      return '暂无可用节点';
-    }
-    if (!this.smartEngaged()) {
-      return '尚未启用自动选择';
-    }
-    if (this.smartChannelDown) {
-      return '内核未连接';
-    }
-    return '当前没有活动连接';
-  }
-
-  private smartEmptyHint(): string {
-    if (!this.smartEngaged()) {
-      return '点了实际节点就会退回手动模式；想用内核自动选点，请点上方「自动选择」';
-    }
-    if (this.smartChannelDown) {
-      return '读不到内核的连接列表，先连接 VPN 再看';
-    }
-    return '产生流量后，内核实际选中的节点会显示在这里（每 3 秒刷新）';
-  }
-
-  /** 自动选择视图的轮询：进入视图才起，离开/页面隐藏必须停 */
-  private smartPollTimer: number = -1;
-
-  private startSmartPoll(): void {
-    this.stopSmartPoll();
-    this.refreshSmartActive();
-    this.smartPollTimer = UnifiedScheduler.every(() => {
-      this.refreshSmartActive();
-    }, 3000);
-  }
-
-  private stopSmartPoll(): void {
-    if (this.smartPollTimer !== -1) {
-      UnifiedScheduler.clear(this.smartPollTimer);
-      this.smartPollTimer = -1;
-    }
-  }
-
-  private enterSmartView(): void {
-    this.smartView = true;
-    this.filterSubId = '';
-    this.rebuildRows();
-    this.startSmartPoll();
-  }
-
-  private exitSmartView(): void {
-    if (!this.smartView) {
-      return;
-    }
-    this.smartView = false;
-    this.stopSmartPoll();
-    // 必须重建：自动选择视图把 this.nodes 换成了内核在用节点的子集，
-    // 不重建就会停留在那个被过滤的列表上（用户会以为"看不到/选不了其他节点"）。
-    this.rebuildRows();
-  }
-
-  /**
-   * 构造「♻️ 自动选择」合成行。
-   *
-   * 它**不是真实节点**（没有 server/port），只为在列表里提供一个可选入口：
-   * 选中它 = 切到自动模式，由内核按连接目标用 LightGBM 选点。
-   * `subscriptionId` 在这里被借用为**作用域标记**：空 = 全局（随当前节点），
-   * 非空 = 只在传入的订阅内优选。
-   * 因此必须靠 `isSmart` 标记把它与真实节点区分开，否则会被送进测速引擎，
-   * 或在下一次生成配置时被当成真实节点（它不在 `subs.nodes` 里，天然不会）。
-   */
-  private mkSmartRow(subscriptionId: string): NodeRow {
-    const node = new ProxyNode();
-    node.id = SMART_ROW_ID;
-    node.name = ClashConfigGenerator.SMART_GROUP_NAME;
-    node.originalName = node.name;
-    node.type = ProxyNodeType.UNKNOWN;
-    node.server = '';
-    node.port = 0;
-    // 作用域标记（非空 = 只在该订阅内优先）。合成行不在 subs.nodes 里，
-    // 这个字段不会被当成真实订阅归属，只在本页的 smart 分支读取。
-    node.subscriptionId = subscriptionId;
-    const row: NodeRow = {
-      node: node,
-      countryCode: '',
-      status: this.statusFor(node),
-      isSmart: true
-    };
-    return row;
-  }
-
-  /** 该订阅可参与 smart 优选的真实节点数（<2 时内核退回全量池，不应展示入口） */
-  private subscriptionSmartPoolSize(subscriptionId: string): number {
-    let count = 0;
-    for (const n of this.subs.nodes) {
-      if (n.subscriptionId === subscriptionId) {
-        count = count + 1;
-      }
-    }
-    return count;
-  }
-
-  /**
-   * 合成行是否处于选中态：**作用域也必须匹配**。
-   * 所有订阅的入口共用同一个内核组名，只比名字会让每个分组里的入口同时高亮。
-   */
-  private isSmartRowSelected(row: NodeRow): boolean {
-    if (row.isSmart !== true) {
-      return false;
-    }
-    if (this.selectedName !== ClashConfigGenerator.SMART_GROUP_NAME) {
-      return false;
-    }
-    const scope: string = this.autoSelectMode === AutoSelectModes.AUTO
-      ? this.settings.preferredNodeSubscriptionId : '';
-    return row.node.subscriptionId === scope;
   }
 
 
@@ -1019,13 +799,10 @@ struct NodeSelectionPage {
   }
 
 
-  /** 本页要测的节点集合 = 当前列表里的真实节点行（不含组行、组成员行与 smart 合成行）。 */
+  /** 本页要测的节点集合 = 当前列表里的真实节点行。 */
   private targetNodes(): ProxyNode[] {
     const out: ProxyNode[] = [];
     for (const row of this.nodes) {
-      if (row.isSmart === true) {
-        continue;
-      }
       out.push(row.node);
     }
     return out;
@@ -1121,7 +898,7 @@ struct NodeSelectionPage {
       for (const batch of byProfile) {
         if (this.batchCancelled) { break; }
         timer = UnifiedScheduler.every((): void => {
-          const current = FlclashLatencyService.currentProgress();
+          const current = TunBoxLatencyService.currentProgress();
           if (driveHeader && current !== null && current.running) {
             this.latencyDone = progress.finished + current.started;
           }
@@ -1137,6 +914,7 @@ struct NodeSelectionPage {
         progress.finished += result.finished;
         progress.measured += result.measured; progress.timeout += result.timeout;
         progress.failed += result.failed; progress.cancelled += result.cancelled;
+        progress.wasCancelled = progress.wasCancelled || result.wasCancelled;
         progress.skipped += result.skipped;
         if (result.message.length > 0) {
           progress.message = result.message;
@@ -1145,6 +923,7 @@ struct NodeSelectionPage {
         this.applyProgress(progress, driveHeader);
       }
       if (this.batchCancelled) {
+        progress.wasCancelled = true;
         progress.cancelled = Math.max(progress.cancelled, progress.total - progress.finished);
       }
       return progress;
@@ -1339,10 +1118,6 @@ struct NodeSelectionPage {
   /** 选择态下点行 = 勾选/取消勾选；非选择态仍是「选中该节点作为当前出口」 */
   private onNodeTap(node: ProxyNode): void {
     if (this.selectMode) {
-      // 合成行（自动选择）不在订阅里，不可删除 —— 选择态下直接忽略点击
-      if (node.id === SMART_ROW_ID) {
-        return;
-      }
       this.toggleSelectedNode(node.id);
       return;
     }
@@ -1360,14 +1135,12 @@ struct NodeSelectionPage {
     this.selectedNodeIds = next;
   }
 
-  /** 全选/取消全选：作用范围 = 当前可见的普通节点（尊重搜索与订阅筛选；合成行不可删） */
+  /** 全选/取消全选：作用范围 = 当前可见的普通节点（尊重搜索与订阅筛选） */
   private toggleSelectAllNodes(): void {
     const visible: NodeRow[] = this.searchFiltered(this.nodes);
     const ids: string[] = [];
     for (const row of visible) {
-      if (row.isSmart !== true) {
-        ids.push(row.node.id);
-      }
+      ids.push(row.node.id);
     }
     this.selectedNodeIds = this.selectedNodeIds.length >= ids.length ? [] : ids;
   }
@@ -1462,12 +1235,36 @@ struct NodeSelectionPage {
         promptAction.showToast({ message: '没有可测速的节点：测速内核未就绪，请稍后重试' });
         return;
       }
-      const message = progress.message.length > 0 ? progress.message
-        : (progress.cancelled > 0 ? '部分测速未完成，未取得响应的目标已保留上次结果'
-          : (progress.skipped > 0 ? '部分节点未加载，已完成其余节点测速'
-            : (progress.measured > 0 ? '✓ 测速完成' : '未测得有效延迟，请检查节点或测速地址')));
-      promptAction.showToast({ message: message });
+      promptAction.showToast({ message: progress.completionMessage() });
     }
+  }
+
+  private refreshSmartEntry(): void {
+    const scope = this.filterSubId || ProfileRepository.currentId();
+    const revision = ++this.smartRefreshRevision;
+    this.smartSelected = this.settings.autoSelectMode === AutoSelectModes.AUTO
+      && this.orchestrator.isSmartModelAvailable()
+      && this.settings.preferredNodeSubscriptionId === scope;
+    if (this.smartSelected) { this.selectedName = ''; }
+    this.orchestrator.smartAvailableFor(scope, this.subs).then((available: boolean): void => {
+      if (revision === this.smartRefreshRevision) { this.smartVisible = available; }
+    }).catch((): void => {
+      if (revision === this.smartRefreshRevision) { this.smartVisible = false; }
+    });
+  }
+
+  private async selectSmart(): Promise<void> {
+    if (this.smartSelecting) { return; }
+    this.smartSelecting = true;
+    try {
+      const restarted = await this.orchestrator.selectSmartSubscription(
+        this.filterSubId || ProfileRepository.currentId(), this.subs);
+      this.settings = await SettingsService.load();
+      this.rebuildRows();
+      promptAction.showToast({ message: restarted ? '已启用本订阅智能选择，代理已重启' : '已选择智能选点，下次连接生效' });
+    } catch (e) {
+      promptAction.showToast({ message: AppLogger.errText(e) });
+    } finally { this.smartSelecting = false; }
   }
 
   private async selectStrategy(parent: ProxyGroup, strategy: ProxyGroup): Promise<void> {
@@ -1489,8 +1286,8 @@ struct NodeSelectionPage {
           s.preferredNodeNamesBySubscription, scope, strategy.name);
       });
       this.settings = await SettingsService.load();
-      this.autoSelectMode = AutoSelectModes.MANUAL;
       this.selectedName = strategy.name;
+      this.refreshSmartEntry();
       this.latencyTick++;
       const revision = AppStorage.get<number>('node_switch_revision') ?? 0;
       AppStorage.setOrCreate('node_switch_revision', revision + 1);
@@ -1508,74 +1305,9 @@ struct NodeSelectionPage {
   }
 
   private async selectNode(node: ProxyNode): Promise<void> {
-    // ── 合成行：内核 smart 组入口 ──────────────────────────────────
-    // 它不是真实节点，不能进 reconnectWithNode（没有 server/port 会生成非法配置）。
-    // 选中它的语义 = 「切到自动模式」，由内核按连接目标用 LightGBM 选点；
-    // 重连仍用当前偏好的真实节点，orchestrator 在 auto 模式下会把 PROXY 指向 smart 组。
-    if (node.id === SMART_ROW_ID) {
-      this.settings.autoSelectMode = AutoSelectModes.AUTO;
-      this.autoSelectMode = AutoSelectModes.AUTO;
-      // 作用域：空 = 由当前/偏好节点所属订阅决定（历史行为）；非空 = 用户在该订阅下
-      // 点了「自动选择」，重连目标必须取自该订阅 —— 生成配置时 smart 池按
-      // groupSelected 的订阅收窄，才能真正做到“只在本订阅内优先”。
-      const scopeSubId: string = node.subscriptionId;
-      // 字段级写：自动模式 + 订阅作用域（空串 = 随当前节点）
-      await SettingsService.patchSettings((s: AppSettings): void => {
-        s.autoSelectMode = AutoSelectModes.AUTO;
-        s.preferredNodeSubscriptionId = scopeSubId;
-      });
-      this.settings.preferredNodeSubscriptionId = scopeSubId;
-      let target: ProxyNode | null = null;
-      if (scopeSubId.length > 0) {
-        const inSub: ProxyNode[] = [];
-        for (const n of this.subs.nodes) {
-          if (n.subscriptionId === scopeSubId) {
-            inSub.push(n);
-          }
-        }
-        for (const n of inSub) {
-          if (n.name === this.settings.preferredNodeName) {
-            target = n;
-            break;
-          }
-        }
-        if (target === null && inSub.length > 0) {
-          target = inSub[0];
-        }
-      }
-      if (target === null) {
-        // 重连目标必须属于当前订阅（跨订阅旧偏好只会钉错节点），与连接路径同源
-        target = await this.subs.resolvePreferenceHint();
-      }
-      if (target === null) {
-        target = this.subs.fallbackConnectionNode();
-      }
-      if (target === null) {
-        promptAction.showToast({ message: '没有可用节点' });
-        return;
-      }
-      const didRestart = await this.orchestrator.reconnectWithNode(
-        target, this.subs, 'autoSelectMode=auto');
-      if (didRestart) {
-        const revision = AppStorage.get<number>('public_ip_revision') ?? 0;
-        AppStorage.setOrCreate('public_ip_revision', revision + 1);
-      }
-      this.selectedName = ClashConfigGenerator.SMART_GROUP_NAME;
-      promptAction.showToast({
-        message: didRestart ? '已启用内核智能选点，代理已重启' : '已启用内核智能选点，下次连接生效'
-      });
-      return;
-    }
-    // ── 真实节点：必须**退出自动模式** ────────────────────────────────
-    // 否则会出现「点了节点但没用」：auto 模式下 connect() 里的 pinSmartGroup 会把
-    // PROXY 指向 smart 组，preferredNodeId 被悄悄架空 —— 用户看到的是手动选择失效。
-    // 手动点节点是明确的"我要固定走这个"意图，必须以它为准。
+    // 用户显式选节点时退出旧版 App 自动选点模式；订阅策略组选择另走 selectStrategy。
     if (this.settings.autoSelectMode === AutoSelectModes.AUTO) {
       this.settings.autoSelectMode = AutoSelectModes.MANUAL;
-      // 页面横幅读的是 @State autoSelectMode，不同步会继续显示"自动选点"，
-      // 与刚刚落库的手动选择自相矛盾。
-      this.autoSelectMode = AutoSelectModes.MANUAL;
-      this.exitSmartView();
       AppLogger.info(TAG, `manual node pick (${node.name}); auto mode disabled`);
     }
     this.settings.preferredNodeId = node.id;
@@ -1584,6 +1316,7 @@ struct NodeSelectionPage {
       this.settings.preferredNodeSubscriptionId = node.subscriptionId;
     }
     this.selectedName = node.name;
+    this.smartSelected = false;
     // 字段级写：只改偏好三件套（id/名字快照/所属订阅）
     await SettingsService.patchSettings((s: AppSettings): void => {
       s.autoSelectMode = AutoSelectModes.MANUAL;
@@ -1638,7 +1371,7 @@ struct NodeSelectionPage {
           Row({ space: 10 }) {
             Row() {
               Image($r('app.media.ic_close'))
-                .width(18).height(18).fillColor(Ui.textPrimary)
+                .width(18).height(18).fillColor(Ui.textPrimaryFor(this.themeRevision))
             }
             .width(36).height(36)
             .justifyContent(FlexAlign.Center)
@@ -1648,24 +1381,24 @@ struct NodeSelectionPage {
             .onClick(() => this.exitSelectMode())
             Text(`已选 ${this.selectedNodeIds.length}`)
               .fontSize(16).fontWeight(FontWeight.Bold)
-              .fontColor(Ui.textPrimary)
+              .fontColor(Ui.textPrimaryFor(this.themeRevision))
               .layoutWeight(1)
             Text('全选')
-              .fontSize(13).fontColor(Ui.primary)
+              .fontSize(13).fontColor(Ui.primaryFor(this.themeRevision))
               .height(36)
               .padding({ left: 12, right: 12 })
               .borderRadius(18)
-              .backgroundColor(Ui.primaryBlueFill)
+              .backgroundColor(Ui.primaryBlueFillFor(this.themeRevision))
               .borderWidth(1).borderColor(Ui.borderStrong)
               .textAlign(TextAlign.Center)
               .onClick(() => this.toggleSelectAllNodes())
             Row({ space: 5 }) {
               Image($r('app.media.ic_delete'))
                 .width(14).height(14)
-                .fillColor(this.selectedNodeIds.length > 0 ? Ui.error : Ui.textTertiary)
+                .fillColor(this.selectedNodeIds.length > 0 ? Ui.error : Ui.textTertiaryFor(this.themeRevision))
               Text('删除')
                 .fontSize(13).fontWeight(FontWeight.Medium)
-                .fontColor(this.selectedNodeIds.length > 0 ? Ui.error : Ui.textTertiary)
+                .fontColor(this.selectedNodeIds.length > 0 ? Ui.error : Ui.textTertiaryFor(this.themeRevision))
             }
             .height(36)
             .padding({ left: 12, right: 12 })
@@ -1684,7 +1417,7 @@ struct NodeSelectionPage {
           Row() {
             Image($r('app.media.ic_arrow_left'))
               .width(20).height(20)
-              .fillColor(Ui.textPrimary)
+              .fillColor(Ui.textPrimaryFor(this.themeRevision))
           }
           .width(36).height(36)
           .justifyContent(FlexAlign.Center)
@@ -1699,7 +1432,7 @@ struct NodeSelectionPage {
             })
             Text(this.selectedName.length > 0 ? this.selectedName : '选择节点')
               .fontSize(16).fontWeight(FontWeight.Bold)
-              .fontColor(Ui.textPrimary)
+              .fontColor(Ui.textPrimaryFor(this.themeRevision))
               // 直接使用完整原始节点名。禁止 compact/去旗标/截断/maxLines/Ellipsis，
               // 让 MARQUEE 对完整字符串循环滚动。
               .textOverflow({ overflow: TextOverflow.MARQUEE })
@@ -1713,7 +1446,7 @@ struct NodeSelectionPage {
             Row() {
               Image($r('app.media.ic_refresh'))
                 .width(20).height(20)
-                .fillColor(this.refreshing ? Ui.primary : Ui.textPrimary)
+                .fillColor(this.refreshing ? Ui.primaryFor(this.themeRevision) : Ui.textPrimaryFor(this.themeRevision))
             }
             .width(36).height(36)
             .justifyContent(FlexAlign.Center)
@@ -1725,22 +1458,22 @@ struct NodeSelectionPage {
               Text(`${this.refreshDone}/${this.refreshTotal}`)
                 .fontSize(11)
                 .fontWeight(FontWeight.Bold)
-                .fontColor(Ui.primary)
+                .fontColor(Ui.primaryFor(this.themeRevision))
             }
             Row({ space: 4 }) {
               Image(this.sortMode === NodeSortModes.MANUAL
                 ? $r('app.media.ic_lock') : $r('app.media.ic_sort'))
                 .width(16).height(16)
-                .fillColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textPrimary : Ui.primary)
+                .fillColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textPrimaryFor(this.themeRevision) : Ui.primaryFor(this.themeRevision))
               Text(this.sortMode === NodeSortModes.AUTO ? '自动排序'
                 : (this.sortMode === NodeSortModes.MANUAL ? '手动固定' : '默认顺序'))
                 .fontSize(11)
-                .fontColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textSecondary : Ui.primary)
+                .fontColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.textSecondaryFor(this.themeRevision) : Ui.primaryFor(this.themeRevision))
             }
             .height(36)
             .padding({ left: 10, right: 10 })
             .borderRadius(18)
-            .backgroundColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.surfaceMuted(this.themeRevision) : Ui.primaryBlueFill)
+            .backgroundColor(this.sortMode === NodeSortModes.DEFAULT ? Ui.surfaceMuted(this.themeRevision) : Ui.primaryBlueFillFor(this.themeRevision))
             .onClick(() => this.cycleSortMode())
             // 组测一起出结果（约 3 秒），进度条没有意义——已去掉（用户要求）。
             // 通道（内核/凭证）不可用时明确告诉用户原因。
@@ -1749,7 +1482,7 @@ struct NodeSelectionPage {
                 // 通道还没就绪（要拉起测速内核，秒级）：明确告诉用户在等什么
                 Text('准备测速通道…')
                   .fontSize(11)
-                  .fontColor(Ui.textSecondary)
+                  .fontColor(Ui.textSecondaryFor(this.themeRevision))
               } else if (this.latencyCoreUnavailable) {
                 Text('内核不可用，本轮未测')
                   .fontSize(11)
@@ -1757,22 +1490,22 @@ struct NodeSelectionPage {
               }
               // 测试中「测全部」变成转圈反馈（用户要求）：不然以为没点上
               if (this.batchTesting) {
-                LoadingProgress().width(20).height(20).color(Ui.primary)
+                LoadingProgress().width(20).height(20).color(Ui.primaryFor(this.themeRevision))
                   .onClick(() => this.testAll())
               } else {
                 Row({ space: 5 }) {
                   Image($r('app.media.ic_bolt'))
                     .width(14).height(14)
-                    .fillColor(Ui.primary)
+                    .fillColor(Ui.primaryFor(this.themeRevision))
                   Text('测全部')
                     .fontSize(13)
                     .fontWeight(FontWeight.Medium)
-                    .fontColor(Ui.primary)
+                    .fontColor(Ui.primaryFor(this.themeRevision))
                 }
                 .height(36)
                 .padding({ left: 12, right: 12 })
                 .borderRadius(18)
-                .backgroundColor(Ui.primaryBlueFill)
+                .backgroundColor(Ui.primaryBlueFillFor(this.themeRevision))
                 .borderWidth(1)
                 .borderColor(Ui.borderStrong)
                 .onClick(() => this.testAll())
@@ -1792,44 +1525,28 @@ struct NodeSelectionPage {
             Row({ space: 8 }) {
               Text('全部')
                 .fontSize(13)
-                .fontWeight(!this.smartView && this.filterSubId.length === 0 ? FontWeight.Bold : FontWeight.Medium)
-                .fontColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primary : Ui.textSecondary)
+                .fontWeight(this.filterSubId.length === 0 ? FontWeight.Bold : FontWeight.Medium)
+                .fontColor(this.filterSubId.length === 0 ? Ui.primaryFor(this.themeRevision) : Ui.textSecondaryFor(this.themeRevision))
                 .padding({ left: 14, right: 14, top: 7, bottom: 7 })
                 .borderRadius(100)
-                .backgroundColor(!this.smartView && this.filterSubId.length === 0 ? Ui.primaryBlueFill : Ui.surfaceMuted(this.themeRevision))
+                .backgroundColor(this.filterSubId.length === 0 ? Ui.primaryBlueFillFor(this.themeRevision) : Ui.surfaceMuted(this.themeRevision))
                 .borderWidth(1)
-                .borderColor(!this.smartView && this.filterSubId.length === 0 ? Ui.borderStrong : Ui.border)
+                .borderColor(this.filterSubId.length === 0 ? Ui.borderStrong : Ui.border)
                 .onClick(() => {
-                  this.exitSmartView();
                   this.filterSubId = '';
                   this.rebuildRows();
                 })
-              // 自动选择分组：把内核按连接选出的节点集中展示。
-              // 只在模型就绪时出现 —— 没模型时内核压根没有这个组，展示会是空壳。
-              if (this.smartSelectable()) {
-                Text('自动选择')
-                  .fontSize(13)
-                  .fontWeight(this.smartView ? FontWeight.Bold : FontWeight.Medium)
-                  .fontColor(this.smartView ? Ui.primary : Ui.textSecondary)
-                  .padding({ left: 14, right: 14, top: 7, bottom: 7 })
-                  .borderRadius(100)
-                  .backgroundColor(this.smartView ? Ui.primaryBlueFill : Ui.surfaceMuted(this.themeRevision))
-                  .borderWidth(1)
-                  .borderColor(this.smartView ? Ui.borderStrong : Ui.border)
-                  .onClick(() => this.enterSmartView())
-              }
               ForEach(this.subChips, (chip: SubChip) => {
                 Text(chip.name)
                   .fontSize(13)
-                  .fontWeight(!this.smartView && this.filterSubId === chip.id ? FontWeight.Bold : FontWeight.Medium)
-                  .fontColor(!this.smartView && this.filterSubId === chip.id ? Ui.primary : Ui.textSecondary)
+                  .fontWeight(this.filterSubId === chip.id ? FontWeight.Bold : FontWeight.Medium)
+                  .fontColor(this.filterSubId === chip.id ? Ui.primaryFor(this.themeRevision) : Ui.textSecondaryFor(this.themeRevision))
                   .padding({ left: 14, right: 14, top: 7, bottom: 7 })
                   .borderRadius(100)
-                  .backgroundColor(!this.smartView && this.filterSubId === chip.id ? Ui.primaryBlueFill : Ui.surfaceMuted(this.themeRevision))
+                  .backgroundColor(this.filterSubId === chip.id ? Ui.primaryBlueFillFor(this.themeRevision) : Ui.surfaceMuted(this.themeRevision))
                   .borderWidth(1)
-                  .borderColor(!this.smartView && this.filterSubId === chip.id ? Ui.borderStrong : Ui.border)
+                  .borderColor(this.filterSubId === chip.id ? Ui.borderStrong : Ui.border)
                   .onClick(() => {
-                    this.exitSmartView();
                     this.filterSubId = chip.id;
                     this.rebuildRows();
                   })
@@ -1844,17 +1561,14 @@ struct NodeSelectionPage {
           .padding({ left: 18, right: 18, top: 18, bottom: 6 })
         }
 
-        // ── 选点模式说明：明确区分「手动固定」与「自动排序」，澄清自动切换不会覆盖手动选择 ──
+        // 订阅的实际策略组决定选点，旧版 AUTO 偏好不能证明内核启用了 Smart。
         Row({ space: 6 }) {
-          Image(this.autoSelectMode === AutoSelectModes.AUTO
-            ? $r('app.media.ic_bolt') : $r('app.media.ic_lock'))
+          Image($r('app.media.ic_network'))
             .width(14).height(14)
-            .fillColor(this.autoSelectMode === AutoSelectModes.AUTO ? Ui.warning : Ui.textSecondary)
-          Text(this.autoSelectMode === AutoSelectModes.AUTO
-            ? $r('app.string.node_mode_auto_banner')
-            : $r('app.string.node_mode_manual_banner'))
+            .fillColor(Ui.textSecondaryFor(this.themeRevision))
+          Text('点击选择节点或策略组 · 长按节点可删除')
             .fontSize(11)
-            .fontColor(Ui.textSecondary)
+            .fontColor(Ui.textSecondaryFor(this.themeRevision))
             .layoutWeight(1)
         }
         .width('100%')
@@ -1868,32 +1582,44 @@ struct NodeSelectionPage {
         // ── 节点列表 ──
         // 说明文案只保留上方那条横幅（模式 + 长按删除提示），
         // 此前这里还有一行「排序：自动排序（按测速结果）」与横幅重复，已移除。
+        if (this.smartVisible && !this.selectMode) {
+          Row({ space: 10 }) {
+            Image($r('app.media.ic_radar')).width(22).height(22)
+              .fillColor(Ui.primaryFor(this.themeRevision))
+            Column({ space: 4 }) {
+              Text('♻️ 自动选择').fontSize(15).fontWeight(FontWeight.Bold)
+                .fontColor(Ui.textPrimaryFor(this.themeRevision))
+              Text('Smart 智能选点 · 只在本订阅内择优').fontSize(11)
+                .fontColor(Ui.textSecondaryFor(this.themeRevision))
+            }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+            Stack({ alignContent: Alignment.Center }) {
+              Circle({ width: 20, height: 20 })
+                .fill(this.smartSelected ? Ui.primaryFor(this.themeRevision) : Color.Transparent)
+                .stroke(this.smartSelected ? Ui.primaryFor(this.themeRevision) : Ui.textTertiaryFor(this.themeRevision))
+                .strokeWidth(1.6)
+              if (this.smartSelected) {
+                Circle({ width: 7, height: 7 }).fill(Color.White)
+              }
+            }
+            .width(20).height(20).flexShrink(0)
+            .accessibilityText(this.smartSelected ? '自动选择：已选中' : '自动选择：未选中')
+          }
+          .padding(14).margin({ left: 18, right: 18, bottom: 8 }).borderRadius(16)
+          .backgroundColor(this.smartSelected ? Ui.primaryBlueFillFor(this.themeRevision) : Ui.surface(this.themeRevision))
+          .enabled(!this.smartSelecting).onClick(() => this.selectSmart())
+        }
         if (this.nodes.length === 0) {
           Column({ space: 12 }) {
-            Image(this.smartView ? $r('app.media.ic_bolt') : $r('app.media.ic_network'))
+            Image($r('app.media.ic_network'))
               .width(46).height(46)
-              .fillColor(Ui.textTertiary)
-            Text(this.smartEmptyTitle())
-              .fontSize(15).fontColor(Ui.textSecondary)
-            if (this.smartView) {
-              Text(this.smartEmptyHint())
-                .fontSize(12).fontColor(Ui.textTertiary)
-                .textAlign(TextAlign.Center)
-                .padding({ left: 30, right: 30 })
-            }
+              .fillColor(Ui.textTertiaryFor(this.themeRevision))
+            Text('暂无可用节点')
+              .fontSize(15).fontColor(Ui.textSecondaryFor(this.themeRevision))
           }
           .width('100%')
           .margin({ top: 120 })
         } else if (this.groupRows.length > 0) {
           List({ space: 9, scroller: this.listScroller }) {
-            // 分组视图只渲染 groupRows，所以合成行必须在这里单独铺一次（置顶）。
-            // 放在 List 顶部而不是每个组里：一个订阅通常有多个策略组，塞进组内会重复。
-            ForEach(this.smartEntries, (row: NodeRow) => {
-              ListItem() {
-                this.SmartCard(row)
-              }
-              .margin({ bottom: 2 })
-            }, (row: NodeRow) => 'smart#' + row.node.subscriptionId)
             ForEach(this.groupRows, (groupRow: ProxyGroupRow) => {
               ListItem() {
                 Column({ space: 7 }) {
@@ -1901,17 +1627,17 @@ struct NodeSelectionPage {
                     Image(this.isGroupExpanded(groupRow.group)
                       ? $r('app.media.ic_chevron_down') : $r('app.media.ic_arrow_right'))
                       .width(18).height(18)
-                      .fillColor(Ui.primary)
+                      .fillColor(Ui.primaryFor(this.themeRevision))
                     Column({ space: 2 }) {
                       Text(groupRow.group.name)
                         .fontSize(16)
                         .fontWeight(FontWeight.Bold)
-                        .fontColor(Ui.textPrimary)
+                        .fontColor(Ui.textPrimaryFor(this.themeRevision))
                         .maxLines(1)
                         .textOverflow({ overflow: TextOverflow.Ellipsis })
                       Text(this.groupSubtitle(groupRow))
                         .fontSize(11)
-                        .fontColor(Ui.textSecondary)
+                        .fontColor(Ui.textSecondaryFor(this.themeRevision))
                     }
                     .layoutWeight(1)
                     .alignItems(HorizontalAlign.Start)
@@ -1930,17 +1656,17 @@ struct NodeSelectionPage {
                       Row({ space: 10 }) {
                         Image($r('app.media.ic_tune'))
                           .width(18).height(18)
-                          .fillColor(Ui.primary)
+                          .fillColor(Ui.primaryFor(this.themeRevision))
                         Column({ space: 2 }) {
                           Text(strategy.name)
                             .fontSize(14)
                             .fontWeight(FontWeight.Medium)
-                            .fontColor(Ui.textPrimary)
+                            .fontColor(Ui.textPrimaryFor(this.themeRevision))
                             .maxLines(1)
                             .textOverflow({ overflow: TextOverflow.Ellipsis })
-                          Text(`${strategy.groupType} · ${this.subs.expandProxyGroup(strategy).length} 个节点`)
+                          Text(`${strategy.groupType} · ${strategy.members.length} 个节点`)
                             .fontSize(10)
-                            .fontColor(Ui.textSecondary)
+                            .fontColor(Ui.textSecondaryFor(this.themeRevision))
                         }
                         .layoutWeight(1)
                         .alignItems(HorizontalAlign.Start)
@@ -1948,7 +1674,7 @@ struct NodeSelectionPage {
                           ? $r('app.media.ic_check') : $r('app.media.ic_arrow_right'))
                           .width(18).height(18)
                           .fillColor(this.selectedStrategyName(groupRow.group) === strategy.name
-                            ? Ui.primary : Ui.textTertiary)
+                            ? Ui.primaryFor(this.themeRevision) : Ui.textTertiaryFor(this.themeRevision))
                       }
                       .width('100%')
                       .padding({ left: 14, right: 14, top: 11, bottom: 11 })
@@ -1997,7 +1723,7 @@ struct NodeSelectionPage {
               }
               // 合成行不可删除：它不在订阅里，DELETE 会拿一个不存在的 id 去删。
               .gesture(LongPressGesture().onAction(() => {
-                if (row.isSmart === true || CoreNodeBridge.isShadow(row.node)) {
+                if (CoreNodeBridge.isShadow(row.node)) {
                   return;
                 }
                 // 长按进入批量多选（2026-10-20）
@@ -2029,7 +1755,7 @@ struct NodeSelectionPage {
     Text(NodeProtocolPolicy.fromNode(node).display())
       .fontSize(10)
       .fontWeight(FontWeight.Medium)
-      .fontColor(NodeProtocolPolicy.isRealityNode(node) ? Ui.textViolet : Ui.textTertiary)
+      .fontColor(NodeProtocolPolicy.isRealityNode(node) ? Ui.textViolet : Ui.textTertiaryFor(this.themeRevision))
   }
 
   /** 通用小徽标 */
@@ -2059,7 +1785,7 @@ struct NodeSelectionPage {
   NodeStatusBadge(st: NodeStatusView) {
     Row({ space: 5 }) {
       if (!st.hasData) {
-        this.Badge($r('app.string.node_badge_untested'), Ui.textTertiary)
+        this.Badge($r('app.string.node_badge_untested'), Ui.textTertiaryFor(this.themeRevision))
       } else {
         if (st.failCount > 0) {
           this.Badge($r('app.string.node_badge_failed_count', st.failCount), Ui.warning)
@@ -2085,70 +1811,15 @@ struct NodeSelectionPage {
     .width(20).height(20)
     .borderRadius(10)
     .borderWidth(1.5)
-    .borderColor(this.isNodeSelected(nodeId) ? Ui.primary : Ui.borderStrong)
-    .backgroundColor(this.isNodeSelected(nodeId) ? Ui.primary : Color.Transparent)
+    .borderColor(this.isNodeSelected(nodeId) ? Ui.primaryFor(this.themeRevision) : Ui.borderStrong)
+    .backgroundColor(this.isNodeSelected(nodeId) ? Ui.primaryFor(this.themeRevision) : Color.Transparent)
     .justifyContent(FlexAlign.Center)
     .alignItems(VerticalAlign.Center)
   }
 
   @Builder
   NodeCard(row: NodeRow) {
-    if (row.isSmart === true) {
-      this.SmartCard(row)
-    } else {
-      this.RealNodeCard(row)
-    }
-  }
-
-  /**
-   * 「♻️ 自动选择」合成行。
-   *
-   * 与真实节点卡片的差别是**刻意的**：它没有 server/port，测速与协议徽标都无意义。
-   * 所以不显示延迟徽标与 ↻，改成说明文字 —— 否则用户会点测速然后拿到一个永远
-   * 「超时」的结果，反而以为功能坏了。
-   */
-  @Builder
-  SmartCard(row: NodeRow) {
-    Row() {
-      Row({ space: 12 }) {
-        Image($r('app.media.ic_radar'))
-          .width(22).height(22)
-          .fillColor(this.isSmartRowSelected(row) ? Ui.primary : Ui.textSecondary)
-        Column({ space: 3 }) {
-          Text('自动选择')
-            .fontSize(16)
-            .fontWeight(FontWeight.Bold)
-            .fontColor(this.isSmartRowSelected(row) ? Ui.primary : Ui.textPrimary)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-          Text(row.node.subscriptionId.length > 0
-            ? '内核智能选点 · 只在本订阅内择优'
-            : '内核智能选点 · 按每条连接的目标自动择优')
-            .fontSize(11)
-            .fontColor(Ui.textSecondary)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .width('100%')
-        }
-        .layoutWeight(1)
-        .alignItems(HorizontalAlign.Start)
-      }
-      .layoutWeight(1)
-      .onClick(() => this.onNodeTap(row.node))
-
-      Image($r('app.media.ic_check'))
-        .width(18).height(18)
-        .fillColor(Ui.primary)
-        .width(24)
-        .opacity(this.isSmartRowSelected(row) ? 1 : 0)
-    }
-    .width('100%')
-    .padding({ left: 14, right: 6, top: 10, bottom: 10 })
-    .borderRadius(16)
-    .backgroundColor(this.isSmartRowSelected(row) ? Ui.primaryBlueFill : Ui.surface(this.themeRevision))
-    .borderWidth(this.isSmartRowSelected(row) ? 1.5 : 1)
-    .borderColor(this.isSmartRowSelected(row) ? Ui.primary : Ui.glassEdge(this.themeRevision))
+    this.RealNodeCard(row)
   }
 
   @Builder
@@ -2168,7 +1839,7 @@ struct NodeSelectionPage {
             Text(NodeDisplay.withoutLeadingFlag(row.node.name))
               .fontSize(16)
               .fontWeight(FontWeight.Bold)
-              .fontColor(row.node.name === this.selectedName ? Ui.primary : Ui.textPrimary)
+              .fontColor(row.node.name === this.selectedName ? Ui.primaryFor(this.themeRevision) : Ui.textPrimaryFor(this.themeRevision))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
@@ -2179,16 +1850,16 @@ struct NodeSelectionPage {
                 LoadingProgress()
                   .width(16)
                   .height(16)
-                  .color(Ui.primary)
+                  .color(Ui.primaryFor(this.themeRevision))
               } else {
                 Text(LatencyStyle.recordText(LatencyStoreBridge.recordFor(row.node.name, this.latencyContext(row.node)), Date.now()))
                   .fontSize(14)
                   .fontWeight(FontWeight.Bold)
-                  .fontColor(LatencyStyle.recordColor(LatencyStoreBridge.recordFor(row.node.name, this.latencyContext(row.node)), Date.now()))
+                  .fontColor(LatencyStyle.recordColor(LatencyStoreBridge.recordFor(row.node.name, this.latencyContext(row.node)), Date.now(), this.themeRevision))
               }
               Image($r('app.media.ic_refresh'))
                 .width(14).height(14)
-                .fillColor(Ui.textSecondary)
+                .fillColor(Ui.textSecondaryFor(this.themeRevision))
                 .padding({ left: 2, right: 6 })
                 .onClick(() => this.testOne(row.node))
             }
@@ -2210,16 +1881,16 @@ struct NodeSelectionPage {
 
       Image($r('app.media.ic_check'))
         .width(18).height(18)
-        .fillColor(Ui.primary)
+        .fillColor(Ui.primaryFor(this.themeRevision))
         .width(24)
         .opacity(row.node.name === this.selectedName ? 1 : 0)
     }
     .width('100%')
     .padding({ left: 14, right: 6, top: 10, bottom: 10 })
     .borderRadius(16)
-    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFill : Ui.surface(this.themeRevision))
+    .backgroundColor(row.node.name === this.selectedName ? Ui.primaryBlueFillFor(this.themeRevision) : Ui.surface(this.themeRevision))
     .borderWidth(row.node.name === this.selectedName ? 1.5 : 1)
-    .borderColor(row.node.name === this.selectedName ? Ui.primary : Ui.glassEdge(this.themeRevision))
+    .borderColor(row.node.name === this.selectedName ? Ui.primaryFor(this.themeRevision) : Ui.glassEdge(this.themeRevision))
   }
 
 }

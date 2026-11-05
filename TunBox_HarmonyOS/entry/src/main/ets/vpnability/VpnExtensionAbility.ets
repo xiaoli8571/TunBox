@@ -508,8 +508,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     const outcome = await this.runStage('startCore', coreBridge.startCore(configPath), CORE_START_TIMEOUT_MS);
     if (outcome.timedOut) {
       // 超时后不在此处 stopCore：native 可能仍在启动路径里，交给 cleanupResources 统一回收
-      throw new Error('内核启动超时（20s 无响应）：配置引用的远程规则集或数据库缺失时，'
-        + '内核会在启动阶段联网下载而长期阻塞。请稍后重试（规则集已在后台补齐）');
+      throw new Error('内核启动超时（20s 无响应），请导出诊断日志查看启动阶段');
     }
     return outcome.ok;
   }
@@ -667,7 +666,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     const tmp = `${path}.mtu.tmp`;
     try {
       const text = this.readConfigText(path);
-      const patched = text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${this.activeMtu}`);
+      const patched = TunBoxVpnExtension.patchConfigMtu(text, this.activeMtu);
       if (patched === text) {
         // Wi-Fi / 以太网：activeMtu 与生成器缺省值（ClashConfigGenerator 的 1400）一致，
         // 无需改写。注意这是**只有蜂窝才会走下面写盘分支**的原因，也是本函数
@@ -736,6 +735,70 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
    * 「蜂窝必现、WiFi 不复现」同款模式。现循环读到 EOF，8MB 硬上限仅防失控
    * （2000 节点 + 规则集的极端配置也在 1MB 量级）。
    */
+  /**
+   * 配置文件两种形态（2026-11-05 FlClash 全量照抄改造）：
+   *   · 新：JSON（TunBoxProfileBuilder 的 dump —— JSON ⊂ YAML，内核同一解析器加载）
+   *   · 旧：YAML 文本（历史生成器产物）
+   * 以下三个读取/改写助手对两种形态都成立：JSON.parse 成功走 JSON 路径，
+   * 失败回落旧的正则扫描。
+   */
+
+  /** 尝试把配置文本按 JSON 解析；失败返回 null（= 旧 YAML 形态）。 */
+  private static tryParseConfigJson(text: string): Record<string, Object> | null {
+    const t = text.trimStart();
+    if (!t.startsWith('{')) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(t) as Object;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, Object>;
+      }
+    } catch (ignore) {
+      // 旧 YAML 形态
+    }
+    return null;
+  }
+
+  /** mtu 改写：JSON 形态改 tun.mtu 后重新序列化；YAML 形态走旧正则。 */
+  private static patchConfigMtu(text: string, mtu: number): string {
+    const config = TunBoxVpnExtension.tryParseConfigJson(text);
+    if (config !== null) {
+      const tun = config['tun'];
+      if (tun !== null && tun !== undefined && typeof tun === 'object' && !Array.isArray(tun)) {
+        const tunMap = tun as Record<string, Object>;
+        if (tunMap['mtu'] !== mtu) {
+          tunMap['mtu'] = mtu;
+          return JSON.stringify(config);
+        }
+      }
+      return text;
+    }
+    return text.replace(/^ {2}mtu: \d+$/m, `  mtu: ${mtu}`);
+  }
+
+  /** 顶层布尔读取：JSON 形态直接取键；YAML 形态走旧正则。 */
+  private static readTopLevelBoolAny(text: string, key: string): boolean {
+    const config = TunBoxVpnExtension.tryParseConfigJson(text);
+    if (config !== null) {
+      return config[key] === true;
+    }
+    return TunBoxVpnExtension.readTopLevelBool(text, key);
+  }
+
+  /** dns.enable 读取：JSON 形态取 dns.enable；YAML 形态走旧扫描。 */
+  private static readDnsEnableAny(text: string): boolean {
+    const config = TunBoxVpnExtension.tryParseConfigJson(text);
+    if (config !== null) {
+      const dns = config['dns'];
+      if (dns !== null && dns !== undefined && typeof dns === 'object' && !Array.isArray(dns)) {
+        return (dns as Record<string, Object>)['enable'] === true;
+      }
+      return false;
+    }
+    return TunBoxVpnExtension.readDnsEnable(text);
+  }
+
   private readConfigText(path: string): string {
     const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
     try {
@@ -782,9 +845,9 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       // 流式 `ipv6: "true"` / `ipv6: yes`，旧正则对它们全部返回 false ⇒ TUN 静默
       // 退回「IPv4-only」，而内核仍按 YAML 开着双栈 —— 正是本文件头部警告的
       // 「TUN 与内核不一致」。
-      flags.ipv6 = TunBoxVpnExtension.readTopLevelBool(text, 'ipv6');
-      // DNS：同一份 YAML 的 dns.enable 行。读不到 ⇒ false（保守：不劫持、不改设备 DNS）
-      flags.dnsOverride = TunBoxVpnExtension.readDnsEnable(text);
+      flags.ipv6 = TunBoxVpnExtension.readTopLevelBoolAny(text, 'ipv6');
+      // DNS：同一份配置的 dns.enable。读不到 ⇒ false（保守：不劫持、不改设备 DNS）
+      flags.dnsOverride = TunBoxVpnExtension.readDnsEnableAny(text);
     } catch (e) {
       // 读不到 → 退回保守形态（IPv4-only）：宁可少开，也不要装一条
       // 内核并不认的 ::/0 把设备的 v6 打进黑洞。
@@ -1763,7 +1826,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       const outcome = await this.runStage('headless startCore', coreBridge.startCore(configPath),
         CORE_START_TIMEOUT_MS);
       if (outcome.timedOut) {
-        throw new Error('测速内核启动超时（20s 无响应）：配置引用的远程规则集缺失导致内核联网下载阻塞');
+        throw new Error('测速内核启动超时（20s 无响应），请导出诊断日志查看启动阶段');
       }
       if (!outcome.ok) {
         const coreErr = await coreBridge.lastError();

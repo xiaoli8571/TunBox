@@ -165,7 +165,7 @@ RuntimeConfigBuilder 在 dnsOverrideEnabled=false 时允许启用的订阅 DNS �
 - 纯逻辑回归：228/228 通过。
 - VPN 架构门禁：322/322 通过。
 - 启动资源与真实内核组合：46/46 通过。
-- 配置/发布相关回归：12/12 通过；`verify-flclash-profile.mjs` 因缺少严格模式所需环境而跳过，非本轮失败。
+- 配置/发布相关回归：12/12 通过；`verify-tunbox-profile.mjs` 因缺少严格模式所需环境而跳过，非本轮失败。
 - mihomo DNS 单元测试：通过。
 - Linux bridge 回归：新增网络更新、DNS-only 保持连接、切网清理旧连接、Protect Stop 生命周期用例均通过。
 - 设备在线但未覆盖安装/切网：真机网络切换、吞吐、功耗和 IPv6 出口仍需单独验收。

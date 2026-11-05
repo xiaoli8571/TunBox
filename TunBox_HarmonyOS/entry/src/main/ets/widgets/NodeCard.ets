@@ -28,9 +28,9 @@ export struct NodeCard {
   }
 
   private latencyColor(): ResourceColor {
-    if (this.latencyMs === -2) return Ui.textTertiary;
+    if (this.latencyMs === -2) return Ui.textTertiaryFor(this.themeRevision);
     if (this.latencyMs === -1) return Ui.error;
-    return LatencyStyle.color(this.latencyMs);
+    return LatencyStyle.color(this.latencyMs, this.themeRevision);
   }
 
   build() {
@@ -41,12 +41,12 @@ export struct NodeCard {
           Text(NodeCountryPolicy.displayName(this.node.name))
             .fontSize(14)
             .fontWeight(FontWeight.Medium)
-            .fontColor(this.selected ? Ui.primary : Ui.textPrimary)
+            .fontColor(this.selected ? Ui.primaryFor(this.themeRevision) : Ui.textPrimaryFor(this.themeRevision))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           Text(`${this.node.server}:${this.node.port}`)
             .fontSize(11)
-            .fontColor(Ui.textTertiary)
+            .fontColor(Ui.textTertiaryFor(this.themeRevision))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
@@ -61,7 +61,7 @@ export struct NodeCard {
         if (this.selected) {
           Image($r('app.media.ic_check'))
             .width(16).height(16)
-            .fillColor(Ui.primary)
+            .fillColor(Ui.primaryFor(this.themeRevision))
         }
       }
       .width('100%')
@@ -69,7 +69,7 @@ export struct NodeCard {
       .borderRadius(16)
       .backgroundColor(this.selected ? Ui.selectedBackground(this.themeRevision) : Ui.surface(this.themeRevision))
       .borderWidth(this.selected ? 1.5 : 1)
-      .borderColor(this.selected ? Ui.primary : Ui.glassEdge(this.themeRevision))
+      .borderColor(this.selected ? Ui.primaryFor(this.themeRevision) : Ui.glassEdge(this.themeRevision))
       .onClick(() => {
         if (this.node !== null) {
           this.onSelect(this.node);

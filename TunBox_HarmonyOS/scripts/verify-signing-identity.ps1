@@ -9,28 +9,28 @@ $function = $ast.Find({ param($node) $node -is [System.Management.Automation.Lan
 if ($null -eq $function) { throw 'Release identity validator missing' }
 Invoke-Expression $function.Extent.Text
 function New-Module {
-  return @{ app = @{ bundleName = 'com.tunbox.client'; versionName = '0.8.0'; versionCode = 552; debug = $false; buildMode = 'release'; minAPIVersion = 60101024 } }
+  return @{ app = @{ bundleName = 'com.tunbox.client'; versionName = '0.8.2'; versionCode = 560; debug = $false; buildMode = 'release'; minAPIVersion = 60101024 } }
 }
 $m = New-Module
-Assert-ReleaseIdentity $m 'com.tunbox.client' '0.8.0' '552'
+Assert-ReleaseIdentity $m 'com.tunbox.client' '0.8.2' '560'
 foreach ($key in @('bundleName', 'versionName', 'versionCode', 'debug', 'buildMode', 'minAPIVersion')) {
   $m = New-Module
   $m.app[$key] = $null
   $caught = $false
-  try { Assert-ReleaseIdentity $m 'com.tunbox.client' '0.8.0' '552' } catch { $caught = $true }
+  try { Assert-ReleaseIdentity $m 'com.tunbox.client' '0.8.2' '560' } catch { $caught = $true }
   if (-not $caught) { throw "Validator accepted missing or mismatched $key" }
 }
 foreach ($case in @(
   @{ key = 'bundleName'; value = 'other.bundle' },
-  @{ key = 'versionName'; value = '0.7.9' },
-  @{ key = 'versionCode'; value = 551 },
+  @{ key = 'versionName'; value = '0.8.1' },
+  @{ key = 'versionCode'; value = 559 },
   @{ key = 'debug'; value = $true },
   @{ key = 'buildMode'; value = 'debug' }
 )) {
   $m = New-Module
   $m.app[$case.key] = $case.value
   $caught = $false
-  try { Assert-ReleaseIdentity $m 'com.tunbox.client' '0.8.0' '552' } catch { $caught = $true }
+  try { Assert-ReleaseIdentity $m 'com.tunbox.client' '0.8.2' '560' } catch { $caught = $true }
   if (-not $caught) { throw "Validator accepted mismatched $($case.key)" }
 }
 Write-Output 'PASS actual signing validator: matching release accepted, six missing and five wrong identity fields rejected'

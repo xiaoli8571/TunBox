@@ -53,7 +53,7 @@ try {
   const fidelity = spawnSync(process.execPath,
     [fileURLToPath(new URL('./verify-subscription-fidelity.mjs', import.meta.url)), fixture], { encoding: 'utf8' });
   assert.equal(fidelity.status, 0, fidelity.stdout + fidelity.stderr);
-  assert.match(fidelity.stdout, /explicit INFO exclusions: 1/);
+  assert.match(fidelity.stdout, /explicit INFO exclusions: 0/);
   const chains = spawnSync(process.execPath,
     [fileURLToPath(new URL('./verify-smart-active-chains.mjs', import.meta.url)), '--self-test'], { encoding: 'utf8' });
   assert.equal(chains.status, 0, chains.stdout + chains.stderr);

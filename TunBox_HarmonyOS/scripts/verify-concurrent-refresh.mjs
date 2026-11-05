@@ -523,9 +523,16 @@ async function runBatch(svc, lanes, stopAfter) {
     /this\.refreshingIds = this\.refreshingIds\.filter\(\(x: string\): boolean => x !== sub\.id\);/.test(subPage)
     && /if \(busyRef\(\)\) \{\n        LoadingProgress\(\)/.test(subPage)
     && /@State private refreshingIds: string\[\] = \[\];/.test(subPage));
-  // 单条刷新必须有结果分支（成功 / 失败都要告诉用户），不能一律报「已刷新」
+  // 单条刷新必须有结果分支（成功 / 失败都要告诉用户），且失败必须带真实原因
+  // （2026-11-04：旧断言只钉 `刷新失败：${sub.name}`，等于把「原因被吞掉」钉成契约）
   ok('wire.subPage.perItemOutcome',
-    /this\.toast\(ok \? `✓ \$\{sub\.name\} 已刷新` : `刷新失败：\$\{sub\.name\}`\);/.test(subPage));
+    /else if \(!ok\) \{/.test(subPage)
+    && /this\.toast\(`✓ \$\{sub\.name\} 已刷新`\);/.test(subPage)
+    && /result\.message\.length > 0 \? result\.message : result\.advice/.test(subPage));
+  // 全部刷新不得无条件报成功：必须按失败集合给出真实统计
+  ok('wire.subPage.refreshAllHonest',
+    /const failed: number = snapshot\.filter\(\(s: Subscription\): boolean =>\s*\n\s*this\.refreshFailedIds\.includes\(s\.id\)\)\.length;/.test(subPage)
+    && /刷新完成：\$\{snapshot\.length - failed\} 成功，\$\{failed\} 失败/.test(subPage));
 
   ok('wire.nodePage.usesConcurrent', /this\.subs\.refreshSubscriptionsConcurrently\(ids,/.test(nodePage));
   ok('wire.nodePage.lanes', /ConcurrentRefresh\.DEFAULT_LANES/.test(nodePage));

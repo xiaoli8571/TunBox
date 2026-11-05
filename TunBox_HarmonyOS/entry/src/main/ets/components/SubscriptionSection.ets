@@ -27,23 +27,78 @@ import { ConnectionOrchestrator, ConnState } from '../commons/services/Connectio
 import { LatencyStoreBridge } from '../commons/services/LatencyStoreBridge';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { NodeProtocolPolicy } from '../commons/services/NodeSortPersistence';
-import { ProfileRepository } from '../commons/flclash/ProfileRepository';
-import { ProfileConfigMerger } from '../commons/flclash/ProfileConfigMerger';
-import { SubConverter } from '../commons/flclash/SubConverter';
+import { ProfileRepository } from '../commons/tunbox/ProfileRepository';
+import { ProfileConfigMerger } from '../commons/tunbox/ProfileConfigMerger';
+// 转换导出物补骨架（仅导出/导入产物链路；内核准入不再合成组，见 withExportSkeleton）
+import { YamlMerger } from '../commons/services/YamlMerger';
+import { SubConverter } from '../commons/tunbox/SubConverter';
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
 import { ImportFilePolicy } from '../commons/services/ImportFilePolicy';
+import { ImportFailureSummary } from '../commons/services/ImportFailureSummary';
 import { MIN_UPDATE_INTERVAL_MINUTES, MAX_UPDATE_INTERVAL_MINUTES } from '../commons/services/SubscriptionUpdateScheduler';
-import { CoreNodeBridge } from '../commons/flclash/CoreNodeBridge';
-import { CoreCatalogService } from '../commons/flclash/CoreCatalogService';
-import { CoreGroup, CoreCatalogModel } from '../commons/flclash/CoreCatalog';
+import { CoreNodeBridge } from '../commons/tunbox/CoreNodeBridge';
+import { CoreCatalogService } from '../commons/tunbox/CoreCatalogService';
+import { CoreGroup, CoreCatalogModel } from '../commons/tunbox/CoreCatalog';
 import { LatencyContext, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
-import { ProxyPanelMembers } from '../commons/flclash/ProxyPanelMembers';
+import { ProxyPanelMembers } from '../commons/tunbox/ProxyPanelMembers';
 import { AppLogger } from '../commons/utils/AppLogger';
-import { ClashConfigGenerator } from '../commons/services/ClashConfigGenerator';
 
 const TAG = 'SubscriptionSection';
+
+/**
+ * 文档 URI → 可显示文件名（解码 `%XX`；解不出就原样返回）。
+ *
+ * 系统 picker 返回的是编码过的 URI（`.../%E4%B8%AD%E6%96%87.yaml`），
+ * 旧实现直接截最后一段当订阅名，卡片上就会出现一串 `%E4%B8%AD...`。
+ */
+function fileNameFromUri(uri: string): string {
+  const raw: string = uri.substring(uri.lastIndexOf('/') + 1);
+  try {
+    return decodeURIComponent(raw);
+  } catch (e) {
+    return raw;
+  }
+}
 /** 节点行高（vp） */
 const NODE_ROW_H: number = 52;
+
+/** 仅在原生校验明确要求密钥时打开，取消不会修改旧配置。 */
+@CustomDialog
+struct AgeKeyDialog {
+  controller?: CustomDialogController;
+  @StorageLink('theme_revision') themeRevision: number = 0;
+  @State keyText: string = '';
+  onComplete: (key: string) => void = () => {};
+
+  build() {
+    Column({ space: 16 }) {
+      Text('解密订阅').fontSize(18).fontWeight(FontWeight.Bold)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+      Text('请输入此订阅的 age 密钥').fontSize(14)
+        .fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+      TextInput({ placeholder: 'AGE-SECRET-KEY-…', text: this.keyText })
+        .type(InputType.Password)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+        .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
+        .onChange((value: string): void => { this.keyText = value; })
+      Row({ space: 16 }) {
+        Button('取消').onClick((): void => {
+          this.keyText = '';
+          this.onComplete('');
+          this.controller?.close();
+        })
+        Button('解密').enabled(this.keyText.trim().length > 0).onClick((): void => {
+          const key = this.keyText.trim();
+          this.keyText = '';
+          this.onComplete(key);
+          this.controller?.close();
+        })
+      }
+    }
+    .padding(24).width('88%').constraintSize({ maxWidth: 420 })
+    .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).borderRadius(20)
+  }
+}
 
 /** 添加订阅弹窗：三种模式（URL / 扫码 / 文件），白底实色，水平垂直居中 */
 @CustomDialog
@@ -72,7 +127,7 @@ struct AddSubDialog {
   build() {
     Column({ space: 14 }) {
       Text('添加订阅')
-        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         .width('100%')
 
       // 三模式切换
@@ -90,19 +145,19 @@ struct AddSubDialog {
           .height(44).borderRadius(12).fontSize(14)
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-          .fontColor(TunBoxTextColors.primary)
+          .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         TextInput({ placeholder: 'https://example.com/sub', text: this.urlText })
           .onChange((v: string) => { this.urlText = v; })
           .height(44).borderRadius(12).fontSize(13)
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-          .fontColor(TunBoxTextColors.primary)
+          .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         // 2026-10-28 用户要求：明文 HTTP 开关从设置页挪到这里（只影响订阅拉取）
         Row() {
           Text('允许明文 HTTP 订阅')
-            .fontSize(13).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+            .fontSize(13).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
           Toggle({ type: ToggleType.Switch, isOn: this.allowInsecure })
-            .selectedColor(TunBoxColors.primary)
+            .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
             .onChange((v: boolean) => {
               this.allowInsecure = v;
               this.onToggleInsecure(v);
@@ -112,9 +167,9 @@ struct AddSubDialog {
         .alignItems(VerticalAlign.Center)
       } else if (this.mode === 'qr') {
         Column({ space: 8 }) {
-          Image($r('app.media.ic_globe')).width(48).height(48).fillColor(TunBoxColors.textMuted)
-          Text('扫描订阅二维码').fontSize(13).fontColor(TunBoxTextColors.secondary)
-          Text('二维码内容需是 Clash 订阅链接').fontSize(11).fontColor(TunBoxTextColors.muted)
+          Image($r('app.media.ic_globe')).width(48).height(48).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+          Text('扫描订阅二维码').fontSize(13).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+          Text('二维码内容需是 Clash 订阅链接').fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         }
         .width('100%')
         .padding({ top: 20, bottom: 20 })
@@ -127,18 +182,18 @@ struct AddSubDialog {
           .height(120).borderRadius(12).fontSize(12)
           .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
           .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-          .fontColor(TunBoxTextColors.primary)
+          .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         Row({ space: 8 }) {
           this.ConvertOutputChoice('直接导入 TunBox', false)
           this.ConvertOutputChoice('导出 YAML 文件', true)
         }.width('100%')
         Text(this.exportConvertedYaml ? '转换后选择本机保存位置。' : '转换后加入 TunBox 订阅列表。')
-          .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+          .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
       } else {
         Column({ space: 8 }) {
-          Image($r('app.media.ic_doc')).width(48).height(48).fillColor(TunBoxColors.textMuted)
-          Text('从文件导入').fontSize(13).fontColor(TunBoxTextColors.secondary)
-          Text('支持 .yaml / .yml（Clash 配置，8MB 以内）').fontSize(11).fontColor(TunBoxTextColors.muted)
+          Image($r('app.media.ic_doc')).width(48).height(48).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+          Text('从文件导入').fontSize(13).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+          Text('支持 .yaml / .yml（Clash 配置，8MB 以内）').fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         }
         .width('100%')
         .padding({ top: 20, bottom: 20 })
@@ -149,7 +204,7 @@ struct AddSubDialog {
 
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).height(44).borderRadius(12).fontSize(14)
-          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxTextColors.primary)
+          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -157,7 +212,7 @@ struct AddSubDialog {
           })
         Button(this.mode === 'url' ? '添加' : (this.mode === 'convert' ? (this.exportConvertedYaml ? '转换并导出' : '转换并导入') : '开始'))
           .layoutWeight(1).height(44).borderRadius(12).fontSize(14)
-          .backgroundColor(TunBoxColors.primary).fontColor(Color.White)
+          .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(Color.White)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -185,9 +240,9 @@ struct AddSubDialog {
   ConvertOutputChoice(label: string, exportFile: boolean) {
     Button(label)
       .layoutWeight(1).height(38).borderRadius(10).fontSize(12)
-      .fontColor(this.exportConvertedYaml === exportFile ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondary)
+      .fontColor(this.exportConvertedYaml === exportFile ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondaryFor(this.themeRevision))
       .backgroundColor(this.exportConvertedYaml === exportFile
-        ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
+        ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.chipBg(this.themeRevision))
       .onClick(() => { this.exportConvertedYaml = exportFile; })
   }
 
@@ -196,12 +251,12 @@ struct AddSubDialog {
     Text(label)
       .fontSize(13)
       .fontWeight(this.mode === value ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.mode === value ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondary)
+      .fontColor(this.mode === value ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondaryFor(this.themeRevision))
       .textAlign(TextAlign.Center)
       .layoutWeight(1)
       .height(36)
       .borderRadius(10)
-      .backgroundColor(this.mode === value ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
+      .backgroundColor(this.mode === value ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.chipBg(this.themeRevision))
       .onClick(() => { this.mode = value; })
   }
 }
@@ -272,40 +327,40 @@ struct EditSubDialog {
   build() {
     Column({ space: 12 }) {
       Text('编辑配置信息')
-        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+        .fontSize(17).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         .width('100%')
 
       // ── 字段区：可滚动 + 高度上限（2026-10-29 用户报「键盘弹出后弹窗变细长」）──
       Scroll() {
         Column({ space: 12 }) {
-      Text('配置名称').fontSize(12).fontColor(TunBoxTextColors.muted).width('100%')
+      Text('配置名称').fontSize(12).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
       TextInput({ text: this.editName, placeholder: '配置名称' })
         .onChange((v: string) => { this.editName = v; })
         .height(44).borderRadius(12).fontSize(14)
         .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
         .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-        .fontColor(TunBoxTextColors.primary)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
 
-      Text('订阅链接或 URL').fontSize(12).fontColor(TunBoxTextColors.muted).width('100%')
+      Text('订阅链接或 URL').fontSize(12).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
       TextInput({ text: this.editUrl, placeholder: 'https://example.com/sub' })
         .onChange((v: string) => { this.editUrl = v; })
         .height(44).borderRadius(12).fontSize(13)
         .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
         .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
-        .fontColor(TunBoxTextColors.primary)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
 
       Row() {
-        Text('自动更新').fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+        Text('自动更新').fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.autoUpdate })
-          .selectedColor(TunBoxColors.primary)
+          .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
           .onChange((v: boolean) => { this.autoUpdate = v; })
       }.width('100%').alignItems(VerticalAlign.Center)
 
-      Text('自动更新间隔（分钟）').fontSize(12).fontColor(TunBoxTextColors.muted).width('100%')
+      Text('自动更新间隔（分钟）').fontSize(12).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
       // 可自定义（2026-10-29 用户要求）：以前这里是一个只读 Row + 「跟随系统」文案，
       // 值由 `return '360'` 写死，用户根本改不了。现在换成数字输入框。
       Row({ space: 6 }) {
-        Image($r('app.media.ic_refresh')).width(14).height(14).fillColor(TunBoxColors.textMuted)
+        Image($r('app.media.ic_refresh')).width(14).height(14).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
         TextInput({ text: this.editInterval, placeholder: '360' })
           .type(InputType.Number)
           .maxLength(5)
@@ -316,8 +371,8 @@ struct EditSubDialog {
           .backgroundColor(Color.Transparent)
           .borderRadius(0)
           .padding({ left: 0, right: 0 })
-          .fontColor(TunBoxTextColors.primary)
-        Text('分钟').fontSize(11).fontColor(TunBoxTextColors.muted).flexShrink(0)
+          .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+        Text('分钟').fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).flexShrink(0)
       }
       .width('100%').height(44)
       .padding({ left: 12, right: 12 })
@@ -327,7 +382,7 @@ struct EditSubDialog {
       .alignItems(VerticalAlign.Center)
 
       Text(`范围 ${MIN_UPDATE_INTERVAL_MINUTES}~${MAX_UPDATE_INTERVAL_MINUTES} 分钟，超出自动取边界值 · 只影响这一个订阅`)
-        .fontSize(10).fontColor(TunBoxTextColors.muted).width('100%')
+        .fontSize(10).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
         }
         .width('100%')
       }
@@ -337,14 +392,14 @@ struct EditSubDialog {
 
       Row({ space: 12 }) {
         Button('取消').layoutWeight(1).height(44).borderRadius(12).fontSize(14)
-          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxTextColors.primary)
+          .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision)).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
             }
           })
         Button('保存更改').layoutWeight(1).height(44).borderRadius(12).fontSize(14)
-          .backgroundColor(TunBoxColors.primary).fontColor(Color.White)
+          .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(Color.White)
           .onClick(() => {
             if (this.controller !== undefined) {
               this.controller.close();
@@ -379,9 +434,76 @@ struct EditSubDialog {
  */
 const SUB_CARD_SPACE: number = 10;
 
+/**
+ * 给「裸节点表」补上最简可用的分流骨架 —— **仅用于订阅转换的导出/导入产物**。
+ *
+ * FlClash 全量照抄（2026-11-05）后，内核配置链不再合成组（compose 接管，
+ * GLOBAL 兜底，准入不做自有推断）；但转换导出的 YAML 是交给其他 Clash 客户端的
+ * 用户产物，裸 proxies 表在那些客户端里没法直接路由，本函数只在导出/导入产物上补骨架。
+ *
+ * 触发条件：原文有 `proxies`，但没有 proxy-groups / proxy-providers / rules。
+ * 骨架刻意最小：手动选择(select, 全部节点 + DIRECT) / 自动选择(url-test) /
+ * rules: MATCH,手动选择。原文已有任何组或规则时原样返回，不介入。
+ */
+/**
+ * R5 收口：内容是不是「分享链接列表」（FlClash convert.ConvertsV2Ray 的输入形态）。
+ * 只识别上游 convert 覆盖的三种形态——逐行 scheme 链接、整体 base64、纯行文本——
+ * 不再猜「是不是 Clash 配置」：Clash YAML/JSON 一律原样交给内核校验（§5.3）。
+ */
+function looksLikeShareLinkBody(body: string): boolean {
+  const text = body.trim();
+  if (text.length === 0) {
+    return false;
+  }
+  const schemeRe = /^[a-z][a-z0-9+.-]*:\/\//i;
+  const lines: string[] = text.split(/\r?\n/).map((l: string): string => l.trim())
+    .filter((l: string): boolean => l.length > 0);
+  const schemeLines = lines.filter((l: string): boolean => schemeRe.test(l)).length;
+  if (lines.length > 0 && schemeLines === lines.length) {
+    return true;
+  }
+  // 整体 base64（decode 后必然出现 scheme 链接）交给 BodyDispatch/SubConverter 判定
+  if (!/[：:{}]/.test(text) && /^[A-Za-z0-9+/=\s]+$/.test(text) && text.replace(/\s+/g, '').length >= 32) {
+    return true;
+  }
+  return false;
+}
+
+function withExportSkeleton(profileYaml: string): string {  if (profileYaml.includes('proxy-groups:')
+    || profileYaml.includes('proxy-providers:')
+    || profileYaml.includes('rules')) {
+    return profileYaml;
+  }
+  const LF: string = String.fromCharCode(10);
+  const SQ: string = String.fromCharCode(39);
+  const names = YamlMerger.sequenceItemNames(profileYaml, 'proxies');
+  if (names.length === 0) {
+    return profileYaml;
+  }
+  const lines: string[] = [profileYaml.trimEnd(), '', 'proxy-groups:',
+    '  - name: 手动选择', '    type: select', '    proxies:'];
+  for (const n of names) {
+    lines.push(`      - '${n.split(SQ).join(SQ + SQ)}'`);
+  }
+  lines.push('      - DIRECT');
+  // 刻意不写 url：mihomo 的 url-test 默认 URL 就是 generate_204（constant.DefaultURLTestURL），
+  // 写死会违反 ND06「测速地址规则常量只能有一处」（真源在 TunBoxDelay.TUNBOX_DELAY_URL）。
+  lines.push('  - name: 自动选择', '    type: url-test',
+    '    interval: 300', '    tolerance: 50', '    proxies:');
+  for (const n of names) {
+    lines.push(`      - '${n.split(SQ).join(SQ + SQ)}'`);
+  }
+  lines.push('rules:', '  - MATCH,手动选择');
+  return lines.join(LF);
+}
+
 @Component
 export struct SubscriptionSection {
   @StorageLink('theme_revision') themeRevision: number = 0;
+  @StorageLink('smart_model_seq') @Watch('refreshSmartEntry') smartModelSeq: number = 0;
+  @State private smartVisible: boolean = false;
+  @State private smartSelected: boolean = false;
+  private smartRefreshRevision: number = 0;
   @State private subs: Subscription[] = [];
   @State private showPanel: boolean = false;
   @State private panelSubId: string = '';
@@ -421,8 +543,6 @@ export struct SubscriptionSection {
    * 之所以落到 @State：`settings` 是普通字段（非 @State），直接读它不会触发重算，
    * 真机表现就是「点了没高亮」。
    */
-  @State private smartVisible: boolean = false;
-  @State private smartSelected: boolean = false;
   /**
    * 长按后紧跟的那次 onClick 要丢掉。
    * 真机手势时序：LongPressGesture 触发后抬手仍会走 onClick，
@@ -457,6 +577,14 @@ export struct SubscriptionSection {
   private service: SubscriptionService = SubscriptionService.instance();
   private settings: AppSettings = new AppSettings();
   private refreshing: boolean = false;
+  /**
+   * 本轮失败的订阅 id（用于「刷新全部」结束时的真实结果统计）。
+   *
+   * 单条刷新成功会把自己从集合里移除，失败会加入 —— 所以它跨多轮自然收敛，
+   * 不需要在 refreshAll 开头重置（历史实现无条件弹「✓ 全部订阅已刷新」，
+   * 即使每一条都失败）。
+   */
+  private refreshFailedIds: string[] = [];
   private converting: boolean = false;
   private editTargetId: string = '';
   private editTargetName: string = '';
@@ -470,6 +598,28 @@ export struct SubscriptionSection {
   private autoUpdateIntervalMin: number = 360;
   /** 允许明文 HTTP 订阅（2026-10-28 从设置页挪到「添加订阅 → URL」） */
   private allowInsecureSubscriptionHttp: boolean = false;
+  private ageKeyResolve: ((key: string) => void) | null = null;
+  private readonly ageKeyDialog: CustomDialogController = new CustomDialogController({
+    builder: AgeKeyDialog({ onComplete: (key: string): void => { this.finishAgeKey(key); } }),
+    autoCancel: false,
+    alignment: DialogAlignment.Center,
+    customStyle: true,
+    cancel: (): void => { this.finishAgeKey(''); }
+  });
+
+  private finishAgeKey(key: string): void {
+    const resolve = this.ageKeyResolve;
+    this.ageKeyResolve = null;
+    if (resolve !== null) { resolve(key); }
+  }
+
+  private requestAgeKey(): Promise<string> {
+    this.finishAgeKey('');
+    return new Promise<string>((resolve) => {
+      this.ageKeyResolve = resolve;
+      this.ageKeyDialog.open();
+    });
+  }
   private readonly addDialog: CustomDialogController = new CustomDialogController({
     builder: AddSubDialog({
       getAllowInsecure: (): boolean => this.allowInsecureSubscriptionHttp,
@@ -559,6 +709,8 @@ export struct SubscriptionSection {
   }
 
   aboutToDisappear(): void {
+    this.finishAgeKey('');
+    this.ageKeyDialog.close();
     if (this.latencyBound) {
       this.latencyBound = false;
       LatencyStoreBridge.removeListener(this.latencyListener);
@@ -620,28 +772,40 @@ export struct SubscriptionSection {
       this.autoUpdateGlobal = loaded.autoUpdateSubscription;
       this.allowInsecureSubscriptionHttp = loaded.allowInsecureSubscriptionHttp;
       this.currentNodeName = orch.getCurrentNodeName();
-      // 偏好是异步读回来的：入口高亮要跟着它重算，否则重进面板看不到已选中的自动行
       this.refreshSmartEntry();
     }).catch((): void => {});
   }
 
-  /**
-   * 重算「♻️ 自动选择」入口的展示/选中态。
-   * settings 是普通字段（非 @State），所以结果必须落到 @State 上，否则点完不高亮。
-   */
   private refreshSmartEntry(): void {
-    let ready: boolean = false;
+    const scope = this.panelSubId;
+    const revision = ++this.smartRefreshRevision;
+    this.smartSelected = this.settings.autoSelectMode === AutoSelectModes.AUTO
+      && ConnectionOrchestrator.instance().isSmartModelAvailable()
+      && this.settings.preferredNodeSubscriptionId === scope;
+    ConnectionOrchestrator.instance().smartAvailableFor(scope, this.service).then((available: boolean): void => {
+      if (revision === this.smartRefreshRevision && scope === this.panelSubId) { this.smartVisible = available; }
+    }).catch((): void => {
+      if (revision === this.smartRefreshRevision) { this.smartVisible = false; }
+    });
+  }
+
+  private async selectSmart(): Promise<void> {
+    if (this.selectingMember.length > 0) { return; }
+    const scope = this.panelSubId;
+    this.selectingMember = 'smart';
     try {
-      ready = ConnectionOrchestrator.instance().ensureSmartModelReady();
+      const restarted = await ConnectionOrchestrator.instance().selectSmartSubscription(scope, this.service);
+      if (this.panelSubId === scope) {
+        this.settings = await SettingsService.load();
+        this.refreshSmartEntry();
+      }
+      this.toast(restarted ? '已启用本订阅智能选择，代理已重启' : '已选择智能选点，下次连接生效');
     } catch (e) {
-      ready = false;
+      this.toast(AppLogger.errText(e));
+    } finally {
+      this.selectingMember = '';
+      this.reload();
     }
-    const scopeId: string = this.panelSubId;
-    const nodeCount: number = scopeId.length > 0 ? this.service.nodesOf(scopeId).length : 0;
-    this.smartVisible = ready && nodeCount >= 2;
-    this.smartSelected = ready && scopeId.length > 0
-      && this.settings.autoSelectMode === AutoSelectModes.AUTO
-      && this.settings.preferredNodeSubscriptionId === scopeId;
   }
 
   private subById(id: string): Subscription | null {
@@ -674,9 +838,8 @@ export struct SubscriptionSection {
       const fromCore: ProxyGroup[] = [];
       const byName: Map<string, ProxyGroup> = new Map<string, ProxyGroup>();
       for (const source of core.groups) {
-        // 「♻️ 自动选择」由面板置顶的合成入口（SmartRow）唯一代表，从内核 chips 里剔掉，
-        // 否则同一个概念会出现两个可点项（2026-10-30 用户报障）。
-        if (source.hidden || source.name === ClashConfigGenerator.SMART_GROUP_NAME) {
+        // 订阅声明的 Smart / URLTest 组均是真实策略，不能按名字隐藏。
+        if (source.hidden) {
           continue;
         }
         const group = new ProxyGroup();
@@ -868,7 +1031,7 @@ export struct SubscriptionSection {
     }
     // The caller already checks the applied profile stamp. Provider nodes and child
     // groups are both legitimate members of this exact graph, not foreign local nodes.
-    return ProxyPanelMembers.fromCore(source, this.panelSubId, ClashConfigGenerator.SMART_GROUP_NAME);
+    return ProxyPanelMembers.fromCore(source, this.panelSubId, '');
   }
 
   /** 本地（订阅配置）路径的节点行：不经内核，天然按 subscriptionId 隔离。 */
@@ -876,7 +1039,7 @@ export struct SubscriptionSection {
     const group: ProxyGroup | null = this.activeGroupOf(this.panelSubId);
     if (group !== null) {
       return ProxyPanelMembers.fromLocal(group, this.service.groupsOf(this.panelSubId),
-        localNodes, ClashConfigGenerator.SMART_GROUP_NAME);
+        localNodes, '');
     }
     return localNodes.slice();
   }
@@ -928,18 +1091,12 @@ export struct SubscriptionSection {
   }
 
   private pingColor(node: ProxyNode): ResourceColor {
-    return TunBoxPing.recordColor(this.pingRecord(node), Math.max(Date.now(), this.latencyRevision));
+    return TunBoxPing.recordColor(this.pingRecord(node), Math.max(Date.now(), this.latencyRevision), this.themeRevision);
   }
 
-  /**
-   * 节点行是否显示为「当前选中」。
-   *
-   * **必须与 `smartSelected` 互斥**：自动选择模式下 `reconnectWithNode` 会借用本订阅内的
-   * 一个**真实节点**作重连目标，`currentNodeName` 因此等于该节点名 —— 若这里不加前置判断，
-   * 「♻️ 自动选择」和那个被借用的真实节点会**同时实心勾选**（2026-10-30 用户报障）。
-   */
+  /** 选中态来自父选择组的真实选择，未连接时读取该订阅保存的选择。 */
   private isActiveNode(node: ProxyNode): boolean {
-    if (this.smartSelected) { return false; }
+    if (this.smartSelected && this.smartVisible) { return false; }
     const parent = this.activeGroupOf(this.panelSubId);
     if (parent !== null && ProxyPanelMembers.type(parent.groupType) === 'Selector') {
       const core = ConnectionOrchestrator.instance().state === ConnState.CONNECTED
@@ -1001,7 +1158,14 @@ export struct SubscriptionSection {
   }
 
   private updateText(sub: Subscription): string {
-    return `${SubscriptionSummary.updateTime(sub.lastFetchedAt)}更新`;
+    // 2026-11-04 用户报障：最后一条订阅显示「未更新更新」。
+    // `updateTime(0)` 返回的就是完整状态词「未更新」，这里再拼一次「更新」会重复。
+    // 只有真实的相对时间（刚刚 / N 分钟前 / N 小时前 / N 天前）才需要后缀。
+    const relative: string = SubscriptionSummary.updateTime(sub.lastFetchedAt);
+    if (!Number.isFinite(sub.lastFetchedAt) || sub.lastFetchedAt <= 0) {
+      return relative;
+    }
+    return `${relative}更新`;
   }
 
   /**
@@ -1051,10 +1215,11 @@ export struct SubscriptionSection {
 
   private onHeaderTap(sub: Subscription): void {
     this.panelSubId = sub.id;
+    this.smartVisible = false;
+    this.refreshSmartEntry();
     const groups: ProxyGroup[] = this.groupsOf(sub.id);
     this.selectedGroup = groups.length > 0 ? groups[0].name : '';
     // 面板一打开就要算出「♻️ 自动选择」入口要不要出现/是否已选中
-    this.refreshSmartEntry();
     // 不再按卡片下标算展开起点：所有订阅统一使用同一条（首条）展开动画。
     this.panelAnimating = true;
     this.showPanel = true;
@@ -1069,11 +1234,8 @@ export struct SubscriptionSection {
   }
 
   private closePanel(): void {
-    this.panelAnimating = true;
-    setTimeout((): void => {
-      this.showPanel = false;
-      this.panelAnimating = false;
-    }, 180);
+    this.showPanel = false;
+    this.panelAnimating = false;
   }
 
   private async activateProfile(id: string): Promise<void> {
@@ -1102,7 +1264,7 @@ export struct SubscriptionSection {
     this.refreshing = true;
     this.refreshingIds = this.refreshingIds.concat([sub.id]);
     try {
-      const result = await this.service.refreshSubscription(sub.id);
+      const result = await this.service.refreshSubscription(sub.id, (): Promise<string> => this.requestAgeKey());
       const ok: boolean = result.status === SubscriptionRefreshStatus.OK
         || result.status === SubscriptionRefreshStatus.NOT_MODIFIED;
       // 2026-11-03：本地 YAML 的 provider 地址是占位符时，刷新是「成功」的（原文没变），
@@ -1112,10 +1274,19 @@ export struct SubscriptionSection {
         : '';
       const advice: string = result.advice.length > 0 ? result.advice : providerIssue;
       if (ok && advice.length > 0) {
-        const brief: string = advice.length > 88 ? `${advice.substring(0, 88)}…` : advice;
-        this.toast(`${sub.name} 已刷新，但节点未加载：${brief}`, 4000);
+        this.toast(`${sub.name} 已刷新，但节点未加载：${ImportFailureSummary.brief(advice)}`, 4000);
+      } else if (!ok) {
+        // 失败必须带真实原因：message 由订阅层算出（空响应字节数 / 校验判词 / HTTP 状态码），
+        // advice 是面向用户的可操作建议。旧实现两者都丢，只剩「刷新失败：<名字>」，
+        // 用户无法判断是链接过期、面板 4xx、还是内容不是 Clash。
+        if (!this.refreshFailedIds.includes(sub.id)) {
+          this.refreshFailedIds = this.refreshFailedIds.concat([sub.id]);
+        }
+        this.toast(ImportFailureSummary.line(`刷新失败：${sub.name}`,
+          result.message.length > 0 ? result.message : result.advice), 4000);
       } else {
-        this.toast(ok ? `✓ ${sub.name} 已刷新` : `刷新失败：${sub.name}`);
+        this.refreshFailedIds = this.refreshFailedIds.filter((x: string): boolean => x !== sub.id);
+        this.toast(`✓ ${sub.name} 已刷新`);
       }
     } catch (e) {
       AppLogger.warn(TAG, `refresh failed: ${AppLogger.errText(e)}`);
@@ -1132,7 +1303,15 @@ export struct SubscriptionSection {
     for (let i = 0; i < snapshot.length; i++) {
       await this.refreshOne(snapshot[i]);
     }
-    this.toast('✓ 全部订阅已刷新');
+    // 旧实现无条件弹「✓ 全部订阅已刷新」：即使每条都失败，用户也会以为已更新。
+    // 真实结果按单条刷新登记的失败集合统计（成功会把自己移出集合）。
+    const failed: number = snapshot.filter((s: Subscription): boolean =>
+      this.refreshFailedIds.includes(s.id)).length;
+    if (failed === 0) {
+      this.toast('✓ 全部订阅已刷新');
+    } else {
+      this.toast(`刷新完成：${snapshot.length - failed} 成功，${failed} 失败`, 4000);
+    }
   }
 
   private async testSub(subId: string, subName: string): Promise<void> {
@@ -1148,16 +1327,7 @@ export struct SubscriptionSection {
         this.toast('测速未执行，请稍后重试');
         return;
       }
-      if (progress.message.length > 0) { this.toast(progress.message); return; }
-      if (progress.total === 0 || progress.finished === 0) {
-        this.toast('测速未执行：没有可测速目标或批次已取消');
-        return;
-      }
-      this.toast(progress.measured > 0
-        ? `测速完成：${progress.measured} 成功，${progress.timeout} 超时，${progress.failed} 失败`
-          + (progress.skipped > 0 ? `，${progress.skipped} 跳过（节点未加载或策略无出口）` : '')
-          + (progress.cancelled > 0 ? `，${progress.cancelled} 未完成` : '')
-        : `未测得有效延迟：${progress.timeout} 超时，${progress.failed} 失败，${progress.cancelled} 未完成（取消或未取得内核响应）`);
+      this.toast(progress.completionMessage());
     } catch (e) {
       AppLogger.warn(TAG, `latency test failed: ${AppLogger.errText(e)}`);
       this.toast('测速失败，请重试');
@@ -1309,9 +1479,8 @@ export struct SubscriptionSection {
       let body: string = text;
       const lower: string = raw.toLowerCase();
       if (lower.startsWith('http://') || lower.startsWith('https://')) {
-        const loaded: AppSettings = await SettingsService.load();
-        const fetched = await SubscriptionFetchPolicy.fetch(raw, '', '',
-          loaded.allowInsecureSubscriptionHttp, 'convert');
+        // fetch 签名收口（§5.1 allowInsecureHttp 已删）：本文件仅适配新签名。
+        const fetched = await SubscriptionFetchPolicy.fetch(raw, '', '', 'convert');
         body = fetched.body;
       }
       if (body.trim().length === 0) {
@@ -1319,14 +1488,19 @@ export struct SubscriptionSection {
         return;
       }
       let yaml: string = body;
-      if (!ProfileConfigMerger.isKernelLoadableConfig(body)) {
+      // R5 收口（FlClash ConvertsV2Ray 语义，固定上游 be847366）：是否走链接转换
+      // 只由「是不是分享链接/base64 列表」决定，不再用行首 proxies/proxy-groups/
+      // proxy-providers 文本闸猜「是不是 Clash 配置」——JSON、带引号键、rules-only
+      // 的合法 mapping 都必须原样交给内核校验（ProfileRepository.validateAndStore）。
+      if (looksLikeShareLinkBody(body)) {
         const converted = SubConverter.convert(body);
         if (!converted.ok) {
           this.toast('无法识别内容：既不是 Clash 配置，也解析不出节点链接');
           return;
         }
         // 补齐选择组与 MATCH，让导出的链接转换结果可直接作为 Clash 配置使用。
-        yaml = ProfileConfigMerger.withSyntheticGroups(converted.proxiesYaml);
+        // （仅导出/导入产物；内核链路是 FlClash 语义：原文进内核，GLOBAL 兜底。）
+        yaml = withExportSkeleton(converted.proxiesYaml);
       }
       const bytes = util.TextEncoder.create('utf-8').encodeInto(yaml);
       const sizeError = ImportFilePolicy.validateSize(bytes.byteLength, ImportFilePolicy.YAML_MAX_BYTES, '配置文件');
@@ -1370,8 +1544,11 @@ export struct SubscriptionSection {
       }
       this.reload();
     } catch (e) {
-      AppLogger.warn(TAG, `convert ${exportFile ? 'export' : 'import'} failed: ${AppLogger.errText(e)}`);
-      this.toast(exportFile ? '转换或保存失败，请检查内容和保存位置后重试' : '转换或导入失败，请重试');
+      const reason: string = AppLogger.errText(e);
+      AppLogger.warn(TAG, `convert ${exportFile ? 'export' : 'import'} failed: ${reason}`);
+      // 不能只说「重试」：这里的异常携带了真实判词（校验失败原因 / 保存器错误码），
+      // 用户据此才能判断是内容问题还是保存位置问题。
+      this.toast(ImportFailureSummary.line(exportFile ? '导出失败' : '导入失败', reason), 4000);
     } finally {
       this.converting = false;
     }
@@ -1383,7 +1560,12 @@ export struct SubscriptionSection {
       const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
       const opts = new picker.DocumentSelectOptions();
       opts.maxSelectNumber = 1;
-      opts.fileSuffixFilters = ['.yaml', '.yml'];
+      // 2026-11-04 撤销"只列 YAML"的省事型限制（唯一边界：不得因省事造成导入异常）。
+      // 机场/转换站导出的文件常见 `.txt` / `.conf`，旧实现让它们在选择器里根本点不到，
+      // 用户看到「导入失败」而内容其实完全合法。真正的判词由
+      // ProfileRepository.validateAndStore（FlClash validateProfile 同款）给出：
+      // 原文可用 → 落原文；否则转换；都失败才拒绝，并展示真实原因。
+      opts.fileSuffixFilters = ['.yaml', '.yml', '.txt', '.conf'];
       const uris = await docPicker.select(opts);
       if (uris.length === 0) {
         return;
@@ -1414,10 +1596,17 @@ export struct SubscriptionSection {
         }
         const text: string = util.TextDecoder.create('utf-8')
           .decodeToString(new Uint8Array(buf, 0, readLen));
-        const fileName: string = uri.substring(uri.lastIndexOf('/') + 1);
-        const count: number = await this.service.addLocalYaml(fileName, text);
-        if (count > 0) {
-          this.toast(`文件导入成功，解析出 ${count} 个节点`);
+        const fileName: string = fileNameFromUri(uri);
+        const count: number = await this.service.addLocalYaml(fileName, text, (): Promise<string> => this.requestAgeKey());
+        // count 的契约是「本次导入是否成功」（provider-only 配置也算成功，返回 ≥1），
+        // 不能当节点数用：旧实现直接报「解析出 1 个节点」，而配置里可能一个静态节点都没有。
+        const parsedNodes: number = this.service.lastLocalImportNodes;
+        if (count > 0 && parsedNodes > 0) {
+          this.toast(`文件导入成功，解析出 ${parsedNodes} 个节点`);
+          this.reload();
+        } else if (count > 0) {
+          // 只有策略组 / proxy-providers：原文已可用，节点等 provider 拉取后由内核给出
+          this.toast('配置已导入 TunBox，节点将在加载订阅后显示');
           this.reload();
         } else {
           this.toast('文件里没有可用的 Clash 节点');
@@ -1426,8 +1615,11 @@ export struct SubscriptionSection {
         fs.closeSync(file);
       }
     } catch (e) {
-      AppLogger.warn(TAG, `yaml import failed: ${AppLogger.errText(e)}`);
-      this.toast('导入失败，请重试');
+      const reason: string = AppLogger.errText(e);
+      AppLogger.warn(TAG, `yaml import failed: ${reason}`);
+      // 真实原因必须到达用户：addLocalYaml 抛出的 message 是"已保留旧配置：<判词>"，
+      // picker/文件读写的 BusinessError 带 code。旧实现只说"请重试"，用户无从下手。
+      this.toast(ImportFailureSummary.line('导入失败', reason), 4000);
     }
   }
 
@@ -1546,11 +1738,10 @@ export struct SubscriptionSection {
       const loaded = await SettingsService.load();
       if (this.panelSubId === scope) {
         this.settings = loaded;
-        this.smartSelected = false;
         this.coreRevision++;
         this.nodeRevision++;
         this.currentNodeName = node.name;
-        this.closePanel();
+        this.smartSelected = false;
       }
       // 先通知主页更新选择，再等待代理重启。
       const revision: number = AppStorage.get<number>('node_switch_revision') ?? 0;
@@ -1576,7 +1767,6 @@ export struct SubscriptionSection {
         node = local;
       }
     }
-    this.closePanel();
     if (this.settings.autoSelectMode === AutoSelectModes.AUTO) {
       this.settings.autoSelectMode = AutoSelectModes.MANUAL;
     }
@@ -1589,6 +1779,7 @@ export struct SubscriptionSection {
         this.settings.preferredNodeNamesBySubscription, node.subscriptionId, node.name);
     }
     this.currentNodeName = node.name;
+    this.smartSelected = false;
     await SettingsService.patchSettings((s: AppSettings): void => {
       s.autoSelectMode = AutoSelectModes.MANUAL;
       s.preferredNodeId = node.id;
@@ -1622,59 +1813,6 @@ export struct SubscriptionSection {
     this.reload();
   }
 
-  /**
-   * 选中本订阅的「♻️ 自动选择」：切自动模式 + 作用域钉在本订阅，然后按本订阅内的
-   * 真实节点重连（内核侧 PROXY → smart 组，池按 groupSelected 的订阅收窄）。
-   * 合成入口没有 server/port，绝不能当节点送进 reconnectWithNode，所以这里挑一个
-   * 本订阅内的真实节点作「重连目标」，具体选哪个节点仍由内核 LightGBM 决定。
-   */
-  private async selectSmart(): Promise<void> {
-    const scopeId: string = this.panelSubId;
-    if (scopeId.length === 0) {
-      return;
-    }
-    const nodes: ProxyNode[] = this.service.nodesOf(scopeId);
-    if (nodes.length === 0) {
-      this.toast('该订阅暂无可用节点，先刷新订阅');
-      return;
-    }
-    // 优先沿用用户在本订阅里上次手选的节点（没有就用第一个）
-    let target: ProxyNode = nodes[0];
-    for (const n of nodes) {
-      if (n.name === this.settings.preferredNodeName) {
-        target = n;
-        break;
-      }
-    }
-    this.settings.autoSelectMode = AutoSelectModes.AUTO;
-    this.settings.preferredNodeSubscriptionId = scopeId;
-    this.settings.selectedSubscriptionId = scopeId;
-    await SettingsService.patchSettings((s: AppSettings): void => {
-      s.autoSelectMode = AutoSelectModes.AUTO;
-      s.preferredNodeSubscriptionId = scopeId;
-      s.selectedSubscriptionId = scopeId;
-    });
-    this.refreshSmartEntry();
-    let restarted: boolean = false;
-    try {
-      restarted = await ConnectionOrchestrator.instance()
-        .reconnectWithNode(target, this.service, 'home-section=smart:' + scopeId);
-    } catch (e) {
-      AppLogger.warn(TAG, `reconnect after smart pick failed: ${AppLogger.errText(e)}`);
-      this.toast('已保存自动选择，但代理重启失败，请重试');
-      return;
-    }
-    const nodeRev: number = AppStorage.get<number>('node_switch_revision') ?? 0;
-    AppStorage.setOrCreate('node_switch_revision', nodeRev + 1);
-    if (restarted) {
-      const rev: number = AppStorage.get<number>('public_ip_revision') ?? 0;
-      AppStorage.setOrCreate('public_ip_revision', rev + 1);
-    }
-    this.closePanel();
-    this.reload();
-    this.toast(restarted ? '已切换自动选择，代理已重启' : '已切换自动选择，下次连接生效');
-  }
-
   private toast(message: string, duration: number = 2000): void {
     promptAction.showToast({ message: message, duration: duration });
   }
@@ -1682,26 +1820,56 @@ export struct SubscriptionSection {
   // ────────────────────────── 渲染 ──────────────────────────
 
   @Builder
+  SmartRow() {
+    Row({ space: 12 }) {
+      Image($r('app.media.ic_radar')).width(22).height(22)
+        .fillColor(TunBoxColors.primaryFor(this.themeRevision))
+      Column({ space: 4 }) {
+        Text('♻️ 自动选择').fontSize(15).fontWeight(FontWeight.Bold)
+          .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+        Text('Smart 智能选点 · 只在本订阅内择优').fontSize(11)
+          .fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+      }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+      Stack({ alignContent: Alignment.Center }) {
+        Circle({ width: 20, height: 20 })
+          .fill(this.smartSelected ? TunBoxColors.success : Color.Transparent)
+          .stroke(this.smartSelected ? TunBoxColors.success : TunBoxColors.textMutedFor(this.themeRevision))
+          .strokeWidth(1.6)
+        if (this.smartSelected) {
+          Circle({ width: 7, height: 7 }).fill(Color.White)
+        }
+      }
+      .width(20).height(20).flexShrink(0)
+      .accessibilityText(this.smartSelected ? '自动选择：已选中' : '自动选择：未选中')
+    }
+    .width('100%').padding({ top: 14, bottom: 14, left: 10, right: 10 })
+    .borderRadius(TunBoxGeometry.controlRadius)
+    .backgroundColor(this.smartSelected ? TunBoxColors.successTint : Color.Transparent)
+    .enabled(this.selectingMember.length === 0)
+    .onClick(() => this.selectSmart())
+  }
+
+  @Builder
   SectionHeader() {
     Row({ space: 8 }) {
       Text('订阅')
         .fontSize(15)
         .fontWeight(FontWeight.Bold)
-        .fontColor(TunBoxTextColors.primary)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
       Text(`${this.subs.length}`)
         .fontSize(11)
-        .fontColor(TunBoxTextColors.accentBlue)
+        .fontColor(TunBoxTextColors.accentBlueFor(this.themeRevision))
         .padding({ left: 6, right: 6, top: 1, bottom: 1 })
-        .backgroundColor(TunBoxColors.primaryLight)
+        .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
         .borderRadius(TunBoxGeometry.pillRadius)
       Blank()
       // 添加订阅：2026-10-28 用户要求「直接用 + 号，点击就弹添加订阅」
       Stack({ alignContent: Alignment.Center }) {
-        Image($r('app.media.ic_plus')).width(18).height(18).fillColor(TunBoxColors.primary)
+        Image($r('app.media.ic_plus')).width(18).height(18).fillColor(TunBoxColors.primaryFor(this.themeRevision))
       }
       .width(32).height(32)
       .borderRadius(TunBoxGeometry.pillRadius)
-      .backgroundColor(TunBoxColors.primaryLight)
+      .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
       .accessibilityText('添加订阅')
       .onClick((): void => { this.addDialog.open(); })
     }
@@ -1723,9 +1891,9 @@ export struct SubscriptionSection {
   CardAction(icon: Resource, label: string, busyRef: () => boolean, onTap: () => void) {
     Stack({ alignContent: Alignment.Center }) {
       if (busyRef()) {
-        LoadingProgress().width(18).height(18).color(TunBoxColors.primary)
+        LoadingProgress().width(18).height(18).color(TunBoxColors.primaryFor(this.themeRevision))
       } else {
-        Image(icon).width(18).height(18).fillColor(TunBoxColors.textMuted)
+        Image(icon).width(18).height(18).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
       }
     }
     .width(40).height(40)
@@ -1743,16 +1911,16 @@ export struct SubscriptionSection {
     Column({ space: 8 }) {
       Row({ space: 8 }) {
         Stack({ alignContent: Alignment.Center }) {
-          Image($r('app.media.ic_nodes')).width(18).height(18).fillColor(TunBoxColors.primary)
+          Image($r('app.media.ic_nodes')).width(18).height(18).fillColor(TunBoxColors.primaryFor(this.themeRevision))
         }
         .width(32).height(32)
         .borderRadius(8)
-        .backgroundColor(TunBoxColors.primaryLight)
+        .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
 
         Column({ space: 2 }) {
           Row({ space: 6 }) {
             Text(sub.name.length > 0 ? sub.name : '未命名订阅')
-              .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+              .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
               .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
             if (sub.id === this.currentProfileId) {
@@ -1767,7 +1935,7 @@ export struct SubscriptionSection {
           Text(this.nodeCountText(sub).length > 0
             ? `${this.updateText(sub)} · ${this.nodeCountText(sub)}`
             : this.updateText(sub))
-            .fontSize(11).fontColor(TunBoxTextColors.secondary)
+            .fontSize(11).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
             .width('100%')
         }
@@ -1792,17 +1960,17 @@ export struct SubscriptionSection {
 
       Row() {
         Text(`↑ ${this.upText(sub)}`)
-          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlue)
+          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlueFor(this.themeRevision))
           .maxLines(1)
         Text(`  ↓ ${this.downText(sub)}`)
           .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentGreen)
           .maxLines(1)
         Text(`  / ${this.totalText(sub)}`)
-          .fontSize(11).fontColor(TunBoxTextColors.muted)
+          .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         Text(this.expiryText(sub))
-          .fontSize(11).fontColor(TunBoxTextColors.secondary)
+          .fontSize(11).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
           .maxLines(1)
           .flexShrink(0)
       }
@@ -1822,7 +1990,7 @@ export struct SubscriptionSection {
             .borderRadius(3)
             .linearGradient({
               angle: 90,
-              colors: [[TunBoxColors.primary, 0.0], [TunBoxColors.success, 1.0]]
+              colors: [[TunBoxColors.primaryFor(this.themeRevision), 0.0], [TunBoxColors.success, 1.0]]
             })
         }
       }
@@ -1838,7 +2006,7 @@ export struct SubscriptionSection {
     .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
     .border({
       width: sub.id === this.currentProfileId ? 1.5 : 1,
-      color: sub.id === this.currentProfileId ? TunBoxColors.primary : TunBoxColors.cardBorder(this.themeRevision)
+      color: sub.id === this.currentProfileId ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.cardBorder(this.themeRevision)
     })
     .onClick((): void => {
       if (tapToClose) {
@@ -1859,10 +2027,10 @@ export struct SubscriptionSection {
     Text(name)
       .fontSize(12)
       .fontWeight(this.selectedGroup === name ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.selectedGroup === name ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondary)
+      .fontColor(this.selectedGroup === name ? TunBoxColors.textOnPrimary : TunBoxTextColors.secondaryFor(this.themeRevision))
       .padding({ left: 12, right: 12, top: 6, bottom: 6 })
       .borderRadius(TunBoxGeometry.pillRadius)
-      .backgroundColor(this.selectedGroup === name ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
+      .backgroundColor(this.selectedGroup === name ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.chipBg(this.themeRevision))
       .maxLines(1)
       .flexShrink(0)
       .onClick((): void => { this.selectedGroup = name; })
@@ -1873,62 +2041,16 @@ export struct SubscriptionSection {
    * 左：节点名（主行）+ 协议（小字灰色，名称下方）；中右：延迟；最右：单选圈。
    * 选中行整行浅绿底，行间用细分隔线（不再是独立卡片块）。
    */
-  /**
-   * 「♻️ 自动选择」行（每个订阅面板的第一个条目）。
-   * 排布与 NodeRow 一致，但它是**合成入口**：不对应任何 server/port，
-   * 点它 = 把选点权交给内核，作用域钉在本订阅（只在本订阅内择优）。
-   */
-  @Builder
-  SmartRow() {
-    Row({ space: 10 }) {
-      Column({ space: 3 }) {
-        Text(ClashConfigGenerator.SMART_GROUP_NAME)
-          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-        Text('内核智能选点 · 只在本订阅内择优')
-          .fontSize(11).fontColor(TunBoxTextColors.muted)
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          .width('100%')
-      }
-      .layoutWeight(1)
-      .alignItems(HorizontalAlign.Start)
-
-      Text('内核')
-        .fontSize(11).fontColor(TunBoxTextColors.accentBlue)
-        .padding({ left: 8, right: 8, top: 2, bottom: 2 })
-        .backgroundColor(TunBoxColors.primaryLight)
-        .borderRadius(TunBoxGeometry.pillRadius)
-        .flexShrink(0)
-
-      Stack({ alignContent: Alignment.Center }) {
-        Circle({ width: 20, height: 20 })
-          .fill(this.smartSelected ? TunBoxColors.success : Color.Transparent)
-          .stroke(this.smartSelected ? TunBoxColors.success : TunBoxColors.textMuted)
-          .strokeWidth(1.6)
-        if (this.smartSelected) {
-          Circle({ width: 7, height: 7 }).fill(Color.White)
-        }
-      }.width(20).height(20)
-    }
-    .width('100%')
-    .padding({ left: 12, right: 12, top: 12, bottom: 12 })
-    .backgroundColor(this.smartSelected ? TunBoxColors.successTint : Color.Transparent)
-    .border({ width: { bottom: 1 }, color: TunBoxColors.cardBorder(this.themeRevision) })
-    .alignItems(VerticalAlign.Center)
-    .onClick((): void => { this.selectSmart(); })
-  }
-
   @Builder
   NodeRow(node: ProxyNode) {
     Row({ space: 10 }) {
       Column({ space: 3 }) {
         Text(node.name)
-          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
+          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
         Text(this.protoOf(node))
-          .fontSize(11).fontColor(TunBoxTextColors.muted)
+          .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -1944,7 +2066,7 @@ export struct SubscriptionSection {
         Stack({ alignContent: Alignment.Center }) {
           Circle({ width: 20, height: 20 })
             .fill(this.isDeleteChecked(node.id) ? TunBoxColors.danger : Color.Transparent)
-            .stroke(this.isDeleteChecked(node.id) ? TunBoxColors.danger : TunBoxColors.textMuted)
+            .stroke(this.isDeleteChecked(node.id) ? TunBoxColors.danger : TunBoxColors.textMutedFor(this.themeRevision))
             .strokeWidth(1.6)
           if (this.isDeleteChecked(node.id)) {
             Text('✓').fontSize(12).fontColor(Color.White).fontWeight(FontWeight.Bold)
@@ -1954,7 +2076,7 @@ export struct SubscriptionSection {
         Stack({ alignContent: Alignment.Center }) {
           Circle({ width: 20, height: 20 })
             .fill(this.isActiveNode(node) ? TunBoxColors.success : Color.Transparent)
-            .stroke(this.isActiveNode(node) ? TunBoxColors.success : TunBoxColors.textMuted)
+            .stroke(this.isActiveNode(node) ? TunBoxColors.success : TunBoxColors.textMutedFor(this.themeRevision))
             .strokeWidth(1.6)
           if (this.isActiveNode(node)) {
             Circle({ width: 7, height: 7 }).fill(Color.White)
@@ -1990,7 +2112,7 @@ export struct SubscriptionSection {
     Column({ space: 6 }) {
       Row({ space: 6 }) {
         Text(node.name)
-          .fontSize(13).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
+          .fontSize(13).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         // 右侧圆圈：与 NodeRow 一样，删除选择态下变勾选框（2026-10-29 语义保持不变）
@@ -1998,7 +2120,7 @@ export struct SubscriptionSection {
           Stack({ alignContent: Alignment.Center }) {
             Circle({ width: 18, height: 18 })
               .fill(this.isDeleteChecked(node.id) ? TunBoxColors.danger : Color.Transparent)
-              .stroke(this.isDeleteChecked(node.id) ? TunBoxColors.danger : TunBoxColors.textMuted)
+              .stroke(this.isDeleteChecked(node.id) ? TunBoxColors.danger : TunBoxColors.textMutedFor(this.themeRevision))
               .strokeWidth(1.5)
             if (this.isDeleteChecked(node.id)) {
               Text('✓').fontSize(11).fontColor(Color.White).fontWeight(FontWeight.Bold)
@@ -2008,7 +2130,7 @@ export struct SubscriptionSection {
           Stack({ alignContent: Alignment.Center }) {
             Circle({ width: 18, height: 18 })
               .fill(this.isActiveNode(node) ? TunBoxColors.success : Color.Transparent)
-              .stroke(this.isActiveNode(node) ? TunBoxColors.success : TunBoxColors.textMuted)
+              .stroke(this.isActiveNode(node) ? TunBoxColors.success : TunBoxColors.textMutedFor(this.themeRevision))
               .strokeWidth(1.5)
             if (this.isActiveNode(node)) {
               Circle({ width: 6, height: 6 }).fill(Color.White)
@@ -2024,7 +2146,7 @@ export struct SubscriptionSection {
 
       Row({ space: 6 }) {
         Text(this.protoOf(node))
-          .fontSize(10).fontColor(TunBoxTextColors.muted)
+          .fontSize(10).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
         Text(this.pingText(node))
@@ -2052,7 +2174,7 @@ export struct SubscriptionSection {
    * 节点行的点击行为（单列 `NodeRow` 与双列 `NodeCell` 共用，2026-11-03 抽取）。
    *
    * 2026-11-03 用户口径（对齐 FlClash）：**组行本身就是可选项**，点一下即把该子组
-   * 选为当前组的成员并立即回主页；不再下钻进组（ClashPlus / FlClash 都不展开小分组）。
+   * 选为当前组的成员；2026-11-05 按用户要求选择后保留面板，不自动返回主页。
    * 想单独看某个组的成员，用顶部那排分组 chips 切组。
    */
   private handleNodeTap(node: ProxyNode): void {
@@ -2068,7 +2190,7 @@ export struct SubscriptionSection {
       return;
     }
     const parent = this.activeGroupOf(this.panelSubId);
-    // 2026-11-03（用户第二轮口径）：组行直接当成员选中，点一下就走人，不下钻。
+    // 组行直接当成员选中，保留面板；不下钻。
     if (ProxyPanelMembers.isGroup(node)) {
       this.selectAsMember(node);
       return;
@@ -2190,30 +2312,30 @@ export struct SubscriptionSection {
       Column({ space: 0 }) {
         Row({ space: 8 }) {
           Text('删除节点')
-            .fontSize(15).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primary)
+            .fontSize(15).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           Blank()
           Text(this.deleteSheetIds.length > 0 ? `已选 ${this.deleteSheetIds.length}` : '未选择')
-            .fontSize(12).fontColor(TunBoxTextColors.muted)
+            .fontSize(12).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         }
         .width('100%')
         .padding({ left: 20, right: 20, top: 16, bottom: 2 })
 
         Text('点上方节点可多选；删除后重新导入订阅可恢复。')
-          .fontSize(11).fontColor(TunBoxTextColors.muted)
+          .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
           .width('100%')
           .padding({ left: 20, right: 20, bottom: 4 })
 
         Row({ space: 10 }) {
           Button('取消')
             .layoutWeight(1).height(44).fontSize(14)
-            .fontColor(TunBoxTextColors.primary)
+            .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
             .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
             .borderRadius(TunBoxGeometry.controlRadius)
             .onClick((): void => { this.closeDeleteSheet(); })
           Button(this.deleteSheetIds.length > 0 ? `删除 ${this.deleteSheetIds.length} 个` : '删除')
             .layoutWeight(1).height(44).fontSize(14).fontWeight(FontWeight.Medium)
             .fontColor(Color.White)
-            .backgroundColor(this.deleteSheetIds.length > 0 ? TunBoxColors.danger : TunBoxColors.textMuted)
+            .backgroundColor(this.deleteSheetIds.length > 0 ? TunBoxColors.danger : TunBoxColors.textMutedFor(this.themeRevision))
             .borderRadius(TunBoxGeometry.controlRadius)
             .enabled(this.deleteSheetIds.length > 0)
             .onClick((): void => { this.applyDeleteNodes(); })
@@ -2276,7 +2398,7 @@ export struct SubscriptionSection {
           // 图标表示「点一下会变成什么」：单列时显示双列图标，反之亦然。
           Row({ space: 4 }) {
             Image(this.gridMode ? $r('app.media.ic_view_list') : $r('app.media.ic_view_grid'))
-              .width(13).height(13).fillColor(TunBoxColors.textMuted)
+              .width(13).height(13).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
           }
           .padding({ left: 8, right: 8, top: 6, bottom: 6 })
           .borderRadius(TunBoxGeometry.pillRadius)
@@ -2285,9 +2407,9 @@ export struct SubscriptionSection {
           .onClick((): void => { this.gridMode = !this.gridMode; })
 
           Row({ space: 4 }) {
-            Image($r('app.media.ic_sort')).width(13).height(13).fillColor(TunBoxColors.textMuted)
+            Image($r('app.media.ic_sort')).width(13).height(13).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
             Text(this.sortByDelay ? '按延迟' : '原始')
-              .fontSize(11).fontColor(TunBoxTextColors.muted).maxLines(1)
+              .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).maxLines(1)
           }
           .padding({ left: 10, right: 10, top: 6, bottom: 6 })
           .borderRadius(TunBoxGeometry.pillRadius)
@@ -2309,18 +2431,18 @@ export struct SubscriptionSection {
       .width('100%')
       .padding({ top: 8, bottom: 8 })
 
-      if (this.panelNodes().length === 0) {
+      if (this.panelNodes().length === 0 && !this.smartVisible) {
         Column({ space: 6 }) {
           // 2026-11-03 用户报障「本地 YAML 一直 0 节点、测速说没有可用代理」：那份模板里
           // 只有一个 `直连` + provider 占位符 url，本来就没有真实代理。空状态必须说清
           // 是「没有代理」还是「这个组为空」，否则用户会以为功能坏了。
           Text(this.subHasRealProxy() ? '该分组暂无可用节点' : '该订阅没有真实代理节点（0 节点）')
-            .fontSize(13).fontColor(TunBoxTextColors.muted)
+            .fontSize(13).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
           Text(this.subHasRealProxy()
             ? '换一个分组，或用卡片上的刷新按钮更新订阅'
             : '配置里只有策略组/直连：常见原因是 proxy-providers 的订阅地址还是模板占位符，'
               + '填好真实地址后重新导入或刷新')
-            .fontSize(11).fontColor(TunBoxTextColors.muted)
+            .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
             .textAlign(TextAlign.Center)
             .padding({ left: 32, right: 32 })
         }
@@ -2330,12 +2452,8 @@ export struct SubscriptionSection {
         .layoutWeight(1)
       } else {
         List({ space: 0 }) {
-          // 「♻️ 自动选择」置顶：每个订阅都有自己的入口（合成行，不属于任何策略组）；
-          // 删除选择态下不展示 —— 它不是真节点，不能被勾选删除。
           if (this.smartVisible && !this.deleteSheetOn) {
-            ListItem() {
-              this.SmartRow()
-            }
+            ListItem() { this.SmartRow() }
           }
           // 2026-11-03 用户第二轮口径（对齐 FlClash）：组行就是可选项，点一下直接选中，
           // 不展开、不下钻，所以列表里没有「上级：xxx」这一行（ClashPlus/FlClash 都没有）。
@@ -2374,7 +2492,7 @@ export struct SubscriptionSection {
         .width('100%')
         .height(44)
         .fontSize(14)
-        .fontColor(TunBoxTextColors.primary)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         .backgroundColor(TunBoxColors.background(this.themeRevision))
         .borderRadius(TunBoxGeometry.controlRadius)
         .margin({ left: 24, right: 24, top: 4, bottom: 12 })
@@ -2409,9 +2527,9 @@ export struct SubscriptionSection {
 
       if (this.subs.length === 0) {
         Row({ space: 8 }) {
-          Image($r('app.media.ic_nodes')).width(18).height(18).fillColor(TunBoxColors.textMuted)
+          Image($r('app.media.ic_nodes')).width(18).height(18).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
           Text('还没有订阅，点右上菜单「添加订阅」')
-            .fontSize(12).fontColor(TunBoxTextColors.muted)
+            .fontSize(12).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
             .layoutWeight(1)
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })

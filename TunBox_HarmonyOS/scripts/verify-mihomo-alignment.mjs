@@ -263,43 +263,30 @@ console.log('\n[6] 持久化（certFingerprint 必须可选，避免丢节点）
   ok(/j\.certFingerprint = n\.certFingerprint/.test(ss), '写入时持久化 certFingerprint');
 }
 
-// ── 7. ETag / 条件请求（304 增量刷新） ─────────────────────────────────────
-console.log('\n[7] ETag 条件请求（304 = 内容未变，不得当成拉取失败）');
+// ── 7. 取回路径（2026-11-05 FlClash 照抄收口） ─────────────────────────────
+console.log('\n[7] 取回 = FlClash 单路径（内核 utls；无 304 条件请求）');
 {
   const fp = fs.readFileSync(path.join(svc, 'SubscriptionFetchPolicy.ets'), 'utf8');
+  // FlClash 的下载没有 If-None-Match/304 逻辑 —— 单次 GET，失败即失败。
+  // 本仓照抄后取回走内核 utls（TunBoxFetchText），不再有 @ohos 双路径。
+  ok(/coreBridge\.fetchText\(/.test(fp), '订阅取回走内核 utls（FlClash request 同构）');
+  ok(!/headers\['If-None-Match'\]/.test(fp), '不再发送 If-None-Match（FlClash 无条件请求）');
+  ok(!/responseCode === 304/.test(fp), '不再识别 304（无条件请求即无 304）');
+  ok(/etag: string = ''/.test(fp), 'SubscriptionFetchResult 保留 etag 字段（兼容旧存储）');
+
   const sub = fs.readFileSync(path.join(models, 'Subscription.ets'), 'utf8');
   const ss = fs.readFileSync(path.join(svc, 'SubscriptionService.ets'), 'utf8');
-
-  ok(/etag: string = ''/.test(fp), 'SubscriptionFetchResult 带 etag 字段');
-  ok(/notModified: boolean = false/.test(fp), 'SubscriptionFetchResult 带 notModified 标志');
-  ok(/headers\['If-None-Match'\] = etag/.test(fp), '条件请求发送 If-None-Match');
-  ok(/resp\.responseCode === 304/.test(fp), '识别 304 响应');
-  ok(/result\.notModified\) \{[\s\S]{0,240}return result;/.test(fp),
-    '304 结果原样返回（不落进 EMPTY_RESPONSE 分支被报成失败）');
-  ok(/static responseEtag/.test(fp) && /'last-modified'/.test(fp),
-    'ETag 缺失时回退 Last-Modified');
-
   ok(/etag: string = ''/.test(sub), 'Subscription 模型带 etag 字段');
-  ok(/s\.etag = j\.etag \?\? ''/.test(sub), 'etag 读取对旧存储兜底为空串');
-  ok(/j\.etag = s\.etag/.test(sub), 'etag 随 preferences 持久化');
-  ok(/j\.etag = ''/.test(ss), '非法/超长 etag 就地归零（不丢订阅）');
-  ok(/fetched\.notModified/.test(ss), '服务层处理 304 分支');
-  ok(/SubscriptionRefreshStatus\.NOT_MODIFIED/.test(ss), '304 映射为 NOT_MODIFIED 状态');
-  // NOT_MODIFIED 必须在落盘白名单里，否则重启会丢订阅（同 RATE_LIMITED 那类坑）
-  ok(/SubscriptionRefreshStatus\.NOT_MODIFIED/.test(
-    ss.slice(ss.indexOf('validRefreshStatus'), ss.indexOf('validRefreshStatus') + 1400)),
-    'NOT_MODIFIED 在 validRefreshStatus 白名单内');
-  // 订阅自身的两条拉取路径（串行 refresh + 并发 prefetch）必须带 etag。
-  // provider 拉取（entry.url / provider.url）是**别的 URL**，不能借用订阅的 etag，
-  // 所以只断言第一参数为 sub.url 的调用点。
+  ok(/fetched\.notModified/.test(ss), '304 分支保留（字段兼容，服务端未给 etag 时不可达）');
+
+  // 订阅自身的两条拉取路径（串行 refresh + 并发 prefetch）必须复用同一策略；
+  // provider 拉取已整体删除（任务1：由内核 confineProviders 交给 mihomo 自己拉）。
   const fetchCalls = [...ss.matchAll(/SubscriptionFetchPolicy\.fetch\(\s*([^)]*)\)/g)]
     .map(m => m[1].replace(/\s+/g, ' '));
   const subCalls = fetchCalls.filter(c => c.startsWith('sub.url'));
   ok(subCalls.length === 2, `订阅自身有 2 处 fetch 调用（实际 ${subCalls.length}）`);
-  ok(subCalls.every(c => /sub\.etag/.test(c)),
-    `订阅自身的 fetch 都传了 etag: ${JSON.stringify(subCalls.map(c => /sub\.etag/.test(c)))}`);
-  ok(fetchCalls.length - subCalls.length === 2,
-    `provider 拉取不借用订阅 etag（另有 ${fetchCalls.length - subCalls.length} 处 provider 拉取）`);
+  ok(fetchCalls.length === subCalls.length,
+    `provider App 侧拉取已删除（fetch 调用只剩订阅自身，实际 ${fetchCalls.length}）`);
 }
 
 // ── 8. 失败原因分类（人话建议，真机实测的错误码都要有归宿） ────────────────
@@ -325,35 +312,35 @@ console.log('\n[8] transportAdvice：真机出现过的错误码都要归到人�
 
   if (adviceOf) {
     // 真机实测过的原始消息
+    // FlClash 口径（§5.6）：本层只给**英文**底层建议 + 原始错误原文，中文只在 UI
+    // 映射层产生；断言按英文口径（旧的中文断言是自创策略的遗留）。
     const cases = [
-      ['code=2300028 Operation timeout', '超时'],
-      ['code=2300060 Invalid SSL peer certificate or SSH remote key', 'TLS 握手失败'],
-      ['SSL handshake has read 0 bytes and written 325 bytes', 'TLS 握手失败'],
-      ['write:errno=104', '被重置'],
-      ['getAddressesByName failed: NODENAME_NOT_RESOLVED', '无法解析'],
-      ['订阅域名解析到私网或保留地址', '内网或保留地址'],
-      ['订阅响应体超过 8 MiB 限制', '大小限制'],
-      ['some brand new failure mode', '无法连接到该订阅地址'],
+      ['code=2300028 Operation timeout', 'timed out'],
+      ['code=2300060 Invalid SSL peer certificate or SSH remote key', 'TLS handshake'],
+      ['SSL handshake has read 0 bytes and written 325 bytes', 'TLS handshake'],
+      ['write:errno=104', 'reset by the peer'],
+      ['getAddressesByName failed: NODENAME_NOT_RESOLVED', 'Cannot resolve'],
+      ['订阅域名解析到私网或保留地址', 'private/reserved'],
+      ['订阅响应体超过 8 MiB 限制', 'size limit'],
+      ['some brand new failure mode', 'Cannot reach'],
     ];
     for (const [raw, expect] of cases) {
       const got = adviceOf(raw, 'https://example.com/s/x');
-      ok(got.includes(expect), `"${raw.slice(0, 42)}…" → 含「${expect}」`);
+      ok(got.toLowerCase().includes(expect.toLowerCase()), `"${raw.slice(0, 42)}…" → 含「${expect}」`);
     }
-    // 病句回归：拼接模板会产生「该订阅地址TLS 握手失败」「该订阅地址地址被…」
-    for (const [raw] of cases) {
-      const got = adviceOf(raw, 'https://example.com/s/x');
-      ok(!/该订阅地址TLS|该订阅地址地址|该订阅地址连接超时。$/.test(got)
-        || !got.includes('该订阅地址TLS'), `"${raw.slice(0, 30)}…" 不产生病句`);
-    }
-    // 被阻断类必须给出「先连接 VPN」这条可操作建议
-    ok(adviceOf('code=2300060 Invalid SSL peer certificate', 'u').includes('连接 VPN'),
-      '阻断类（TLS/超时/重置）都提示「先连接 VPN」');
+    // 被阻断类必须给出「先连接 VPN」这条可操作建议（英文表述）
+    ok(adviceOf('code=2300060 Invalid SSL peer certificate', 'u').includes('VPN'),
+      '阻断类（TLS/超时/重置）都提示 VPN 路径');
     // 但「地址写错」类不该甩锅给 VPN
-    ok(!adviceOf('NODENAME_NOT_RESOLVED', 'u').includes('连接 VPN'),
+    ok(!adviceOf('NODENAME_NOT_RESOLVED', 'u').includes('VPN'),
       '域名无法解析不提示 VPN（那是地址写错，不是被墙）');
+    // 本层必须是英文（中文只在 UI 映射层产生，FlClash 原文透传口径）
+    for (const [raw] of cases) {
+      ok(!/[\u4e00-\u9fa5]/.test(adviceOf(raw, 'u')), `"${raw.slice(0, 30)}…" 建议为英文（中文归 UI 层）`);
+    }
     // 每条建议都必须以句号结尾（要展示给用户）
     for (const [raw] of cases) {
-      ok(adviceOf(raw, 'u').trim().endsWith('。'), `"${raw.slice(0, 30)}…" 建议以句号结尾`);
+      ok(adviceOf(raw, 'u').trim().endsWith('.'), `"${raw.slice(0, 30)}…" 建议以句号结尾`);
     }
   }
 }
@@ -390,35 +377,24 @@ console.log('\n[9] validRefreshStatus 白名单 == 枚举全集');
   ok(/if \(value === ''\) \{\s*return true;/.test(fn), '空串（direct 伪订阅）必须放行');
 }
 
-// ── 10. 传输层失败的重试：要能自愈抖动，但不得退回 75s ──────────────────────
-console.log('\n[10] 传输层重试（时间预算封顶）');
+// ── 10. 取回层与 FlClash 同构：单一 UA、单次请求（无 UA 链 / 无传输重试）─────
+console.log('\n[10] 取回层：单一 UA + 单次请求（FlClash 口径）');
 {
   const fp = fs.readFileSync(path.join(svc, 'SubscriptionFetchPolicy.ets'), 'utf8');
 
-  const max = Number(/TRANSPORT_RETRY_MAX\s*=\s*(\d+)/.exec(fp)?.[1] ?? 0);
-  const budget = Number(/TRANSPORT_RETRY_BUDGET_MS\s*=\s*(\d+)/.exec(fp)?.[1] ?? 0);
-  ok(max >= 2 && max <= 4, `重试次数有界且 >1（实际 ${max}）`);
-  ok(budget > 0 && budget <= 30000, `重试预算封顶 ≤30s（实际 ${budget}ms）`);
-
-  // 预算必须真正参与判定，否则超时场景会叠成 N × 15s
-  ok(/elapsed\s*<\s*TRANSPORT_RETRY_BUDGET_MS/.test(fp), '预算参与 canRetry 判定');
-  // 重试必须复用同一个 UA（uaIndex 不自增）—— 换 UA 修不了可达性
-  const retryBlock = fp.slice(fp.indexOf('const canRetry'), fp.indexOf('transportExhausted = true'));
-  ok(/continue;/.test(retryBlock), '可重试时 continue（重试同一 UA）');
-  ok(!/uaIndex\s*=\s*uaIndex\s*\+\s*1/.test(retryBlock),
-    '重试分支内不自增 uaIndex（否则变成换 UA 重试，回到旧缺陷）');
-
-  // 有 HTTP 状态码时不得重试（4xx/5xx 是服务端确定答复）
-  const catchBlock = fp.slice(fp.indexOf('const status = SubscriptionFetchPolicy.extractHttpStatus'),
-    fp.indexOf('transportExhausted = true'));
-  ok(/status > 0/.test(catchBlock), '有 HTTP 状态码走原分支（不进入传输重试）');
-
-  ok(/private static delay\(ms: number\): Promise<void>/.test(fp), '存在 delay 退避助手');
-  ok(/已自动重试/.test(fp), '多次重试仍失败时告知用户「已重试 N 次」');
-
-  // 最坏时长估算：一次 15s 超时 + 退避，必须远低于旧的 75s
-  const worst = 15000 + 2 * 700;
-  ok(worst < 20000, `最坏总时长估算 ${worst}ms 远低于旧的 75000ms`);
+  ok(!/UA_CHAIN/.test(fp), '不存在 UA 链（FlClash 只有一个 packageInfo.ua）');
+  ok(!/TRANSPORT_RETRY_(MAX|BUDGET_MS)/.test(fp), '不存在传输层重试预算（失败即失败）');
+  ok(!/uaIndex/.test(fp), '不存在 uaIndex 轮换残留');
+  // 真机取证：@ohos.net.http 与 Go 默认 TLS 都被 Cloudflare 判成机器人 → 必须走内核 utls。
+  ok(/coreBridge\.fetchText\(fetchUrl, ua, auth\.header\)/.test(fp),
+    '取回走内核 utls（浏览器级 TLS 指纹）');
+  ok(/const ua = await resolveUserAgent\(\);/.test(fp),
+    '单次请求只取一个 UA');
+  // 403 不是限流：FlClash 只把它当 badResponse。
+  ok(/status === 429/.test(fp), '只有 429 归为限流');
+  ok(/this\.httpStatus === 429/.test(fp), 'isRateLimited() 只认 429（403 如实报 HTTP）');
+  ok(/const status = SubscriptionFetchPolicy\.extractHttpStatus\(e, msg\);/.test(fp),
+    'HTTP 状态码从错误里如实提取');
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

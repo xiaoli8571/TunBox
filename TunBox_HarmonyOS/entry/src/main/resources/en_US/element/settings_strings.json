@@ -31,10 +31,7 @@
     { "name": "settings_health_enable_desc", "value": "Check link health and perform bounded automatic repairs when allowed." },
     { "name": "settings_health_repair_steps_label", "value": "Maximum repair steps" },
     { "name": "settings_health_repair_steps_desc", "value": "Repair limit after each health check. Range: 0–3; 0 checks without repairing." },
-    { "name": "settings_about_title", "value": "About & Privacy" },
-    { "name": "settings_version_label", "value": "Version" },
-    { "name": "settings_privacy_policy_row", "value": "View Privacy Policy" },
-    { "name": "settings_privacy_policy_desc", "value": "Provided by AppGallery's hosted privacy statement service; identical to the first-launch privacy dialog." },
-    { "name": "settings_privacy_unavailable", "value": "Privacy policy link is unavailable. Install the store build linked to hosted privacy statements." }
+    { "name": "settings_about_title", "value": "About" },
+    { "name": "settings_version_label", "value": "Version" }
   ]
 }

@@ -23,8 +23,8 @@
  * ## 断言
  *   A. decodeScalar 经 sequenceItemNames 读转义名 = 真 emoji（不再是字面反斜杠）。
  *   B. 单引号标量里的 `\U` **必须保持字面**（YAML 单引号不做转义，别改坏真实值）。
- *   C. 全链：真实 profile 原文 → merge → injectSmartPrimary 成功，
- *      且注入的 smart 组成员名与 proxies 段节点名**逐字相同**（这是内核寻址的前提）。
+ *   C. 全链：profile 自带 Smart 的名称、成员和选项在 compose 后原样保留；
+ *      没有 Smart 的 profile 不因旧 useSmart 参数而凭空增加分组。
  *
  * 断言方式：Node 原生 TS type-stripping **直接加载 YamlMerger.ets / ProfileConfigMerger.ets
  * 源文件本体**（只把 SDK import 换成最小垫片），被测逻辑一行都不在垫片里重写。
@@ -32,7 +32,7 @@
  * 用法: node scripts/verify-smart-inject-unicode-names.mjs
  * 退出码: 0 = 全部断言通过；1 = 有断言失败
  */
-import { readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -54,9 +54,8 @@ function eq(label, actual, expected) {
 }
 
 // ── 加载沙箱：真实源码 + 最小垫片 ────────────────────────────────────
-const sandbox = join(tmpdir(), 'tunbox-smartunicode-verify-' + process.pid);
-rmSync(sandbox, { recursive: true, force: true });
-mkdirSync(sandbox, { recursive: true });
+const sandbox = mkdtempSync(join(tmpdir(), 'tunbox-probe-smartunicode-'));
+process.once('exit', () => rmSync(sandbox, { recursive: true, force: true }));
 writeFileSync(join(sandbox, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
 
 writeFileSync(join(sandbox, 'shim_appkit.ts'), [
@@ -94,6 +93,46 @@ const mergerOut = stage(join(flclashDir, 'ProfileConfigMerger.ets'), 'ProfileCon
 const { YamlMerger } = await import(pathToFileURL(yamlOut).href);
 const { ProfileConfigMerger } = await import(pathToFileURL(mergerOut).href);
 
+// 2026-11-05（FlClash 全量照抄）：compose 的依赖 shim —— 门禁只用到两个常量
+writeFileSync(join(sandbox, 'shim_generator.ts'), [
+  'export class ClashConfigGenerator {',
+  `  static readonly SMART_GROUP_NAME = '♻️ 自动选择';`,
+  "  static readonly SMART_INFO_NODE_FILTER = '流量|过期';",
+  '}',
+].join('\n'), 'utf8');
+writeFileSync(join(sandbox, 'shim_fetchpolicy.ts'), [
+  'export function tunboxUserAgent(): string {',
+  "  return 'TunBox/v-harness clash-verge Platform/OpenHarmony';",
+  '}',
+].join('\n'), 'utf8');
+writeFileSync(join(sandbox, 'shim_corebridge.ts'), [
+  'export const coreBridge = {',
+  '  async getProfileBase(_p: string): Promise<never> { throw new Error("compose-only gate"); },',
+  '  async decodeYaml(_t: string): Promise<never> { throw new Error("compose-only gate"); },',
+  '};',
+].join('\n'), 'utf8');
+writeFileSync(join(sandbox, 'shim_filekit.ts'), [
+  'export const fileIo = new Proxy({}, {',
+  '  get() { throw new Error("compose-only gate must not access the filesystem"); }',
+  '});',
+].join('\n'), 'utf8');
+
+function stageBuilder(srcPath, name) {
+  const src = readFileSync(srcPath, 'utf8');
+  const patched = src
+    .replace(/from '@kit\.CoreFileKit'/g, "from './shim_filekit.ts'")
+    .replace(/from '\.\.\/\.\.\/core\/CoreBridge'/g, "from './shim_corebridge.ts'")
+    .replace(/from '\.\.\/services\/ClashConfigGenerator'/g, "from './shim_generator.ts'")
+    .replace(/from '\.\.\/services\/SubscriptionFetchPolicy'/g, "from './shim_fetchpolicy.ts'")
+    .replace(/from '\.\.\/latency\/LatencyTestUrl'/g, "from './LatencyTestUrl.ts'")
+    .replace(/from '\.\.\/utils\/AppLogger'/g, "from './shim_logger.ts'");
+  const out = join(sandbox, name + '.ts');
+  writeFileSync(out, patched, 'utf8');
+  return out;
+}
+stage(join(appRoot,'entry/src/main/ets/commons/latency/LatencyTestUrl.ets'),'LatencyTestUrl');
+const builderOut = stageBuilder(join(flclashDir, 'TunBoxProfileBuilder.ets'), 'TunBoxProfileBuilder');
+
 // ── A. 双引号里的 \U / \u / \x 必须解码成真字符 ──────────────────────
 console.log('\n[A] 双引号标量转义解码（YAML 1.2 语义）');
 const profileEscaped = [
@@ -125,76 +164,95 @@ eq('单引号内普通名字不变', singleNames[1], 'plain name');
 record('单引号结果确实带反斜杠（说明不是被误当双引号解）',
   singleNames[0].indexOf('\\') === 0, 'got ' + JSON.stringify(singleNames[0]));
 
-// ── C. 全链：真实 profile（PrepareProfile 重序列化形态）→ merge → inject ──
-console.log('\n[C] 全链：重序列化 profile → merge → injectSmartPrimary');
-const profileYaml = [
-  'mixed-port: 7890',
-  'mode: rule',
-  'proxies:',
-  '  - { name: "\\U0001F1EF\\U0001F1F5日本•移联01", type: socks5, server: a.example, port: 1 }',
-  '  - { name: "\\U0001F1F8\\U0001F1EC新加坡•移联01", type: socks5, server: b.example, port: 2 }',
-  '  - { name: 剩余流量：947.23 GB, type: socks5, server: c.example, port: 3 }',
-  'proxy-groups:',
-  '    - name: 吹雪云',
-  '      type: select',
-  '      proxies:',
-  '        - 自动选择',
-  '        - "\\U0001F1EF\\U0001F1F5日本•移联01"',
-  '        - "\\U0001F1F8\\U0001F1EC新加坡•移联01"',
-  '    - name: 自动选择',
-  '      type: url-test',
-  '      proxies:',
-  '        - "\\U0001F1EF\\U0001F1F5日本•移联01"',
-  'rules:',
-  '    - MATCH,吹雪云',
-  '',
-].join('\n');
-const overlay = ['mixed-port: 7890', 'mode: rule', 'proxies: []', 'proxy-groups: []',
-  'rules:', '  - GEOIP,CN,DIRECT', ''].join('\n');
+// ── C. 全链：unicode profile → compose 保留真实分组 ──────────────────────
+console.log('\n[C] 全链：compose 保留真实 Smart / URLTest，unicode 名字逐字一致');
+const { TunBoxProfileBuilder, TunBoxBaseData, TunBoxProfileInput } =
+  await import(pathToFileURL(join(sandbox, 'TunBoxProfileBuilder.ts')).href);
 
-const merged = ProfileConfigMerger.merge(overlay, profileYaml);
-record('merge 成功', merged.ok === true, merged.error);
-
-const SMART_NAME = '♻️ 自动选择';
-const smartHead = [
-  `  - name: "${SMART_NAME}"`,
-  '    type: smart',
-  '    url: "https://www.gstatic.com/generate_204"',
+const profileProxies = [
+  { name: '\u{1F1EF}\u{1F1F5}日本•移联01', type: 'socks5', server: 'a.example', port: 1 },
+  { name: '\u{1F1F8}\u{1F1EC}新加坡•移联01', type: 'socks5', server: 'b.example', port: 2 },
+  { name: '剩余流量：947.23 GB', type: 'socks5', server: 'c.example', port: 3 },
 ];
-const injected = ProfileConfigMerger.injectSmartPrimary(merged.yaml, SMART_NAME, smartHead);
-record('injectSmartPrimary 成功（未跳过）', injected.ok === true, injected.reason);
+const baseConfig = {
+  'mixed-port': 7890,
+  'mode': 'rule',
+  'proxies': profileProxies,
+  'proxy-groups': [
+    { name: '吹雪云', type: 'select', proxies: ['自动选择', '\u{1F1EF}\u{1F1F5}日本•移联01', '\u{1F1F8}\u{1F1EC}新加坡•移联01'] },
+    { name: '自动选择', type: 'url-test', proxies: ['\u{1F1EF}\u{1F1F5}日本•移联01'] },
+  ],
+  'rules': ['MATCH,吹雪云'],
+};
+const base = new TunBoxBaseData();
+base.config = baseConfig;
+base.digest = 'u';
+base.proxies = 3;
+base.proxyGroups = 2;
+base.rules = 1;
+base.matchRules = ['MATCH,吹雪云'];
 
-if (injected.ok) {
-  // 取出 smart 组的成员名，与 proxies 段的节点名逐一比对
-  const lines = injected.yaml.split('\n');
-  const smartIdx = lines.findIndex((l) => l.indexOf(`name: "${SMART_NAME}"`) >= 0);
-  record('注入后存在 smart 组', smartIdx >= 0);
-  // proxies 段真实名字（解码后）
-  const decodedProxies = YamlMerger.sequenceItemNames(injected.yaml, 'proxies');
-  record('proxies 段读到 3 个节点', decodedProxies.length === 3,
-    'got ' + decodedProxies.length + ' ' + JSON.stringify(decodedProxies));
-  const emojiNode = decodedProxies.find((n) => n.indexOf('日本') >= 0) || '';
-  record('proxies 段节点名是真 emoji', emojiNode.indexOf('\\') < 0 && emojiNode.length > 0,
-    'got ' + JSON.stringify(emojiNode));
-  // smart 组成员块：找 smartIdx 之后第一个 proxies: 起的成员行
-  const memberLines = [];
-  let inMembers = false;
-  for (let i = smartIdx + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (/^\s*proxies:\s*$/.test(l)) { inMembers = true; continue; }
-    if (inMembers) {
-      if (/^\s*-\s/.test(l)) { memberLines.push(l.trim().replace(/^-\s*/, '').replace(/^["']|["']$/g, '')); }
-      else if (l.trim().length === 0) { break; }
-      else if (!l.startsWith('     ')) { break; }
-    }
-  }
-  record('smart 组有成员', memberLines.length > 0, 'members=' + memberLines.length);
-  const emojiMember = memberLines.find((m) => m.indexOf('日本') >= 0) || '';
-  record('smart 组成员名是真 emoji（无字面反斜杠）',
-    emojiMember.length > 0 && emojiMember.indexOf('\\') < 0,
-    'got ' + JSON.stringify(emojiMember));
-  record('smart 组成员名与 proxies 节点名逐字相同（内核寻址前提）',
-    emojiMember === emojiNode, 'member=' + JSON.stringify(emojiMember) + ' node=' + JSON.stringify(emojiNode));
+// 旧 useSmart 参数不得改变 profile 自带的分组语义。
+const input = new TunBoxProfileInput();
+input.profileId = 'uni';
+input.profilePath = '/profiles/uni.yaml';
+input.profilesDir = '/profiles';
+input.overrideYaml = '';
+input.dnsOverrideEnabled = false;
+input.tunEnabled = true;
+input.ipv6Enabled = true;
+input.mtu = 1400;
+input.useSmart = false;
+input.smartTestUrl = 'https://www.gstatic.com/generate_204';
+input.smartPolicyPriority = '';
+
+// C1 同名 URLTest：不得合成重复组，也不得把真实 URLTest 改为 Smart。
+{
+  const collide = JSON.parse(JSON.stringify(base));
+  collide.config['proxy-groups'] = [
+    { name: '吹雪云', type: 'select', proxies: ['自动选择'] },
+    { name: '♻️ 自动选择', type: 'url-test', proxies: ['自动选择'] },
+  ];
+  const r = TunBoxProfileBuilder.compose(collide, {}, null, input);
+  const groups = JSON.parse(r.yaml)['proxy-groups'];
+  const count = groups.filter((g) => g.name === '♻️ 自动选择').length;
+  record('同名组碰撞 → 不注入（无重复组名）', count === 1, 'count=' + count);
+  record('同名 URLTest 类型不变', groups.find(g => g.name === '♻️ 自动选择')?.type === 'url-test');
+}
+
+// C2 真实 Smart：主组、Smart 与静态节点名逐字一致（emoji 无字面反斜杠）
+{
+  const base2 = JSON.parse(JSON.stringify(base));
+  base2.config['proxy-groups'] = [
+    { name: '吹雪云', type: 'select',
+      proxies: ['♻️ 自动选择', '\u{1F1EF}\u{1F1F5}日本•移联01', '\u{1F1F8}\u{1F1EC}新加坡•移联01'] },
+    { name: '♻️ 自动选择', type: 'smart', uselightgbm: false,
+      proxies: ['\u{1F1EF}\u{1F1F5}日本•移联01', '\u{1F1F8}\u{1F1EC}新加坡•移联01'] },
+  ];
+  const r = TunBoxProfileBuilder.compose(base2, {}, null, input);
+  const doc = JSON.parse(r.yaml);
+  const groups = doc['proxy-groups'];
+  const smart = groups.find((g) => g.name === '♻️ 自动选择');
+  record('profile 自带 Smart 组原样保留', smart?.type === 'smart' && smart.uselightgbm === false);
+  const emojiNode = profileProxies[0].name;
+  record('静态节点名是真 emoji（无字面反斜杠）', emojiNode.indexOf('\\') < 0, JSON.stringify(emojiNode));
+  record('smart 组成员含真 emoji 节点名（与 proxies 逐字一致）',
+    smart !== undefined && Array.isArray(smart.proxies) && smart.proxies.includes(emojiNode),
+    smart ? JSON.stringify(smart.proxies) : 'no group');
+  const primary = groups.find((g) => g.name === '吹雪云');
+  record('主组首位 = smart', primary !== undefined && primary.proxies[0] === '♻️ 自动选择',
+    primary ? JSON.stringify(primary.proxies.slice(0, 2)) : 'no group');
+  record('主组原有 unicode 成员保留',
+    primary !== undefined && primary.proxies.includes(emojiNode));
+}
+
+{
+  input.useSmart = true;
+  const r = TunBoxProfileBuilder.compose(JSON.parse(JSON.stringify(base)), {}, null, input);
+  const doc = JSON.parse(r.yaml);
+  const smart=doc['proxy-groups'].find(group=>group.name===r.smartGroupName);
+  record('恢复的 Smart 使用内核解析后的 unicode 名称',smart?.proxies.includes(profileProxies[0].name));
+  record('Smart 不含机场信息条目',!smart?.proxies.includes(profileProxies[2].name));
 }
 
 // ── 结论 ───────────────────────────────────────────────────────────────

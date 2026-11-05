@@ -2,7 +2,7 @@
  * TunBox UI Tokens — 1:1 对齐 upstream packages/tunbox_shared/lib/widgets/tunbox_app_surface.dart
  * 这是真实安卓版使用的现代色板（app_theme.dart 为旧版兼容色，勿再使用）。
  */
-import { LatencyRecord, LatencyState, LatencyPolicy } from '../commons/services/LatencyState';
+import { LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore';
 import { AppBgTheme, ThemeService } from './ThemeService';
 
@@ -44,6 +44,41 @@ export class Ui {
   static readonly powerRingIdle: ResourceColor = $r('app.color.ui_power_ring_idle');
   static readonly powerInnerActive: ResourceColor = $r('app.color.ui_power_inner_active');
   static readonly powerInnerIdle: ResourceColor = $r('app.color.ui_power_inner_idle');
+
+  static primaryFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.brandPrimary : Ui.primary;
+  }
+
+  static primaryBlueFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.brandPrimary : Ui.primaryBlue;
+  }
+
+  static primaryBlueFillFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.brandLight : Ui.primaryBlueFill;
+  }
+
+  static textPrimaryFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.textPrimary : Ui.textPrimary;
+  }
+
+  static textSecondaryFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.textSecondary : Ui.textSecondary;
+  }
+
+  static textTertiaryFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.textMuted : Ui.textTertiary;
+  }
+
+  static textBlueFor(rev: number): ResourceColor {
+    const palette = ThemeService.semanticPalette(rev);
+    return palette.backgroundVariant ? palette.brandText : Ui.textBlue;
+  }
 
   // ── 随浅色背景配色派生的表面色（2026-10-28 用户要求「卡片/表面要跟着背景配色走，别是死白」）──
   //
@@ -148,9 +183,9 @@ export class LatencyStyle {
     return latency !== null && (latency <= 0 || latency >= LatencyStyle.TIMEOUT_MS);
   }
 
-  static color(latency: number | null): ResourceColor {
+  static color(latency: number | null, rev: number = -1): ResourceColor {
     if (latency === null) {
-      return Ui.textSecondary;
+      return rev >= 0 ? Ui.textSecondaryFor(rev) : Ui.textSecondary;
     }
     if (LatencyStyle.isTimeout(latency)) {
       return Ui.error;
@@ -184,6 +219,7 @@ export class LatencyStyle {
    * 显示成中性「未测」，真机表现为「导入订阅后一大片未测」，用户明确要求
    * 「要么显示延迟多少、要么显示超时」——已测出结论却显示成没测过，反而误导。
    */
+  /** 缓存结论直接显示，不附加旧标记；时间戳仍由调度/重测策略使用。 */
   static recordText(rec: LatencyRecord | null, nowMs: number): string {
     if (rec === null) {
       return '--';
@@ -193,10 +229,8 @@ export class LatencyStyle {
       if (rec.state === LatencyState.OFFLINE) {
         return `≈${body}`;
       }
-      return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
+      return body;
     }
-    // 上一轮（冷启动从快照恢复）的失败结论 → 标「·旧」并灰显，
-    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」。
     // 瞬态（测试中 / 已取消）不是结论 —— 用状态词，不查结论表。
     if (rec.state === LatencyState.TESTING) {
       return '测试中';
@@ -208,32 +242,22 @@ export class LatencyStyle {
     // 旧实现在这里另有一份 stateText 包装（两份一模一样 ⇒ 审计 LP05），
     // 现在只认内核那一张表：同一个 failKind 在任何来源都得到同一个文案与级别。
     const view = LatencyStore.describe(rec.failKind, rec.delayMs, rec.atMs, nowMs);
-    // 失败结论也可能是**上一轮**的（冷启动从持久化快照恢复）。
-    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」：
-    // 旧结论不能顶着一颗新鲜的红「超时」出现在列表里 → 标「·旧」并灰显，
-    // 与「123ms·旧」的既有口径一致（过期 = 中性，不是当前结论）。
-    if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
-      return `${view.text}·旧`;
-    }
     return view.text;
   }
 
   /**
-   * 状态化配色：实测走既有阈值；过期结果与测试中为中性色；失败一律红。
+   * 状态化配色：缓存与本次实测都走延迟阈值；测试中为中性色；失败一律红。
    *
    * 例外：「节点未生效」（内核代理表里没有它 = 节点没进配置）用警告色 —— 红=「节点坏了」，
    * 但这种情况节点可能是好的、只是配置生成把它丢了（真机 2026-10-19：36 个 anytls
    * 被丢弃 → 内核 404 → UI 全红，节点实际可用）。
    */
-  static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
+  static recordColor(rec: LatencyRecord | null, nowMs: number, rev: number = -1): ResourceColor {
     if (rec === null) {
-      return Ui.textSecondary;
+      return rev >= 0 ? Ui.textSecondaryFor(rev) : Ui.textSecondary;
     }
     if (rec.hasValue()) {
-      if (LatencyPolicy.isStale(rec, nowMs)) {
-        return Ui.textSecondary;
-      }
-      return LatencyStyle.color(rec.delayMs);
+      return LatencyStyle.color(rec.delayMs, rev);
     }
     // 结论的**级别**（严重程度）同样归真源：describe().level
     // WARN = 「未生效」（内核表里没有它 = 配置把它丢了，节点可能是好的）→ 警告色；
@@ -243,14 +267,10 @@ export class LatencyStyle {
       return Ui.warning;
     }
     if (view.level === LatencyViewLevel.BAD) {
-      // 陈旧的失败结论（上一轮的）→ 中性灰，不顶红字（与 recordText 同口径）
-      if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
-        return Ui.textSecondary;
-      }
       return Ui.error;
     }
     // UNTESTED / TESTING / CANCELLED：中性，不吓唬用户
-    return Ui.textSecondary;
+    return rev >= 0 ? Ui.textSecondaryFor(rev) : Ui.textSecondary;
   }
 }
 

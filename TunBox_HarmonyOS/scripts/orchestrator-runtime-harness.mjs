@@ -63,6 +63,7 @@ export function harness() {
     return { ok: text.length > 0, text, truncated: false };
   }
   const subs = { nodes: [{ id: 'fixture-node', name: 'test-node' }], async init() {},
+    nodesOf() { return this.nodes; },
     fallbackConnectionNode() { return this.nodes[0] ?? null; } };
   const context = vm.createContext({
     Date: Clock, Math, Promise, Map, Set, Number,
@@ -219,6 +220,15 @@ export function harness() {
   // Phase 3（2026-10-28）：退避策略与重连链路已独立成模块，门禁必须跑**真实**实现。
   // 用桩会让「用户断开后旧定时器不得复活」「作废尝试不得排重试」这类断言失去意义。
   Object.assign(context, load('commons/services/ReconnectPolicy.ets', '({ ReconnectPolicy })', context));
+  Object.assign(context, load('commons/services/NetworkStateWatcher.ets', '({ NetTypes })', context));
+  Object.assign(context, load('commons/services/connection/ConnState.ets', '({ ConnState, connStateName })', context));
+  Object.assign(context, load('commons/services/connection/ConnectionStateMachine.ets', '({ ConnectionStateMachine })', context));
+  Object.assign(context, load('commons/services/VpnRecoveryPolicy.ets',
+    '({ isNonRetryableStartupError, friendlyVpnStartError })', context));
+  Object.assign(context, load('commons/services/LinkHealthChecker.ets',
+    '({ ProbeOutcome, runLinkHealthCheck, summarize, repairSteps, RepairActions })', context));
+  Object.assign(context, load('commons/services/OrchestratorHealthProbes.ets',
+    '({ OrchestratorHealthProbes })', context));
   Object.assign(context, load('commons/services/connection/ReconnectManager.ets',
     '({ ReconnectManager, ReconnectHost, ReconnectAttemptOutcome, ReconnectRuntimeState, ReconnectTelemetry })',
     context));

@@ -96,7 +96,8 @@ const ARC_IP_SPAN_MAX_DEG = 180;
 
 @Component
 export struct CelestialPowerOrb {
-  @Link @Watch('onConnectionChanged') isConnected: boolean;
+  /** 仅用于按钮展示；父页面可提前点亮，不向真实连接状态反写。 */
+  @Prop @Watch('onConnectionChanged') isConnected: boolean = false;
   @Prop isConnecting: boolean = false;
   /** 当前节点名：显示在启动按钮内部（空则显示占位，同旧 StatusRing 行为） */
   @Prop nodeName: string = '';
@@ -215,7 +216,7 @@ export struct CelestialPowerOrb {
         Text(ch)
           .fontSize(this.arcFontSize(this.ipChars().length))
           .fontFamily('monospace')
-          .fontColor(TunBoxColors.textSecondary)
+          .fontColor(TunBoxColors.textSecondaryFor(this.themeRevision))
           .rotate({ angle: this.arcAngleDeg(idx, this.ipChars().length) - 90 })
           .position({ x: this.arcPosX(idx, this.ipChars().length), y: this.arcPosY(idx, this.ipChars().length) })
       }, (ch: string, idx: number) => `${this.ipText.length}:${idx}:${ch}`)
@@ -281,7 +282,7 @@ export struct CelestialPowerOrb {
 
   /** 当前强调色：连接态转翡翠绿，其余品牌蓝 */
   private accent(): ResourceColor {
-    return this.isConnected ? TunBoxColors.success : TunBoxColors.primary;
+    return this.isConnected ? TunBoxColors.success : TunBoxColors.primaryFor(this.themeRevision);
   }
 
   // ── 文案状态机 ──
@@ -680,12 +681,12 @@ export struct CelestialPowerOrb {
           Text(this.titleText())
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
-            .fontColor(TunBoxColors.textPrimary)
+            .fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
             .maxLines(1)
           // 当前节点名（按钮内部，原 StatusRing 位置语义）
           Text(this.nodeName.length > 0 ? this.nodeName : '暂无可用节点')
             .fontSize(12)
-            .fontColor(TunBoxColors.textMuted)
+            .fontColor(TunBoxColors.textMutedFor(this.themeRevision))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .constraintSize({ maxWidth: this.discSize - 40 })

@@ -9,9 +9,59 @@ import (
 	"testing"
 	"time"
 
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener"
 	LC "github.com/metacubex/mihomo/listener/config"
+	"github.com/metacubex/mihomo/tunnel/statistic"
 )
+
+type networkTracker struct {
+	C.Connection
+	id     string
+	closed bool
+	info   statistic.TrackerInfo
+}
+
+func (c *networkTracker) ID() string                   { return c.id }
+func (c *networkTracker) Info() *statistic.TrackerInfo { return &c.info }
+func (c *networkTracker) Close() error                 { c.closed = true; return nil }
+
+func TestUpdateNetworkDoesNotRecreateTunOrCloseFlowsForDNSOnly(t *testing.T) {
+	coreMu.Lock()
+	previousRunning := running
+	running = true
+	coreMu.Unlock()
+	defer func() { coreMu.Lock(); running = previousRunning; coreMu.Unlock() }()
+	before := listener.LastTunConf
+	tracker := &networkTracker{id: "network-update-fixture", info: statistic.TrackerInfo{Metadata: &C.Metadata{}}}
+	statistic.DefaultManager.Join(tracker)
+	defer statistic.DefaultManager.Leave(tracker)
+	if err := UpdateNetwork([]string{"1.1.1.1"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if tracker.closed {
+		t.Fatal("DNS-only update closed live flow")
+	}
+	if err := UpdateNetwork([]string{"9.9.9.9"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if !tracker.closed {
+		t.Fatal("network replacement retained obsolete flow")
+	}
+	if listener.LastTunConf.Enable != before.Enable || listener.LastTunConf.FileDescriptor != before.FileDescriptor || listener.LastTunConf.MTU != before.MTU {
+		t.Fatal("lightweight network update changed TUN configuration")
+	}
+	if !IsRunning() {
+		t.Fatal("network update stopped Core")
+	}
+}
+
+func TestUpdateNetworkRejectsStoppedCore(t *testing.T) {
+	Stop()
+	if err := UpdateNetwork([]string{"1.1.1.1"}, true); err == nil {
+		t.Fatal("stopped core reported update success")
+	}
+}
 
 type fixedRawConn uintptr
 
@@ -28,12 +78,19 @@ func (fixedRawConn) Write(func(uintptr) bool) error {
 	return errors.New("unexpected RawConn.Write")
 }
 
-func TestProtectSocketFailsOpenWithoutSession(t *testing.T) {
+func TestProtectSocketHeadlessAndMissingVpnSession(t *testing.T) {
 	replaceProtectSession(nil)
+	previous := protectRequired.Load()
+	defer protectRequired.Store(previous)
+	protectRequired.Store(false)
 	// 新语义: protect 通知只是兜底提示(进程级 protectProcessNet 才是主保障),
 	// 没有会话时也必须放行拨号, 绝不能让 dial 失败。
 	if err := protectSocket("tcp", "example.com:443", nil); err != nil {
 		t.Fatalf("protect dispatcher blocked a socket without a monitor: %v", err)
+	}
+	protectRequired.Store(true)
+	if err := protectSocket("tcp", "example.com:443", nil); !errors.Is(err, ErrSocketUnprotected) {
+		t.Fatalf("missing VPN protector allowed outbound: %v", err)
 	}
 }
 
@@ -112,7 +169,10 @@ func TestInstallProtectSessionRejectsPendingStop(t *testing.T) {
 
 // TestProtectSocketWaitsForAckAndFailsOpenGrace 验证 v3 语义:
 // 无回执时等待上限≈protectWaitTimeout 后放行(fail-open), 有按 fd 回执时快速放行。
-func TestProtectSocketWaitsForAckAndFailsOpenGrace(t *testing.T) {
+func TestProtectSocketRequiresPositiveAck(t *testing.T) {
+	previous := protectRequired.Load()
+	protectRequired.Store(true)
+	defer protectRequired.Store(previous)
 	readPipe, writePipe, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("create protect pipe: %v", err)
@@ -137,8 +197,8 @@ func TestProtectSocketWaitsForAckAndFailsOpenGrace(t *testing.T) {
 	// 1) 无读者: 单次调用应在 grace 内返回 nil, 且 (fd, seq) 记录已写入管道。
 	_ = readPipe.SetDeadline(time.Now().Add(30 * time.Second))
 	started := time.Now()
-	if err := protectSocket("tcp", "example.com:443", fixedRawConn(42)); err != nil {
-		t.Fatalf("protect socket blocked the dial with an error: %v", err)
+	if err := protectSocket("tcp", "example.com:443", fixedRawConn(42)); !errors.Is(err, ErrSocketUnprotected) {
+		t.Fatalf("unacknowledged VPN dial was not blocked: %v", err)
 	}
 	elapsed := time.Since(started)
 	if elapsed < protectWaitTimeout/2 || elapsed > protectWaitTimeout+3*time.Second {
@@ -198,8 +258,8 @@ func TestProtectSocketWaitsForAckAndFailsOpenGrace(t *testing.T) {
 	// 3) 会话退役: 等待者立即放行(不挂 grace 时长), 管道 EOF。
 	retireProtectSession(session)
 	retireStarted := time.Now()
-	if err := protectSocket("tcp", "example.com:443", fixedRawConn(7)); err != nil {
-		t.Fatalf("protect after retire: %v", err)
+	if err := protectSocket("tcp", "example.com:443", fixedRawConn(7)); !errors.Is(err, ErrSocketUnprotected) {
+		t.Fatalf("retired VPN protector allowed dial: %v", err)
 	}
 	if time.Since(retireStarted) > time.Second {
 		t.Fatal("protect did not skip a retired session promptly")
@@ -321,5 +381,96 @@ func TestInitProtectTransfersDuplicateReaderAcrossStop(t *testing.T) {
 	var trailing [1]byte
 	if count, err := transferRead.Read(trailing[:]); count != 0 || !errors.Is(err, io.EOF) {
 		t.Fatalf("transferred reader after Stop = (%d, %v), want (0, EOF)", count, err)
+	}
+}
+
+func TestHeadlessPhysicalBinderFailsClosedAndDoesNotReplaceVPNProtection(t *testing.T) {
+	previousRequired := protectRequired.Swap(false)
+	previous := currentProtectSession()
+	replaceProtectSession(nil)
+	defer func() {
+		SetHeadlessSocketBinder(nil)
+		protectRequired.Store(previousRequired)
+		replaceProtectSession(previous)
+	}()
+	calls := 0
+	bindError := errors.New("physical network disappeared")
+	SetHeadlessSocketBinder(func(fd int) error {
+		calls++
+		if fd != 42 {
+			t.Fatalf("wrong fd: %d", fd)
+		}
+		return bindError
+	})
+	if err := protectSocket("tcp", "example.com:443", fixedRawConn(42)); !errors.Is(err, bindError) {
+		t.Fatalf("headless dial must fail closed: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("binder not called: %d", calls)
+	}
+	protectRequired.Store(true)
+	if err := protectSocket("tcp", "example.com:443", fixedRawConn(42)); !errors.Is(err, ErrSocketUnprotected) {
+		t.Fatalf("VPN must still require its own protection receipt: %v", err)
+	}
+	if calls != 1 {
+		t.Fatal("headless binder bypassed VPN protect gate")
+	}
+	SetHeadlessSocketBinder(nil)
+	if err := protectSocket("udp", "dns.example:53", fixedRawConn(42)); !errors.Is(err, ErrSocketUnprotected) {
+		t.Fatalf("clearing the headless binder must not bypass VPN protection: %v", err)
+	}
+	protectRequired.Store(false)
+	if err := protectSocket("udp", "dns.example:53", fixedRawConn(42)); err != nil {
+		t.Fatalf("subscription DNS after headless cleanup must use the ordinary route: %v", err)
+	}
+	if calls != 1 {
+		t.Fatal("subscription DNS reused the retired headless binder")
+	}
+}
+
+// A completed protect(fd) Promise may outlive its monitor and InitProtect.
+func TestProtectReceiptCannotCrossSessionRestart(t *testing.T) {
+	old := newProtectSession()
+	_, oldSeq := old.registerWaiter()
+	old.cancel()
+	next := newProtectSession()
+	replaceProtectSession(next)
+	t.Cleanup(func() { replaceProtectSession(nil) })
+	entry, nextSeq := next.registerWaiter()
+	if oldSeq == nextSeq || nextSeq == 0 {
+		t.Fatal("protect receipt reused across sessions")
+	}
+	// Even reuse of the same OS fd must not let the old callback authorize it.
+	SetProtectResultForFd(42, oldSeq, true)
+	select {
+	case <-entry.ch:
+		t.Fatal("late callback authorized a new session's socket")
+	default:
+	}
+	SetProtectResultForFd(42, nextSeq, true)
+	select {
+	case ok := <-entry.ch:
+		if !ok {
+			t.Fatal("current callback rejected")
+		}
+	default:
+		t.Fatal("current callback not delivered")
+	}
+}
+
+func TestProtectReceiptSequenceExhaustionFailsClosed(t *testing.T) {
+	previous := protectSequence.Load()
+	t.Cleanup(func() { protectSequence.Store(previous) })
+	protectSequence.Store(^uint32(0) - 1)
+	session := newProtectSession()
+	entry, seq := session.registerWaiter()
+	if entry == nil || seq != ^uint32(0) {
+		t.Fatal("last unique token was lost")
+	}
+	for i := 0; i < 3; i++ {
+		entry, seq = newProtectSession().registerWaiter()
+		if entry != nil || seq != 0 {
+			t.Fatal("sequence wrapped and reused an old token")
+		}
 	}
 }

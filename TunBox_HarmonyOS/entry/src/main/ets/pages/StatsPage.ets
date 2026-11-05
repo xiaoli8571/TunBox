@@ -72,6 +72,7 @@ function countryCodeToFlag(code: string): string {
  */
 @Component
 struct StatsRateChart {
+  @StorageLink('theme_revision') themeRevision: number = 0;
   @Prop upPoints: number[] = [];
   @Prop downPoints: number[] = [];
 
@@ -102,12 +103,12 @@ struct StatsRateChart {
     Stack({ alignContent: Alignment.TopStart }) {
       Polygon({ width: this.chartW, height: this.chartH })
         .points(this.areaOf(this.downPoints))
-        .fill(TunBoxColors.primaryLight)
+        .fill(TunBoxColors.primaryLightFor(this.themeRevision))
         .stroke(Color.Transparent)
         .strokeWidth(0)
       Polyline({ width: this.chartW, height: this.chartH })
         .points(this.toPoints(this.downPoints))
-        .stroke(TunBoxColors.primary)
+        .stroke(TunBoxColors.primaryFor(this.themeRevision))
         .strokeWidth(2.2)
         .strokeLineCap(LineCapStyle.Round)
         .strokeLineJoin(LineJoinStyle.Round)
@@ -186,6 +187,7 @@ export struct StatsPage {
   private rssReadLogged: boolean = false;
   private ipQueuedTrigger: string = '';
   private ipRequestId: number = 0;
+  private ipActiveRequestId: number = 0;
   private pageMounted: boolean = false;
   private connEventToken: number = -1;
   private ready: boolean = false;
@@ -438,14 +440,18 @@ export struct StatsPage {
       return;
     }
     if (this.ipBusy) {
-      this.ipQueuedTrigger = trigger;
+      // 同一会话的 shown/bootstrap 共用在飞查询；只有换会话作废旧请求后才补一轮。
+      if (this.ipActiveRequestId !== this.ipRequestId) { this.ipQueuedTrigger = trigger; }
       return;
     }
     const requestId: number = ++this.ipRequestId;
+    this.ipActiveRequestId = requestId;
     this.ipBusy = true;
     this.ipState = 1;
     try {
-      const info: PublicIpInfo = await PublicIpService.query('stats/' + trigger);
+      const info: PublicIpInfo = await PublicIpService.query('stats/' + trigger, true,
+        (): boolean => this.pageMounted && requestId === this.ipRequestId
+          && this.orchestrator.state === ConnState.CONNECTED);
       if (requestId !== this.ipRequestId) {
         return;
       }
@@ -612,7 +618,7 @@ export struct StatsPage {
       return TunBoxColors.danger;
     }
     if (state === ProbeState.IDLE || state === ProbeState.TESTING) {
-      return TunBoxColors.textMuted;
+      return TunBoxColors.textMutedFor(this.themeRevision);
     }
     return TunBoxColors.danger;
   }
@@ -620,15 +626,15 @@ export struct StatsPage {
   // ───────────────────────── 卡片 ─────────────────────────
 
   @Builder
-  MetricRow(icon: Resource, label: string, value: string, valueColor: ResourceColor) {
+  MetricRow(icon: Resource, label: string, value: string) {
     Row({ space: 6 }) {
-      Image(icon).width(13).height(13).fillColor(TunBoxColors.textMuted)
+      Image(icon).width(13).height(13).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
       Text(label)
-        .fontSize(11).fontColor(TunBoxTextColors.secondary)
+        .fontSize(11).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
         .maxLines(1)
       Blank()
       Text(value)
-        .fontSize(12).fontWeight(FontWeight.Medium).fontColor(valueColor)
+        .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
         .textAlign(TextAlign.End)
@@ -643,11 +649,11 @@ export struct StatsPage {
       Row({ space: 10 }) {
         Column({ space: 2 }) {
           Row({ space: 4 }) {
-            Image($r('app.media.ic_chevron_down')).width(12).height(12).fillColor(TunBoxColors.primary)
-            Text('下载').fontSize(11).fontColor(TunBoxTextColors.secondary)
+            Image($r('app.media.ic_chevron_down')).width(12).height(12).fillColor(TunBoxColors.primaryFor(this.themeRevision))
+            Text('下载').fontSize(11).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
           }
           Text(this.formatSpeed(this.downSpeed))
-            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .alignItems(HorizontalAlign.Start)
@@ -658,10 +664,10 @@ export struct StatsPage {
             Image($r('app.media.ic_chevron_down'))
               .width(12).height(12).fillColor(TunBoxColors.success)
               .rotate({ angle: 180 })
-            Text('上传').fontSize(11).fontColor(TunBoxTextColors.secondary)
+            Text('上传').fontSize(11).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
           }
           Text(this.formatSpeed(this.upSpeed))
-            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+            .fontSize(18).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .alignItems(HorizontalAlign.Start)
@@ -673,26 +679,21 @@ export struct StatsPage {
       StatsRateChart({ upPoints: this.upPoints, downPoints: this.downPoints })
 
       this.MetricRow($r('app.media.ic_bolt'), '峰值',
-        `${this.formatSpeed(this.peakDown)} / ${this.formatSpeed(this.peakUp)}`,
-        TunBoxTextColors.primary)
+        `${this.formatSpeed(this.peakDown)} / ${this.formatSpeed(this.peakUp)}`)
       this.MetricRow($r('app.media.ic_sort'), '平均',
-        `${this.formatSpeed(this.avgDown)} / ${this.formatSpeed(this.avgUp)}`,
-        TunBoxTextColors.primary)
+        `${this.formatSpeed(this.avgDown)} / ${this.formatSpeed(this.avgUp)}`)
 
       Divider().color(TunBoxColors.cardBorder(this.themeRevision)).strokeWidth(1)
 
       this.MetricRow($r('app.media.ic_swap'), '本次连接',
-        `↓ ${this.formatBytes(this.sessionDown)}   ↑ ${this.formatBytes(this.sessionUp)}`,
-        TunBoxTextColors.primary)
+        `↓ ${this.formatBytes(this.sessionDown)}   ↑ ${this.formatBytes(this.sessionUp)}`)
       this.MetricRow($r('app.media.ic_doc'), '累计总量',
-        `↓ ${this.formatBytes(this.lifetimeDown)}   ↑ ${this.formatBytes(this.lifetimeUp)}`,
-        TunBoxTextColors.primary)
+        `↓ ${this.formatBytes(this.lifetimeDown)}   ↑ ${this.formatBytes(this.lifetimeUp)}`)
       this.MetricRow($r('app.media.ic_globe'), '今日',
-        `↓ ${this.formatBytes(this.todayDown)}   ↑ ${this.formatBytes(this.todayUp)}`,
-        TunBoxTextColors.primary)
+        `↓ ${this.formatBytes(this.todayDown)}   ↑ ${this.formatBytes(this.todayUp)}`)
 
       Text(`每月 ${this.resetDay} 日 00:00 自动清零累计（点按切换 1–28 日）`)
-        .fontSize(10).fontColor(TunBoxTextColors.muted)
+        .fontSize(10).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         .width('100%')
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         .onClick((): void => { this.cycleResetDay(); })
@@ -711,15 +712,15 @@ export struct StatsPage {
     Row({ space: 12 }) {
       Column({ space: 6 }) {
         Row({ space: 5 }) {
-          Image($r('app.media.ic_memory')).width(14).height(14).fillColor(TunBoxColors.primary)
+          Image($r('app.media.ic_memory')).width(14).height(14).fillColor(TunBoxColors.primaryFor(this.themeRevision))
           Text('内存占用')
-            .fontSize(12).fontColor(TunBoxTextColors.secondary)
+            .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
         Text(this.memoryText)
-          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -732,15 +733,15 @@ export struct StatsPage {
 
       Column({ space: 6 }) {
         Row({ space: 5 }) {
-          Image($r('app.media.ic_clock')).width(14).height(14).fillColor(TunBoxColors.primary)
+          Image($r('app.media.ic_clock')).width(14).height(14).fillColor(TunBoxColors.primaryFor(this.themeRevision))
           Text('运行时间')
-            .fontSize(12).fontColor(TunBoxTextColors.secondary)
+            .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
             .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
         Text(this.uptimeText)
-          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -759,9 +760,9 @@ export struct StatsPage {
   IpCard() {
     Column({ space: 8 }) {
       Row({ space: 6 }) {
-        Image($r('app.media.ic_globe')).width(14).height(14).fillColor(TunBoxColors.primary)
+        Image($r('app.media.ic_globe')).width(14).height(14).fillColor(TunBoxColors.primaryFor(this.themeRevision))
         Text('出口 IP')
-          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         Blank()
         if (this.ipFlag.length > 0) {
           Text(this.ipFlag).fontSize(16).margin({ right: 6 })
@@ -771,7 +772,7 @@ export struct StatsPage {
             : (this.ipText.length > 0 ? this.ipText : '--')))
           .fontSize(12)
           .fontColor(this.ipState === 3 ? TunBoxColors.danger
-            : (this.ipState === 1 ? TunBoxTextColors.muted : TunBoxTextColors.primary))
+            : (this.ipState === 1 ? TunBoxTextColors.mutedFor(this.themeRevision) : TunBoxTextColors.primaryFor(this.themeRevision)))
           .fontFamily('monospace')
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .onClick((): void => { this.queryIp('user-retry'); })
@@ -781,19 +782,19 @@ export struct StatsPage {
 
       if (this.ipState === 2) {
         this.MetricRow($r('app.media.ic_globe'), '国家/地区',
-          this.ipCountry.length > 0 ? this.ipCountry : '--', TunBoxTextColors.primary)
+          this.ipCountry.length > 0 ? this.ipCountry : '--')
         this.MetricRow($r('app.media.ic_globe'), '城市',
-          this.ipCity.length > 0 ? this.ipCity : '--', TunBoxTextColors.primary)
+          this.ipCity.length > 0 ? this.ipCity : '--')
         this.MetricRow($r('app.media.ic_globe'), 'ISP',
-          this.ipIsp.length > 0 ? this.ipIsp : '--', TunBoxTextColors.primary)
+          this.ipIsp.length > 0 ? this.ipIsp : '--')
         this.MetricRow($r('app.media.ic_globe'), 'ASN',
-          this.ipAsn.length > 0 ? this.ipAsn : '--', TunBoxTextColors.primary)
+          this.ipAsn.length > 0 ? this.ipAsn : '--')
         this.MetricRow($r('app.media.ic_globe'), '时区',
-          this.ipTimezone.length > 0 ? this.ipTimezone : '--', TunBoxTextColors.primary)
+          this.ipTimezone.length > 0 ? this.ipTimezone : '--')
       } else {
         Text(this.ipState === 3 ? '未取得出口信息（节点可能不可用，或查询被限流）'
           : (this.isConnected ? '正在通过隧道查询出口信息…' : '连接后显示出口信息'))
-          .fontSize(11).fontColor(TunBoxTextColors.muted)
+          .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
           .width('100%')
           .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
       }
@@ -812,7 +813,7 @@ export struct StatsPage {
       Circle({ width: 7, height: 7 })
         .fill(this.probeStateColor(entry.state, entry.delayMs))
       Text(entry.host)
-        .fontSize(13).fontColor(TunBoxTextColors.secondary)
+        .fontSize(13).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
       Text(entry.state === ProbeState.OK
@@ -847,26 +848,26 @@ export struct StatsPage {
   ConnectivityCard() {
     Column({ space: 10 }) {
       Row({ space: 8 }) {
-        Image($r('app.media.ic_shield')).width(14).height(14).fillColor(TunBoxColors.primary)
+        Image($r('app.media.ic_shield')).width(14).height(14).fillColor(TunBoxColors.primaryFor(this.themeRevision))
         Text('连通性')
-          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+          .fontSize(13).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         Blank()
         Row({ space: 4 }) {
           if (this.testingAll) {
-            LoadingProgress().width(12).height(12).color(TunBoxColors.primary)
+            LoadingProgress().width(12).height(12).color(TunBoxColors.primaryFor(this.themeRevision))
           } else {
-            Image($r('app.media.ic_bolt')).width(13).height(13).fillColor(TunBoxColors.primary)
+            Image($r('app.media.ic_bolt')).width(13).height(13).fillColor(TunBoxColors.primaryFor(this.themeRevision))
           }
-          Text('全部测试').fontSize(11).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlue)
+          Text('全部测试').fontSize(11).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlueFor(this.themeRevision))
         }
         .padding({ left: 8, right: 8, top: 4, bottom: 4 })
         .borderRadius(TunBoxGeometry.pillRadius)
-        .backgroundColor(TunBoxColors.primaryLight)
+        .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
         .onClick((): void => { this.testAll(); })
 
         Row({ space: 4 }) {
-          Image($r('app.media.ic_plus')).width(13).height(13).fillColor(TunBoxColors.textMuted)
-          Text('添加').fontSize(11).fontColor(TunBoxTextColors.muted)
+          Image($r('app.media.ic_plus')).width(13).height(13).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+          Text('添加').fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         }
         .padding({ left: 8, right: 8, top: 4, bottom: 4 })
         .borderRadius(TunBoxGeometry.pillRadius)
@@ -887,9 +888,9 @@ export struct StatsPage {
             .onChange((v: string): void => { this.hostInput = v; })
             .onSubmit((_key: EnterKeyType): void => { this.addHost(); })
           Text('确定')
-            .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlue)
+            .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlueFor(this.themeRevision))
             .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-            .backgroundColor(TunBoxColors.primaryLight)
+            .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
             .borderRadius(10)
             .onClick((): void => { this.addHost(); })
         }
@@ -913,11 +914,11 @@ export struct StatsPage {
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
       } else {
         Text('暂无目标，点「添加」输入域名')
-          .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+          .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
       }
 
       Text('TCP 直连目标 443；HTTP/HTTPS 在代理运行时经本机代理端口。点按单项重测，左滑删除。')
-        .fontSize(10).fontColor(TunBoxTextColors.muted)
+        .fontSize(10).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         .width('100%')
         .maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
     }

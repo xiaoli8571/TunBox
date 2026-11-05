@@ -10,8 +10,8 @@
  *  6) 选择节点的 REST 请求构造（**只造 method/path/body，不发 HTTP**）。
  *
  * 来源（逐条对齐；任何偏离都在下面的「关键口径」里写明）：
- *  - `ref/flclash/core/proxy.go:51-60`  isProxyGroupType：只有这 5 个 AdapterType 算组。
- *  - `ref/flclash/core/proxy.go:84-142` handleGetProxies / proxyView / isBuiltInGlobal：
+ *  - `ref/tunbox/core/proxy.go:51-60`  isProxyGroupType：只有这 5 个 AdapterType 算组。
+ *  - `ref/tunbox/core/proxy.go:84-142` handleGetProxies / proxyView / isBuiltInGlobal：
  *      非组只给 {name,type}；组额外给 now / all / url / history；内置 GLOBAL（reserved
  *      provider）额外打 `"hidden": true`；组名列表里没有 GLOBAL 时把它插到**最前**。
  *  - `lib/providers/state/proxies.dart:4-25`  currentGroupsState：

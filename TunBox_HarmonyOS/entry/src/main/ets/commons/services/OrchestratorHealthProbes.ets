@@ -49,9 +49,18 @@ export interface OrchestratorHealthView {
 /** 10 项链路探针的真实实现 */
 export class OrchestratorHealthProbes implements LinkHealthProbes {
   private view: OrchestratorHealthView;
+  private controllerProbe: Promise<boolean> | null = null;
 
   constructor(view: OrchestratorHealthView) {
     this.view = view;
+  }
+
+  /** 同一轮自检共用一次认证探活，避免心跳与 API 两项得出矛盾结论。 */
+  private controllerAlive(): Promise<boolean> {
+    if (this.controllerProbe === null) {
+      this.controllerProbe = this.view.checkClashApiReachable().catch((): boolean => false);
+    }
+    return this.controllerProbe;
   }
 
   probeSubscription(): Promise<ProbeOutcome> {
@@ -74,7 +83,7 @@ export class OrchestratorHealthProbes implements LinkHealthProbes {
   probeVpnAuth(): Promise<ProbeOutcome> {
     const err = this.view.startErrorText();
     const lower = err.toLowerCase();
-    if (lower.indexOf('permission') >= 0 || err.indexOf('授权') >= 0 || lower.indexOf('201') >= 0) {
+    if (lower.indexOf('permission') >= 0 || err.indexOf('授权') >= 0 || /(?:code[=: ]+|错误码[：: ]+)201\b/.test(lower)) {
       return Promise.resolve(ProbeOutcome.fail('VPN 能力授权缺失: ' + err,
         '请在系统弹窗中允许 VPN 连接', 'grant-vpn-permission'));
     }
@@ -96,21 +105,27 @@ export class OrchestratorHealthProbes implements LinkHealthProbes {
     });
   }
 
-  probeCore(): Promise<ProbeOutcome> {
-    if (this.view.isHeartbeatAlive()) {
-      return Promise.resolve(ProbeOutcome.pass('内核心跳新鲜'));
+  async probeCore(): Promise<ProbeOutcome> {
+    if (!await this.view.isDesiredConnected()) {
+      return ProbeOutcome.skip('未请求连接，跳过内核检查');
     }
-    return Promise.resolve(ProbeOutcome.fail('内核心跳缺失或过期（内核可能已死）',
-      '请重启内核并重建隧道', 'restart-core'));
+    if (this.view.isHeartbeatAlive()) {
+      return ProbeOutcome.pass('扩展进程心跳新鲜');
+    }
+    if (await this.controllerAlive()) {
+      return ProbeOutcome.pass('内核控制接口可达（心跳暂未更新）');
+    }
+    const error = this.view.startErrorText();
+    return ProbeOutcome.fail(error.length > 0 ? `内核未就绪：${error}`
+      : '扩展心跳与内核控制接口均无响应', '请重建代理连接', 'restart-core');
   }
 
-  probeClashApi(): Promise<ProbeOutcome> {
-    return this.view.checkClashApiReachable().then((ok: boolean): ProbeOutcome => {
-      if (ok) {
-        return ProbeOutcome.pass('Clash API 可达');
-      }
-      return ProbeOutcome.fail('Clash API 不可达', '请重启 Clash API（重建隧道）', 'restart-clash-api');
-    });
+  async probeClashApi(): Promise<ProbeOutcome> {
+    if (!await this.view.isDesiredConnected()) {
+      return ProbeOutcome.skip('未请求连接，跳过控制接口检查');
+    }
+    return await this.controllerAlive() ? ProbeOutcome.pass('Clash API 可达')
+      : ProbeOutcome.fail('Clash API 不可达', '请重建代理连接', 'restart-clash-api');
   }
 
   probeDns(): Promise<ProbeOutcome> {

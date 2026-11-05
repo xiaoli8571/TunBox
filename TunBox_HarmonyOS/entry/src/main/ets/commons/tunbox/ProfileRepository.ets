@@ -24,23 +24,27 @@
  * preferences 'tunbox_profiles'        { current: '<id>', autoUpdate: {id:bool} }
  * ```
  *
- * ## 校验（等价 FlClash validateProfile，转换分支见 attachConverter）
+ * ## 校验（等价 FlClash validateProfile，固定上游 be847366）
  *
- * 1. 原文是 Clash 配置 → 内核解析完整文档、展开别名、校验后落盘；
- * 2. 否则尝试 `SubConverter`（mihomo `convert.ConvertsV2Ray` 的移植）→ 转成
- *    `proxies:` 列表再落盘；
- * 3. 两者都失败 → 拒绝，**不覆盖已有文件**（旧 profile 保持可用）。
+ * 1. 原文 temp → 原生 validateProfile（`getProfileBase`，mihomo 同一解析器）；
+ *    通过 → 原样落盘；
+ * 2. age 加密内容 → 原始 AgeSecretKey 错误回 UI；
+ * 3. 其他失败 → `SubConverter`（mihomo `convert.ConvertsV2Ray` 的移植）→ 再原生
+ *    校验 → 通过写转换产物；
+ * 4. 两者都失败 → 拒绝，**不覆盖已有文件**（旧 profile 保持可用）。
  */
 import { preferences } from '@kit.ArkData';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
-import { ProfileConfigMerger } from './ProfileConfigMerger';
 import { BodyDispatch } from '../subscription/BodyDispatch';
+// FlClash saveFile 同构：订阅校验由内核完成（mihomo 同一解析器）
+import { coreBridge } from '../../core/CoreBridge';
 
 const TAG = 'ProfileRepository';
 const PREF_NAME = 'tunbox_profiles';
 const KEY_STATE = 'profile_state';
+const KEY_AGE_PREFIX = 'profile_age_key.';
 const DIR_NAME = 'profiles';
 /** 单份 profile 上限（与订阅拉取上限一致：8MB） */
 const MAX_PROFILE_BYTES = 8 * 1024 * 1024;
@@ -49,20 +53,18 @@ export class ProfileValidationResult {
   ok: boolean = false;
   /** 面向用户的失败文案（成功为空串，对齐 FlClash validateProfile 的返回） */
   message: string = '';
-  /** 是否走了 convertProxies 回退（日志/诊断用） */
+  /** 保留兼容：convert 回退已在 Go 内完成（bridge/profile.go），App 不再自转 */
   converted: boolean = false;
-  /** 转换出的节点数（converted=false 时为原文条目数） */
+  /** age 加密订阅需要密钥（FlClash AgeSecretKeyRequiredException 同构；UI 弹框要 key 后重试） */
+  needAgeSecretKey: boolean = false;
+  /** 节点数（FlClash configCountsOf 口径：内核解析出的 proxies 数） */
   nodeCount: number = 0;
 }
-
-/** 可注入的转换器（SubConverter 的薄接口，避免本文件依赖其实现细节）。 */
-export type ProfileTextConverter = (text: string) => string;
 
 export class ProfileRepository {
   private static store: preferences.Preferences | null = null;
   private static dirPath: string = '';
   private static currentProfileId: string = '';
-  private static converter: ProfileTextConverter | null = null;
   private static loaded: boolean = false;
   private static preparedCache: Map<string, string> = new Map<string, string>();
   private static preparer: ((text: string) => Promise<string>) | null = null;
@@ -71,18 +73,67 @@ export class ProfileRepository {
     ProfileRepository.preparer = preparer;
   }
 
+  /**
+   * config/profile_prepare 严格校验**只留预览**：锚点展开 + 引用校验（Go
+   * `PrepareProfile` 比原生 `UnmarshalRawConfig` 更严，会卡 `rule proxy not
+   * found` 等）。预览失败绝不得卡 native 已通过的 profile —— 回退原文。
+   */
   static async prepare(text: string): Promise<string> {
     if (ProfileRepository.preparer === null) {
-      throw new Error('订阅校验器尚未初始化');
+      return text;
     }
     const key = ProfileRepository.fingerprint(text);
     const cached = ProfileRepository.preparedCache.get(key);
     if (cached !== undefined) { return cached; }
-    const prepared = await ProfileRepository.preparer(text);
+    let prepared = text;
+    try {
+      prepared = await ProfileRepository.preparer(text);
+    } catch (e) {
+      AppLogger.warn(TAG, `profile prepare failed, keep raw text: ${AppLogger.errText(e)}`);
+      return text;
+    }
     if (ProfileRepository.preparedCache.size >= 8) { ProfileRepository.preparedCache.clear(); }
     ProfileRepository.preparedCache.set(key, prepared);
     ProfileRepository.preparedCache.set(ProfileRepository.fingerprint(prepared), prepared);
     return prepared;
+  }
+
+  /** 原生错误是否为 age 加密 / 密钥缺失（bridge/profile.go `ErrAgeSecretKeyRequired`）。 */
+  private static isAgeError(message: string): boolean {
+    const msg = message.toLowerCase();
+    if (msg.includes('agesecretkeyrequired')) {
+      return true;
+    }
+    return msg.includes('age') && (msg.includes('decrypt') || msg.includes('secret'));
+  }
+
+  /**
+   * FlClash `Profile.ageSecretKey`：按 profile 持久化的 age 密钥。
+   * 首次校验返回 `AgeSecretKeyRequired` → UI 要 key → 写入后重试（上游同序）。
+   */
+  static async getAgeSecretKey(id: string): Promise<string> {
+    if (ProfileRepository.store === null || id.length === 0) {
+      return '';
+    }
+    try {
+      const value = await ProfileRepository.store.get(`${KEY_AGE_PREFIX}${id}`, '');
+      return typeof value === 'string' ? value : '';
+    } catch (e) {
+      AppLogger.warn(TAG, `read age key failed: ${AppLogger.errText(e)}`);
+      return '';
+    }
+  }
+
+  static async setAgeSecretKey(id: string, key: string): Promise<void> {
+    if (ProfileRepository.store === null || id.length === 0) {
+      return;
+    }
+    try {
+      await ProfileRepository.store.put(`${KEY_AGE_PREFIX}${id}`, key);
+      await ProfileRepository.store.flush();
+    } catch (e) {
+      AppLogger.warn(TAG, `persist age key failed: ${AppLogger.errText(e)}`);
+    }
   }
 
   /** Content identity only; never include profile text or credentials in logs. */
@@ -98,11 +149,6 @@ export class ProfileRepository {
 
   static revisionOf(id: string): string {
     return id.length === 0 ? '' : ProfileRepository.fingerprint(ProfileRepository.read(id));
-  }
-
-  /** 注入 convertProxies 实现（由 SubConverter 接入；未注入时只走 YAML 校验）。 */
-  static attachConverter(converter: ProfileTextConverter | null): void {
-    ProfileRepository.converter = converter;
   }
 
   static async init(context: Context): Promise<void> {
@@ -285,40 +331,67 @@ export class ProfileRepository {
   }
 
   /**
-   * 校验并落盘（FlClash `validateProfile` 的等价实现）。
+   * 校验并落盘（**FlClash `Profile.saveFile` + controller.validateProfile 同构**，
+   * 固定上游 be847366）。整条链已在原生 `validateProfile` 内实现（bridge/profile.go）：
    *
-   * 已存在的 profile 不被坏内容覆盖：只有 converted 或 YAML 合法时才写。
+   *   原文 → temp → age 解密（armor 头 + 空 key → 原始 `AgeSecretKeyRequired`）
+   *   → validateConfig（`unmarshalRawConfig`，含 short-id retag）
+   *   → 失败走转换器：`convert.ConvertsV2Ray` → 非空写 `{'proxies':...}` 再校验
+   *   → 仍失败返回**首次** issue → 通过后把最终字节**原样** copy 到
+   *   `profiles/<id>.yaml`（不展开锚点、不规范化）。
+   *
+   * App 侧只做三件事：解包裹层（BodyDispatch 不是准入闸）、把 age 密钥透传、
+   * 把原生错误原样回 UI。没有文本闸（R5 反例：JSON 引号键 / `rules:`-only
+   * 都必须直接交给原生判定），也没有 App 侧二次 convert。
    */
-  static async validateAndStore(id: string, text: string): Promise<ProfileValidationResult> {
+  static async validateAndStore(id: string, text: string, ageSecretKey?: string): Promise<ProfileValidationResult> {
     const out = new ProfileValidationResult();
     if (id.length === 0 || text.trim().length === 0) {
       out.message = '订阅内容或标识为空';
       return out;
     }
+    let candidate = text;
     try {
-      // Decode a wrapped YAML document before trying the URI converter.
-      let candidate = BodyDispatch.classify(text).body;
-      if (!ProfileConfigMerger.isKernelLoadableConfig(candidate)) {
-        if (ProfileRepository.converter === null) {
-          out.message = '请提供 Clash 配置或有效节点链接';
-          return out;
-        }
-        candidate = ProfileRepository.converter(candidate);
-        out.converted = true;
-      }
-      // Native YAML resolves aliases in the complete document and validates
-      // outbound/group references without starting a core or fetching providers.
-      const prepared = await ProfileRepository.prepare(candidate);
-      if (prepared.length === 0 || !ProfileRepository.write(id, prepared)) {
-        out.message = '订阅保存失败，已保留旧配置';
-        return out;
-      }
-      out.ok = true;
-      out.nodeCount = ProfileConfigMerger.merge('a: 1', prepared).profileProxyItems;
-      return out;
+      // 解包裹层（base64 包裹的 YAML），不是内容准入闸。
+      candidate = BodyDispatch.classify(text).body;
     } catch (e) {
       out.message = `订阅校验失败，已保留旧配置：${AppLogger.errText(e)}`;
       return out;
+    }
+    let key: string = ageSecretKey ?? '';
+    if (key.trim().length === 0) {
+      key = await ProfileRepository.getAgeSecretKey(id);
+    }
+    const target = ProfileRepository.pathOf(id);
+    try {
+      await coreBridge.validateProfile(candidate, key, target);
+      out.ok = true;
+    } catch (e) {
+      // 原生校验失败：错误原文就是用户需要的东西（FlClash 原样抛给 UI，§5.6）
+      const message: string = AppLogger.errText(e);
+      out.ok = false;
+      out.message = message;
+      // age 密钥需求：原始错误回 UI，UI 取 key 后带 ageSecretKey 重试（上游同序）。
+      if (ProfileRepository.isAgeError(message)) {
+        out.needAgeSecretKey = true;
+      }
+      return out;
+    }
+    if (key.trim().length > 0) {
+      await ProfileRepository.setAgeSecretKey(id, key);
+    }
+    out.nodeCount = await ProfileRepository.countNodes(target);
+    return out;
+  }
+
+  /** FlClash `configCountsOf` 口径：节点数 = 内核解析出的 proxies 数（失败不回打校验结果）。 */
+  private static async countNodes(profilePath: string): Promise<number> {
+    try {
+      const base = await coreBridge.getProfileBase(profilePath);
+      return base.proxies;
+    } catch (e) {
+      AppLogger.warn(TAG, `count profile nodes failed: ${AppLogger.errText(e)}`);
+      return 0;
     }
   }
 }

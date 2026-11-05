@@ -67,7 +67,7 @@
 | verify-latency-core-freshness | 44 项通过 | 新鲜度检查与凭据回填顺序。 |
 | verify-latency-warmup | 28 项通过 | 接管前先结算测速核等约束。 |
 | verify-site-routing | 58 项通过 | 保存/应用边界；另列 6 项既有非门禁 AUDIT 观察。 |
-| verify-flclash-profile | 通过 | 显式开启规则后验证自定义规则集；未改变默认关闭要求。 |
+| verify-tunbox-profile | 通过 | 显式开启规则后验证自定义规则集；未改变默认关闭要求。 |
 
 ### 3.1 回归脚本调整理由
 

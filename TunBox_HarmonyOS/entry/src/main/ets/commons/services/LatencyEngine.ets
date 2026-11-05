@@ -362,6 +362,8 @@ export class LatencyProgress {
   timeout: number = 0;
   failed: number = 0;
   cancelled: number = 0;
+  /** cancelled 为兼容字段，包含无结论数量；只有明确取消才置本标志。 */
+  wasCancelled: boolean = false;
   /** 因结果仍新鲜而跳过的节点数（force=false 时） */
   skipped: number = 0;
   /**
@@ -397,6 +399,19 @@ export class LatencyProgress {
 
   done(): boolean {
     return !this.running;
+  }
+
+  /** 订阅卡与节点页共用收尾口径，不以个别无回复推断整批中断。 */
+  completionMessage(): string {
+    if (this.message.length > 0) { return this.message; }
+    if (this.wasCancelled) { return '本次测速已取消，已完成的结果已保留'; }
+    if (this.total === 0) { return '测速未执行：没有可测速目标'; }
+    const counts = `${this.measured}成功，${this.timeout}超时`
+      + (this.failed > 0 ? `，${this.failed}失败` : '');
+    if (this.cancelled > 0) {
+      return `测速结束：${counts}，${this.cancelled}项未取得结果，请重试`;
+    }
+    return `测速完成：${counts}`;
   }
 }
 
@@ -443,7 +458,7 @@ export class LatencyRun {
    * 批次身份（写入每条 TESTING 记录）。与 generation 分开：
    * generation 会被 cancel/invalidate 递增（用于丢弃结果），runId 必须**稳定**
    * 表示"这批标记是谁打的"，否则收尾时会认不出自己的标记。
-   * 发号统一走 LatencyLiveView.nextRunId（进程内跨引擎唯一，防与 Flclash 路径撞号）。
+   * 发号统一走 LatencyLiveView.nextRunId（进程内跨引擎唯一，防与 TunBox 路径撞号）。
    */
   private readonly runId: number = LatencyLiveView.nextRunId();
   private cancelled: boolean = false;
@@ -519,6 +534,7 @@ export class LatencyRun {
       return;
     }
     this.userCancelled = true;
+    this.progress.wasCancelled = true;
     this.cancelled = true;
     this.generation = this.generation + 1;
     if (this.api !== null) {

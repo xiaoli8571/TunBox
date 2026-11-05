@@ -45,15 +45,17 @@ load('commons/latency/LatencyTestUrl.ets','LatencyTestUrl');
 load('commons/models/AppSettings.ets','AppSettings,AutoSelectModes');
 load('commons/config/RuntimeConfigBuilder.ets','RuntimeConfigBuilder,ConnectionTarget,ConnectionTargetSource');
 load('commons/services/ClashApiService.ets','ClashApiService');
-load('commons/flclash/CoreCatalog.ets','CoreCatalog');
-load('commons/flclash/CoreNodeBridge.ets','CoreNodeBridge');
-load('commons/flclash/ProxyPanelMembers.ets','ProxyPanelMembers');
+load('commons/tunbox/CoreCatalog.ets','CoreCatalog');
+load('commons/tunbox/CoreNodeBridge.ets','CoreNodeBridge');
+load('commons/tunbox/ProxyPanelMembers.ets','ProxyPanelMembers');
+load('commons/services/YamlMerger.ets','YamlMerger');
+load('commons/tunbox/ProfileConfigMerger.ets','ProfileConfigMerger');
 const {SubscriptionService}=load('commons/services/SubscriptionService.ets','SubscriptionService');
-const {CoreCatalogService}=load('commons/flclash/CoreCatalogService.ets','CoreCatalogService');
+const {CoreCatalogService}=load('commons/tunbox/CoreCatalogService.ets','CoreCatalogService');
 // The startup pin phase is executed verbatim, including the legacy fallback branch.
 // Failures before this phase (VPN permissions/platform bring-up) are outside this fixture.
 const orch=read('commons/services/ConnectionOrchestrator.ets');
-const start=orch.indexOf('      const pinSmartGroup =',orch.indexOf('private async connectExclusive('));
+const start=orch.indexOf('      const startupGroupName:',orch.indexOf('private async connectExclusive('));
 const end=orch.indexOf('      ConnectionEvents.emit(ConnEvent.exit(',start);
 assert.ok(start>0 && end>start);
 const pin=vm.runInContext(stripTypeScriptTypes(`(async function(target,built,settings,subs){
@@ -117,6 +119,9 @@ try {
   const yaml=prepare(`external-controller: 127.0.0.1:${port}
 mode: rule
 log-level: error
+dns:
+  enable: false
+  enhanced-mode: fake-ip
 profile:
   store-selected: true
 proxy-providers:
@@ -128,12 +133,13 @@ proxy-providers:
 proxies:
   - {name: 直连, type: direct}
 proxy-groups:
-  - {name: 默认代理, type: select, proxies: [香港故转, 台湾手动, 直连]}
+  - {name: 默认代理, type: select, proxies: [香港故转, 台湾手动, 直连, APP-SMART]}
   - {name: AI, type: select, proxies: [默认代理, 台湾手动, 直连]}
   - {name: YouTube, type: select, proxies: [默认代理, 台湾手动, 直连]}
   - {name: 香港故转, type: fallback, use: [HH], filter: ^HK, lazy: true, url: http://127.0.0.1:${provider.address().port}/check, interval: 86400}
   - {name: 台湾手动, type: select, use: [HH], filter: ^TW}
-  - {name: GLOBAL, type: select, proxies: [默认代理, 台湾手动, 直连]}
+  - {name: APP-SMART, type: smart, use: [HH], uselightgbm: false, collectdata: false, prefer-asn: false, interval: 0}
+  - {name: GLOBAL, type: select, proxies: [默认代理, 台湾手动, 直连, APP-SMART]}
 rules:
   - DOMAIN,ai.example,AI
   - DOMAIN,youtube.example,YouTube
@@ -163,10 +169,10 @@ rules:
   const api=new context.ClashApiService();api.setEndpoint(port,'');
   const state=async()=>JSON.parse(await api.proxiesJson()).proxies;
   function saved(group,name){settings.proxyGroupSelections=context.ProxyPanelMembers.remember(settings.proxyGroupSelections,profileId,group,name);}
-  async function startup(){
+  async function startup(smart=false){
     const target=await service.resolvePreferenceHint() || service.fallbackConnectionNode();
     const resolved=context.RuntimeConfigBuilder.resolvePinTarget(yaml,target.name);
-    const built={yaml,options:{useSmart:false},effectiveNodeName:resolved.nodeName,ruleGroupName:resolved.groupName,pinMatched:resolved.matched};
+    const built={yaml,options:{useSmart:smart},smartGroupName:smart?'APP-SMART':'',effectiveNodeName:resolved.nodeName,ruleGroupName:resolved.groupName,pinMatched:resolved.matched};
     const owner={api,connectSeq:1,disconnectRequested:false,attempts:{currentGeneration:()=>1},pendingProfileRevision:'fixture',
       kernelSelection:{set(value){this.value=value;}},async selfHealPreferredNode(){throw Error('explicit intent was overwritten by fallback');}};
     const selected=await pin.call(owner,target,built,settings,service);return {selected,owner};
@@ -203,6 +209,14 @@ rules:
     try {await assert.rejects(startup,/节点选择未生效/);assert.equal(settings.preferredNodeName,'missing-leaf');}
     finally {api.selectNodeInGroup=select;}
   });
+  for(const mode of ['rule','global']) await test(`Smart startup keeps the group selected in ${mode} mode`,async()=>{
+    reset('TW-02');settings.autoSelectMode='auto';settings.proxyMode=mode;
+    saved('默认代理','直连');saved('GLOBAL','直连');saved('AI','直连');
+    const result=await startup(true);const after=await state();
+    assert.equal(after[mode==='global'?'GLOBAL':'默认代理'].now,'APP-SMART');
+    assert.equal(result.selected,'APP-SMART');
+    assert.equal(after.AI.now,'直连');assert.equal(settings.preferredNodeName,'TW-02');
+  });
   await test('missing explicit leaf is rejected without changing the root to Direct',async()=>{
     const before=(await state())['默认代理'].now;
     assert.equal(await api.selectNodeInGroup('默认代理','missing-leaf',()=>true,0),false);
@@ -223,6 +237,26 @@ rules:
     transport=async(...args)=>{calls++;const result=await original(...args);current=false;return result;};
     assert.equal(await api.selectNodeInGroup('默认代理','台湾手动',()=>current),false);assert.equal(calls,2); // GET proxies + providers, no PUT
     transport=original;
+  });
+  await test('unscoped disk cache cannot force a reimported profile to Direct',async()=>{
+    await api.applyGroupSelection('AI','直连');
+    await api.applyGroupSelection('YouTube','直连');
+    await stop();await boot();
+    assert.equal((await state()).AI.now,'直连'); // reproduce the old cache, not just a mock
+    await stop();
+    const isolated=context.ProfileConfigMerger.enforceTunnelContract(yaml,1500,false);
+    fs.writeFileSync(path.join(scratch,'config.yaml'),isolated);
+    await boot();
+    assert.equal((await state()).AI.now,'默认代理');
+    assert.equal((await state()).YouTube.now,'默认代理');
+    reset('台湾手动');saved('默认代理','台湾手动');saved('台湾手动','TW-02');saved('AI','直连');
+    await startup();
+    assert.equal((await state()).AI.now,'直连'); // explicit, scoped Direct remains valid
+    assert.equal((await state()).YouTube.now,'默认代理');
+    await stop();await boot();
+    await CoreCatalogService.restoreGroupSelections(api,'another-import',settings.proxyGroupSelections);
+    assert.equal((await state()).AI.now,'默认代理');
+    await startup();assert.equal((await state()).AI.now,'直连');
   });
   await stop();
   console.log(`startup selection runtime: ${count} passed`);

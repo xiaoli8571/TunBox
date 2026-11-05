@@ -41,24 +41,24 @@ struct SiteInputDialog {
 
   build() {
     Column({ space: 12 }) {
-      Text('添加 / 批量导入网站').fontSize(19).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      Text('添加 / 批量导入网站').fontSize(19).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimaryFor(this.themeRevision))
       Text('每行一个纯域名，例如 example.com。无需 https://，不要填写路径、端口或通配符；规则包含其子域名。')
-        .fontSize(12).fontColor(Ui.textSecondary)
+        .fontSize(12).fontColor(Ui.textSecondaryFor(this.themeRevision))
       TextArea({ text: this.text, placeholder: 'example.com\nexample.org' }).height(170).maxLength(131072)
-        .backgroundColor(Ui.inputBackground(this.themeRevision)).fontColor(Ui.textPrimary).onChange((value: string) => { this.text = value; })
+        .backgroundColor(Ui.inputBackground(this.themeRevision)).fontColor(Ui.textPrimaryFor(this.themeRevision)).onChange((value: string) => { this.text = value; })
       // 输入即识别：全部行都是合法域名时按钮立刻变实心蓝，不合法行就地标红。
       if (this.text.trim().length > 0) {
         Text(this.errorText().length > 0 ? this.errorText() : this.previewText())
           .fontSize(11)
-          .fontColor(this.errorText().length > 0 ? TunBoxColors.danger : TunBoxColors.textSecondary)
+          .fontColor(this.errorText().length > 0 ? TunBoxColors.danger : TunBoxColors.textSecondaryFor(this.themeRevision))
           .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
       }
       Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong(this.themeRevision)).fontColor(Ui.textPrimary)
+        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong(this.themeRevision)).fontColor(Ui.textPrimaryFor(this.themeRevision))
           .onClick(() => this.controller?.close())
         Button('添加到当前名单').layoutWeight(2)
-          .backgroundColor(this.canAdd() ? TunBoxColors.primary : Ui.buttonDisabled)
-          .fontColor(this.canAdd() ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+          .backgroundColor(this.canAdd() ? TunBoxColors.primaryFor(this.themeRevision) : Ui.buttonDisabled)
+          .fontColor(this.canAdd() ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondaryFor(this.themeRevision))
           .enabled(this.canAdd())
           .onClick(() => { if (this.onAdd(this.text)) { this.controller?.close(); } })
       }
@@ -269,15 +269,15 @@ struct SiteRoutingPage {
   KindTab(kind: string, label: string) {
     Row({ space: 5 }) {
       Circle({ width: 6, height: 6 })
-        .fill(kind === 'direct' ? TunBoxColors.success : kind === 'block' ? TunBoxColors.danger : TunBoxColors.primary)
+        .fill(kind === 'direct' ? TunBoxColors.success : kind === 'block' ? TunBoxColors.danger : TunBoxColors.primaryFor(this.themeRevision))
         .opacity(this.kind === kind ? 1 : 0.45)
       Text(label).fontSize(13)
         .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
-        .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textSecondary)
+        .fontColor(this.kind === kind ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.textSecondaryFor(this.themeRevision))
         .maxLines(1)
       Text(`${this.countOf(kind)}`).fontSize(12)
         .fontWeight(this.kind === kind ? FontWeight.Bold : FontWeight.Normal)
-        .fontColor(this.kind === kind ? TunBoxColors.primary : TunBoxColors.textMuted)
+        .fontColor(this.kind === kind ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.textMutedFor(this.themeRevision))
         .maxLines(1)
     }
     .padding({ top: 8, bottom: 8 })
@@ -306,7 +306,7 @@ struct SiteRoutingPage {
         TopNavBar({ title: '网站分流', hasBack: true, onBack: (): void => { this.back(); } }) {
           Row({ space: 8 }) {
             Button(this.busy ? '请稍候' : '保存').fontSize(14)
-              .backgroundColor(TunBoxColors.primary).fontColor(TunBoxColors.textOnPrimary)
+              .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(TunBoxColors.textOnPrimary)
               .borderRadius(TunBoxGeometry.controlRadius)
               .enabled(this.ready && !this.busy && this.dirty)
               .onClick(() => { this.save(); })
@@ -325,21 +325,21 @@ struct SiteRoutingPage {
           Column({ space: 6 }) {
             Text(this.kind === 'direct' ? '以下网站使用直连策略'
               : this.kind === 'block' ? '以下网站将被拦截（DNS 层拒绝）' : '以下网站使用代理策略')
-              .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+              .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
             Text(this.kind === 'block'
               ? '拦截名单在 DNS 解析层直接拒绝这些域名（含子域名），不建立连接。与代理/直连名单互斥，同名冲突需移除一侧。'
               : '三份名单同时生效，切换标签不会关闭其他两份。规则匹配域名及子域名；同名冲突需移除一侧。绕过 VPN 的应用不受此设置影响。')
-              .fontSize(12).fontColor(TunBoxColors.textSecondary)
+              .fontSize(12).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision))
             Text('勾选仅用于批量操作，不是启用开关。网站规则位于广告 / 自定义规则之后；网站名单之间重叠时直连优先。')
-              .fontSize(11).fontColor(TunBoxColors.textMuted)
+              .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
           }.width('100%').padding(16).alignItems(HorizontalAlign.Start).borderRadius(TunBoxGeometry.cardRadiusSmall)
             .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
             .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
           // 既有搜索框（过滤逻辑不变；视觉改令牌配方：高 42 / surfaceCard / 圆角 14 / 描边 / 前置 ic_search）
           Row({ space: 8 }) {
-            Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMuted)
+            Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
             TextInput({ text: this.query, placeholder: '搜索域名' })
-              .fontSize(14).fontColor(TunBoxColors.textPrimary).placeholderColor(TunBoxColors.textMuted)
+              .fontSize(14).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
               .backgroundColor(Color.Transparent).padding(0).height('100%').layoutWeight(1)
               .onChange((value: string) => { this.query = value; this.rebuild(); })
           }.width('100%').height(42).padding({ left: 12, right: 12 })
@@ -348,10 +348,10 @@ struct SiteRoutingPage {
           // 既有过滤行（切换逻辑不变；'▾' 文字符号去掉）
           Row() {
             Text(this.selectedOnly ? `已勾选 ${this.selected.length}` : `当前名单 ${this.current().length}`).fontSize(13)
-              .fontColor(TunBoxColors.primary)
+              .fontColor(TunBoxColors.primaryFor(this.themeRevision))
               .onClick(() => { this.selectedOnly = !this.selectedOnly; this.rebuild(); })
             Blank()
-            Text(this.alphabetical ? '域名排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondary)
+            Text(this.alphabetical ? '域名排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision))
               .onClick(() => { this.alphabetical = !this.alphabetical; this.rebuild(); })
           }.width('100%')
           // 规则行（文档 §3.5：Checkbox + 域名 14 Bold + 类型标签 9 primary primaryLight 圆角 4 +
@@ -361,15 +361,15 @@ struct SiteRoutingPage {
             ForEach(this.visible, (domain: string) => {
               ListItem() {
                 Row({ space: 10 }) {
-                  Checkbox({ name: domain }).select(this.selected.includes(domain)).selectedColor(TunBoxColors.primary)
+                  Checkbox({ name: domain }).select(this.selected.includes(domain)).selectedColor(TunBoxColors.primaryFor(this.themeRevision))
                     .onChange((value: boolean) => { if (value !== this.selected.includes(domain)) { this.toggle(domain); } })
                   Column({ space: 4 }) {
                     Row({ space: 6 }) {
-                      Text(domain || '（空域名）').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                      Text(domain || '（空域名）').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                         .wordBreak(WordBreak.BREAK_ALL).layoutWeight(1)
                       Text(this.kind === 'direct' ? '直连' : this.kind === 'block' ? '拦截' : '代理')
-                        .fontSize(9).fontColor(TunBoxColors.primary)
-                        .backgroundColor(TunBoxColors.primaryLight).borderRadius(4).padding(2)
+                        .fontSize(9).fontColor(TunBoxColors.primaryFor(this.themeRevision))
+                        .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision)).borderRadius(4).padding(2)
                     }.width('100%')
                     if (this.other().includes(domain) || SiteRoutingPolicy.domainError(domain).length > 0) {
                       Text(this.other().includes(domain) ? '两份名单重复，请移除一侧' : '格式无效，请移除后重新添加')
@@ -377,7 +377,7 @@ struct SiteRoutingPage {
                     }
                   }.layoutWeight(1).alignItems(HorizontalAlign.Start)
                   Button() {
-                    Image($r('app.media.ic_delete')).width(16).height(16).fillColor(TunBoxColors.textMuted)
+                    Image($r('app.media.ic_delete')).width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
                   }.type(ButtonType.Normal).backgroundColor(Color.Transparent)
                     .onClick(() => this.remove([domain]))
                 }.padding(14).width('100%').borderRadius(18)
@@ -386,11 +386,11 @@ struct SiteRoutingPage {
               }
             }, (domain: string) => `${domain}:${this.selected.includes(domain)}`)
             if (this.visible.length === 0) {
-              ListItem() { Text('没有匹配的网站，可点击下方添加 / 导入。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
+              ListItem() { Text('没有匹配的网站，可点击下方添加 / 导入。').fontSize(13).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision)).padding(22) }
             }
           }.layoutWeight(1).width('100%').enabled(this.ready && !this.busy) .edgeEffect(EdgeEffect.Spring)
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
-          if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(TunBoxColors.primary).width('100%') }
+          if (this.notice.length > 0) { Text(this.notice).fontSize(11).fontColor(TunBoxColors.primaryFor(this.themeRevision)).width('100%') }
         }.width('100%').layoutWeight(1).padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
         }).width('100%')
@@ -398,13 +398,13 @@ struct SiteRoutingPage {
         // 回调与可用条件（ready && !busy）不变
         Column({ space: 8 }) {
           Row({ space: 10 }) {
-            Text('全选结果').fontSize(12).fontColor(TunBoxColors.primary).onClick(() => {
+            Text('全选结果').fontSize(12).fontColor(TunBoxColors.primaryFor(this.themeRevision)).onClick(() => {
               this.selected = SiteRoutingPolicy.normalizeList(this.selected.concat(this.visible)); this.rebuild();
             })
-            Text('取消勾选').fontSize(12).fontColor(TunBoxColors.textSecondary).onClick(() => { this.selected = []; this.rebuild(); })
-            Text(`移除 ${this.selected.length} 项`).fontSize(12).fontColor(TunBoxColors.primary).onClick(() => this.remove(this.selected.slice()))
+            Text('取消勾选').fontSize(12).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision)).onClick(() => { this.selected = []; this.rebuild(); })
+            Text(`移除 ${this.selected.length} 项`).fontSize(12).fontColor(TunBoxColors.primaryFor(this.themeRevision)).onClick(() => this.remove(this.selected.slice()))
             Blank()
-            Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(10).fontColor(TunBoxColors.textMuted)
+            Text(this.dirty ? '草稿未保存' : '无未保存更改').fontSize(10).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
           }.width('100%').enabled(this.ready && !this.busy)
           Row({ space: 12 }) {
             Button() {
@@ -413,12 +413,12 @@ struct SiteRoutingPage {
                 Text('添加/导入').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textOnPrimary)
               }
             }
-            .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primary)
+            .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primaryFor(this.themeRevision))
             .borderRadius(TunBoxGeometry.controlRadius)
             .onClick(() => this.dialog.open())
             Button('导出名单').height(46).padding({ left: 20, right: 20 })
               .fontSize(14).fontWeight(FontWeight.Medium)
-              .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+              .fontColor(TunBoxColors.primaryFor(this.themeRevision)).backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
               .borderRadius(TunBoxGeometry.controlRadius)
               .onClick(() => this.exportList())
           }.width('100%').enabled(this.ready && !this.busy)

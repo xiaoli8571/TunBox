@@ -273,7 +273,7 @@
 
 - TUN 构建：`VpnService.kt:179-229` —— v4 地址 + `addRoute("0.0.0.0", 0)`；`ipv6` 为真时才 `addAddress(fdfe:dcba:9876::1/126)` 并 `addRoute("::", 0)`，DNS 用 `198.18.0.2` / `fdfe:dcba:9876::2`（`:298-301`）。
 - IPv6 默认值：`flutter_config.pretty.json:128,188,215` —— `vpnProps.ipv6=false`、`patchClashConfig.ipv6=false`、`dns.ipv6=false`，三层默认**全关**；TunBox 默认「开」但实际不生效（AAAA 恒空），这是文案与事实背离的根源。
-- DNS：真机运行配置 `diag/device-flclash/flclash/runtime_config_dns_block.txt:8-60` —— `dns.enable: true`、`enhanced-mode: redir-host`（**不是 fake-ip**）、`fake-ip-range6: ""`、订阅的 `nameserver-policy` 原样透传、订阅没给 `proxy-server-nameserver` 时保持 `null`（主解析器才查 policy）。
+- DNS：真机运行配置 `diag/device-flclash/tunbox/runtime_config_dns_block.txt:8-60` —— `dns.enable: true`、`enhanced-mode: redir-host`（**不是 fake-ip**）、`fake-ip-range6: ""`、订阅的 `nameserver-policy` 原样透传、订阅没给 `proxy-server-nameserver` 时保持 `null`（主解析器才查 policy）。
 - ⇒ FlClash 没有「DNS 覆写开关」：DNS 恒接管；`dnsHijacking` 只决定劫持目标是 sentinel 还是 `0.0.0.0`（`VpnService.kt:77-89`）。TunBox 把「应用劫持 / 内核解析 / 代理入口解析」捆在 `dns.enable` 一个开关上，是与 FlClash 最大的结构性差异。
 
 ### 复现门禁
@@ -593,7 +593,7 @@ provider 声明段），与延迟判定口径无关：
 
 测量身份改为 profile、内容修订、URL、expected-status、出口的组合；旧无作用域记录不补造来源。Preferences 使用短字段槽及完整身份校验，支持长 URL/emoji 节点并防止错误身份借用；UI 修订在数据边界缓存，行绘制不读 profile 文件。
 
-父组测试沿当前选择链继承子组 URL/期望码，再按完整策略和出口去重。主页面板和旧平面节点页均使用共享 Flclash 测速服务；后者按订阅分批并按每行作用域排序，保留跨订阅同名行。旧 LatencyEngine 仅保留兼容与回归，通道故障也不再补造节点超时。
+父组测试沿当前选择链继承子组 URL/期望码，再按完整策略和出口去重。主页面板和旧平面节点页均使用共享 TunBox 测速服务；后者按订阅分批并按每行作用域排序，保留跨订阅同名行。旧 LatencyEngine 仅保留兼容与回归，通道故障也不再补造节点超时。
 
 非当前 profile 使用 UI 进程中的独立无头核，不切换在线 profile 或 Extension。Go 出站经 NAPI 系统 API 绑定物理网络，失败拒绝拨号；在线 VPN 的 protect 收据逻辑不变。详细边界、回归和设备验收见 `REVIEW_REMAINING_FIXES_2026-11-03.md`。
 
@@ -601,3 +601,12 @@ provider 声明段），与延迟判定口径无关：
 
 - 指纹 `704b554944a2f45a` → `884dcfa9b60b41c0`。复核已存在的 `preferredGroupName` 发射改动：手动选择策略组时把有效组名放入 PROXY 首项，不能把 provider-only 组降为静态 Direct。
 - 本轮补齐指纹台账，没有改变测速 URL、测速并发或内核探测策略。在线选择统一改为完整重启，启动阶段继续校验真实流量入口的选中链。
+
+## 2026-11-04 指纹变更说明（默认路由边界与已裁剪协议）
+
+当前归一化指纹为 `8685bc31ed1c18f2`。本次生成器变化与测速引擎无关，不改变测速 URL、测速并发、单节点超时或结果判定：
+
+- `generate()` 新增 `useDefaultRouting` 参数；只有启用默认路由且用户打开国内应用直连时，才发射 `GEOIP,CN,DIRECT` 与 `DOMAIN-SUFFIX,cn,DIRECT`。
+- 删除生成器中对 `tailscale`、`zerotier`、`easytier` 的专门拦截，交由当前协议白名单统一判定，避免生成侧保留与内核裁剪策略重复的特殊分支。
+
+这次同步指纹是为了让测速回归门禁只关注测速契约，同时如实记录配置生成器的独立变更。

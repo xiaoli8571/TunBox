@@ -44,13 +44,13 @@ tap → 读 profile 1.13MB + 合并生成配置 ~1.5s → 停旧扩展 600ms →
 
 ### 2.1 传输层：新增 `ArkTcpDelayHttpTransport`（TCP 直连，绕开 http 栈连接池）
 
-`commons/flclash/FlclashDelay.ets`
+`commons/tunbox/TunBoxDelay.ets`
 
 - 每个 delay 请求一条 `@kit.NetworkKit` TCPSocket 到本地内核，手写 HTTP/1.1 请求
   （`Connection: close`，靠内核关连接收尾，或用 `Content-Length` 提前收尾）；
 - 语义与 `ArkDelayHttpTransport` 完全一致：只有拿到 HTTP 响应才 resolve（非 2xx 也 resolve），
   连接失败/超时/abort ⇒ reject；
-- 开关 `FLCLASH_DELAY_USE_TCP_TRANSPORT`（false = 回退 `@ohos.net.http`）；
+- 开关 `TUNBOX_DELAY_USE_TCP_TRANSPORT`（false = 回退 `@ohos.net.http`）；
 - `HTTP_CRLF` 用 `String.fromCharCode(13, 10)` 构造：仓库此前踩过「python heredoc 吃掉一层反斜杠，
   把 `\r\n` 写成真实换行导致源码被切断」的坑。
 
@@ -61,12 +61,12 @@ flclashDelayConcurrency(total)  // ≤32 一波发完；>32 一路抬到 total�
 ```
 
 - 24 → 24（一波）、37 → 37（一波）、80 → 64（2 波）、600 → 64（10 波，原来 19 波）；
-- `FlclashDelayPolicy` 新增 `adaptive`（默认 true）；`false` 时严格按传入并发，
+- `TunBoxDelayPolicy` 新增 `adaptive`（默认 true）；`false` 时严格按传入并发，
   供闸门保留「固定 N 路」的行为用例。
 
 ### 2.3 超时：内核 `timeout` 5000 → 3000
 
-- `FLCLASH_DELAY_TIMEOUT_MS = 3000`，与 `LatencyTimeout.DEFAULT_TIMEOUT_MS` 同值（闸门锁两处相等）；
+- `TUNBOX_DELAY_TIMEOUT_MS = 3000`，与 `LatencyTimeout.DEFAULT_TIMEOUT_MS` 同值（闸门锁两处相等）；
 - 客户端守护 30000 → 10000（`3s 内核 + 7s 余量`）——30s 的真实含义是
   「http 栈卡死的请求把整批墙钟钉在 30s」，真机那 2 条 cancelled 就是它。
 
@@ -86,12 +86,12 @@ flclashDelayConcurrency(total)  // ≤32 一波发完；>32 一路抬到 total�
 ### 2.5 性能画像日志（长期保留，用于以后 A/B）
 
 ```
-FlclashDelay: batch dispatchable: nodes=80 concurrency=64
-FlclashDelay: batch profile: concurrency=64 peakInflight=64 avgQueueWait=0ms p50=1083ms p90=3058ms wall=3662ms
-FlclashLatencyService: delay batch done: total=80 measured=49 timeout=23 failed=4 cancelled=4 wall=3662ms conc=64 peak=64
+TunBoxDelay: batch dispatchable: nodes=80 concurrency=64
+TunBoxDelay: batch profile: concurrency=64 peakInflight=64 avgQueueWait=0ms p50=1083ms p90=3058ms wall=3662ms
+TunBoxLatencyService: delay batch done: total=80 measured=49 timeout=23 failed=4 cancelled=4 wall=3662ms conc=64 peak=64
 ```
 
-`FlclashDelaySummary` 新增 `concurrency / peakInflight / avgQueueWaitMs / p50ElapsedMs / p90ElapsedMs / wallMs`。
+`TunBoxDelaySummary` 新增 `concurrency / peakInflight / avgQueueWaitMs / p50ElapsedMs / p90ElapsedMs / wallMs`。
 `avgQueueWait` 是判断「应用层排队」还是「传输层/内核慢」的第一指标。
 
 ---
@@ -133,7 +133,7 @@ FlclashLatencyService: delay batch done: total=80 measured=49 timeout=23 failed=
 ## 4. 验证命令
 
 ```bash
-node scripts/verify-flclash-delay.mjs        # 11/11 PASS（含新增 C0b 自适应曲线、C1b 一波用例）
+node scripts/verify-tunbox-delay.mjs        # 11/11 PASS（含新增 C0b 自适应曲线、C1b 一波用例）
 node scripts/verify-vpn-architecture.mjs     # 313/313 PASS
 node scripts/verify-latency-display.mjs      # 55/55 PASS
 node scripts/verify-latency-concurrency.mjs  # 14/14 PASS
@@ -151,9 +151,9 @@ node scripts/verify-latency-restore.mjs      # 42/42 PASS
 
 | 想回退什么 | 怎么退 |
 |---|---|
-| TCP 传输层 | `FlclashDelay.ets` 的 `FLCLASH_DELAY_USE_TCP_TRANSPORT = false`（回 `@ohos.net.http`，同时应把 `FLCLASH_DELAY_MAX_CONCURRENCY` 降回 32，否则会重现 2300028 风暴） |
-| 并发上限 | `FLCLASH_DELAY_MAX_CONCURRENCY` 改 32 |
-| 3s 超时 | `FLCLASH_DELAY_TIMEOUT_MS` + `LatencyTimeout.DEFAULT_TIMEOUT_MS` 一起改回 5000 |
+| TCP 传输层 | `TunBoxDelay.ets` 的 `TUNBOX_DELAY_USE_TCP_TRANSPORT = false`（回 `@ohos.net.http`，同时应把 `TUNBOX_DELAY_MAX_CONCURRENCY` 降回 32，否则会重现 2300028 风暴） |
+| 并发上限 | `TUNBOX_DELAY_MAX_CONCURRENCY` 改 32 |
+| 3s 超时 | `TUNBOX_DELAY_TIMEOUT_MS` + `LatencyTimeout.DEFAULT_TIMEOUT_MS` 一起改回 5000 |
 | 冷启动预热 | 删 `EntryAbility.onCreate` 里的 `this.scheduleLatencyPrewarm();` |
 | 测速核常驻 | `TEST_CORE_IDLE_RECYCLE_MS` 改回 90000 |
 

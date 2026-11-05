@@ -3,6 +3,7 @@
  * 移植自 upstream: TunBox_Android/lib/main.dart + app.dart + startup/*（启动编排的 ArkTS 等价）
  */
 import { UIAbility, AbilityConstant, Want, Configuration } from '@kit.AbilityKit';
+import { StageSessionRecovery } from '../commons/services/StageSessionRecovery';
 import { window, display } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -81,6 +82,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    StageSessionRecovery.noteUiLaunch();
     PersistentLogStore.init(this.context, 'app');
     AppLogger.info(TAG, 'onCreate');
     this.applyMotionFloorByScreenSize();
@@ -106,13 +108,15 @@ export default class EntryAbility extends UIAbility {
     SubscriptionService.instance().init(this.context).catch((e: Object): void => {
       AppLogger.warn(TAG, `early subs init failed: ${AppLogger.errText(e)}`);
     });
-    this.captureWant(want);
+    if (launchParam.launchReason !== AbilityConstant.LaunchReason.APP_RECOVERY) {
+      this.captureWant(want);
+    }
     this.captureDeepLink(want);
     this.captureImportScheme(want);
     // 订阅自动刷新（双轨触发之一）：注册 WorkScheduler 周期任务 + 冷启动兜底检查。
     // autoUpdateSubscription 开关此前无任何调度器消费，节点池会随机场更新逐渐失效。
     SubscriptionUpdateScheduler.instance().onAppStart(this.context);
-    // 冷启动仅接管已存在的真实会话；证据不足时保留意图，不因打开应用拆建隧道。
+    // 冷启动先接管活会话；进程已退出时按未结束的持久意图进入有限恢复。
     this.scheduleSelfHeal('cold-start');
     this.scheduleLatencyPrewarm();
   }
@@ -126,7 +130,7 @@ export default class EntryAbility extends UIAbility {
    * 不存在这个等待。
    *
    * 这里把这段准备挪到**用户还没点测速**的时候：
-   *  - 延迟 4s：不与首帧/首页 bootstrap 抢主线程（启动速度是单独优化过的指标）；
+   *  - 首帧后延迟 1s：避开首页 bootstrap，尽早准备用户接下来要用的通道；
    *  - 只预热、不探测：`prewarmChannel` 不写任何延迟结论、不动排序；
    *  - 已连接/连接中：`ensureTestCore` 的安全门禁直接跳过，不会碰用户的隧道；
    *  - 失败静默：预热失败不影响任何功能，用户真点测速时照常按需启动。
@@ -140,7 +144,13 @@ export default class EntryAbility extends UIAbility {
       BackgroundLatencyService.prewarmChannel(this.context).catch((e: Object): void => {
         AppLogger.warn(TAG, `latency prewarm failed: ${AppLogger.errText(e)}`);
       });
-    }, 4000);
+    }, 1000);
+  }
+
+  onSaveState(reason: AbilityConstant.StateType, wantParam: Record<string, Object>): AbilityConstant.OnSaveResult {
+    // VPN 恢复只读已经落盘的连接快照；故障回调里不做异步 I/O 或调用 native。
+    wantParam['tunbox_recovery'] = true;
+    return AbilityConstant.OnSaveResult.RECOVERY_AGREE;
   }
 
   /** 应用已在前台/后台存活时, 快捷方式与卡片点击走这里 */

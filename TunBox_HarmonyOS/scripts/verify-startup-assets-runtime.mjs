@@ -52,12 +52,13 @@ function harness() {
     shortWrite: false, views: false, corruptResource: false, gzReads: [], stagingLeft: [] };
   const handles = new Map();
   const io = {
+    accessSync: fs.existsSync,
     OpenMode: { READ_WRITE: fs.constants.O_RDWR, READ_ONLY: fs.constants.O_RDONLY,
       CREATE: fs.constants.O_CREAT, TRUNC: fs.constants.O_TRUNC },
     statSync(file) { const s = fs.statSync(file); return { size: s.size, mtime: s.mtimeMs, ino: s.ino }; },
     openSync(file, flags) { const fd = fs.openSync(file, flags); handles.set(fd, file); return { fd }; },
     closeSync(file) { handles.delete(file.fd); fs.closeSync(file.fd); },
-    readSync(fd, buffer, options) { return fs.readSync(fd, Buffer.from(buffer), 0, options.length, options.offset); },
+    readSync(fd, buffer, options = {}) { return fs.readSync(fd, Buffer.from(buffer), 0, options.length ?? buffer.byteLength, options.offset ?? null); },
     writeSync(fd, buffer) {
       state.writes++;
       if (state.writeFailure && path.basename(handles.get(fd)).startsWith('geoip.metadb')) {
@@ -124,7 +125,7 @@ function harness() {
     HttpBodyCodec: { decompress: bytes => new Uint8Array(zlib.gunzipSync(Buffer.from(bytes))) },
     AppLogger: logger, Uint8Array, ArrayBuffer, Map, Math, setTimeout, Promise });
   const { GeoDataInstaller } = load(installerSource, 'GeoDataInstaller', sandbox);
-  return { ...state, state, dir, context, installer: GeoDataInstaller };
+  return { ...state, state, dir, context, sandbox, installer: GeoDataInstaller };
 }
 async function test(name, run) {
   try { await run(); passed++; console.log('PASS ' + name); }
@@ -212,14 +213,124 @@ const settingsModule = await import(generated('AppSettings'));
 const { ProxyNode } = await import(generated('ProxyNode'));
 const { ClashConfigGenerator } = await import(generated('ClashConfigGenerator'));
 const { ProfileConfigMerger } = await import(generated('ProfileConfigMerger'));
+// 2026-11-05（FlClash 全量照抄）：profile-backed 走 TunBoxProfileBuilder ——
+// 沙箱注入内核桥（mini-yaml 承接 fixture/overlay 解码；生产由内核 decodeYaml 承担）。
+const { miniYamlParse } = await import(pathToFileURL(path.join(root, 'scripts/fixtures/mini-yaml.mjs')).href);
+const decodeFixture = text => text.trimStart().startsWith('{') ? JSON.parse(text) : miniYamlParse(text);
+const profileRegistry = new Map();
+const sandboxCoreBridge = {
+  async getProfileBase(p) {
+    const text = profileRegistry.get(p);
+    if (text === undefined) throw new Error(`sandbox: no profile registered at ${p}`);
+    const doc = decodeFixture(text);
+    const proxies = Array.isArray(doc['proxies']) ? doc['proxies'] : [];
+    const groups = Array.isArray(doc['proxy-groups']) ? doc['proxy-groups'] : [];
+    const rules = Array.isArray(doc['rules']) ? doc['rules'].map((x) => String(x)) : [];
+    return { config: doc, digest: 'sandbox', proxies: proxies.length, proxyGroups: groups.length,
+      rules: rules.length, matchRules: rules.filter((r) => r.toUpperCase().startsWith('MATCH,')) };
+  },
+  async decodeYaml(text) { return decodeFixture(text); },
+};
+const builderContext = vm.createContext({
+  coreBridge: sandboxCoreBridge, ClashConfigGenerator,
+  SubscriptionFetchPolicy: { tunboxUserAgent: () => 'TunBox/v-harness clash-verge Platform/OpenHarmony' },
+  ProfileRepository: { pathOf: (id) => '/sandbox/profiles/' + id + '.yaml', dir: () => '/sandbox/profiles' },
+  tunboxUserAgent: () => 'TunBox/v-harness clash-verge Platform/OpenHarmony',
+  AppLogger: logger, Math, Map, Set, JSON, Date, console,
+});
+const { TunBoxProfileBuilder, TunBoxProfileInput } = load(
+  fs.readFileSync(path.join(ets, 'commons/tunbox/TunBoxProfileBuilder.ets'), 'utf8'),
+  'TunBoxProfileBuilder,TunBoxProfileInput', builderContext);
+
+const { LatencyTestUrl } = await import(generated('LatencyTestUrl'));
 const sandbox = vm.createContext({ AppSettings: settingsModule.AppSettings, AutoSelectModes: settingsModule.AutoSelectModes,
-  ProxyNode, ClashConfigGenerator, ProfileConfigMerger,
+  ProxyNode, ClashConfigGenerator, ProfileConfigMerger, TunBoxProfileBuilder, TunBoxProfileInput, LatencyTestUrl,
+  ProfileRepository: { pathOf: (id) => '/sandbox/profiles/' + id + '.yaml', dir: () => '/sandbox/profiles' },
   BASE_MTU: (await import(generated('VpnRecoveryPolicy'))).BASE_MTU, AppLogger: logger,
   DoHResolver: { async refreshStale() {}, async resolveMany() { return {}; } }, Math, Map, Set });
 const runtime = load(fs.readFileSync(path.join(ets, 'commons/config/RuntimeConfigBuilder.ets'), 'utf8'),
   'RuntimeConfigProfile,RuntimeConfigBuilder,RuntimeConfigMode', sandbox);
 const kernel = path.join(root, '../mihomo-build/mihomo-smart-462455136157a760937c666bba71afe33b1a809e/mihomo.exe');
 assert.ok(fs.existsSync(kernel), 'same-source kernel is required');
+
+// Execute the real final gate and model installer. Native parsing itself is
+// covered by TestPrepareProfileSmartDoesNotInitialize in the same-source core.
+function smartHarness() {
+  const h = harness();
+  h.sandbox.TAG = 'ConfigGate';
+  const validator = load(fs.readFileSync(path.join(ets, 'commons/services/ConfigValidator.ets'), 'utf8'), 'ConfigValidator', h.sandbox);
+  h.sandbox.ConfigValidator = validator.ConfigValidator;
+  h.validationError = '';
+  h.validated = [];
+  h.sandbox.coreBridge = {
+    async prepareProfile(text) {
+      h.validated.push(text);
+      if (h.validationError) throw Error(h.validationError);
+      return text;
+    },
+    async decodeYaml(text) { return decodeFixture(text); }
+  };
+  const source = fs.readFileSync(path.join(ets, 'commons/services/ConnectionOrchestrator.ets'), 'utf8');
+  const methods = ['prepareConfigYaml', 'isSmartModelReady', 'isSmartModelAvailable'].map(name => {
+    const match = source.match(new RegExp(`^  (?:private )?(?:async )?${name}\\([\\s\\S]*?^  }`, 'm'));
+    assert.ok(match, name); return match[0];
+  });
+  const Gate = vm.runInContext(stripTypeScriptTypes(`(()=>{class Gate {${methods.join('\n')}}return Gate})()`, {mode:'transform'}), h.sandbox);
+  h.gate = Object.assign(new Gate(), {context: h.context});
+  return h;
+}
+const smartDoc = (enabled = true, type = 'smart') => ({
+  'proxy-groups': [{name:'♻️ 自动选择',type,proxies:['DIRECT'],uselightgbm:enabled}],
+  rules:['MATCH,♻️ 自动选择']
+});
+function installManualModel(h) {
+  const bytes = Buffer.alloc(1024 * 1024 + 1); bytes.write('tree');
+  fs.writeFileSync(path.join(h.dir,'Model.bin'),bytes);
+  fs.writeFileSync(path.join(h.dir,'Model.bin.manual'),'manual-v1');
+  return bytes;
+}
+await test('final Smart overrides require manual installation, never bundle or download', async () => {
+  for (const mode of ['auto','manual']) {
+    const h = smartHarness(); const p = new runtime.RuntimeConfigProfile();
+    p.profileId = 'smart-override'; p.profileYaml = JSON.stringify({'proxy-groups':[{name:'Main',type:'select',proxies:['DIRECT']}],rules:['MATCH,Main']});
+    profileRegistry.set('/sandbox/profiles/smart-override.yaml', p.profileYaml);
+    p.settings.autoSelectMode = mode; p.settings.hyperAdRulesEnabled = false; p.settings.customRules = [];
+    p.settings.yamlOverride = JSON.stringify(smartDoc());
+    const result = await runtime.RuntimeConfigBuilder.buildRuntimeConfig(p, runtime.RuntimeConfigMode.TEST);
+    await assert.rejects(h.gate.prepareConfigYaml(result.yaml,'no-model'),/设置手动更新/);
+    assert.equal(h.state.reads,0); assert.equal(h.state.writes,0);
+    const bytes = installManualModel(h);
+    assert.equal(await h.gate.prepareConfigYaml(result.yaml,'manual-model'),result.yaml);
+    sameFile(path.join(h.dir,'Model.bin'),bytes);
+    assert.equal(h.state.reads,0); assert.equal(h.state.writes,0);
+  }
+});
+await test('missing LightGBM model fails before core startup; non-LightGBM policies stay usable', async () => {
+  for (const [enabled,type,required] of [[1,'smart',true],[-1,'smart',true],[0,'smart',false],[false,'smart',false],[true,'url-test',false]]) {
+    const h = smartHarness(), text=JSON.stringify(smartDoc(enabled,type));
+    if(required) await assert.rejects(h.gate.prepareConfigYaml(text,'option'),/设置手动更新/);
+    else assert.equal(await h.gate.prepareConfigYaml(text,'option'),text);
+    assert.deepEqual(fs.readdirSync(h.dir),[]);
+    assert.equal(h.state.reads,0);assert.equal(h.state.writes,0);
+  }
+});
+await test('legacy bundled cache is not manual installation; invalid models never become ready', async () => {
+  const h = smartHarness(), bytes=installManualModel(h);
+  assert.equal(h.gate.isSmartModelAvailable(),true);
+  fs.unlinkSync(path.join(h.dir,'Model.bin.manual'));
+  assert.equal(h.gate.isSmartModelAvailable(),false);
+  await assert.rejects(h.gate.prepareConfigYaml(JSON.stringify(smartDoc()),'legacy-model'),/设置手动更新/);
+  sameFile(path.join(h.dir,'Model.bin'),bytes);
+  fs.writeFileSync(path.join(h.dir,'Model.bin.manual'),'manual-v1');
+  fs.writeFileSync(path.join(h.dir,'Model.bin'),Buffer.from('tree-truncated'));
+  assert.equal(h.gate.isSmartModelAvailable(),false);
+  assert.equal(h.state.reads,0);assert.equal(h.state.writes,0);
+});
+await test('native final-validation errors abort before model writes or config publication', async () => {
+  const h = smartHarness(); h.validationError = 'rule proxy missing not found';
+  await assert.rejects(h.gate.prepareConfigYaml(JSON.stringify(smartDoc()),'bad-final-reference'),/rule proxy missing not found/);
+  assert.equal(h.state.reads,0); assert.equal(h.state.writes,0); assert.deepEqual(fs.readdirSync(h.dir),[]);
+});
 const node = new ProxyNode(); Object.assign(node, { id: 'a', name: 'A', originalName: 'A',
   proxyType: 'socks5', server: '127.0.0.1', port: 9 });
 const profileYaml = 'proxies:\n  - {name: A, type: socks5, server: 127.0.0.1, port: 9}\nproxy-groups:\n  - {name: Main, type: select, proxies: [A]}\nrules:\n  - GEOIP,CN,DIRECT\n  - GEOSITE,cn,DIRECT\n  - MATCH,Main\n';
@@ -235,7 +346,10 @@ for (const profileBacked of [false, true]) for (let flags = 0; flags < 16; flags
     p.settings.customRules = ['GEOIP,US,DIRECT', 'DOMAIN-SUFFIX,example.com,REJECT'];
     p.settings.yamlOverride = 'geox-url:\n  mmdb: http://127.0.0.1:1/missing\n  geosite: http://127.0.0.1:1/missing\n';
     p.settings.autoSelectMode = 'auto'; p.smartModelReady = false; p.geoipReady = true; p.ruleProviderFileReady = true;
-    p.profileYaml = profileBacked ? profileYaml : ''; p.proxyHosts = { localhost: '127.0.0.1' };
+    p.profileYaml = profileBacked ? profileYaml : '';
+    p.profileId = profileBacked ? 'offline-fixture' : '';
+    if (profileBacked) { profileRegistry.set('/sandbox/profiles/offline-fixture.yaml', profileYaml); }
+    p.proxyHosts = { localhost: '127.0.0.1' };
     p.selectedNodeName = 'A'; p.mixedPort = 17890; p.apiPort = 19090; p.dnsPort = 11053; p.apiSecret = 'test';
     for (const mode of [runtime.RuntimeConfigMode.TEST, runtime.RuntimeConfigMode.TUNNEL]) {
       const result = await runtime.RuntimeConfigBuilder.buildRuntimeConfig(p, mode);
@@ -255,7 +369,13 @@ for (const live of liveConfigs) await test('live core controller and proxy table
   await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve));
   const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
   const file = path.join(live.dir, 'live.yaml');
-  fs.writeFileSync(file, live.yaml.replace(/^external-controller:.*$/m, `external-controller: 127.0.0.1:${port}`));
+  if (live.yaml.trimStart().startsWith('{')) {
+    const liveDoc = JSON.parse(live.yaml);
+    liveDoc['external-controller'] = `127.0.0.1:${port}`;
+    fs.writeFileSync(file, JSON.stringify(liveDoc));
+  } else {
+    fs.writeFileSync(file, live.yaml.replace(/^external-controller:.*$/m, `external-controller: 127.0.0.1:${port}`));
+  }
   const child = spawn(kernel, ['-d', live.dir, '-f', file], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const exited = new Promise(resolve => child.once('exit', resolve));
   let output = ''; const collect = chunk => { output = (output + chunk.toString()).slice(-8192); };

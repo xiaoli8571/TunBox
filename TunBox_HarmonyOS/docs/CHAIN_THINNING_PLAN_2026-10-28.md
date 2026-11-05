@@ -24,13 +24,13 @@
 | 订阅 | `commons/services/SubscriptionService.ets` | 3 947 | 拉取 + 解析 + 节点表 + 分组 + 配置原料 |
 | | `commons/subscription/UriNodeParser.ets` | 782 | **App 侧解析器（拟退场）** |
 | | `commons/services/SubscriptionParser.ets` | 668 | **App 侧解析器（拟退场）** |
-| | `commons/flclash/SubConverter.ets` | 2 849 | 转换器（保留 → 独立化） |
+| | `commons/tunbox/SubConverter.ets` | 2 849 | 转换器（保留 → 独立化） |
 | | `commons/services/YamlMerger.ets` | 3 302 | 合并节点/规则到最终 YAML |
-| | `commons/flclash/ProfileConfigMerger.ets` | 903 | 原文→可加载配置的预检/合并 |
+| | `commons/tunbox/ProfileConfigMerger.ets` | 903 | 原文→可加载配置的预检/合并 |
 | | `commons/services/ClashConfigGenerator.ets` | 3 352 | 生成内核配置 |
 | | `commons/services/SubscriptionFetchPolicy.ets` | 1 008 | 拉取策略（UA 链/重试/上限） |
 | 测速 | `commons/services/LatencyEngine.ets` | 1 224 | 双通道探针 + 队列 + 分类 |
-| | `commons/flclash/FlclashDelay.ets` | 869 | FlClash 等价 delay 实现 |
+| | `commons/tunbox/TunBoxDelay.ets` | 869 | FlClash 等价 delay 实现 |
 | | `commons/latency/LatencyStore.ets` | 694 | 结果持久化/分层 |
 | | `commons/services/BackgroundLatencyService.ets` | 236 | 启动/后台测速调度 |
 | 启动 | `commons/services/ConnectionOrchestrator.ets` | 5 888 | 全部编排（连接/自愈/failover/网络/保活） |
@@ -134,7 +134,7 @@
 ### 3.3 P1 —— 批量走内核组测速（1–2 人日）
 
 - 批量/整组：优先 `BackgroundLatencyService.runKernelGroupTest()`（内核一次调用测整组）；
-- 仅「单节点点测」走单次 delay（`FlclashDelay`）。
+- 仅「单节点点测」走单次 delay（`TunBoxDelay`）。
 - 删除 App 侧 50 worker 调度与 `QUEUE_TIMEOUT` 分类（内核排队语义已足够）。
 
 **验收**
@@ -152,7 +152,7 @@
 
 | 项 | 内容 |
 |---|---|
-| **退出主链** | `LatencyEngine` 队列/分类段 ~600 + `FlclashDelay` 冗余分支 ~300 + `LatencyStore` 明细持久化 ~200 ≈ **1 100 行** |
+| **退出主链** | `LatencyEngine` 队列/分类段 ~600 + `TunBoxDelay` 冗余分支 ~300 + `LatencyStore` 明细持久化 ~200 ≈ **1 100 行** |
 | **保留** | `LatencyStore` 的"最后结论 + 时间戳"持久化（这是 ClashPlus 缺的、也是用户体感"重启后延迟还在"的关键） |
 | **代价** | 失去离线探测出的"服务器可达性"（改为数据页连通性功能，语义更清楚） |
 | **风险** | 内核组测速对 `url-test` 组的副作用（可能扰动自动选点）→ 需在内核侧确认"测速不改选择" |

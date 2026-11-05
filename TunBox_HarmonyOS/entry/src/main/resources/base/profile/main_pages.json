@@ -8,6 +8,8 @@
     "pages/AppRoutingPage",
     "pages/SiteRoutingPage",
     "pages/ConnectionsPage",
-    "pages/BackupPage"
+    "pages/BackupPage",
+    "pages/ProfileEditorPage",
+    "pages/DnsQueryPage"
   ]
 }

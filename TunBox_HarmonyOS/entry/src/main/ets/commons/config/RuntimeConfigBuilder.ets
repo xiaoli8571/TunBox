@@ -20,7 +20,7 @@
  *
  * 1. **整仓只允许本文件调用 ClashConfigGenerator.generate(**（闸门：
  *    scripts/verify-config-single-source.mjs）。别处再调用 = 配置分叉回来了。
- * 2. 四个决策（useSmart / ruleProviderReady / selectedNode / useGeoip）
+ * 2. 运行决策（ruleProviderReady / selectedNode / useGeoip）
  *    **只在 decideRuntimeOptions() 里做一次**，两种 mode 共享同一份结果。
  * 3. hosts（节点域名 → 固定 IP）**只从 DoHResolver 的共享快照取**，
  *    refreshStale() 也**只在这里调一处** —— 不做「自己解析一套 + 再用隧道结果补洞」。
@@ -48,8 +48,7 @@
  * profile.dnsPort = this.dnsPort;
  * profile.apiSecret = this.apiSecret;
  * profile.smartModelReady = this.isSmartModelReady();  // Model.bin 是否就绪
- *   （播种 seedSmartModelFromRawfile() 仍可保留在编排器里，但「要不要用 smart 组」
- *     的**判定**只在 builder 里做一次 —— 这里只给「事实」）
+ *   （只查询手动安装事实；构建、测速和启动均不得自动安装或下载模型）
  * profile.geoipReady = this.isGeoipReady();
  * profile.ruleProviderFileReady = this.isRuleProviderReady();
  * // hosts 提前解析（与端口探测并行推进），来源只有 DoHResolver 共享快照这一处
@@ -70,10 +69,12 @@ import { ProxyGroup } from '../models/ProxyGroup';
 import { AppSettings, AutoSelectModes } from '../models/AppSettings';
 import { SubDnsUpstream } from '../models/SubDnsUpstream';
 import { ClashConfigGenerator } from '../services/ClashConfigGenerator';
-import { LatencyTestUrl } from '../latency/LatencyTestUrl';
 import { DoHResolver } from '../services/DoHResolver';
 // 订阅原文 → overlay 合并（FlClash mergeProfileBase 的等价实现）
-import { ProfileConfigMerger } from '../flclash/ProfileConfigMerger';
+import { ProfileConfigMerger } from '../tunbox/ProfileConfigMerger';
+// FlClash 同构构建器（2026-11-05）：内核解析 → map patch → JSON dump
+import { TunBoxProfileBuilder, TunBoxProfileInput, TunBoxProfileResult, TunBoxGroupInfo } from '../tunbox/TunBoxProfileBuilder';
+import { ProfileRepository } from '../tunbox/ProfileRepository';
 import { AppLogger } from '../utils/AppLogger';
 import { BASE_MTU } from '../services/VpnRecoveryPolicy';
 
@@ -173,9 +174,22 @@ export class RuntimeConfigProfile {
    * 空串 = 没有 profile（首次导入前/旧数据），保持旧的全量生成行为。
    */
   profileYaml: string = '';
+  /**
+   * 每 profile 覆盖层（FlClash `Profile.overrides` 的等价物）。
+   * 空串 = 回落全局 `settings.yamlOverride`；非空时**只**作用于本 profile。
+   * 由 `ConnectionOrchestrator.buildRuntimeProfile` 从 ProfileOverrideStore 注入。
+   */
+  overrideYaml: string = '';
+
+  /**
+   * 当前 Profile 的订阅 id（= FlClash profileId）。
+   * FlClash 构建链用它在 provider 缓存目录里隔离各 profile
+   * （`<profilesDir>/providers/<id>/<type>/<md5>`）；空串 = 无 profile。
+   */
+  profileId: string = '';
 }
 
-/** 四个决策的结果（两种 mode 共享同一份）。 */
+/** 运行决策的结果（连接与测速共享；Smart 按模型状态和订阅作用域决定）。 */
 export class RuntimeConfigOptions {
   /** 是否声明内核 smart 组（type: smart）。 */
   useSmart: boolean = false;
@@ -193,6 +207,7 @@ export class RuntimeConfigOptions {
 
 /** 生成结果：YAML 文本 + 本次实际用到的端口/密钥/决策（调用方按此接线）。 */
 export class RuntimeConfigResult {
+  smartGroupName: string = '';
   /** 最终 YAML（可直接落盘）。 */
   yaml: string = '';
   /** 本次构建的模式（tunnel / test）。 */
@@ -352,9 +367,9 @@ export class RuntimeConfigBuilder {
   /**
    * **唯一的决策点**（审计 F5 / F6）。
    *
-   * 四个决策只在这里做一次，两种 mode 共享：
-   *   · useSmart：自动模式 **且** Model.bin 就绪 —— 缺模型时若仍声明 smart 组，
-   *     内核 GetModel() 会在启动路径同步下载 Model.bin（实测阻塞 90s）。
+   * 运行决策只在这里做一次，两种 mode 共享。
+   * Smart 组来自最终 profile；模型按组的 uselightgbm 配置在启动前准备，
+   * 不由 App 模式或模型文件存在与否生成策略组。
    *   · ruleProviderReady：**必须含 adRulesOn 闸门** —— 旧实现测速核漏了这个判断
    *     （只判「文件在不在」），于是「去广告开关关闭」时隧道不声明规则集、测速核
    *     却声明 → 两份 YAML 的规则集不一致（审计 F5）。
@@ -365,9 +380,9 @@ export class RuntimeConfigBuilder {
     const options = new RuntimeConfigOptions();
     const settings = profile.settings;
 
-    // ── useSmart ────────────────────────────────────────────────────────────
-    const useSmart = settings.autoSelectMode === AutoSelectModes.AUTO && profile.smartModelReady;
-    options.useSmart = useSmart;
+    options.useSmart = settings.autoSelectMode === AutoSelectModes.AUTO && profile.smartModelReady
+      && profile.profileId.length > 0
+      && settings.preferredNodeSubscriptionId === profile.profileId;
 
     // ── ruleProviderReady（含 adRulesOn 闸门，审计 F5）───────────────────────
     // 2026-10-23：adRulesOn 只看去广告开关本体 —— 去广告是独立开关，
@@ -384,36 +399,32 @@ export class RuntimeConfigBuilder {
     // ── selectedNode（两种 mode 共用同一个，审计 F6）─────────────────────────
     const selectedNode = RuntimeConfigBuilder.resolveSelectedNode(profile);
     options.selectedNode = selectedNode;
-    options.selectedNodeName = selectedNode === null ? '' : selectedNode.name;
+    options.selectedNodeName = profile.profileYaml.trim().length > 0
+      ? profile.selectedNodeName.trim() : (selectedNode === null ? '' : selectedNode.name);
     return options;
   }
 
   /**
    * 选出本次要用的节点。
    *
-   * 口径：优先用户选中的节点（按名精确匹配 → 忽略大小写匹配），
-   * 都没有则退回节点集第一个；节点集为空则返回 null（由调用方报错，不静默生成空配置）。
+   * FlClash 同构（core/proxy.go:39 lookupProxy 精确，§5.5）：用户所选名逐字精确命中
+   * 才有效；无命中即如实返回 null（提示「节点未命中」，不推断、不退首个）。
    */
   private static resolveSelectedNode(profile: RuntimeConfigProfile): ProxyNode | null {
     if (profile.nodes.length === 0) {
       return null;
     }
     const wanted = profile.selectedNodeName.trim();
-    if (wanted.length > 0) {
-      for (const node of profile.nodes) {
-        if (node.name === wanted) {
-          return node;
-        }
-      }
-      const lower = wanted.toLowerCase();
-      for (const node of profile.nodes) {
-        if (node.name.toLowerCase() === lower) {
-          return node;
-        }
-      }
-      AppLogger.warn(TAG, `selected node "${wanted}" not in node set; fallback to first node`);
+    if (wanted.length === 0) {
+      return null;
     }
-    return profile.nodes[0];
+    for (const node of profile.nodes) {
+      if (node.name === wanted) {
+        return node;
+      }
+    }
+    AppLogger.warn(TAG, `selected node "${wanted}" not found; no fallback (exact match only)`);
+    return null;
   }
 
   /**
@@ -495,14 +506,14 @@ export class RuntimeConfigBuilder {
     // 关键路径 —— 首连与测速核启动都可能多等几秒（极端 20s），那是纯白等。
     // 刷新照样每次都触发（这才是本条的目的），只是不挡住出配置。
     // DoHResolver 内部有 refreshing 单航班保护，并发调用共享同一个任务。
-    DoHResolver.refreshStale().catch((e: Error): void => {
+    if (!profileBacked) { DoHResolver.refreshStale().catch((e: Error): void => {
       AppLogger.info(TAG, `doh stale refresh skipped: ${AppLogger.errText(e)}`);
-    });
+    }); }
     // hosts：唯一来源。profile 带了快照就直接用（隧道路径会提前解析好以便与
     // 端口探测并行）；没带就用同一个来源解析一次 —— 两条路径都只经过
     // resolveSharedHosts，不存在第二套来源、也不做互相补洞。
-    let hosts: Record<string, string> = profile.proxyHosts;
-    if (Object.keys(hosts).length === 0) {
+    let hosts: Record<string, string> = profileBacked ? {} : profile.proxyHosts;
+    if (!profileBacked && Object.keys(hosts).length === 0) {
       const priority: string[] = node.server.length > 0 ? [node.server] : [];
       hosts = await RuntimeConfigBuilder.resolveSharedHosts(profile.nodes, priority);
     }
@@ -518,64 +529,67 @@ export class RuntimeConfigBuilder {
       profileBacked ? overlayNode : node, profileBacked ? [overlayNode] : profile.nodes, profile.settings,
       profile.mixedPort, profile.apiPort, profile.dnsPort, profile.apiSecret,
       options.useGeoip, ipv6Enabled, hosts, tunEnabled, profile.proxyGroups,
-      options.ruleProviderReady, options.useSmart,
+      options.ruleProviderReady,
       profile.subscriptionRules, profile.subscriptionRuleProviders,
-      // smart 组的测速地址：这里只传**用户填的原始值**，规则由生成器侧的
-      // LatencyTestUrl.effective()（唯一真源）统一处理（审计 F12）。
-      profile.settings.testLatencyUrl,
       // 订阅自带 DNS 上游（proxy-server-nameserver / nameserver-policy）：
       // 机场入口域名的真实 IP 只有这些上游知道，不能丢（2026-10-20 全超时定案）。
-      profile.subscriptionDnsUpstreams, profile.subscriptionDnsPolicies);
+      profile.subscriptionDnsUpstreams, profile.subscriptionDnsPolicies, !profileBacked);
 
-    // ── FlClash 同构：订阅原文接管 proxies / proxy-groups / rules / dns ──────
-    // overlay（上面生成的 yaml）只保留运行期参数（端口 / secret / tun / mode 等），
-    // 原文代理/规则段整体替换；DNS 覆写开启时保留应用 DNS，关闭时采用订阅 DNS。
-    // 有原文时合并失败必须拒绝，不能把内部占位节点当作用户的有效配置。
+    // ── FlClash 同构（2026-11-05 全量照抄）：内核解析 → map patch → JSON dump ──
+    // FlClash apply 链：`getConfig`（内核解析 profile）→ `_makeRealProfileTask`
+    // （map 级 patch）→ 写 config.yaml → 内核 Parse。本仓对应：
+    //   1. TunBoxProfileBuilder.build() —— 内核 getProfileBase(profilePath) 解析
+    //      profile 原文成 map（mihomo 同一解析器，锚点/类型与最终加载一致）；
+    //   2. overlay（生成器产物 = 本仓 patchClashConfig 等价物）经内核 decodeYaml
+    //      解成 map，按 FlClash patch 链逐键落在 profile map 上；
+    //   3. provider path 收容（任务1）：带 url 的 provider 由 **mihomo 自己拉取**
+    //      （global-ua 同 FlClash 单一 UA），App 不再预取/解析 provider；
+    //   4. JSON dump（JSON ⊂ YAML，内核 -t 实测通过；等价 FlClash _encodeYaml）。
+    // 有 profile 时构建失败必须拒绝，不能把内部占位节点当作用户的有效配置。
     let finalYaml = yaml;
+    let builtProfile: TunBoxProfileResult | null = null;
     if (profile.profileYaml.trim().length > 0) {
-      const merged = ProfileConfigMerger.merge(yaml, profile.profileYaml,
-        profile.settings.dnsOverrideEnabled === false);
-      if (merged.ok) {
-        finalYaml = merged.yaml;
-        AppLogger.info(TAG, `profile merged: mode=${mode} applied=${merged.applied} `
-          + `items=${merged.profileProxyItems} bytes=${finalYaml.length}`);
-        // ── smart 组注入（2026-10-25 定案）────────────────────────────
-        // 原文接管模式下生成器的 ♻️ smart 组会被原文 proxy-groups 整段顶掉，
-        // 自动模式在真实订阅上从未生效。这里把 smart 组接回分流结构：
-        // 追加组定义（成员=原文自己的节点名，天然单订阅）+ 主选择组首位插入。
-        // 注入失败（无 MATCH/主组非 select/纯 provider 订阅）只降级不报错——
-        // 自动模式回落为钉选具体节点，与历史行为一致。
-        if (mode === RuntimeConfigMode.TUNNEL && options.useSmart
-          && profile.settings.autoSelectMode === AutoSelectModes.AUTO) {
-          const smartUrl: string = LatencyTestUrl.effective(profile.settings.testLatencyUrl);
-          const smartHead: string[] = [
-            `  - name: "${ClashConfigGenerator.SMART_GROUP_NAME}"`,
-            '    type: smart',
-            '    uselightgbm: true',
-            '    collectdata: false',
-            '    prefer-asn: false',
-            `    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`,
-            `    exclude-filter: "${ClashConfigGenerator.escapeYaml(ClashConfigGenerator.SMART_INFO_NODE_FILTER)}"`
-          ];
-          const priority: string = (profile.settings.smartPolicyPriority ?? '').trim();
-          if (priority.length > 0) {
-            smartHead.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
-          }
-          const injected = ProfileConfigMerger.injectSmartPrimary(
-            finalYaml, ClashConfigGenerator.SMART_GROUP_NAME, smartHead);
-          if (injected.ok) {
-            finalYaml = injected.yaml;
-            AppLogger.info(TAG, `smart group injected: ${injected.reason}`);
-          } else {
-            AppLogger.warn(TAG, `smart group injection skipped: ${injected.reason}`);
-          }
-        }
-      } else {
-        throw new Error(`订阅配置合并失败：${merged.error}`);
+      if (profile.profileId.length === 0) {
+        throw new Error('订阅配置缺少 profile 标识，无法构建 FlClash 同构配置');
       }
+      // 每 profile 覆盖优先（FlClash `Profile.overrides`）；否则回落全局 yamlOverride。
+      // 这样「只给 A 机场改 DNS」不会波及 B/C（全局覆盖的旧行为会一起改）。
+      const effectiveOverride: string = profile.overrideYaml.length > 0
+        ? profile.overrideYaml : (profile.settings.yamlOverride ?? '');
+      const input = new TunBoxProfileInput();
+      input.profileId = profile.profileId;
+      input.profilePath = ProfileRepository.pathOf(profile.profileId);
+      input.profilesDir = ProfileRepository.dir();
+      input.overlayYaml = yaml;
+      input.overrideYaml = effectiveOverride;
+      input.dnsOverrideEnabled = profile.settings.dnsOverrideEnabled !== false;
+      input.tunEnabled = tunEnabled;
+      input.ipv6Enabled = ipv6Enabled;
+      input.mtu = BASE_MTU;
+      input.useSmart = options.useSmart;
+      input.smartPolicyPriority = profile.settings.smartPolicyPriority;
+      const built = await TunBoxProfileBuilder.build(input);
+      if (!built.ok) {
+        throw new Error(`订阅配置合并失败：${built.error}`);
+      }
+      builtProfile = built;
+      finalYaml = built.yaml;
+      AppLogger.info(TAG, `flclash profile built: mode=${mode} applied=${built.applied} `
+        + `proxies=${built.profileProxies} groups=${built.profileGroups} rules=${built.profileRules} `
+        + `providers=${built.confinedProviders} bytes=${finalYaml.length}`);
     }
 
-    finalYaml = ProfileConfigMerger.enforceTunnelContract(finalYaml, BASE_MTU, ipv6Enabled);
+    if (!profile.profileYaml.trim().length) {
+      finalYaml = ProfileConfigMerger.enforceTunnelContract(finalYaml, BASE_MTU, ipv6Enabled);
+      if (options.useSmart) {
+        const input = new TunBoxProfileInput();
+        input.useSmart = true;
+        input.smartPolicyPriority = profile.settings.smartPolicyPriority;
+        builtProfile = await TunBoxProfileBuilder.enhanceStandalone(finalYaml, input);
+        if (!builtProfile.ok) { throw new Error(builtProfile.error); }
+        finalYaml = builtProfile.yaml;
+      }
+    }
     const result = new RuntimeConfigResult();
     result.yaml = finalYaml;
     result.mode = mode;
@@ -595,30 +609,24 @@ export class RuntimeConfigBuilder {
     //   ① 组名 = 规则真正指向的 select 组（兜底 proxy-groups 首组）；
     //   ② 节点 = 用户所选节点若在该组/该配置里存在就用它，否则按「去 emoji 归一化 /
     //      地区关键词」自愈到组内同名地区的真实节点，再否则取组内首个叶子节点。
-    let resolvedPin: ConnectionTarget = RuntimeConfigBuilder.resolvePinTarget(
-      finalYaml, options.selectedNodeName);
-    // ── 用户意图落地闸门（2026-10-28 收口）───────────────────────────────────
-    // 机场组常只把一部分节点列进主选择组（因为「没列进去的节点不该让用户选」不是
-    // 我们的产品口径）。此时用户在 App 里选得到、YAML 里 proxies 也有，但组的成员
-    // 表里没有它 → 钉选 PUT 必 400 → 旧实现静默换成组内首个叶子（真机：香港 → 日本）。
-    // 现在先把该节点补进规则组首位，让它成为**可钉的真实成员**；补不进去才降级。
-    if (!resolvedPin.matched && resolvedPin.groupName.length > 0) {
-      const yamlName: string = RuntimeConfigBuilder.proxyNameInYaml(finalYaml,
+    // ── 钉选目标解析（FlClash selectedMap 语义：精确名，无注入、无自愈、无替换）──
+    // FlClash 的选点 = 组内成员列表里精确名字（selectedMap[group] = proxyName），
+    // 内核 patchSelectGroup/PUT 拒绝不存在的成员时**如实失败**。本仓对齐：
+    // 名字来自内核目录（NodeTruth），App 不再「自愈地区关键词 / 补组成员 /
+    // 替换首个叶子」（2026-11-05 删除 —— 那些是自造推断，违反「节点准入不做
+    // 自有过滤/改名/推断」）。
+    let resolvedPin: ConnectionTarget;
+    if (builtProfile !== null) {
+      resolvedPin = RuntimeConfigBuilder.resolvePinTargetFromProfile(
+        builtProfile.groups, builtProfile.rules, builtProfile.proxyNames,
         options.selectedNodeName);
-      if (yamlName.length > 0) {
-        const inj = ProfileConfigMerger.ensureGroupMember(finalYaml, resolvedPin.groupName, yamlName);
-        if (inj.ok) {
-          finalYaml = inj.yaml;
-          resolvedPin = RuntimeConfigBuilder.resolvePinTarget(finalYaml, yamlName);
-          AppLogger.info(TAG, `selected node injected into group "${resolvedPin.groupName}": `
-            + `"${yamlName}" (${inj.reason})`);
-        } else {
-          AppLogger.warn(TAG, `selected node "${yamlName}" not injectable into group `
-            + `"${resolvedPin.groupName}": ${inj.reason}`);
-        }
-      }
+    } else {
+      resolvedPin = RuntimeConfigBuilder.resolvePinTarget(finalYaml, options.selectedNodeName);
     }
-    result.ruleGroupName = resolvedPin.groupName;
+    result.smartGroupName = builtProfile !== null ? builtProfile.smartGroupName : '';
+    result.ruleGroupName = builtProfile !== null && builtProfile.smartParentGroupName.length > 0
+      ? builtProfile.smartParentGroupName : resolvedPin.groupName;
+    result.yaml = finalYaml;
     result.pinMatched = resolvedPin.matched;
     // provider-only 订阅的组在文本里只有内部占位 outbound（__tunbox_overlay__），
     // 真实节点由 `use: provider` 在运行时注入 —— 这个占位符绝不能当钉选目标。
@@ -628,11 +636,74 @@ export class RuntimeConfigBuilder {
       ? resolvedPin.nodeName
       : (fromGenerator.length > 0 ? fromGenerator : options.selectedNodeName);
     AppLogger.info(TAG, `runtime config built: mode=${mode} bytes=${finalYaml.length} `
-      + `hosts=${result.hostsCount} useSmart=${options.useSmart} `
+      + `hosts=${result.hostsCount} `
       + `ruleProviderReady=${options.ruleProviderReady} useGeoip=${options.useGeoip} `
       + `ipv6=${ipv6Enabled} node="${options.selectedNodeName}" `
       + `group="${result.ruleGroupName}" effective="${result.effectiveNodeName}"`);
     return result;
+  }
+
+  /**
+   * map 级钉选解析（profile 路径专用；语义与 resolvePinTarget 相同但输入来自
+   * TunBoxProfileBuilder 的结构化投影，不再解析 YAML 文本）。
+   *
+   * 删除项（FlClash 照抄收口）：地区关键词自愈、组内首个叶子替换、
+   * 任意叶子兜底、成员注入 —— 选不到就如实 unmatched，由连接路径报错。
+   */
+  static resolvePinTargetFromProfile(groups: TunBoxGroupInfo[], rules: string[],
+    proxies: string[], preferredName: string): ConnectionTarget {
+    const out = new ConnectionTarget();
+    const groupInfos: YamlGroupInfo[] = [];
+    const groupNames: Set<string> = new Set<string>();
+    for (const g of groups) {
+      const info = new YamlGroupInfo();
+      info.name = g.name;
+      info.type = g.type;
+      info.members = g.members.slice();
+      groupInfos.push(info);
+      groupNames.add(g.name);
+    }
+    // The first declared selector is the profile's primary panel. Rules are
+    // ordered by traffic matching priority: the first one may target AI or
+    // YouTube and must not become the app's default exit group.
+    for (const g of groupInfos) {
+      if (g.type === 'select' && g.name !== 'GLOBAL') { out.groupName = g.name; break; }
+    }
+    for (const tgt of rules) {
+      if (out.groupName.length > 0) { break; }
+      const g: YamlGroupInfo | null = RuntimeConfigBuilder.findGroup(groupInfos, tgt);
+      if (g !== null && g.type === 'select') { out.groupName = g.name; break; }
+    }
+    if (out.groupName.length === 0) {
+      for (const tgt of rules) {
+        const g: YamlGroupInfo | null = RuntimeConfigBuilder.findGroup(groupInfos, tgt);
+        if (g !== null) { out.groupName = g.name; break; }
+      }
+    }
+    if (out.groupName.length === 0 && groupInfos.length > 0) { out.groupName = groupInfos[0].name; }
+    // 成员 = 内核 map 里该组的直接成员（providers 动态成员此时还不在静态列表里，
+    // 由 providerIntent 分支放行用户所选名——与内核目录对齐后由 PUT 校验）。
+    const ruleGroup: YamlGroupInfo | null = out.groupName.length > 0
+      ? RuntimeConfigBuilder.findGroup(groupInfos, out.groupName) : null;
+    const members: string[] = ruleGroup !== null ? ruleGroup.members : [];
+    const preferred: string = preferredName.startsWith('__') ? '' : preferredName.trim();
+    out.nodeName = RuntimeConfigBuilder.kernelLeafFor(Array.from(groupNames), preferred);
+    if (out.nodeName.length === 0) {
+      for (const m of members) {
+        if (m === preferred) { out.nodeName = m; break; }
+      }
+    }
+    if (out.nodeName.length === 0 && preferred.length > 0) {
+      // provider-only 订阅：所选名在静态 proxies/组里都没有（成员来自 provider）。
+      // 放行原名由内核 PUT 校验，绝不替换成别的节点（FlClash 行为）。
+      const providerIntent = proxies.length === 0;
+      if (providerIntent) { out.nodeName = preferred; }
+    }
+    out.source = (out.nodeName.length > 0 && out.nodeName === preferred)
+      ? ConnectionTargetSource.USER : ConnectionTargetSource.YAML;
+    // FlClash 同构：matched 仅当精确名命中用户所选（无归一化等价）。
+    out.matched = preferred.length > 0 && out.nodeName === preferred;
+    return out;
   }
 
   // ── 钉选目标解析（2026-10-27 二次修）─────────────────────────────────────
@@ -677,58 +748,38 @@ export class RuntimeConfigBuilder {
       ? RuntimeConfigBuilder.findGroup(groups, out.groupName) : null;
     const members: string[] = ruleGroup !== null ? ruleGroup.members : [];
 
-    // ②③ 依次尝试：**规则组直连成员优先**（订阅里常有 PROXY/GLOBAL/自动选择/故障转移
-    // 多个分组，只有直连成员能被 SET 到），再退到全量 proxies：
-    // 精确命中 → 归一化命中 → 地区关键词命中 → 组内首个叶子节点 → 任意叶子节点。
+    // FlClash 语义（2026-11-05 收口）：精确命中（含归一化名等价）→ 找不到就如实
+    // unmatched。地区关键词自愈、组内首叶子替换、任意叶子兜底、信息条目过滤
+    // 一律删除 —— 那些是自造推断；选不到由连接路径报错，绝不替用户挑节点。
     const preferred: string = preferredName.startsWith('__') ? '' : preferredName.trim();
     // A selected child strategy is a valid target, with its own selection and
     // policy. It must not be replaced by the first static leaf (often Direct).
     out.nodeName = RuntimeConfigBuilder.kernelLeafFor(Array.from(groupNames), preferred);
     if (out.nodeName.length === 0) {
-      out.nodeName = RuntimeConfigBuilder.pickExisting(members, groupNames, preferred, true);
-    }
-    if (out.nodeName.length === 0) {
-      out.nodeName = RuntimeConfigBuilder.pickExisting(proxies, groupNames, preferred, true);
-    }
-    const providerIntent: boolean = out.nodeName.length === 0 && preferred.length > 0
-      && RuntimeConfigBuilder.splitYamlLines(yaml).some((line: string): boolean => line === 'proxy-providers:');
-    if (providerIntent) { out.nodeName = preferred; }
-    if (out.nodeName.length === 0) {
-      // 组里第一个**真节点**（跳过策略组与「剩余流量/到期」信息条目）。
       for (const m of members) {
-        if (RuntimeConfigBuilder.isInfoOrGroup(m, groupNames)) { continue; }
-        out.nodeName = m;
-        break;
+        if (m === preferred) { out.nodeName = m; break; }
       }
     }
-    if (out.nodeName.length === 0) {
-      for (const p of proxies) {
-        if (RuntimeConfigBuilder.isInfoOrGroup(p, groupNames)) { continue; }
-        out.nodeName = p;
-        break;
-      }
+    if (out.nodeName.length === 0 && preferred.length > 0) {
+      // provider 成员：所选名不在静态 proxies/组里（成员来自 provider 拉取）。
+      // 配置声明了 proxy-providers 即放行原名，由内核 PUT 校验，绝不替换
+      // （FlClash 的 provider 成员选点同此形态）。
+      const providerIntent = RuntimeConfigBuilder.splitYamlLines(yaml).some((line: string): boolean =>
+        line === 'proxy-providers:');
+      if (providerIntent) { out.nodeName = preferred; }
     }
-    // 来源标注：与用户所选**逐字节相同**才算 user；地区自愈/组内首叶子都算 yaml。
     out.source = (out.nodeName.length > 0 && out.nodeName === preferred)
       ? ConnectionTargetSource.USER : ConnectionTargetSource.YAML;
-    // 「是不是同一个节点」按归一化名判（emoji / 空格 / 分隔符差异不算换节点）。
-    // 地区自愈（`新加坡01aws` → `🇸🇬新加坡•移联01`）与组内首叶子**一律不算**：
-    // 它们是替身，不能让连接路径以为用户意图已经落地。
-    const wantKey: string = RuntimeConfigBuilder.nodeKey(preferred);
-    out.matched = wantKey.length > 0 && !providerIntent
-      && RuntimeConfigBuilder.nodeKey(out.nodeName) === wantKey;
+    // FlClash 同构：matched 仅当精确名命中用户所选（无归一化等价）。
+    out.matched = preferred.length > 0 && out.nodeName === preferred;
     return out;
   }
 
   /**
-   * 在**内核**给回的成员名单里找用户所选节点（精确 → 归一化）。
+   * 在**内核**给回的成员名单里找用户所选节点（FlClash 同构：精确名匹配）。
    *
-   * 为什么要单独一个函数（2026-10-28 真机定案）：连接路径旧实现用
-   * `leaf === target.name` **逐字节**比较内核成员名，App 侧名字与内核名只要差一个
-   * emoji/空格就判「不是这个节点」，于是走进「认内核旧出口」分支 —— 用户看到的
-   * 就是「未连接时选了香港、一连接又变回上次那个节点」。
-   *
-   * 返回**内核里的真实名字**（PUT 必须用这个名字），找不到返回空串。
+   * `core/proxy.go:39 lookupProxy` 精确：App 不做归一化、不猜组、不首个回退。
+   * 找不到返回空串，由调用方提示「节点未命中」。
    */
   static kernelLeafFor(members: string[], preferred: string): string {
     const want: string = preferred.trim();
@@ -736,15 +787,10 @@ export class RuntimeConfigBuilder {
     for (const m of members) {
       if (m === want) { return m; }
     }
-    const key: string = RuntimeConfigBuilder.nodeKey(want);
-    if (key.length === 0) { return ''; }
-    for (const m of members) {
-      if (RuntimeConfigBuilder.nodeKey(m) === key) { return m; }
-    }
     return '';
   }
 
-  /** 顶层 `proxies:` 里是否存在该节点；返回 YAML 里的真实写法（精确 → 归一化）。 */
+  /** 顶层 `proxies:` 里是否存在该节点；返回 YAML 里的真实写法（精确名匹配）。 */
   static proxyNameInYaml(yaml: string, preferred: string): string {
     const want: string = preferred.trim();
     if (want.length === 0) { return ''; }
@@ -752,35 +798,16 @@ export class RuntimeConfigBuilder {
     for (const n of names) {
       if (n === want) { return n; }
     }
-    const key: string = RuntimeConfigBuilder.nodeKey(want);
-    if (key.length === 0) { return ''; }
-    for (const n of names) {
-      if (RuntimeConfigBuilder.nodeKey(n) === key) { return n; }
-    }
     return '';
   }
 
-  /** 在候选名集合里找用户意图对应的真实节点（精确 / 归一化 / 地区关键词三级）。 */
+  /** 在候选名集合里找用户所选节点（FlClash 同构：精确名匹配，无命中即空）。 */
   private static pickExisting(pool: string[], groupNames: Set<string>, preferred: string,
     leafOnly: boolean): string {
     if (pool.length === 0 || preferred.length === 0) { return ''; }
     for (const name of pool) {
       if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
       if (name === preferred) { return name; }
-    }
-    const wantKey: string = RuntimeConfigBuilder.nodeKey(preferred);
-    if (wantKey.length === 0) { return ''; }
-    for (const name of pool) {
-      if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
-      if (RuntimeConfigBuilder.nodeKey(name) === wantKey) { return name; }
-    }
-    // 地区关键词：`新加坡01aws` → 新加坡 ；`hy2台湾1` → 台湾
-    const runs: string[] = RuntimeConfigBuilder.cjkRuns(preferred);
-    for (const region of runs) {
-      for (const name of pool) {
-        if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
-        if (RuntimeConfigBuilder.nodeKey(name).indexOf(region) >= 0) { return name; }
-      }
     }
     return '';
   }
@@ -791,7 +818,10 @@ export class RuntimeConfigBuilder {
     return name.indexOf('剩余') >= 0 || name.indexOf('到期') >= 0;
   }
 
-  /** 去 emoji / 分隔符 / 大小写差异后的比较键（只保留 ASCII 字母数字与 CJK）。 */
+  /**
+   * 去 emoji / 分隔符 / 大小写差异后的比较键（只保留 ASCII 字母数字与 CJK）。
+   * 注（§5.5）：选点已不再用此键做匹配（FlClash 精确名）；仅保留供外部/诊断使用。
+   */
   static nodeKey(raw: string): string {
     let out: string = '';
     for (let i = 0; i < raw.length; i++) {

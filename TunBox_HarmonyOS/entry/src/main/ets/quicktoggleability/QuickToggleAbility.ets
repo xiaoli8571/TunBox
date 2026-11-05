@@ -27,6 +27,7 @@
  * 重复点击/在途请求：单航班 + 末次意图合并，绝不吞点击，也不重复拉起。
  */
 import { UIAbility, AbilityConstant, Want } from '@kit.AbilityKit';
+import { StageSessionRecovery } from '../commons/services/StageSessionRecovery';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { window } from '@kit.ArkUI';
 import backgroundTaskManager from '@ohos.resourceschedule.backgroundTaskManager';
@@ -65,13 +66,6 @@ const WINDOW_STAGE_POLL_MS = 100;
 const GUARDIAN_POLL_MS = 15000;
 /** 连续缺失多少次才判定会话终结（≈30s，容忍扩展重启窗口与文件读写抖动） */
 const GUARDIAN_MISS_THRESHOLD = 2;
-/**
- * 租约丢失后的自愈预算：最多重连 GUARDIAN_MAX_HEAL_ATTEMPTS 次，间隔线性退避。
- * 用尽才交还系统处理 —— 守护者存在的意义是"被杀之后自己爬起来"，
- * 仅仅放弃守护等于把隧道直接丢给用户的下一次手动操作。
- */
-const GUARDIAN_MAX_HEAL_ATTEMPTS = 3;
-const GUARDIAN_HEAL_BACKOFF_MS = 5000;
 
 export default class QuickToggleAbility extends UIAbility implements ContinuousTaskCancelListener {
   private running: boolean = false;
@@ -88,8 +82,6 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   private guardianChecking: boolean = false;
   /** 自愈单航班：重连在途时不再叠加新的尝试 */
   private healing: boolean = false;
-  /** 已消耗的自愈次数（退避后重试，耗尽才释放守护） */
-  private healAttempts: number = 0;
   /**
    * 长时任务取消后的重挂定时器。
    * 2026-10-20 起时长不再固定：取 BackgroundTaskWatch 分类结论里的退避时长
@@ -100,6 +92,7 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
   private mainWindow: window.Window | null = null;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    StageSessionRecovery.noteUiLaunch();
     PersistentLogStore.init(this.context, 'quick');
     this.armLifetimeGuard();
     AppLogger.info(TAG, 'headless host created (no page loaded by design)');
@@ -110,6 +103,11 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     // 卡片/快捷方式拉起本宿主 = 显式用户操作：清除"用户主动停止后台任务"的抑制态
     UiGuardian.clearExternalCancelSuppression();
     this.enqueue(this.resolveMode(want));
+  }
+
+  onSaveState(reason: AbilityConstant.StateType, wantParam: Record<string, Object>): AbilityConstant.OnSaveResult {
+    wantParam['tunbox_recovery'] = true;
+    return AbilityConstant.OnSaveResult.RECOVERY_AGREE;
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
@@ -468,53 +466,20 @@ export default class QuickToggleAbility extends UIAbility implements ContinuousT
     });
   }
 
-  /**
-   * 守护者自愈：租约丢失但用户意图仍为"连接"时，重新走一遍标准连接流程。
-   *
-   * 走 VpnQuickStart('start') 而不是自己拼连接：它自带进程级单航班、节点选择、
-   * 卡片/通知同步与失败后的状态回写，自愈与用户手动点「启动代理」因此完全同款，
-   * 不会出现"自愈路径连上了、卡片却还显示断开"的分裂状态。
-   * 退避重试有上限，耗尽才 releaseGuardian 交还系统，避免无限重连风暴。
-   */
+  /** 与前台/冷启动共用恢复链，禁止用快捷启动重放用户意图或另起一组重试。 */
   private selfHeal(): void {
-    if (this.destroyed || !this.guardianActive || this.healing) {
-      return;
-    }
+    if (this.destroyed || !this.guardianActive || this.healing) { return; }
     this.healing = true;
     this.guardianMisses = 0;
-    VpnQuickStart.run(MODE_START, this.context).then((result: string): void => {
-      this.healing = false;
-      if (this.destroyed || !this.guardianActive) {
-        return;
+    ConnectionOrchestrator.instance().restoreKilledSession(this.context).then((reason: string): void => {
+      if (this.destroyed || !this.guardianActive) { return; }
+      AppLogger.info(TAG, `guardian self-heal: ${reason}`);
+      if (reason === 'no-intent' || reason.startsWith('phase-') || reason === 'no-recovery-target') {
+        this.releaseGuardian(`recovery-ended:${reason}`);
       }
-      AppLogger.info(TAG, `guardian self-heal attempt #${this.healAttempts + 1} => ${result}`);
-      if (result === 'on' || result === 'already') {
-        this.healAttempts = 0; // 隧道回来了，复位计数继续守护
-        this.guardianMisses = 0;
-        return;
-      }
-      this.scheduleHealRetry('self-heal-failed');
     }).catch((error: Error): void => {
-      this.healing = false;
-      if (this.destroyed || !this.guardianActive) {
-        return;
-      }
-      AppLogger.warn(TAG, `guardian self-heal threw: ${error.message}`);
-      this.scheduleHealRetry('self-heal-error');
-    });
-  }
-
-  /** 自愈失败退避重试；预算耗尽才释放守护（原因串用于落盘排障）。 */
-  private scheduleHealRetry(reason: string): void {
-    this.healAttempts = this.healAttempts + 1;
-    if (this.healAttempts < GUARDIAN_MAX_HEAL_ATTEMPTS) {
-      setTimeout((): void => {
-        this.selfHeal();
-      }, GUARDIAN_HEAL_BACKOFF_MS * this.healAttempts);
-      return;
-    }
-    AppLogger.error(TAG, `guardian self-heal exhausted after ${this.healAttempts} attempt(s); releasing`);
-    this.releaseGuardian(reason + '-exhausted');
+      AppLogger.warn(TAG, `guardian self-heal failed: ${error.message}`);
+    }).finally((): void => { this.healing = false; });
   }
 
   /** 释放守护：注销连续任务 → 尽力把真实状态刷到卡片 → 自毁。 */

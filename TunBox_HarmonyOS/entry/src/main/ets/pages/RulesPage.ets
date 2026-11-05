@@ -296,7 +296,7 @@ export struct RulesView {
   /** 策略徽章文字色（doc §3.6：DIRECT=success / PROXY=primary / REJECT=danger） */
   private policyColor(policy: string): ResourceColor {
     if (policy === 'PROXY') {
-      return TunBoxColors.primary;
+      return TunBoxColors.primaryFor(this.themeRevision);
     }
     if (policy === 'REJECT' || policy === 'REJECT-DROP') {
       return TunBoxColors.danger;
@@ -304,13 +304,13 @@ export struct RulesView {
     if (policy === 'DIRECT') {
       return TunBoxColors.success;
     }
-    return TunBoxColors.textSecondary;
+    return TunBoxColors.textSecondaryFor(this.themeRevision);
   }
 
   /** 策略徽章底色（对应浅底） */
   private policyBg(policy: string): ResourceColor {
     if (policy === 'PROXY') {
-      return TunBoxColors.primaryLight;
+      return TunBoxColors.primaryLightFor(this.themeRevision);
     }
     if (policy === 'REJECT' || policy === 'REJECT-DROP') {
       return TunBoxColors.dangerLight;
@@ -332,7 +332,7 @@ export struct RulesView {
           TopNavBar({ title: '路由与规则' }) {
             Button('保存')
               .fontSize(14)
-              .backgroundColor(TunBoxColors.primary)
+              .backgroundColor(TunBoxColors.primaryFor(this.themeRevision))
               .fontColor(TunBoxColors.textOnPrimary)
               .borderRadius(TunBoxGeometry.controlRadius)
               .onClick(() => { this.save(); })
@@ -344,12 +344,12 @@ export struct RulesView {
                 Row() {
                   Column({ space: 2 }) {
                     Text('启用规则路由引擎')
-                      .fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                      .fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                     Text('全局或自定义规则将在网络连接建立时立即生效')
-                      .fontSize(11).fontColor(TunBoxColors.textMuted)
+                      .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
                   }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                   Toggle({ type: ToggleType.Switch, isOn: this.rulesEnabled })
-                    .selectedColor(TunBoxColors.primary)
+                    .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
                     .onChange((value: boolean) => { this.rulesEnabled = value; })
                 }.width('100%').alignItems(VerticalAlign.Center)
                 Divider().strokeWidth(1).color(TunBoxColors.cardBorder(this.themeRevision))
@@ -357,20 +357,20 @@ export struct RulesView {
                   Column({ space: 2 }) {
                     Row({ space: 6 }) {
                       Text('HyperADRules 智能去广告')
-                        .fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                        .fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                       Text('官方 MRS')
-                        .fontSize(9).fontColor(TunBoxColors.primary)
-                        .backgroundColor(TunBoxColors.primaryLight)
+                        .fontSize(9).fontColor(TunBoxColors.primaryFor(this.themeRevision))
+                        .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                         .padding({ left: 4, right: 4, top: 2, bottom: 2 })
                         .borderRadius(4)
                     }.alignItems(VerticalAlign.Center)
                     // 独立开关（2026-10-23 用户口径）：不依赖上面的规则引擎；
                     // 规则集随包内置，打开即用，后台再自动增量更新。
                     Text('独立开关 · 内置规则集随包自带，开箱即用 · 来源：Lynricsy')
-                      .fontSize(11).fontColor(TunBoxColors.textMuted)
+                      .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
                   }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                   Toggle({ type: ToggleType.Switch, isOn: this.hyperAdRulesEnabled })
-                    .selectedColor(TunBoxColors.primary)
+                    .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
                     .onChange((value: boolean) => { this.hyperAdRulesEnabled = value; })
                 }.width('100%').alignItems(VerticalAlign.Center)
               }
@@ -383,15 +383,15 @@ export struct RulesView {
               Column({ space: 10 }) {
                 Row() {
                   Text('自定义域名与 IP 规则')
-                    .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                    .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                   Blank()
                   Text('模版注入')
-                    .fontSize(12).fontColor(TunBoxColors.primary)
+                    .fontSize(12).fontColor(TunBoxColors.primaryFor(this.themeRevision))
                     .padding({ left: 8, right: 4, top: 6, bottom: 6 })
                     .onClick(() => { this.injectRuleTemplate(); })
                 }.width('100%').alignItems(VerticalAlign.Center)
                 Text('每行一条，例如 DOMAIN-SUFFIX,example.com,REJECT')
-                  .fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+                  .fontSize(12).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
                 TextArea({
                   placeholder: 'DOMAIN-SUFFIX,example.com,REJECT\nDOMAIN,example.org,DIRECT',
                   text: this.customRulesText
@@ -404,7 +404,7 @@ export struct RulesView {
                   .width('100%').height(260)
                   .fontSize(12).fontFamily('monospace').lineHeight(20)
                   .fontColor(TunBoxColors.codeText)
-                  .placeholderColor(TunBoxColors.textMuted)
+                  .placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
                   .backgroundColor(TunBoxColors.codeBg(this.themeRevision))
                   .borderRadius(14)
                   .padding(12)
@@ -430,7 +430,7 @@ export struct RulesView {
                   .alignItems(HorizontalAlign.Start)
                 }
                 Text('支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR、IP-CIDR6、GEOIP；策略支持 DIRECT、PROXY、REJECT、PASS、REJECT-DROP；IP 类规则可追加 no-resolve。')
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                  .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
@@ -441,16 +441,16 @@ export struct RulesView {
               Column({ space: 12 }) {
                 Row() {
                   Text('规则命中快速调试')
-                    .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                    .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                   Blank()
-                  Text('沙盒模拟').fontSize(11).fontColor(TunBoxColors.textMuted)
+                  Text('沙盒模拟').fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
                 }.width('100%')
                 Row({ space: 8 }) {
                   TextInput({ placeholder: 'developer.apple.com', text: this.debugDomain })
                     .layoutWeight(1).height(40)
                     .fontSize(13)
-                    .fontColor(TunBoxColors.textPrimary)
-                    .placeholderColor(TunBoxColors.textMuted)
+                    .fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
+                    .placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
                     .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                     .borderRadius(10)
                     .padding({ left: 10, right: 10 })
@@ -460,8 +460,8 @@ export struct RulesView {
                     })
                   Text('诊断')
                     .fontSize(14).fontWeight(FontWeight.Medium)
-                    .fontColor(TunBoxColors.primary)
-                    .backgroundColor(TunBoxColors.primaryLight)
+                    .fontColor(TunBoxColors.primaryFor(this.themeRevision))
+                    .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                     .height(40)
                     .padding({ left: 16, right: 16 })
                     .borderRadius(10)
@@ -473,16 +473,16 @@ export struct RulesView {
                 if (this.debugDomain.trim().length > 0) {
                   Row() {
                     Circle({ width: 6, height: 6 })
-                      .fill(this.debugResult.length > 0 ? TunBoxColors.success : TunBoxColors.textMuted)
+                      .fill(this.debugResult.length > 0 ? TunBoxColors.success : TunBoxColors.textMutedFor(this.themeRevision))
                       .margin({ right: 8 })
                     Column({ space: 2 }) {
                       Text(this.debugResult.length > 0
                         ? `匹配规则: ${this.debugMatchedRule()}` : '未命中自定义域名规则')
-                        .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimary)
+                        .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                       Text(this.debugResult.length > 0
                         ? `路由去向: ${this.policyDesc(this.debugTargetPolicy())}`
                         : '（走 DIRECT/PROXY 名单或 GEOIP/MATCH）')
-                        .fontSize(11).fontColor(TunBoxColors.textMuted)
+                        .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
                     }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                     if (this.debugResult.length > 0) {
                       Text(this.debugTargetPolicy())
@@ -507,16 +507,16 @@ export struct RulesView {
               // ── 自定义远程规则集（P1-2）：条目列表 + 新增表单，对标 iOS 六家 RULE-SET 能力 ──
               Column({ space: 10 }) {
                 Text('自定义规则集').fontSize(16).fontWeight(FontWeight.Bold)
-                  .fontColor(TunBoxColors.textPrimary).width('100%')
+                  .fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).width('100%')
                 Text('添加远程 RULE-SET（URL+格式+策略），命中后整体应用一条策略，比逐条规则更高效。内核自动下载与定时更新，失败保留上一版。')
-                  .fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+                  .fontSize(12).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
                 ForEach(this.ruleSets, (rs: CustomRuleSet) => {
                   Row({ space: 8 }) {
                     Column({ space: 2 }) {
                       Text(`${rs.name} → ${rs.policy}`)
-                        .fontSize(13).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimary)
+                        .fontSize(13).fontWeight(FontWeight.Medium).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                       Text(`${rs.behavior}/${rs.format} · ${rs.url}`)
-                        .fontSize(11).fontColor(TunBoxColors.textMuted).maxLines(1)
+                        .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).maxLines(1)
                         .textOverflow({ overflow: TextOverflow.Ellipsis })
                     }.alignItems(HorizontalAlign.Start).layoutWeight(1)
                     Text('删除').fontSize(12).fontColor(TunBoxColors.danger).padding(6)
@@ -528,51 +528,51 @@ export struct RulesView {
                 TextInput({ placeholder: '名称（字母数字-_，如 my-rules）', text: this.rsName })
                   .enabled(this.rulesEnabled)
                   .onChange((value: string) => { this.rsName = value; })
-                  .height(40).fontSize(13).fontColor(TunBoxColors.textPrimary)
-                  .placeholderColor(TunBoxColors.textMuted)
+                  .height(40).fontSize(13).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
+                  .placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
                   .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                   .borderRadius(12).padding({ left: 10, right: 10 })
                   .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
                 TextInput({ placeholder: 'https://… 规则集 URL（yaml/text/mrs）', text: this.rsUrl })
                   .enabled(this.rulesEnabled)
                   .onChange((value: string) => { this.rsUrl = value; })
-                  .height(40).fontSize(13).fontColor(TunBoxColors.textPrimary)
-                  .placeholderColor(TunBoxColors.textMuted)
+                  .height(40).fontSize(13).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
+                  .placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
                   .backgroundColor(TunBoxColors.surfaceSubtle(this.themeRevision))
                   .borderRadius(12).padding({ left: 10, right: 10 })
                   .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
                 // 格式 chip 换行（Flex wrap，Row 无 flexWrap 属性）：窄屏下 chip 挤一行
                 // 会超出卡片边界，允许换行。
                 Flex({ wrap: FlexWrap.Wrap, space: { main: LengthMetrics.vp(8), cross: LengthMetrics.vp(8) } }) {
-                  Text('格式').fontSize(12).fontColor(TunBoxColors.textMuted)
+                  Text('格式').fontSize(12).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
                   ForEach(['yaml', 'text', 'mrs'], (f: string) => {
                     Text(f).fontSize(12).padding({ left: 10, right: 10, top: 4, bottom: 4 })
                       .borderRadius(TunBoxGeometry.pillRadius)
-                      .fontColor(this.rsFormat === f ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
-                      .backgroundColor(this.rsFormat === f ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
+                      .fontColor(this.rsFormat === f ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondaryFor(this.themeRevision))
+                      .backgroundColor(this.rsFormat === f ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.chipBg(this.themeRevision))
                       .onClick(() => { this.rsFormat = f; })
                   }, (f: string) => f)
                 }.width('100%')
                 // 策略 chip 换行（Flex wrap）：窄屏下 REJECT/DIRECT/PROXY 三枚 chip
                 // 与「策略」标签挤在一行会超出卡片边界，允许换行。
                 Flex({ wrap: FlexWrap.Wrap, space: { main: LengthMetrics.vp(8), cross: LengthMetrics.vp(8) } }) {
-                  Text('策略').fontSize(12).fontColor(TunBoxColors.textMuted)
+                  Text('策略').fontSize(12).fontColor(TunBoxColors.textMutedFor(this.themeRevision))
                   ForEach(['REJECT', 'DIRECT', 'PROXY'], (p: string) => {
                     Text(p).fontSize(12).padding({ left: 10, right: 10, top: 4, bottom: 4 })
                       .borderRadius(TunBoxGeometry.pillRadius)
-                      .fontColor(this.rsPolicy === p ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
-                      .backgroundColor(this.rsPolicy === p ? TunBoxColors.primary : TunBoxColors.chipBg(this.themeRevision))
+                      .fontColor(this.rsPolicy === p ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondaryFor(this.themeRevision))
+                      .backgroundColor(this.rsPolicy === p ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.chipBg(this.themeRevision))
                       .onClick(() => { this.rsPolicy = p; })
                   }, (p: string) => p)
                 }.width('100%')
                 Text('添加').fontSize(14).fontWeight(FontWeight.Bold)
-                  .fontColor(this.rulesEnabled ? TunBoxColors.textOnPrimary : TunBoxColors.textMuted)
+                  .fontColor(this.rulesEnabled ? TunBoxColors.textOnPrimary : TunBoxColors.textMutedFor(this.themeRevision))
                   .textAlign(TextAlign.Center).width('100%').padding(10)
                   .borderRadius(TunBoxGeometry.controlRadius)
-                  .backgroundColor(this.rulesEnabled ? TunBoxColors.primary : TunBoxColors.surfaceSubtle(this.themeRevision))
+                  .backgroundColor(this.rulesEnabled ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.surfaceSubtle(this.themeRevision))
                   .onClick(() => this.addRuleSet())
                 Text('behavior 由格式推断：yaml/text 默认 domain，可在生成器侧自动匹配 ipcidr/classical；名称将生成 rs-<名称> 的 provider 键。')
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+                  .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
               }
               .width('100%')
               .padding(TunBoxGeometry.cardPadding)
@@ -582,9 +582,9 @@ export struct RulesView {
               // ── YAML 覆盖层（P2）：对标 Stash JS Override 的无脚本形态 ──
               Column({ space: 10 }) {
                 Text('YAML 覆盖层').fontSize(16).fontWeight(FontWeight.Bold)
-                  .fontColor(TunBoxColors.textPrimary).width('100%')
+                  .fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).width('100%')
                 Text('追加在生成配置尾部的高级 YAML 片段，同名键覆盖默认值（如 sniffer/keep-alive/profile）。rules/proxies/proxy-groups/external-controller/secret/tun 六键被拦截，由程序管理。')
-                  .fontSize(12).fontColor(TunBoxColors.textMuted).width('100%')
+                  .fontSize(12).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
                 TextArea({ placeholder: '如：\nprofile:\n  store-selected: true', text: this.yamlOverrideText })
                   .enabled(true)
                   // 录入侧即挡住超长（maxLength），保存侧 validateLength 再兜一层；
@@ -594,18 +594,18 @@ export struct RulesView {
                   .width('100%').height(120)
                   .fontSize(12).fontFamily('monospace').lineHeight(20)
                   .fontColor(TunBoxColors.codeText)
-                  .placeholderColor(TunBoxColors.textMuted)
+                  .placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
                   .backgroundColor(TunBoxColors.codeBg(this.themeRevision))
                   .borderRadius(14)
                   .padding(12)
                   .border({ width: 1, color: TunBoxColors.codeBorder(this.themeRevision) })
                 Text(`${this.yamlOverrideText.length}/${ImportFilePolicy.YAML_OVERRIDE_MAX_CHARS}`)
-                  .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%').textAlign(TextAlign.End)
+                  .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%').textAlign(TextAlign.End)
                 Text('保存').fontSize(14).fontWeight(FontWeight.Bold)
                   .fontColor(TunBoxColors.textOnPrimary)
                   .textAlign(TextAlign.Center).width('100%').padding(10)
                   .borderRadius(TunBoxGeometry.controlRadius)
-                  .backgroundColor(TunBoxColors.primary)
+                  .backgroundColor(TunBoxColors.primaryFor(this.themeRevision))
                   .onClick(() => this.saveYamlOverride())
               }
               .width('100%')
@@ -623,7 +623,7 @@ export struct RulesView {
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
         } else {
           TopNavBar({ title: '路由与规则' })
-          Text('正在读取规则设置…').fontSize(14).fontColor(TunBoxColors.textMuted).margin({ top: 24 })
+          Text('正在读取规则设置…').fontSize(14).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).margin({ top: 24 })
         }
       }.width('100%').height('100%')
     }.width('100%').height('100%')

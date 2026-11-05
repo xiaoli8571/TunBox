@@ -34,7 +34,9 @@ export enum ReconnectAttemptOutcome {
   /** 尝试执行了但失败 —— 进入预算判定，可继续退避重试 */
   FAILED = 1,
   /** 尝试已被新的连接事务/用户断开取代 —— 不重试、不必计数 */
-  SUPERSEDED = 2
+  SUPERSEDED = 2,
+  /** 配置/授权等无法靠重复启动解决，立即结束恢复链。 */
+  STOPPED = 3
 }
 
 /**
@@ -155,6 +157,8 @@ export class ReconnectManager {
    */
   cancel(reason: string): void {
     if (this.timerId >= 0) {
+      // 断网取消的只是尚未执行的预约，不应耗掉一次实际恢复预算。
+      if (reason === 'network-lost') { this.attempts = Math.max(0, this.attempts - 1); }
       clearTimeout(this.timerId);
       this.timerId = -1;
       this.pendingDelayMs = 0;
@@ -239,7 +243,7 @@ export class ReconnectManager {
     if (ReconnectPolicy.exhausted(this.attempts, this.maxAttempts)) {
       this.telemetry.gaveUp = this.telemetry.gaveUp + 1;
       AppLogger.warn(TAG, `[reconnect] max attempts(${this.maxAttempts}) reached; give up (${reason})`);
-      this.host.onGiveUp('网络切换后自动重连多次失败，已停止自动重试');
+      this.host.onGiveUp('自动恢复多次失败，已停止重试');
       return;
     }
     const delay: number = ReconnectPolicy.delayMs(this.attempts + 1, this.baseMs, this.maxMs);
@@ -291,7 +295,14 @@ export class ReconnectManager {
     }
     this.telemetry.started = this.telemetry.started + 1;
     AppLogger.info(TAG, `[reconnect] attempt ${this.attempts}/${this.maxAttempts} (${reason})`);
-    const outcome = await this.host.runAttempt(reason);
+    let outcome: ReconnectAttemptOutcome;
+    try {
+      outcome = await this.host.runAttempt(reason);
+    } catch (e) {
+      AppLogger.warn(TAG, `attempt threw: ${AppLogger.errText(e)}`);
+      if (generation !== this.host.sessionGeneration() || this.host.userDisconnected()) { return; }
+      outcome = ReconnectAttemptOutcome.FAILED;
+    }
     if (outcome === ReconnectAttemptOutcome.SUCCESS) {
       this.telemetry.succeeded = this.telemetry.succeeded + 1;
       AppLogger.info(TAG, `[reconnect] success (${reason})`);
@@ -301,6 +312,11 @@ export class ReconnectManager {
     }
     if (outcome === ReconnectAttemptOutcome.SUPERSEDED) {
       // 新事务已经接管（或用户断开）：旧链路不得继续排重试。
+      return;
+    }
+    if (outcome === ReconnectAttemptOutcome.STOPPED) {
+      this.telemetry.gaveUp = this.telemetry.gaveUp + 1;
+      this.host.onGiveUp('自动恢复受阻，请检查配置或 VPN 授权');
       return;
     }
     this.telemetry.failed = this.telemetry.failed + 1;
@@ -313,7 +329,7 @@ export class ReconnectManager {
       this.request(ReconnectReason.RETRY);
     } else {
       this.telemetry.gaveUp = this.telemetry.gaveUp + 1;
-      this.host.onGiveUp('网络切换后自动重连失败（已达最大尝试次数）');
+      this.host.onGiveUp('自动恢复失败，已达到最大尝试次数');
     }
   }
 }

@@ -330,7 +330,7 @@ try {
     bad.failKind = 'network_unreachable';
     const legacyNoKind = LatencyRecord.failed('legacy-no-kind', LatencyState.FAILED, now);
 
-    // 五态文案两两不同 —— 这就是"可区分"的可执行定义
+    // 实测、未测、测试中和取消保持可区分；已执行的失败统一显示超时。
     const texts = [fresh, old, off, unt, testing, cancelled, to, bad]
       .map((r) => LatencyStyle.recordText(r, now));
     check('未测显示 --，绝不是"超时"（旧实现最大的可信度问题）',
@@ -342,23 +342,25 @@ try {
     check('取消与失败/超时文案都不同（取消不是结论）',
       LatencyStyle.recordText(cancelled, now) !== LatencyStyle.recordText(bad, now)
       && LatencyStyle.recordText(cancelled, now) !== LatencyStyle.recordText(to, now));
-    check('五态以上文案两两可区分', new Set(texts).size === texts.length);
+    check('失败统一显示超时，其余状态仍可区分',
+      texts[texts.length - 1] === '超时' && texts[texts.length - 2] === '超时'
+      && texts[0] === texts[1] // 缓存值和本次值同样显示，用户要求不再标旧。
+      && new Set(texts.filter((_, i) => i !== 1 && i !== 7)).size === 6);
     check('null 记录显示 --', LatencyStyle.recordText(null, now) === '--');
 
     check('实测文案带 ms', LatencyStyle.recordText(fresh, now) === '90ms');
     check('离线粗略值带 ≈ 前缀（不冒充代理延迟）',
       LatencyStyle.recordText(off, now).startsWith('≈'));
-    check('过期结果被标注但仍显示数值',
-      LatencyStyle.recordText(old, now).startsWith('90ms')
-      && LatencyStyle.recordText(old, now) !== '90ms');
+    check('缓存结果正常显示延迟，不附加旧标记（2026-11-04 用户要求）',
+      LatencyStyle.recordText(old, now) === '90ms');
 
     check('实测按阈值配色（<180 绿 / <350 黄 / >=350 红）',
       LatencyStyle.recordColor(LatencyRecord.measured('a', 100, LatencyChannel.CORE, now), now)
         === LatencyStyle.recordColor(fresh, now)
       && LatencyStyle.recordColor(LatencyRecord.measured('b', 400, LatencyChannel.CORE, now), now)
         !== LatencyStyle.recordColor(fresh, now));
-    check('过期结果用中性色（不假装新鲜）',
-      LatencyStyle.recordColor(old, now) !== LatencyStyle.recordColor(fresh, now));
+    check('缓存结果沿用正常延迟阈值配色',
+      LatencyStyle.recordColor(old, now) === LatencyStyle.recordColor(fresh, now));
     check('超时与失败用错误色',
       LatencyStyle.recordColor(to, now) === LatencyStyle.recordColor(bad, now));
     check('未测/测试中/取消用中性色（不吓用户）',

@@ -136,6 +136,16 @@ const FILES = [
       '../utils/AppLogger': './stubs.ts',
     },
   },
+  // 2026-11-04（P1 对齐 FlClash `Profile.overrides`）：每订阅覆盖层。
+  // SubscriptionService 已 import 它 → 必须在 FILES 里登记，否则 prepare 直接 exit(2)，
+  // verify-tunbox-profile / verify-config-* 会连锁红（2026-11-04 合并时实际踩到）。
+  {
+    src: 'commons/services/ProfileOverrideStore.ets', out: 'ProfileOverrideStore.ts', map: {
+      '@kit.ArkData': './stubs.ts',
+      '../utils/AppLogger': './stubs.ts',
+      '../models/AppSettings': './AppSettings.ts',
+    },
+  },
   {
     src: 'commons/services/SubscriptionService.ets', out: 'SubscriptionService.ts', map: {
       './SubscriptionQuotaService': './SubscriptionQuotaService.ts',
@@ -154,6 +164,8 @@ const FILES = [
       './YamlMerger': './YamlMerger.ts',
       './ClashConfigGenerator': './ClashConfigGenerator.ts',
       './ProxyProviderParser': './ProxyProviderParser.ts',
+      // 2026-11-04（P1：FlClash Profile.overrides 的鸿蒙等价物）：每订阅覆盖层
+      './ProfileOverrideStore': './ProfileOverrideStore.ts',
       './RawSubscriptionStore': './stubs.ts',
       './RawProxyYaml': './RawProxyYaml.ts',
       './CredentialStore': './stubs.ts',
@@ -167,11 +179,12 @@ const FILES = [
       // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退改走规范解析层
       '../subscription/UriNodeParser': './UriNodeParser.ts',
       // 2026-10-22（FlClash 同构）：订阅原文落成 profile 文件
-      '../flclash/ProfileRepository': './ProfileStore.ts',
+      '../tunbox/ProfileRepository': './ProfileStore.ts',
+      '../tunbox/CoreCatalog': './CoreCatalog.ts',
       '../../core/CoreBridge': './stubs.ts',
-      '../flclash/SubConverter': './SubConverter.ts',
-      '../flclash/CoreCatalogService': './stubs.ts',
-      '../flclash/CoreNodeBridge': './stubs.ts',
+      '../tunbox/SubConverter': './SubConverter.ts',
+      '../tunbox/CoreCatalogService': './stubs.ts',
+      '../tunbox/CoreNodeBridge': './stubs.ts',
     },
   },
   {
@@ -221,23 +234,38 @@ const FILES = [
   },
   // ── 2026-10-22：FlClash 1:1 复刻（订阅原文 = profile；节点目录来自内核）──
   {
-    src: 'commons/flclash/ProfileConfigMerger.ets', out: 'ProfileConfigMerger.ts', map: {
+    src: 'commons/tunbox/ProfileConfigMerger.ets', out: 'ProfileConfigMerger.ts', map: {
       '../services/YamlMerger': './YamlMerger.ts',
       '../utils/AppLogger': './stubs.ts',
     },
   },
   // convertProxies（mihomo ConvertsV2Ray 的 ArkTS 移植；零 import）
-  { src: 'commons/flclash/SubConverter.ets', out: 'SubConverter.ts', map: {} },
+  { src: 'commons/tunbox/SubConverter.ets', out: 'SubConverter.ts', map: {} },
   // 内核目录解析（零 import，纯函数）
-  { src: 'commons/flclash/CoreCatalog.ets', out: 'CoreCatalog.ts', map: {} },
+  { src: 'commons/tunbox/CoreCatalog.ets', out: 'CoreCatalog.ts', map: {} },
   {
-    src: 'commons/flclash/ProfileRepository.ets', out: 'ProfileStore.ts', map: {
+    src: 'commons/tunbox/ProfileRepository.ets', out: 'ProfileStore.ts', map: {
       '@kit.ArkData': './stubs.ts',
       '@kit.CoreFileKit': './stubs.ts',
       '@kit.ArkTS': './stubs.ts',
       '../utils/AppLogger': './stubs.ts',
       './ProfileConfigMerger': './ProfileConfigMerger.ts',
       '../subscription/BodyDispatch': './BodyDispatch.ts',
+      // 2026-11-05（FlClash saveFile 同构）：validateAndStore 改由内核校验
+      '../../core/CoreBridge': './stubs.ts',
+    },
+  },
+  // 2026-11-05（FlClash 全量照抄）：map 级 profile 构建器 —— compose 为纯函数，
+  // 门禁直接喂 map 真跑（内核桥打桩）；build 是薄异步壳不在 Node 里跑。
+  {
+    src: 'commons/tunbox/TunBoxProfileBuilder.ets', out: 'TunBoxProfileBuilder.ts', map: {
+      '../latency/LatencyTestUrl': './LatencyTestUrl.ts',
+      '@kit.ArkTS': './stubs.ts',
+      '@kit.CoreFileKit': './stubs.ts',
+      '../../core/CoreBridge': './stubs.ts',
+      '../services/ClashConfigGenerator': './ClashConfigGenerator.ts',
+      '../services/SubscriptionFetchPolicy': './stubs.ts',
+      '../utils/AppLogger': './stubs.ts',
     },
   },
 ];

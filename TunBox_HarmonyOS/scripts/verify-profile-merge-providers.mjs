@@ -1,305 +1,267 @@
 #!/usr/bin/env node
 /**
- * 订阅合并 · provider 段并集闸门（Profile Provider Merge Gate）
+ * 订阅合并 · provider 段闸门（Profile Provider Merge Gate）—— 2026-11-05 按上游重写
  *
- * ## 为什么有这道闸门（2026-10-23 用户真机报障）
+ * ## 历史背景
  *
- * 现象：0.5.4 手动更新去广告规则后 VPN 启动失败，删掉规则集就正常。
- * 真机日志（VpnExtensionAbility）给出的内核原话：
- *
- *   vpn onCreate failed: code=-1 msg=parse config:
+ * 2026-10-23 用户真机报障：0.5.4 手动更新去广告规则后 VPN 启动失败，内核原话
  *   rules[0] [RULE-SET,hyper-adrules,REJECT] error: rule set [hyper-adrules] not found
+ * 根因：旧文本合并把 overlay 的 rule-providers 声明删了，rules 引用在、声明丢。
  *
- * 根因：`ProfileConfigMerger.merge()` 把 overlay（App 生成的运行配置）里的
- * `rule-providers` 段**整段删掉**再追加订阅原文的同名段；而订阅原文没有
- * `rule-providers`，于是：
- *   · overlay 的 `rules:` 被保留（RULE-SET,hyper-adrules,REJECT 仍在第一条）
- *   · overlay 的 `rule-providers:` 声明消失
- * → 引用在、声明丢 → 内核整份拒载 → 隧道起不来。
+ * ## 现在的生产链路（FlClash 上游 be847366 task.dart:135-160 / 261-279）
  *
- * ## 闸门断言什么
+ * `TunBoxProfileBuilder.compose`（map 级）：内核解析 profile → overlay（生成器产物）
+ * 经内核 decodeYaml 解码 → patch 链。provider 相关语义：
+ *   · 全部非 inline provider 都收容 path（有 URL key=name@url，无 URL key=section/name，
+ *     section ∈ {proxy-providers, rule-providers}；含 file 型；旧 URL-only MD5 记迁移）；
+ *   · overlay 注入（injected）先铺、profile 后铺，同名 profile 赢；注入声明路径原样
+ *     （与上游注入的 App 落盘路径一致，不二次收容）；
+ *   · mihomo 自己拉取（App 不再预取）。
  *
- *  A. 用**真实的** `ProfileConfigMerger`（tools/true-chain-harness 生成）跑合并：
- *     overlay 有 provider + 原文没有 → 合并结果必须**保留** overlay 的 provider 声明，
- *     且 `RULE-SET,hyper-adrules` 仍能被声明满足（自洽性：每个 RULE-SET 引用的名字
- *     都能在 rule-providers 段找到声明）。
- *  B. 原文自带 provider（订阅自己的 rule-providers）→ 两边的块都要在（并集）。
- *  C. 同名 provider → overlay 优先（原文同名块被丢弃，不产生重复顶层键）。
- *  D. `proxy-providers` 同理（同类缺陷，一并守住）。
- *  E. 原文完全没有 provider 段时，不能凭空造出一个空 `rule-providers:` 头
- *     （空 mapping 会让内核报 cannot unmarshal）。
- *  F. 负对照：把实现改回「整段替换」→ 闸门必须变红。
+ * 闸门断言（compose 纯函数真跑，内核桥数据手喂）：
+ *   A. 注入 provider 声明保留 + 路径原样，RULE-SET 引用可满足（自洽）
+ *   B. 原文自带 provider → 并集（两边块都在）；profile http 型收容
+ *   C. 同名 → profile 赢（注入先铺语义；profile 行被收容）
+ *   D. proxy-providers 同理（含 inline 不收容）
+ *   E. 无 provider 段 → 不凭空造空 `rule-providers: {}` 头（空 mapping 内核拒载）
+ *   F. file 型收容：无 URL key=section/name；有声明的 file path 被重写为收容路径
+ *   G. 规则 MATCH 替换：附加规则 target=MATCH → 选定 matchTarget（默认最后 profile MATCH），
+ *      no-resolve 原样保留，前置顺序
  *
  * 跑法：
  *   node scripts/verify-profile-merge-providers.mjs
- *   node scripts/verify-profile-merge-providers.mjs --self-test
  */
-import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+if (!process.execArgv.includes('--experimental-transform-types')
+  && process.env.TUNBOX_PPM_CHILD !== '1') {
+  const res = spawnSync(
+    process.execPath,
+    ['--experimental-transform-types', '--no-warnings', fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+    { stdio: 'inherit', env: { ...process.env, TUNBOX_PPM_CHILD: '1' } },
+  );
+  process.exit(res.status === null ? 1 : res.status);
+}
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..');
-const generated = (name) => pathToFileURL(path.join(root, 'tools/true-chain-harness/generated', name)).href;
+const genDir = path.join(root, 'tools/true-chain-harness/generated');
+const G = (name) => pathToFileURL(path.join(genDir, name)).href;
+
+const prepare = spawnSync(process.execPath,
+  [path.join(root, 'tools/true-chain-harness/prepare.mjs')], { stdio: 'inherit' });
+if (prepare.status !== 0) process.exit(1);
+const { TunBoxProfileBuilder, TunBoxBaseData, TunBoxProfileInput } = await import(G('TunBoxProfileBuilder.ts'));
 
 let passed = 0;
 let failed = 0;
-const failures = [];
-
-function check(name, fn) {
+const check = (name, fn) => {
   try {
     fn();
-    passed += 1;
+    passed++;
     console.log(`PASS ${name}`);
   } catch (e) {
-    failed += 1;
-    failures.push(`${name} :: ${e.message}`);
+    failed++;
     console.log(`FAIL ${name} :: ${e.message}`);
   }
-}
+};
+const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
 
-/** 从 YAML 文本里取某顶层段的命名块名（2 空格缩进、以 : 结尾） */
-function providerNames(yaml, key) {
-  const lines = yaml.split('\n');
-  const out = [];
-  let inSection = false;
-  for (const line of lines) {
-    if (line === `${key}:` || line.startsWith(`${key}: `)) {
-      inSection = true;
-      continue;
-    }
-    if (!inSection) {
-      continue;
-    }
-    if (/^[A-Za-z0-9_"'.-]+:/.test(line)) {
-      inSection = false; // 回到顶层键
-      continue;
-    }
-    const m = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*$/);
-    if (m) {
-      out.push(m[1]);
-    }
-  }
-  return out;
-}
-
-/** 取出 rules 段里所有 RULE-SET 引用的 provider 名 */
-function ruleSetRefs(yaml) {
-  const out = [];
-  for (const line of yaml.split('\n')) {
-    const m = line.match(/^\s*-\s*RULE-SET,([^,]+),/);
-    if (m) {
-      out.push(m[1].trim());
-    }
-  }
-  return out;
-}
-
-const OVERLAY = `mixed-port: 7890
-mode: rule
-rules:
-  - RULE-SET,hyper-adrules,REJECT
-  - RULE-SET,rs-my-rules,REJECT
-  - GEOIP,CN,DIRECT
-rule-providers:
-  hyper-adrules:
-    type: http
-    behavior: domain
-    format: mrs
-    interval: 86400
-    path: ./ruleset/hyper_adrules_ads.mrs
-    url: "https://example.invalid/hyper_adrules_ads.mrs"
-  rs-my-rules:
-    type: http
-    behavior: domain
-    format: yaml
-    interval: 86400
-    path: ./ruleset/custom_rs_my_rules
-    url: "https://example.invalid/my-rules.yaml"
-proxy-providers: []
-`;
-
-const PROFILE_NO_PROVIDERS = `proxies:
-  - name: 香港01
-    type: ss
-    server: 1.2.3.4
-    port: 8388
-    cipher: aes-128-gcm
-    password: x
-proxy-groups:
-  - name: 选择节点
-    type: select
-    proxies:
-      - 香港01
-rules:
-  - GEOIP,CN,DIRECT
-  - MATCH,选择节点
-`;
-
-const PROFILE_WITH_PROVIDERS = `${PROFILE_NO_PROVIDERS}rule-providers:
-  sub-ads:
-    type: http
-    behavior: domain
-    format: yaml
-    interval: 86400
-    path: ./ruleset/sub-ads.yaml
-    url: "https://example.invalid/sub-ads.yaml"
-`;
-
-const PROFILE_SHADOW = `${PROFILE_NO_PROVIDERS}rule-providers:
-  hyper-adrules:
-    type: http
-    behavior: ipcidr
-    format: yaml
-    interval: 3600
-    path: ./ruleset/should-be-dropped.yaml
-    url: "https://example.invalid/sub-version.yaml"
-`;
-
-async function main() {
-  const selfTest = process.argv.includes('--self-test');
-  const modulePath = path.join(root, 'tools/true-chain-harness/generated/ProfileConfigMerger.ts');
-  if (!fs.existsSync(modulePath)) {
-    // generated/ 不进 git（.gitignore 里忽略），新克隆的仓库必须先按真源码生成一遍
-    console.log('generated/ProfileConfigMerger.ts 缺失，先跑 prepare 生成 …');
-    const prepared = spawnSync(process.execPath,
-      [path.join(root, 'tools/true-chain-harness/prepare.mjs')], { encoding: 'utf8' });
-    if (prepared.status !== 0 || !fs.existsSync(modulePath)) {
-      console.log('FAIL 无法生成 generated/ProfileConfigMerger.ts');
-      console.log(prepared.stderr || prepared.stdout || '');
-      process.exit(1);
-    }
-  }
-  const { ProfileConfigMerger } = await import(generated('ProfileConfigMerger.ts'));
-
-  const merge = (overlay, profile) => {
-    const r = ProfileConfigMerger.merge(overlay, profile);
-    assert.equal(r.ok, true, `merge 失败：${r.error}`);
-    return r.yaml;
+const mkBase = (extra) => {
+  const config = {
+    'mixed-port': 1234,
+    'proxies': [{ 'name': 'TW', 'type': 'ss', 'server': 't.example.com', 'port': 443, 'cipher': 'aes-128-gcm', 'password': 'p' }],
+    'proxy-groups': [{ 'name': 'Root', 'type': 'select', 'proxies': ['TW', 'DIRECT'] }],
+    'rules': ['RULE-SET,hyper-adrules,REJECT', 'MATCH,Root'],
+    ...extra,
   };
+  const base = new TunBoxBaseData();
+  base.config = config;
+  base.digest = 't';
+  base.proxies = config.proxies.length;
+  base.proxyGroups = 1;
+  base.rules = config.rules.length;
+  base.matchRules = ['MATCH,Root'];
+  return base;
+};
 
-  check('原文没有 provider 段时，overlay 的 rule-providers 声明必须保留', () => {
-    const out = merge(OVERLAY, PROFILE_NO_PROVIDERS);
-    const names = providerNames(out, 'rule-providers');
-    assert.ok(names.includes('hyper-adrules'), `rule-providers 丢了 hyper-adrules；实际=${names.join(',')}`);
-    assert.ok(names.includes('rs-my-rules'), `rule-providers 丢了自定义规则集 rs-my-rules；实际=${names.join(',')}`);
+const mkOverlay = (extra) => ({
+  'mixed-port': 7890,
+  'external-controller': '127.0.0.1:9090',
+  'secret': 's',
+  'mode': 'rule',
+  'log-level': 'warning',
+  'tun': { 'enable': true, 'stack': 'mips', 'auto-route': false, 'auto-detect-interface': false },
+  'dns': { 'enable': true, 'enhanced-mode': 'fake-ip', 'nameserver': ['223.5.5.5'] },
+  'rule-providers': {
+    'hyper-adrules': { 'type': 'file', 'path': './ruleset/hyper-adrules.mrs', 'behavior': 'domain' },
+  },
+  'rules': ['DOMAIN-SUFFIX,ads.example,REJECT'],
+  ...extra,
+});
+
+const mkInput = (over) => {
+  const input = new TunBoxProfileInput();
+  input.profileId = 'sub-9';
+  input.profilePath = '/profiles/sub-9.yaml';
+  input.profilesDir = '/profiles';
+  input.overrideYaml = '';
+  input.dnsOverrideEnabled = false;
+  input.tunEnabled = true;
+  input.ipv6Enabled = true;
+  input.mtu = 1400;
+  input.useSmart = false;
+  input.smartTestUrl = 'https://www.gstatic.com/generate_204';
+  input.smartPolicyPriority = '';
+  return Object.assign(input, over ?? {});
+};
+
+const compose = (base, overlay, input) =>
+  TunBoxProfileBuilder.compose(JSON.parse(JSON.stringify(base)), overlay, null, input ?? mkInput());
+
+check('A. 注入 provider 声明保留 + 路径原样，RULE-SET 引用可满足', () => {
+  const r = compose(mkBase(), mkOverlay());
+  assert(r.ok, `compose 失败: ${r.error}`);
+  const doc = JSON.parse(r.yaml);
+  const decl = doc['rule-providers'];
+  assert(decl && decl['hyper-adrules'], 'hyper-adrules 声明丢失');
+  assert(doc['rules'].includes('RULE-SET,hyper-adrules,REJECT'), 'profile 的 RULE-SET 规则丢失');
+  assert(decl['hyper-adrules']['path'] === './ruleset/hyper-adrules.mrs',
+    '注入 provider 路径保持落盘原值（与 App provider 落盘路径一致，不二次收容）');
+  assert(doc['rule-providers']['hyper-adrules']['behavior'] === 'domain', '声明字段丢失');
+});
+
+check('B. 原文自带 provider → 并集（两边块都在）；profile http 型收容', () => {
+  const base = mkBase({
+    'rule-providers': {
+      'own-rules': { 'type': 'http', 'url': 'https://own.example/rules.yaml', 'interval': 86400 },
+    },
+    'rules': ['RULE-SET,own-rules,Root', 'MATCH,Root'],
   });
+  const r = compose(base, mkOverlay());
+  const doc = JSON.parse(r.yaml);
+  assert(doc['rule-providers']['hyper-adrules'], '注入声明丢失');
+  assert(doc['rule-providers']['own-rules'], '原文声明丢失');
+  assert(doc['rules'].some((x) => x.startsWith('RULE-SET,own-rules')), '原文规则丢失');
+  const expect = `/profiles/providers/sub-9/rules/${
+    crypto.createHash('md5').update('own-rules@https://own.example/rules.yaml').digest('hex')}`;
+  assert(doc['rule-providers']['own-rules']['path'] === expect,
+    `profile http provider 必须收容: ${doc['rule-providers']['own-rules']['path']}`);
+});
 
-  check('保留声明后 RULE-SET 引用自洽（引用 ⊆ 声明）', () => {
-    const out = merge(OVERLAY, PROFILE_NO_PROVIDERS);
-    const declared = new Set(providerNames(out, 'rule-providers'));
-    const refs = ruleSetRefs(out);
-    assert.ok(refs.length >= 2, `RULE-SET 规则条数异常：${refs.length}`);
-    for (const ref of refs) {
-      assert.ok(declared.has(ref), `RULE-SET 引用了未声明的 provider「${ref}」（内核会整份拒载）`);
-    }
+check('C. 同名 provider → profile 赢（注入先铺，task.dart:261-279）', () => {
+  const base = mkBase({
+    'rule-providers': {
+      'hyper-adrules': { 'type': 'file', 'path': './ruleset/OLD.mrs', 'behavior': 'domain' },
+    },
   });
+  const r = compose(base, mkOverlay());
+  const doc = JSON.parse(r.yaml);
+  const confined = `/profiles/providers/sub-9/rules/${
+    crypto.createHash('md5').update('rule-providers/hyper-adrules').digest('hex')}`;
+  assert(doc['rule-providers']['hyper-adrules']['path'] === confined,
+    `同名 profile 声明必须覆盖注入: ${doc['rule-providers']['hyper-adrules']['path']}`);
+  assert(doc['rule-providers']['hyper-adrules']['path'] !== './ruleset/hyper-adrules.mrs',
+    '注入行不得覆盖同名 profile 行');
+});
 
-  check('RULE-SET 仍在 rules 首条（顺序未被合并破坏）', () => {
-    const out = merge(OVERLAY, PROFILE_NO_PROVIDERS);
-    const rulesStart = out.indexOf('rules:');
-    assert.ok(rulesStart >= 0, 'rules 段丢失');
-    const firstRule = out.substring(rulesStart).split('\n').slice(1)
-      .map((l) => l.trim()).filter((l) => l.startsWith('- '))[0];
-    assert.equal(firstRule, '- RULE-SET,hyper-adrules,REJECT');
+check('D. proxy-providers 同理（注入保留 + profile http 收容 + inline 不收容）', () => {
+  const base = mkBase({
+    'proxy-providers': {
+      'airport': { 'type': 'http', 'url': 'https://sub.example.com/clash.yaml', 'interval': 86400 },
+      'file-pool': { 'type': 'file', 'path': './pool.yaml' },
+    },
   });
-
-  check('原文自带 rule-providers 时两边取并集', () => {
-    const out = merge(OVERLAY, PROFILE_WITH_PROVIDERS);
-    const names = providerNames(out, 'rule-providers');
-    assert.ok(names.includes('hyper-adrules'), `丢了 overlay 的 hyper-adrules；实际=${names.join(',')}`);
-    assert.ok(names.includes('sub-ads'), `丢了原文的 sub-ads；实际=${names.join(',')}`);
-    assert.equal(names.filter((n) => n === 'hyper-adrules').length, 1, '同名 provider 被写了两次');
-    assert.equal(out.split('\n').filter((l) => l === 'rule-providers:').length, 1,
-      'rule-providers 顶层键重复（内核报 duplicate key）');
+  const overlay = mkOverlay({
+    'proxy-providers': {
+      'local-pool': { 'type': 'inline', 'payload': [{ 'name': 'inl', 'type': 'ss', 'server': 'i.example.com', 'port': 443, 'cipher': 'aes-128-gcm', 'password': 'p' }] },
+    },
   });
+  const r = compose(base, overlay);
+  const doc = JSON.parse(r.yaml);
+  assert(doc['proxy-providers']['airport'], '原文 proxy-provider 丢失');
+  assert(doc['proxy-providers']['local-pool'], '注入 proxy-provider 丢失');
+  const expect = `/profiles/providers/sub-9/proxies/${
+    crypto.createHash('md5').update('airport@https://sub.example.com/clash.yaml').digest('hex')}`;
+  assert(doc['proxy-providers']['airport']['path'] === expect,
+    `url provider path 收容不符: ${doc['proxy-providers']['airport']['path']} vs ${expect}`);
+  const fileExpect = `/profiles/providers/sub-9/proxies/${
+    crypto.createHash('md5').update('proxy-providers/file-pool').digest('hex')}`;
+  assert(doc['proxy-providers']['file-pool']['path'] === fileExpect,
+    `file provider 无 URL 必须按 section/name 收容: ${doc['proxy-providers']['file-pool']['path']}`);
+  assert(doc['proxy-providers']['local-pool']['path'] === undefined, 'inline provider 不收容');
+  assert(r.providerMigrations.length === 1
+    && r.providerMigrations[0].from === `/profiles/providers/sub-9/proxies/${
+      crypto.createHash('md5').update('https://sub.example.com/clash.yaml').digest('hex')}`
+    && r.providerMigrations[0].to === expect,
+    `旧 URL-only 缓存迁移登记: ${JSON.stringify(r.providerMigrations)}`);
+});
 
-  check('同名 provider 冲突时 overlay 优先（原文版本被丢弃）', () => {
-    const out = merge(OVERLAY, PROFILE_SHADOW);
-    const lines = out.split('\n');
-    assert.ok(!lines.some((l) => l.includes('should-be-dropped')), '原文同名 provider 的字段泄漏进了最终配置');
-    assert.ok(lines.some((l) => l.includes('behavior: domain')), 'overlay 的 behavior: domain 丢了');
-    assert.ok(!lines.some((l) => l.trim() === 'behavior: ipcidr'), '原文的 behavior: ipcidr 覆盖了 overlay');
+check('E. 两边都没有 provider 段 → 不凭空造空头', () => {
+  const overlay = mkOverlay();
+  delete overlay['rule-providers'];
+  const r = compose(mkBase(), overlay);
+  const doc = JSON.parse(r.yaml);
+  assert(doc['rule-providers'] === undefined, '凭空造出空 rule-providers（内核拒载空 mapping）');
+  assert(doc['proxy-providers'] === undefined, '凭空造出空 proxy-providers');
+});
+
+check('F. file provider 收容：无 URL key=section/name；http 型 name@url', () => {
+  const base = mkBase({
+    'rule-providers': {
+      'local-rules': { 'type': 'file', 'path': './ruleset/local.yaml' },
+      'remote-rules': { 'type': 'http', 'url': 'https://rules.example/list.yaml', 'interval': 86400 },
+    },
   });
+  const r = compose(base, mkOverlay());
+  const doc = JSON.parse(r.yaml);
+  const localExpect = `/profiles/providers/sub-9/rules/${
+    crypto.createHash('md5').update('rule-providers/local-rules').digest('hex')}`;
+  assert(doc['rule-providers']['local-rules']['path'] === localExpect,
+    `file provider 不得原样保留: ${doc['rule-providers']['local-rules']['path']}`);
+  const remoteExpect = `/profiles/providers/sub-9/rules/${
+    crypto.createHash('md5').update('remote-rules@https://rules.example/list.yaml').digest('hex')}`;
+  assert(doc['rule-providers']['remote-rules']['path'] === remoteExpect,
+    `http provider 必须 name@url 收容: ${doc['rule-providers']['remote-rules']['path']}`);
+});
 
-  check('proxy-providers 同类并集（原文声明会保留）', () => {
-    const overlay = OVERLAY.replace('proxy-providers: []', `proxy-providers:
-  own-pp:
-    type: http
-    url: "https://example.invalid/pp.yaml"
-    path: ./providers/own-pp.yaml`);
-    const profile = `${PROFILE_NO_PROVIDERS}proxy-providers:
-  sub-pp:
-    type: http
-    url: "https://example.invalid/sub-pp.yaml"
-    path: ./providers/sub-pp.yaml
-`;
-    const out = merge(overlay, profile);
-    const names = providerNames(out, 'proxy-providers');
-    assert.ok(names.includes('own-pp'), `丢了 overlay 的 own-pp；实际=${names.join(',')}`);
-    assert.ok(names.includes('sub-pp'), `丢了原文的 sub-pp；实际=${names.join(',')}`);
+check('G. 规则 MATCH 替换：选定 matchTarget / 回退最后 profile MATCH；no-resolve 与前置', () => {
+  const base = mkBase({
+    'rules': ['DOMAIN-SUFFIX,x.example,TW', 'MATCH,Root'],
   });
-
-  check('两边都没有 provider 段时不凭空造空头', () => {
-    const overlay = `mixed-port: 7890
-mode: rule
-rules:
-  - GEOIP,CN,DIRECT
-`;
-    const out = merge(overlay, PROFILE_NO_PROVIDERS);
-    assert.ok(!out.includes('rule-providers:'), '凭空生成了 rule-providers 空段');
-    assert.ok(!out.includes('proxy-providers:'), '凭空生成了 proxy-providers 空段');
+  const overlay = mkOverlay({
+    'rules': [
+      'DOMAIN,example.org,MATCH',
+      'IP-CIDR,1.1.1.0/24,DIRECT,no-resolve',
+    ],
   });
+  const r = compose(base, overlay);
+  const doc = JSON.parse(r.yaml);
+  assert(doc['rules'].includes('DOMAIN,example.org,Root'),
+    `附加 MATCH 必须替换为最后 profile MATCH target: ${JSON.stringify(doc['rules'])}`);
+  assert(doc['rules'].includes('IP-CIDR,1.1.1.0/24,DIRECT,no-resolve'),
+    `no-resolve 附加规则必须原样保留: ${JSON.stringify(doc['rules'])}`);
+  assert(doc['rules'][0] === 'DOMAIN,example.org,Root'
+    && doc['rules'][1] === 'IP-CIDR,1.1.1.0/24,DIRECT,no-resolve',
+    `附加规则必须前置: ${JSON.stringify(doc['rules'])}`);
+  assert(doc['rules'].includes('DOMAIN-SUFFIX,x.example,TW'), 'profile 规则被误杀');
+  // 选定 matchTarget 优先于回退值
+  const r2 = compose(base, overlay, mkInput({ matchTarget: 'TW' }));
+  const doc2 = JSON.parse(r2.yaml);
+  assert(doc2['rules'].includes('DOMAIN,example.org,TW'),
+    `选定 matchTarget 必须优先: ${JSON.stringify(doc2['rules'])}`);
+});
 
-  check('不会把 provider 字段行漏到顶层（缩进必须保留）', () => {
-    const out = merge(OVERLAY, PROFILE_NO_PROVIDERS);
-    const lines = out.split('\n');
-    assert.ok(!lines.includes('type: http'), 'provider 字段行掉到了顶层缩进');
-    for (const key of ['type:', 'behavior:', 'format:', 'path:', 'url:']) {
-      const top = lines.find((l) => l.startsWith(key));
-      assert.equal(top, undefined, `字段「${key.trim()}」出现在顶层`);
-    }
-  });
-
-  if (selfTest) {
-    console.log('');
-    console.log('── 负对照（回退成「整段替换」，必须复现用户报障）──');
-    const mutatedPath = path.join(root, 'tools/true-chain-harness/generated/_mutant_ProfileConfigMerger.ts');
-    const original = fs.readFileSync(modulePath, 'utf8');
-    const mutant = original.replace(
-      /const PROVIDER_MERGE_KEYS: string\[\] = \['proxy-providers', 'rule-providers'\];/,
-      'const PROVIDER_MERGE_KEYS: string[] = [];');
-    if (mutant === original) {
-      failed += 1;
-      failures.push('负对照变异未生效：generated 里的 PROVIDER_MERGE_KEYS 声明格式变了，请同步修改变异正则');
-      console.log('    ❌ 变异未生效（正则没匹配到常量声明）');
-    } else {
-      fs.writeFileSync(mutatedPath, mutant);
-      const { ProfileConfigMerger: Mutant } = await import(pathToFileURL(mutatedPath).href);
-      const merged = Mutant.merge(OVERLAY, PROFILE_NO_PROVIDERS);
-      const mutatedOut = merged.ok ? merged.yaml : '';
-      fs.unlinkSync(mutatedPath);
-      const names = providerNames(mutatedOut, 'rule-providers');
-      const refs = ruleSetRefs(mutatedOut);
-      const caught = !names.includes('hyper-adrules') && refs.includes('hyper-adrules');
-      console.log(`  · 回退成整段替换 → rule-providers=[${names.join(',')}] refs=[${refs.join(',')}]`);
-      console.log(caught ? '    ✅ 复现用户报障（引用在、声明丢），闸门判红' : '    ❌ 闸门不敏感：变异后仍看不到「声明丢失」');
-      if (!caught) {
-        failed += 1;
-        failures.push('负对照未生效：变异后仍未复现「声明丢失」');
-      }
-    }
-  }
-
-  console.log('');
-  console.log(`PASSED=${passed} FAILED=${failed} TOTAL=${passed + failed}`);
-  console.log(`RESULT: ${failed === 0 ? 'PROFILE PROVIDER MERGE PASSED' : 'PROFILE PROVIDER MERGE FAILED'}`);
-  for (const line of failures) {
-    console.log(`  ❌ ${line}`);
-  }
-  process.exit(failed === 0 ? 0 : 1);
+console.log('');
+console.log(`PASSED=${passed}  FAILED=${failed}  TOTAL=${passed + failed}`);
+if (failed === 0) {
+  console.log('RESULT: PROFILE PROVIDER MERGE PASSED');
+} else {
+  console.log('RESULT: PROFILE PROVIDER MERGE FAILED');
+  process.exit(1);
 }
-
-main();

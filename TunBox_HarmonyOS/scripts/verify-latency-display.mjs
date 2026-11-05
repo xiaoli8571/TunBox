@@ -47,7 +47,7 @@ for (const t of targets) {
   const full = path.join(root, t.file);
   const src = fs.readFileSync(full, 'utf8');
   const text = methodBody(src, 'static recordText(rec: LatencyRecord | null, nowMs: number): string {');
-  const color = methodBody(src, 'static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {');
+  const color = methodBody(src, 'static recordColor(rec: LatencyRecord | null, nowMs: number, rev: number = -1): ResourceColor {');
 
   ok(`${t.ns}.recordText 存在`, text.length > 0);
   ok(`${t.ns}.recordColor 存在`, color.length > 0);
@@ -122,12 +122,10 @@ ok('页面层不再实现内核侧组测速（无 /group/ 端点、无 runGroupL
   !/runGroupLatency/.test(persistSrc) && !/\/group\//.test(persistSrc));
 ok('「测全部」统一走按订阅隔离的 BackgroundLatencyService',
   /BackgroundLatencyService\.testNodes\(/.test(persistSrc));
-// 2026-10-22 用户口径：测速完成提示**不许带计数**（"可用 X / 超时 Y / 未生效 Z" 是自造噪音，
-// 用户点名「谁让你乱加的，赶快去掉」）。"没测成"的原因（过载/通道不可用）仍要单独说明。
-ok('测速完成提示不带计数（只有「✓ 测速完成」）',
-  /'✓ 测速完成'/.test(persistSrc)
-  && !/可用 \$\{progress\.measured\}/.test(persistSrc)
-  && !/可用 \$\{progress\.measured\}/.test(fs.readFileSync(
+// 2026-11-04 用户口径：只显示成功与超时两项，失败归入超时。
+ok('测速完成提示只有成功和超时两项',
+  /测速完成：\$\{progress\.measured\}成功，\$\{progress\.timeout \+ progress\.failed\}超时/.test(persistSrc)
+  && /测速完成：\$\{progress\.measured\}成功，\$\{progress\.timeout \+ progress\.failed\}超时/.test(fs.readFileSync(
     path.join(root, 'entry/src/main/ets/components/SubscriptionSection.ets'), 'utf8')));
 
 // 2026-10-23 用户要求：所有组级失败统计提示一律移除，诊断数据仍留在日志。
@@ -146,11 +144,11 @@ ok('进度映射把 coreOverloaded 交给调用方（后台测速返回 progress
 const bgSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/services/BackgroundLatencyService.ets'), 'utf8');
 // 2026-10-22（用户要求「测速完全按 FlClash」）：组测速 = 组内节点**逐个测**，
-// 不再调内核 `GET /group/{name}/delay`；唯一实现是 FlclashLatencyService.start。
+// 不再调内核 `GET /group/{name}/delay`；唯一实现是 TunBoxLatencyService.start。
 const flcSrc = fs.readFileSync(
-  path.join(root, 'entry/src/main/ets/commons/flclash/FlclashDelay.ets'), 'utf8');
-ok('组测唯一入口 = FlclashLatencyService（逐节点，不再调内核组接口）',
-  /FlclashLatencyService\.start\(/.test(bgSrc) && !/testGroupDetailedResult/.test(bgSrc));
+  path.join(root, 'entry/src/main/ets/commons/tunbox/TunBoxDelay.ets'), 'utf8');
+ok('组测唯一入口 = TunBoxLatencyService（逐节点，不再调内核组接口）',
+  /TunBoxLatencyService\.start\(/.test(bgSrc) && !/testGroupDetailedResult/.test(bgSrc));
 ok('订阅卡片保留可访问的测速入口',
   /this\.CardAction\(\$r\('app.media.ic_bolt'\), '订阅测速'/.test(subPageSrc)
   && /this\.testSub\(sub.id, sub.name\)/.test(subPageSrc)
@@ -160,12 +158,12 @@ ok('订阅测速在途有防重入与响应式转圈',
   && /@State private testingIds: string\[\] = \[\];/.test(subPageSrc)
   && /if \(busyRef\(\)\) \{\s*LoadingProgress\(\)/.test(subPageSrc));
 const flcServiceSrc = fs.readFileSync(
-  path.join(root, 'entry/src/main/ets/commons/flclash/FlclashLatencyService.ets'), 'utf8');
+  path.join(root, 'entry/src/main/ets/commons/tunbox/TunBoxLatencyService.ets'), 'utf8');
 ok('组测/批量结果有可检索的完成日志（total/measured/timeout/failed/cancelled）',
   /delay batch done: total=\$\{summary\.total\} measured=\$\{summary\.measured\}/.test(flcServiceSrc)
   && /cancelled=\$\{summary\.cancelled\}/.test(flcServiceSrc));
 // ── 2026-10-22 真机 bug：失败节点显示 "--" 而不是「超时/拨号失败」 ─────────────
-// 根因：FlclashLatencyService.apply 把非超时失败写成表外字面量 `'failed'`，
+// 根因：TunBoxLatencyService.apply 把非超时失败写成表外字面量 `'failed'`，
 // 而 LatencyStore.describe() 只认 LatencyProbeKind 里的分类，认不出就 else → '--'。
 ok('失败结果写 LatencyProbeKind 真分类（timeout / switch_failed / network_unreachable）',
   /LatencyProbeKind\.TIMEOUT/.test(flcServiceSrc)
@@ -173,13 +171,17 @@ ok('失败结果写 LatencyProbeKind 真分类（timeout / switch_failed / netwo
   && /LatencyProbeKind\.NETWORK_UNREACHABLE/.test(flcServiceSrc)
   && /import \{[^}]*LatencyProbeKind[^}]*\} from/.test(flcServiceSrc));
 ok('不再写表外失败分类字面量（: \'failed\' 会让 describe() 落到 --）',
-  !/result\.value === FLCLASH_DELAY_TIMED_OUT \? 'timeout' : 'failed'/.test(flcServiceSrc));
-// 2026-10-26（用户拍板）：超时 5000 → 3000（「等 5 秒太久」）；并发基线仍 32，
-// 上限由 FLCLASH_DELAY_MAX_CONCURRENCY 管（64，配 TCP 直连传输层才真的并发）。
-ok('并发基线 32 / 单节点超时 3000ms / 测速地址 gstatic https',
-  /FLCLASH_DELAY_CONCURRENCY: number = 32/.test(flcSrc)
-  && /FLCLASH_DELAY_TIMEOUT_MS: number = 3000/.test(flcSrc)
-  && /https:\/\/www\.gstatic\.com\/generate_204/.test(flcSrc));
+  !/result\.value === TUNBOX_DELAY_TIMED_OUT \? 'timeout' : 'failed'/.test(flcServiceSrc));
+// 客户端默认 8000ms，实际取 App 设置；不能把内核缺省 5000ms 当成客户端常量。
+// URL 字面量只保留在 LatencyTestUrl；运行期超时传递由 verify-tunbox-delay 覆盖。
+const delayUrlSrc = fs.readFileSync(
+  path.join(root, 'entry/src/main/ets/commons/latency/LatencyTestUrl.ets'), 'utf8');
+ok('并发 32 / 超时使用固定设置真源 / 测速地址使用 HTTPS 单一真源',
+  /TUNBOX_DELAY_CONCURRENCY: number = 32/.test(flcSrc)
+  && /TUNBOX_DELAY_DEFAULT_TIMEOUT_MS: number = AppSettings.DEFAULT_DELAY_TEST_TIMEOUT/.test(flcSrc)
+  && !/settings\.delayTestTimeout/.test(flcSrc)
+  && /TUNBOX_DELAY_URL: string = LatencyTestUrl\.DEFAULT_URL/.test(flcSrc)
+  && /DEFAULT_URL: string = 'https:\/\/www\.gstatic\.com\/generate_204'/.test(delayUrlSrc));
 ok('大订阅与小订阅同一条路径（不存在「≥120 节点改内核组测」的分叉）',
   !/KERNEL_GROUP_TEST_MIN_NODES/.test(bgSrc));
 
@@ -207,7 +209,7 @@ const kindsSrc = fs.readFileSync(
   path.join(root, 'entry/src/main/ets/commons/latency/LatencyKinds.ets'), 'utf8');
 // 2026-10-21（用户对标三家）：超时由 3s 回到 **5s**（FlClash 8s / Verge 10s / CMFA 5s），
 // 在途并发由 50 收敛为 8 = OHOS http 栈对同一 host 的连接池容量（排队改在应用层闸门里发生）。
-// 2026-10-26（用户第二次要求缩短）：5000 → 3000，与 FLCLASH_DELAY_TIMEOUT_MS 同值。
+// 2026-10-26（用户第二次要求缩短）：5000 → 3000，与 TUNBOX_DELAY_TIMEOUT_MS 同值。
 ok('单节点测速超时为 3000ms（真源 LatencyTimeout.DEFAULT_TIMEOUT_MS）',
   /DEFAULT_TIMEOUT_MS:\s*number\s*=\s*3000/.test(kindsSrc));
 ok('LatencyPolicy 的超时是转调真源（不留第二份字面量）',

@@ -49,27 +49,27 @@ struct RoutingInputDialog {
 
   build() {
     Column({ space: 12 }) {
-      Text('添加 / 批量导入').fontSize(19).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimary)
+      Text('添加 / 批量导入').fontSize(19).fontWeight(FontWeight.Bold).fontColor(Ui.textPrimaryFor(this.themeRevision))
       Text('每行一条，支持「名称|包名」，例如 支付宝|com.alipay.mobile.client；也可以只填鸿蒙包名。请勿使用 Android 包名代替鸿蒙包名。')
-        .fontSize(12).fontColor(Ui.textSecondary)
+        .fontSize(12).fontColor(Ui.textSecondaryFor(this.themeRevision))
       TextInput({ text: this.label, placeholder: '名称备注（可选，只用于单条输入）' }).maxLength(40)
-        .onChange((v: string) => { this.label = v; }).backgroundColor(Ui.inputBackground(this.themeRevision)).fontColor(Ui.textPrimary)
+        .onChange((v: string) => { this.label = v; }).backgroundColor(Ui.inputBackground(this.themeRevision)).fontColor(Ui.textPrimaryFor(this.themeRevision))
       TextArea({ text: this.packages, placeholder: '支付宝|com.alipay.mobile.client' })
-        .height(170).maxLength(65536).fontColor(Ui.textPrimary).backgroundColor(Ui.inputBackground(this.themeRevision))
+        .height(170).maxLength(65536).fontColor(Ui.textPrimaryFor(this.themeRevision)).backgroundColor(Ui.inputBackground(this.themeRevision))
         .onChange((v: string) => { this.packages = v; })
       // 输入即识别：合法包名全部解析成功时按钮立刻变实心蓝并可点，不合法的行就地标红。
       if (this.packages.trim().length > 0) {
         Text(this.errorText().length > 0 ? this.errorText() : this.previewText())
           .fontSize(11)
-          .fontColor(this.errorText().length > 0 ? TunBoxColors.danger : TunBoxColors.textSecondary)
+          .fontColor(this.errorText().length > 0 ? TunBoxColors.danger : TunBoxColors.textSecondaryFor(this.themeRevision))
           .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
       }
       Row({ space: 12 }) {
-        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong(this.themeRevision)).fontColor(Ui.textPrimary)
+        Button('取消').layoutWeight(1).backgroundColor(Ui.surfaceStrong(this.themeRevision)).fontColor(Ui.textPrimaryFor(this.themeRevision))
           .onClick(() => this.controller?.close())
         Button('添加到当前名单').layoutWeight(2)
-          .backgroundColor(this.canAdd() ? TunBoxColors.primary : Ui.buttonDisabled)
-          .fontColor(this.canAdd() ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+          .backgroundColor(this.canAdd() ? TunBoxColors.primaryFor(this.themeRevision) : Ui.buttonDisabled)
+          .fontColor(this.canAdd() ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondaryFor(this.themeRevision))
           .enabled(this.canAdd())
           .onClick(() => { if (this.onAdd(this.packages, this.label)) { this.controller?.close(); } })
       }
@@ -393,7 +393,7 @@ struct AppRoutingPage {
       hash = (hash * 31 + name.charCodeAt(i)) % 9973;
     }
     const palette: ResourceColor[] = [
-      TunBoxColors.primaryLight,
+      TunBoxColors.primaryLightFor(this.themeRevision),
       TunBoxColors.successLight,
       TunBoxColors.dangerLight
     ];
@@ -405,7 +405,7 @@ struct AppRoutingPage {
   ModeChip(mode: string, label: string) {
     Text(label).fontSize(13)
       .fontWeight(this.mode === mode ? FontWeight.Bold : FontWeight.Normal)
-      .fontColor(this.mode === mode ? TunBoxColors.primary : TunBoxColors.textSecondary)
+      .fontColor(this.mode === mode ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.textSecondaryFor(this.themeRevision))
       .padding({ top: 8, bottom: 8 }).layoutWeight(1).textAlign(TextAlign.Center).borderRadius(8)
       .backgroundColor(this.mode === mode ? TunBoxColors.surfaceCard(this.themeRevision) : Color.Transparent)
       .onClick(() => this.selectMode(mode))
@@ -429,7 +429,7 @@ struct AppRoutingPage {
         TopNavBar({ title: '应用分流', hasBack: true, onBack: (): void => { this.back(); } }) {
           Row({ space: 8 }) {
             Button(this.busy ? '请稍候' : '保存').fontSize(14)
-              .backgroundColor(TunBoxColors.primary).fontColor(TunBoxColors.textOnPrimary)
+              .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(TunBoxColors.textOnPrimary)
               .borderRadius(TunBoxGeometry.controlRadius)
               .enabled(this.ready && !this.busy && this.dirty)
               .onClick(() => { this.save(); })
@@ -450,23 +450,23 @@ struct AppRoutingPage {
             Text(this.needsReview ? '旧名单存在冲突，请先明确选择一种模式'
               : this.mode === 'all' ? '所有应用进入 VPN'
               : `${this.mode === 'include' ? '仅接管' : '已排除'} ${this.current().length} 个应用`)
-              .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary).width('100%')
+              .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).width('100%')
             Text(this.mode === 'all' ? '两份名单仍保留，但当前均不启用。'
               : this.mode === 'include' ? '仅所选应用进入 VPN，其余应用直接联网。' : '所选应用直接联网，其余应用进入 VPN。')
-              .fontSize(12).fontColor(TunBoxColors.textSecondary).width('100%')
+              .fontSize(12).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision)).width('100%')
             Text('进入 VPN 后仍按规则 / 全局模式处理，不代表强制走代理节点。')
-              .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+              .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
           }.width('100%').padding(16).borderRadius(TunBoxGeometry.cardRadiusSmall)
             .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
             .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
           Text('当前 SDK 不支持读取完整安装列表。以下是常用目录与手动名单，不代表本机已安装；字形为名称标识，并非应用图标。')
-            .fontSize(11).fontColor(TunBoxColors.textMuted).width('100%')
+            .fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
           // 搜索框（文档 §3.3：高 42 / surfaceCard 底 / 圆角 14 / 描边 cardBorder / 前置 ic_search 16 textMuted；
           // 搜索过滤逻辑不变）
           Row({ space: 8 }) {
-            Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMuted)
+            Image($r('app.media.ic_search')).width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
             TextInput({ text: this.query, placeholder: '搜索应用名称或鸿蒙包名 (BundleName)...' })
-              .fontSize(14).fontColor(TunBoxColors.textPrimary).placeholderColor(TunBoxColors.textMuted)
+              .fontSize(14).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).placeholderColor(TunBoxColors.textMutedFor(this.themeRevision))
               .backgroundColor(Color.Transparent).padding(0).height('100%').layoutWeight(1)
               .onChange((v: string) => { this.query = v; this.rebuild(); })
           }.width('100%').height(42).padding({ left: 12, right: 12 })
@@ -476,13 +476,13 @@ struct AppRoutingPage {
           Row({ space: 12 }) {
             Text(this.batchMode ? `已勾选 (${this.pendingDeletes.length})`
               : (this.selectedOnly ? `已选择 (${this.current().length})` : `可用目录 (${this.rows.length})`))
-              .fontColor(this.batchMode && this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.primary).fontSize(13)
+              .fontColor(this.batchMode && this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.primaryFor(this.themeRevision)).fontSize(13)
               .onClick(() => { if (this.batchMode) { return; } this.selectedOnly = !this.selectedOnly; this.rebuild(); })
             Blank()
-            Text(this.nameSort ? '名称排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondary)
+            Text(this.nameSort ? '名称排序' : '已选置顶').fontSize(12).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision))
               .onClick(() => { if (this.batchMode) { return; } this.nameSort = !this.nameSort; this.rebuild(); })
             Text(this.batchMode ? '完成' : '批量删除').fontSize(12)
-              .fontColor(this.batchMode ? TunBoxColors.primary : TunBoxColors.textSecondary)
+              .fontColor(this.batchMode ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.textSecondaryFor(this.themeRevision))
               .padding({ left: 4, top: 4, bottom: 4 })
               .onClick(() => this.toggleBatchMode())
           }.width('100%')
@@ -494,27 +494,27 @@ struct AppRoutingPage {
               ListItem() {
                 Row({ space: 12 }) {
                   Text(row.label.substring(0, 1)).fontSize(17).fontWeight(FontWeight.Bold)
-                    .fontColor(TunBoxColors.primary)
+                    .fontColor(TunBoxColors.primaryFor(this.themeRevision))
                     .width(44).height(44).textAlign(TextAlign.Center).borderRadius(12)
                     .backgroundColor(this.iconBg(row.bundleName))
                   Column({ space: 4 }) {
                     Row({ space: 6 }) {
-                      Text(row.label).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimary)
+                      Text(row.label).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision))
                         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
-                      Text(row.source).fontSize(10).fontColor(TunBoxColors.textSecondary).maxLines(1)
+                      Text(row.source).fontSize(10).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision)).maxLines(1)
                         .padding({ left: 6, right: 6, top: 1, bottom: 1 })
                         .backgroundColor(TunBoxColors.chipBg(this.themeRevision)).borderRadius(4)
                     }.width('100%')
-                    Text(row.bundleName).fontSize(11).fontColor(TunBoxColors.textMuted).maxLines(1)
+                    Text(row.bundleName).fontSize(11).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis }).width('100%')
                     if (!this.batchMode) {
-                      Text('移除条目').fontSize(11).fontColor(TunBoxColors.primary)
+                      Text('移除条目').fontSize(11).fontColor(TunBoxColors.primaryFor(this.themeRevision))
                         .padding({ top: 5, bottom: 5 }).onClick(() => this.removeEntry(row.bundleName))
                     }
                   }.layoutWeight(1).alignItems(HorizontalAlign.Start)
                   Checkbox({ name: row.bundleName })
                     .select(this.batchMode ? this.pendingDeletes.includes(row.bundleName) : row.selected)
-                    .selectedColor(this.batchMode ? TunBoxColors.danger : TunBoxColors.primary)
+                    .selectedColor(this.batchMode ? TunBoxColors.danger : TunBoxColors.primaryFor(this.themeRevision))
                     .enabled(this.batchMode ? !this.busy : (this.mode !== 'all' && !this.busy))
                     .onChange((checked: boolean) => {
                       if (this.batchMode) {
@@ -537,38 +537,38 @@ struct AppRoutingPage {
             }, (row: RoutingRow) => `${row.bundleName}:${row.selected}:`
               + `${this.batchMode && this.pendingDeletes.includes(row.bundleName) ? 1 : 0}`)
             if (this.rows.length === 0) {
-              ListItem() { Text('没有匹配项，可手动添加鸿蒙包名。').fontSize(13).fontColor(TunBoxColors.textSecondary).padding(22) }
+              ListItem() { Text('没有匹配项，可手动添加鸿蒙包名。').fontSize(13).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision)).padding(22) }
             }
           }.width('100%').layoutWeight(1).scrollBar(BarState.Auto) .edgeEffect(EdgeEffect.Spring)
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
-          if (this.resultText.length > 0) { Text(this.resultText).fontSize(12).fontColor(TunBoxColors.primary).width('100%') }
+          if (this.resultText.length > 0) { Text(this.resultText).fontSize(12).fontColor(TunBoxColors.primaryFor(this.themeRevision)).width('100%') }
         }.width('100%').layoutWeight(1).padding({
           left: TunBoxGeometry.pagePadding, right: TunBoxGeometry.pagePadding, top: 8, bottom: 8
         }).width('100%')
         // 底部固定操作 Dock（文档 §3.3）：批量删除模式换成「删除所选」，其余入口保持原样
         Column({ space: 8 }) {
           Row({ space: 16 }) {
-            Text('全选当前结果').fontSize(12).fontColor(TunBoxColors.primary)
+            Text('全选当前结果').fontSize(12).fontColor(TunBoxColors.primaryFor(this.themeRevision))
               .onClick(() => { if (this.batchMode) { this.selectVisibleForDelete(true); } else { this.selectVisible(true); } })
-            Text(this.batchMode ? '取消全选' : '取消当前结果').fontSize(12).fontColor(TunBoxColors.textSecondary)
+            Text(this.batchMode ? '取消全选' : '取消当前结果').fontSize(12).fontColor(TunBoxColors.textSecondaryFor(this.themeRevision))
               .onClick(() => { if (this.batchMode) { this.selectVisibleForDelete(false); } else { this.selectVisible(false); } })
             Blank()
             Text(this.batchMode ? `已勾选 ${this.pendingDeletes.length} 项` : (this.dirty ? '草稿未保存' : '无未保存更改'))
               .fontSize(11)
-              .fontColor(this.batchMode && this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.textMuted)
+              .fontColor(this.batchMode && this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.textMutedFor(this.themeRevision))
           }.width('100%').enabled(this.ready && !this.busy && (this.batchMode || this.mode !== 'all'))
           Row({ space: 12 }) {
             if (this.batchMode) {
               Button(`删除所选（${this.pendingDeletes.length}）`).layoutWeight(1).height(46)
                 .fontSize(14).fontWeight(FontWeight.Bold)
-                .fontColor(this.pendingDeletes.length > 0 ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondary)
+                .fontColor(this.pendingDeletes.length > 0 ? TunBoxColors.textOnPrimary : TunBoxColors.textSecondaryFor(this.themeRevision))
                 .backgroundColor(this.pendingDeletes.length > 0 ? TunBoxColors.danger : TunBoxColors.controlTrackSoft(this.themeRevision))
                 .borderRadius(TunBoxGeometry.controlRadius)
                 .enabled(this.pendingDeletes.length > 0 && !this.busy)
                 .onClick(() => { this.deleteSelected(); })
               Button('完成').height(46).padding({ left: 20, right: 20 })
                 .fontSize(14).fontWeight(FontWeight.Medium)
-                .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+                .fontColor(TunBoxColors.primaryFor(this.themeRevision)).backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                 .borderRadius(TunBoxGeometry.controlRadius)
                 .onClick(() => this.toggleBatchMode())
             } else {
@@ -578,12 +578,12 @@ struct AppRoutingPage {
                   Text('添加/导入应用').fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textOnPrimary)
                 }
               }
-              .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primary)
+              .layoutWeight(1).height(46).backgroundColor(TunBoxColors.primaryFor(this.themeRevision))
               .borderRadius(TunBoxGeometry.controlRadius)
               .onClick(() => this.inputDialog.open())
               Button('导出规则').height(46).padding({ left: 20, right: 20 })
                 .fontSize(14).fontWeight(FontWeight.Medium)
-                .fontColor(TunBoxColors.primary).backgroundColor(TunBoxColors.primaryLight)
+                .fontColor(TunBoxColors.primaryFor(this.themeRevision)).backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                 .borderRadius(TunBoxGeometry.controlRadius)
                 .onClick(() => this.exportList())
             }

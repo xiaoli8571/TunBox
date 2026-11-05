@@ -134,6 +134,7 @@ export class LatencyKernelEndpoint {
   baseUrl: string = 'http://127.0.0.1:9090';
   /** 控制面密钥（空 = 不带鉴权头） */
   secret: string = '';
+  /** 废弃同名保留：delayUrl 不再按 provider 选专属路由。 */
   providerName: string = '';
 
   /** 鉴权头 */
@@ -250,14 +251,15 @@ export class LatencyProbe {
     return `${body.substring(0, LatencyProbeLimits.FAILURE_BODY_LOG_MAX)}…(已截断，全文 ${body.length} 字符)`;
   }
 
-  /** 构造延迟探测的 URL（与内核路由 `/proxies/{name}/delay` 对齐） */
+  /**
+   * 构造延迟探测的 URL（与内核路由 `/proxies/{name}/delay` 对齐）。
+   * FlClash core/delay.go:99 空 expected-status 范围（不传 expected）；
+   * provider 成员同此路由（无 provider 专属特例）。
+   */
   static delayUrl(endpoint: LatencyKernelEndpoint, nodeName: string, testUrl: string,
     nodeTimeoutMs: number): string {
     const name: string = encodeURIComponent(nodeName);
-    const path: string = endpoint.providerName.length > 0
-      ? `/providers/proxies/${encodeURIComponent(endpoint.providerName)}/${name}/healthcheck`
-      : `/proxies/${name}/delay`;
-    return `${endpoint.baseUrl}${path}`
+    return `${endpoint.baseUrl}/proxies/${name}/delay`
       + `?url=${encodeURIComponent(testUrl)}&timeout=${nodeTimeoutMs}`;
   }
 

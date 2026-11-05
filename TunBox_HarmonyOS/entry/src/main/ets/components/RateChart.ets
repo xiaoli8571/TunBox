@@ -17,7 +17,7 @@ export struct RateChart {
   @State private chartH: number = NexusSizes.rateChartH;
 
   private lineColor(): ResourceColor {
-    return TunBoxColors.primary;
+    return TunBoxColors.primaryFor(this.themeRevision);
   }
 
   private areaColor(): ResourceColor {

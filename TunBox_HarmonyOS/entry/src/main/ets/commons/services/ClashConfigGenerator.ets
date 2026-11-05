@@ -16,7 +16,7 @@ import { RawProxyItem, RawBodyCache, RawProxyYaml } from './RawProxyYaml';
 import { ProxyNode, ProxyNodeType } from '../models/ProxyNode';
 import { SubDnsUpstream, SubDnsUpstreamPolicy } from '../models/SubDnsUpstream';
 import { ProxyGroup } from '../models/ProxyGroup';
-import { AppSettings, AutoSelectModes, CustomRuleSet } from '../models/AppSettings';
+import { AppSettings, CustomRuleSet } from '../models/AppSettings';
 // 测速地址的**单一真源**（零 import ⇒ 不会形成循环依赖）。
 // 生成器不再自己读用户配置、也不再自带任何 url 规则（审计 F12）。
 import { LatencyTestUrl } from '../latency/LatencyTestUrl';
@@ -204,10 +204,10 @@ export class ClashConfigGenerator {
     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
     ipv6Enabled: boolean = true, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
-    ruleProviderReady: boolean = true, useSmart: boolean = false,
+    ruleProviderReady: boolean = true,
     subscriptionRules: string[] = [], subscriptionRuleProviders: string = '',
-    smartTestUrl: string = '',
-    subscriptionDnsUpstreams: SubDnsUpstream[] = [], subscriptionDnsPolicies: string[][] = []): string {
+    subscriptionDnsUpstreams: SubDnsUpstream[] = [], subscriptionDnsPolicies: string[][] = [],
+    useDefaultRouting: boolean = true): string {
     const lines: string[] = [];
 
     lines.push('mixed-port: ' + mixedPort);
@@ -571,17 +571,9 @@ export class ClashConfigGenerator {
     }
     const emittedGroups = ClashConfigGenerator.planProxyGroups(mergedGroups, validNodes);
     const selections = ClashConfigGenerator.parseProxyGroupSelections(settings.proxyGroupSelections);
-    // ── ♻️ 自动选择（内核 smart 组 / LightGBM）──────────────────────────────
-    // 仅在「自动选择模式 + Model.bin 已就绪」时声明（见 isSmartModelReady）。
-    // 必须满足三个前提，否则整块不写：
-    //   1) useSmart：应用侧确认 Model.bin 已落盘。内核 GetModel() 在缺文件时会
-    //      **同步联网下载**（github 直连不可达 → 实测阻塞 90s，然后软失败降级）。
-    //      与坑 24/40 同源的启动期阻塞，必须在应用侧拦住。
-    //   2) validNodes.length >= 2：只有一个节点时 smart 无意义，且会平白多一层跳转。
-    //   3) 名称不与任何节点/PROXY 冲突（组名与节点名同名会造成引用二义性）。
-    const SMART_GROUP_NAME = ClashConfigGenerator.SMART_GROUP_NAME;
-    const emitSmart = useSmart && validNodes.length >= 2
-      && !ClashConfigGenerator.usesName(validNodes, emittedGroups, SMART_GROUP_NAME);
+    // ── Smart 组注入已删除（R6，FlClash 固定上游 be847366 无此功能，§5.4）──
+    // 上游不注入任何 smart 组；本仓此前 useSmart/AUTO/Model.bin 的注入决策链全部
+    // 移除。`useSmart` 入参保留仅为调用点兼容，恒不生效。
     lines.push('');
     lines.push('proxy-groups:');
     lines.push('  - name: "PROXY"');
@@ -611,16 +603,7 @@ export class ClashConfigGenerator {
       proxyMembers.push(preferredGroupName);
       AppLogger.info(TAG, `PROXY primary member is a strategy group: ${preferredGroupName}`);
     }
-    if (emitSmart) {
-      // 自动模式下 PROXY 默认指向 smart 组：内核按每条连接的目标特征（ASN/GeoIP/
-      // 端口/域名类型）在组内动态选点，而不是整条隧道钉死在一个节点上。
-      // 选中节点来自 provider 时同样直接指向 smart 组（它的名字不能按名引用）。
-      const smartFirst = settings.autoSelectMode === AutoSelectModes.AUTO || selectedFromProvider;
-      proxyMembers.push(smartFirst ? SMART_GROUP_NAME : groupSelected.name);
-      if (!smartFirst) {
-        proxyMembers.push(SMART_GROUP_NAME);
-      }
-    } else if (!selectedFromProvider) {
+    if (!selectedFromProvider) {
       proxyMembers.push(groupSelected.name);
     }
     for (const group of emittedGroups) {
@@ -702,79 +685,6 @@ export class ClashConfigGenerator {
         }
       }
     }
-    if (emitSmart) {
-      // 内核 smart 组：LightGBM 综合评分（延迟 / 建连时间 / 成功率 / 历史吞吐 /
-      // 丢包 / ASN / GeoIP / 端口 / 域名类型），按连接粒度选点。
-      //   uselightgbm: true → 用学习模型；collectdata 仅在你愿意上传样本时才开，
-      //     默认 false（本地隐私优先，且不影响本地推理）。
-      //   prefer-asn 必须为 false：开启后 smart.go 会同步调 geodata.InitASN() 拉
-      //     ASN.mmdb，实测 **90s 阻塞**（同 MMDB 坑），而设备上并没有 ASN.mmdb。
-      //   url 用用户配置的测速地址，而不是内核默认的 gstatic —— 否则「测速设置」
-      //     对自动选点不生效，两处延迟口径不一致（真机发现的遗漏）。
-      //   ⚠ 2026-10-20（A12c / 审计 F12）：测速地址**只有一个真源** ——
-      //     调用方把用户填的原始值传进来（smartTestUrl），规则（空/非法 → 默认 https、
-      //     历史 http 默认值 → https、用户自填 http 保持原样）全部由
-      //     LatencyTestUrl.effective() 决定。生成器**不再自己读用户配置**，
-      //     也不再自带任何 url 规则 —— 避免「两份实现、两套话术」。
-      lines.push(`  - name: "${SMART_GROUP_NAME}"`);
-      lines.push('    type: smart');
-      lines.push('    uselightgbm: true');
-      lines.push('    collectdata: false');
-      lines.push('    prefer-asn: false');
-      const smartUrl: string = LatencyTestUrl.effective(smartTestUrl);
-      lines.push(`    url: "${ClashConfigGenerator.escapeYaml(smartUrl)}"`);
-      // 机场常把「剩余流量/套餐到期」这类**信息条**塞进 proxies 列表，它们和真实节点
-      // 共用同一个 server/uuid（真机实证：4 条信息条与 🇯🇵日本•移联01 端点完全相同），
-      // 纯属重复噪音。不排除的话内核会把它们当真节点参与评分，甚至选成出口 ——
-      // 真机 /connections 里就出现过 chains[0] = "套餐到期：长期有效"。
-      // 交给内核自己的 exclude-filter 过滤（GroupBase 对显式 proxies 同样生效），
-      // 不改可见节点列表，用户仍可在「全部」里看到并手动选它们。
-      lines.push(`    exclude-filter: "${ClashConfigGenerator.SMART_INFO_NODE_FILTER}"`);
-      // fork 独有：policy-priority 是**高于** LightGBM 评分的排序键（因子不同则按因子
-      // 降序，分数再高也翻不过来）。默认不写该键 = 完全交给模型评分。
-      const priority: string = (settings.smartPolicyPriority ?? '').trim();
-      if (priority.length > 0) {
-        lines.push(`    policy-priority: "${ClashConfigGenerator.escapeYaml(priority)}"`);
-      }
-      lines.push('    proxies:');
-      // 【2026-10-25 产品口径：单订阅优选】smart 池只收**当前选中节点所属订阅**的
-      // 节点（无订阅归属的本地/直链节点一并保留）；池不足 2 个时退回全量，宁可
-      // 跨订阅优选也不让自动模式在单订阅小池上失效。PROXY 选择组仍含全部节点，
-      // 手动跨订阅选点不受影响。
-      // 【2026-10-31 修正】作用域判定必须用**该订阅的真实节点数**（validNodes 含
-      // provider 覆盖的节点）。旧实现数的是 staticNodes：订阅走 provider 接管后该
-      // 订阅在 staticNodes 里是 0 个 → 误判“池不足” → 退回跨订阅全量池，
-      // 「只在本订阅内优选」静默失效。
-      const smartScopeId: string = groupSelected.subscriptionId;
-      let smartScopeCount = 0;
-      if (smartScopeId.length > 0) {
-        for (const n of validNodes) {
-          if (n.subscriptionId === smartScopeId) {
-            smartScopeCount = smartScopeCount + 1;
-          }
-        }
-      }
-      const smartGlobalPool = smartScopeId.length === 0 || smartScopeCount < 2;
-      const smartPool: ProxyNode[] = smartGlobalPool
-        ? staticNodes
-        : staticNodes.filter((n: ProxyNode): boolean =>
-          n.subscriptionId === smartScopeId || n.subscriptionId.length === 0);
-      for (const n of smartPool) {
-        lines.push(`      - "${ClashConfigGenerator.escapeYaml(n.name)}"`);
-      }
-      // smart 组同样要 `use:` provider：provider 提供的节点不在静态列表里，
-      // 少了这一段自动选点会看不到这些节点。
-      const scopedProviderEntries = smartGlobalPool
-        ? providerPlan.entries
-        : providerPlan.entries.filter((entry: RawProviderEntry): boolean =>
-          entry.subscriptionId === smartScopeId);
-      if (scopedProviderEntries.length > 0) {
-        lines.push('    use:');
-        for (const entry of scopedProviderEntries) {
-          lines.push(`      - "${ClashConfigGenerator.escapeYaml(entry.providerName)}"`);
-        }
-      }
-    }
     // ── YAML 覆盖层的 rules/rule-providers 预解析 ─────────────────────────
     // 【2026-10-20 认知纠正】mihomo 用 go.yaml.in/yaml/v3，**uniqueKeys 默认开启**：
     // 同一层级的重复键是 **TypeError → 整份配置拒载**（全有全无），
@@ -785,7 +695,10 @@ export class ClashConfigGenerator {
     let overrideBody = '';
     let overrideRuleLines: string[] = [];
     let overrideProviderLines: string[] = [];
-    const override = (settings.yamlOverride ?? '').trim();
+    // Profile overrides are applied once by TunBoxProfileBuilder (per-profile
+    // wins over global). Reapplying the global override here leaks its rules/DNS
+    // into profiles with their own override and duplicates replacement rules.
+    const override = useDefaultRouting ? (settings.yamlOverride ?? '').trim() : '';
     if (override.length > 0 && ClashConfigGenerator.validateYamlOverride(override)) {
       try {
         const orules = YamlMerger.extractSection(override, 'rules').trim();
@@ -941,7 +854,8 @@ export class ClashConfigGenerator {
     // 段，规则引用放在自定义单条规则之前（RULE-SET 精确度高于逐条扫描，mihomo 按序匹配）。
     if (settings.rulesEnabled) {
       for (const ruleSet of settings.customRuleSets) {
-        lines.push(`  - RULE-SET,rs-${ruleSet.name},${ruleSet.policy}`);
+        const policy = !useDefaultRouting && ruleSet.policy === 'PROXY' ? 'MATCH' : ruleSet.policy;
+        lines.push(`  - RULE-SET,rs-${ruleSet.name},${policy}`);
       }
       for (const customRule of ClashConfigGenerator.normalizeCustomRules(settings.customRules)) {
         // 自定义 GEOIP 与订阅 GEOIP 共用资产闸门，缺库时避免启动期同步下载。
@@ -949,7 +863,7 @@ export class ClashConfigGenerator {
         if (!useGeoip && customRule.toUpperCase().startsWith('GEOIP,')) {
           continue;
         }
-        lines.push(`  - ${customRule}`);
+        lines.push(`  - ${useDefaultRouting ? customRule : ClashConfigGenerator.profilePolicyRule(customRule)}`);
       }
       // ── 订阅自带 rules（导入订阅时落账）──────────────────────────────
       // 策略目标必须是**实际写进 proxy-groups 段的组**或内置策略；RULE-SET 必须引用
@@ -968,11 +882,7 @@ export class ClashConfigGenerator {
       for (const g of emittedGroups) {
         groupTargets.add(g.name);
       }
-      // ♻️ 自动选择组只在 emitSmart 为真时才真正声明（见上方 proxy-groups 段），
-      // 未声明就不能算合法目标，否则同理会写出指向不存在组的规则。
-      if (emitSmart) {
-        groupTargets.add(ClashConfigGenerator.SMART_GROUP_NAME);
-      }
+      // ♻️ 自动选择组已删除（R6）：不再声明、不再算合法规则目标。
       let skippedUserRules = 0;
       // GEOIP 规则依赖 geoip.metadb（坑 40 同源）：metadb 缺失/损坏时内核会在
       // config.Parse 阶段同步联网下载 MMDB（国内不可达）→ 启动卡死超时。
@@ -1039,7 +949,7 @@ export class ClashConfigGenerator {
     for (const site of proxySites) {
       // DIRECT 优先，避免同一域名生成互相冲突的规则。
       if (!directSites.includes(site)) {
-        lines.push(`  - DOMAIN-SUFFIX,${site},PROXY`);
+        lines.push(`  - DOMAIN-SUFFIX,${site},${useDefaultRouting ? 'PROXY' : 'MATCH'}`);
       }
     }
     // P0-3 路由层兜底：SNI 嗅探/纯 IP 直连等不经过 DNS 解析的路径仍可能到达
@@ -1053,16 +963,18 @@ export class ClashConfigGenerator {
     // 国内直连：GEOIP 需要 geoip.metadb（内核 home 目录）; 缺失时降级跳过,
     // 否则 config.Parse 阶段就会联网下载 MMDB, 国内网络不可达直接导致启动失败。
     // DOMAIN-SUFFIX,cn 直连不受影响, MMDB 由编排器后台补齐后下次连接生效。
-    if (useGeoip) {
+    if (useDefaultRouting && settings.bypassDomesticApps && useGeoip) {
       lines.push('  - GEOIP,CN,DIRECT');
     }
-    lines.push('  - DOMAIN-SUFFIX,cn,DIRECT');
+    if (useDefaultRouting && settings.bypassDomesticApps) { lines.push('  - DOMAIN-SUFFIX,cn,DIRECT'); }
     // 兜底规则: 上面的国内规则已放行国内流量, 剩余(YouTube/Google 等国外站点)
     // 必须走代理。此前 bypassDomesticApps=true 会生成 MATCH,DIRECT, 导致
     // 国外流量也直连、无法访问被墙站点(真机 core.log: youtube:443 using DIRECT)。
     // bypassDomesticApps 的语义收敛为"国内直连分流是否启用"(见上方 GEOIP/cn 规则),
     // 不再影响兜底 —— 兜底永远是 PROXY, 否则 VPN 没有意义。
-    lines.push('  - MATCH,PROXY');
+    // A profile already owns its routing table. An app catch-all prepended to
+    // it either references a missing PROXY or makes all subscription rules dead.
+    if (useDefaultRouting) { lines.push('  - MATCH,PROXY'); }
     // ── YAML 覆盖层合并（C17 + C18）──────────────────────────────────
     // 【2026-10-20 认知纠正】mihomo 用 go.yaml.in/yaml/v3（uniqueKeys **默认开启**）：
     // 同一层级的重复键 = TypeError = **整份配置拒载**（全有全无，一个节点坏整个
@@ -2276,6 +2188,15 @@ export class ClashConfigGenerator {
     return out;
   }
 
+  /** Map only the app UI's proxy policy to FlClash's main-exit placeholder. */
+  private static profilePolicyRule(rule: string): string {
+    const parts = rule.split(',');
+    let index = parts.length - 1;
+    while (index > 1 && ['no-resolve', 'src'].includes(parts[index].trim().toLowerCase())) { index--; }
+    if (index >= 1 && parts[index].trim() === 'PROXY') { parts[index] = 'MATCH'; }
+    return parts.join(',');
+  }
+
   static normalizeCustomRules(values: string[]): string[] {
     const out: string[] = [];
     for (const raw of values) {
@@ -2430,21 +2351,6 @@ export class ClashConfigGenerator {
     // direct 出站只有 name/type（mihomo 合法节点），没有 server/port/凭据可校验
     if (proxyType === 'direct') {
       return n.name.length === 0 ? ProxyDropReason.MISSING_FIELD : ProxyDropReason.NONE;
-    }
-    // ── 0.8.0：内核已裁掉的三个协议，必须在生成侧就拦住 ────────────────────
-    // 内核自 0.8.0 起用 no_tailscale,no_zerotier,no_easytier 编译（省 6.26MB 包体），
-    // 这三个 outbound 在二进制里已不存在。而 mihomo 对未知类型的处理是
-    //   adapter/parser.go: default: return nil, fmt.Errorf("unsupport proxy type: %s")
-    // 且 config/config.go:922 一旦 err != nil 就
-    //   return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
-    // —— **整份配置拒载**，不是丢那一个节点。
-    //
-    // 而下面白名单末尾的 YamlMerger.isRelayType() 带兜底正则
-    //   /^[a-z][a-z0-9-]{0,31}$/
-    // tailscale / zerotier / easytier 全都匹配 ⇒ 不拦就会写进配置 ⇒ 用户整个代理起不来。
-    // 所以这一条必须在 isRelayType 之前短路：丢掉这几个节点 + 计数提示，其余照常。
-    if (proxyType === 'tailscale' || proxyType === 'zerotier' || proxyType === 'easytier') {
-      return ProxyDropReason.UNSUPPORTED_PROTOCOL;
     }
     if (proxyType !== 'ss' && proxyType !== 'ssr' && proxyType !== 'vless'
       && proxyType !== 'vmess' && proxyType !== 'trojan' && proxyType !== 'hysteria2'

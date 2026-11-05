@@ -57,7 +57,7 @@ i.ytimg.com          rule= DomainSuffix ytimg.com   chain= [🇭🇰 香港Z01, 
 183.232.70.106       rule= GeoIp cn                 chain= [DIRECT]
 ```
 
-闸门：`verify-flclash-profile`
+闸门：`verify-tunbox-profile`
 
 ---
 
@@ -163,7 +163,7 @@ PublicIp: after-disconnect ok 2208ms
 | 闸门 | 覆盖 |
 |---|---|
 | `verify-sub-convert-protocols.mjs` | 11 种协议转换 + insecure 三参数 + 未编码 `/` + 裸节点表补组（60 项） |
-| `verify-flclash-profile.mjs` | overlay/原文合并、dns 语义、真实内核 `-t` |
+| `verify-tunbox-profile.mjs` | overlay/原文合并、dns 语义、真实内核 `-t` |
 | `verify-vpn-architecture.mjs` | 架构不变量（303 项） |
 | `verify-latency-display.mjs` | 延迟显示口径（50 项） |
 

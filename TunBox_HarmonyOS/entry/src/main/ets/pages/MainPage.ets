@@ -21,10 +21,12 @@
  *    首页「规则管理」卡片等入口写该键即可切到目标页签。
  */
 import { FloatingBottomBar } from '../components/FloatingBottomBar';
+import { FloatingQuickLaunchButton } from '../components/FloatingQuickLaunchButton';
 import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
 import { SafeArea } from '../theme/SafeArea';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { SettingsService } from '../commons/services/SettingsService';
 import { HomePage } from './HomePage';
 import { StatsPage } from './StatsPage'; // 页签 1「数据」= ClashPlus 数据页
 import { SettingsView } from './SettingsPage';
@@ -40,6 +42,7 @@ const TAB_SETTINGS = 2;
 @Component
 struct MainPage {
   @StorageLink('theme_revision') themeRevision: number = 0;
+  @StorageLink('floating_quick_launch_enabled') floatingQuickLaunchEnabled: boolean = false;
   /** 当前页签（AppStorage 真相源：外部入口可写 'tb_main_tab' 直接跳页签） */
   @StorageLink('tb_main_tab') @Watch('onTabChanged') activeIndex: number = TAB_HOME;
   /** 已创建过的页签（懒挂载 + 常驻） */
@@ -51,6 +54,27 @@ struct MainPage {
   private homeBridge: TabLifecycleBridge = new TabLifecycleBridge();
   private statsBridge: TabLifecycleBridge = new TabLifecycleBridge();
   private settingsBridge: TabLifecycleBridge = new TabLifecycleBridge();
+
+  aboutToAppear(): void {
+    this.loadQuickLaunchPreference();
+  }
+
+  private async loadQuickLaunchPreference(): Promise<void> {
+    try {
+      const context = getContext(this) as Context;
+      await SettingsService.init(context);
+      const settings = await SettingsService.load();
+      AppStorage.setOrCreate('floating_quick_launch_enabled', settings.floatingQuickLaunchEnabled);
+    } catch (e) {
+      AppLogger.warn(TAG, `quick launch preference unavailable: ${AppLogger.errText(e)}`);
+    }
+  }
+
+  private requestConnectionToggle(): void {
+    AppStorage.setOrCreate('vpn_request_mode', 'toggle');
+    const seq = (AppStorage.get<number>('vpn_request_seq') ?? 0) + 1;
+    AppStorage.setOrCreate('vpn_request_seq', seq);
+  }
 
   onPageShow(): void {
     // 从推入式子页（节点 / 连接 / 应用分流 / 网站分流等）返回时刷新当前页签
@@ -153,10 +177,27 @@ struct MainPage {
       })
 
       // 底部悬浮导航栏（文档 §2.2，浮在内容之上，栏体完全透明）
-      FloatingBottomBar({
-        currentTab: this.activeIndex,
-        onSelect: (index: number): void => { this.selectTab(index); }
-      })
+      if (this.floatingQuickLaunchEnabled) {
+        Row({ space: 10 }) {
+          FloatingBottomBar({
+            currentTab: this.activeIndex,
+            compact: true,
+            onSelect: (index: number): void => { this.selectTab(index); }
+          }).layoutWeight(1)
+          FloatingQuickLaunchButton({
+            onToggle: (): void => { this.requestConnectionToggle(); }
+          })
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12 })
+        .align(Alignment.Bottom)
+      } else {
+        FloatingBottomBar({
+          currentTab: this.activeIndex,
+          onSelect: (index: number): void => { this.selectTab(index); }
+        })
+        .align(Alignment.Bottom)
+      }
     }
     .width('100%')
     .height('100%')

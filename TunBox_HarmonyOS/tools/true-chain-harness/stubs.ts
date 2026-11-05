@@ -440,6 +440,24 @@ export class CoreNodeBridge {
 
 export const coreBridge = { async prepareProfile(_text: string): Promise<string> { throw new Error("Inject a real profile validator in tests"); } };
 
+// 2026-11-05（FlClash 全量照抄）：getProfileBase / decodeYaml 由各门禁按需注入；
+// 默认实现与生产语义一致地抛错（测 compose 的门禁直接喂 map，不经这里）。
+const injectedProfileBase: Record<string, unknown> = {};
+export const harnessCoreBridge = {
+  setProfileBase(path: string, base: unknown): void { injectedProfileBase[path] = base; },
+};
+(globalThis as AnyObj).__tunboxProfileBase = injectedProfileBase;
+
+/** FlClash 单一 UA 替身（与 SubscriptionFetchPolicy.tunboxUserAgent 同格式）。 */
+export function tunboxUserAgent(): string {
+  return 'TunBox/v-harness clash-verge Platform/OpenHarmony';
+}
+
+/** YAML 解码替身（生产由内核 decodeYaml 承担；Node 门禁注入 JSON map）。 */
+export function harnessDecodeYaml(map: Record<string, unknown>): Record<string, unknown> {
+  return map;
+}
+
 // ArkUI AppStorage 沙箱（SubscriptionService.persist 里的 revision 计数）
 (globalThis as AnyObj).AppStorage = {
   map: new Map<string, Object>(),

@@ -13,6 +13,9 @@ import (
 )
 
 func (c *systemClient) getDnsClients() ([]dnsClient, error) {
+	if clients, installed := platformSystemClients(); installed {
+		return clients, nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var err error

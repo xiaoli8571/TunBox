@@ -260,19 +260,40 @@ try {
   check('实测值不适用「结论陈旧」判定',
     LatencyPolicy.isStaleConclusion(LatencyRecord.measured('m', 10, LatencyChannel.CORE, OLD), NOW) === false);
 
-  // ── 5. 渲染层：旧失败显示「超时·旧」，不再是一颗新鲜的红「超时」 ──
-  check('陈旧失败文案是「超时·旧」',
-    LatencyStyle.recordText(oldFail, NOW) === '超时·旧');
+  // ── 5. 2026-11-04 用户要求：缓存结果直接正常显示，不带旧标记 ──
+  check('缓存失败文案直接显示超时',
+    LatencyStyle.recordText(oldFail, NOW) === '超时');
   check('新鲜失败文案仍是「超时」',
     LatencyStyle.recordText(freshFail, NOW) === '超时');
-  check('陈旧失败配色为中性（不是红色）',
+  check('缓存失败沿用正常失败色',
     LatencyStyle.recordColor(oldFail, NOW) === LatencyStyle.recordColor(
-      LatencyRecord.untested('q'), NOW));
+      freshFail, NOW));
   check('新鲜失败仍为红色',
     LatencyStyle.recordColor(freshFail, NOW) !== LatencyStyle.recordColor(
       LatencyRecord.untested('q'), NOW));
-  check('陈旧实测值显示「123ms·旧」',
-    LatencyStyle.recordText(LatencyRecord.measured('m', 123, LatencyChannel.CORE, OLD), NOW) === '123ms·旧');
+  check('缓存实测值直接显示123ms',
+    LatencyStyle.recordText(LatencyRecord.measured('m', 123, LatencyChannel.CORE, OLD), NOW) === '123ms');
+
+  // 首页实际使用 TunBoxPing：执行生产类，颜色令牌仅替换为可比较的标签。
+  const pingSource = readFileSync(join(ets, 'theme/TunBoxTokens.ets'), 'utf8');
+  writeFileSync(join(sandbox, 'theme/TunBoxPing.ts'),
+    "import { LatencyRecord, LatencyState } from '../commons/services/LatencyState.ts';\n"
+    + "import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore.ts';\n"
+    + "const TunBoxColors = { textMuted: 'muted', success: 'green', warning: 'yellow', danger: 'red' };\n"
+    + pingSource.slice(pingSource.indexOf('export class TunBoxPing')), 'utf8');
+  const { TunBoxPing } = await import(pathToFileURL(join(sandbox, 'theme/TunBoxPing.ts')).href);
+  for (const [name, renderer] of [['TunBoxPing', TunBoxPing], ['LatencyStyle', LatencyStyle]]) {
+    for (const delay of [90, 400, 950]) {
+      const cached = LatencyRecord.measured('cached', delay, LatencyChannel.CORE, OLD);
+      const fresh = LatencyRecord.measured('fresh', delay, LatencyChannel.CORE, NOW);
+      check(`${name} 缓存${delay}ms正常显示和配色`,
+        renderer.recordText(cached, NOW) === `${delay}ms`
+        && renderer.recordColor(cached, NOW) === renderer.recordColor(fresh, NOW));
+    }
+    check(`${name} 缓存超时无旧标记且保留失败色`,
+      renderer.recordText(oldFail, NOW) === '超时'
+      && renderer.recordColor(oldFail, NOW) === renderer.recordColor(freshFail, NOW));
+  }
 
   // ── 6. 非判定判定表唯一真源 ────────────────────────────────────────
   check('isNonVerdictKind：通道故障类为非判定',
@@ -354,11 +375,9 @@ check('非判定判定表收敛到 LatencyPolicy.isNonVerdictKind（唯一真源
   /return\s+LatencyPolicy\.isNonVerdictKind\(failKind\)/.test(persistSrc));
 
 const tokensSrc = stripComments(readFileSync(join(ets, 'theme/TunBoxTokens.ets'), 'utf8'));
-check('TunBoxPing.recordText 对陈旧失败标「·旧」',
-  /isStaleConclusion\(rec,\s*nowMs\)/.test(tokensSrc));
+check('TunBoxPing 展示不再附加旧标记', !tokensSrc.includes('·旧'));
 const uiTokensSrc = stripComments(readFileSync(join(ets, 'theme/UiTokens.ets'), 'utf8'));
-check('LatencyStyle.recordText 对陈旧失败标「·旧」',
-  /isStaleConclusion\(rec,\s*nowMs\)/.test(uiTokensSrc));
+check('LatencyStyle 展示不再附加旧标记', !uiTokensSrc.includes('·旧'));
 
 // ── 输出 ──────────────────────────────────────────────────────────────
 let pass = 0;
@@ -373,5 +392,5 @@ if (fails.length > 0) {
   console.error('失败：' + fails.join(' | '));
   process.exit(1);
 }
-console.log('全部通过（陈旧结论不再被渲染成新鲜的红「超时」）');
+console.log('全部通过（保留真实时间戳与分类，缓存结果正常显示）');
 process.exit(0);

@@ -11,8 +11,11 @@
  *              job.cancelled 后既不启动新任务也不落结论）
  *   FlClash  lib/common/constant.dart            maxConcurrentDelayTests = 32
  *                                                delayTestGuardDuration = 30s
+ *   TunBox 产品要求：单节点超时固定 5000ms（不提供用户设置）。
  *                                                renderThrottleDuration = 300ms（合批由 UI 侧做，本文件不掺和）
  *   FlClash  lib/core/interface.dart             asyncTestDelay(timeout: delayTestGuardDuration)
+ *   FlClash  core/delay.go                       delayTestConcurrency = 50、缺省 5s（内核兜底）
+ *                                                空 expected-status 范围、provider 超时特例在内核侧
  *   mihomo   hub/route/proxies.go getProxyDelay  200 {"delay":n} / 504 ctx 超时 / 503 失败 / 404 proxy 不存在
  *   mihomo   core/delay.go                       delayTimedOut = -1、delayFailed = -2
  *   mihomo   core/delay.go defaultTestURL        https://www.gstatic.com/generate_204
@@ -30,87 +33,47 @@
  * 平台差异（规格 §五，不算偏离）：FlClash 走 core IPC，TunBox 走内核 REST；
  * 内核 `delayTestConcurrency = 50 > 32`，客户端 32 并发天然落在核内槽位之内。
  *
- * 测试：scripts/verify-flclash-delay.mjs（网络层通过 DelayHttpTransport 注入桩，
+ * 测试：scripts/verify-tunbox-delay.mjs（网络层通过 DelayHttpTransport 注入桩，
  *       默认实现 ArkDelayHttpTransport 用 @kit.NetworkKit）。
  */
 import { http, socket } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { LatencyTestUrl } from '../latency/LatencyTestUrl';
+import { AppSettings } from '../models/AppSettings';
 import { AppLogger } from '../utils/AppLogger';
 
-const TAG = 'FlclashDelay';
+const TAG = 'TunBoxDelay';
 
-/** 并发池基线（FlClash maxConcurrentDelayTests） */
-export const FLCLASH_DELAY_CONCURRENCY: number = 32;
 /**
- * 并发池上限。
- *
- * 【为什么允许超过 32】真机实测内核 `hub/route/proxies.go:getProxyDelay` **没有任何
- * 并发信号量**（每个请求独立 goroutine + 自己的 ctx 超时），客户端并发数就是真实
- * 同时在拨测的节点数；而一批测速的总时长 ≈ ceil(N / 并发) × 单波最慢节点耗时。
- * 2026-10-26 真机基线（80 节点 / 32 并发）批次 30~32s，24 节点一波 7.3s ⇒ 时长被
- * 波数主导。把「≤64 个目标一波发完」后 80 节点降到 2 波。
- *
- * 为什么不无限：一次 600 个节点同时拨 gstatic 会同时打开 600 条代理连接，
- * 弱 Wi-Fi 下互相抢带宽反而制造假超时（技能里 32 路在途压垮 /version 探针的现场）。
- * 2026-10-26 用户要求「并发再稍微提高一点」⇒ 32 → 64（配合 TCP 直连传输层，
- * 并发才真的落到内核；在 @ohos.net.http 上试过 80/96，同 host 连接池直接噎住，
- * p50 反而涨到 10s、46 个节点无结论）。
+ * 并发池：固定 32（FlClash `maxConcurrentDelayTests`，constant.dart:100）。
+ * 无自适应、无上限抬升 —— FlClash TaskPool(32) 就是这么跑的。
  */
-export const FLCLASH_DELAY_MAX_CONCURRENCY: number = 64;
+export const TUNBOX_DELAY_CONCURRENCY: number = 32;
+/**
+ * TunBox 产品固定 5000ms；与 FlClash 可配置档位有意不同。
+ */
+export const TUNBOX_DELAY_TIMEOUT_OPTIONS: number[] = [5000];
+/** 单节点超时与 AppSettings 同源，旧设置不能改变生产策略。 */
+export const TUNBOX_DELAY_DEFAULT_TIMEOUT_MS: number = AppSettings.DEFAULT_DELAY_TEST_TIMEOUT;
+/**
+ * 客户端守护 30s（FlClash `delayTestGuardDuration`，constant.dart:63）。
+ * 从请求发出起算，覆盖「排槽 + 本次探测」和 IPC 余量。
+ * 到期不作结论（与 FlClash `getDelay` 返回 null 同语义）。
+ */
+export const TUNBOX_DELAY_GUARD_MS: number = 30000;
 /** 是否用 TCP 直连传输层（false = 回退 @ohos.net.http，见 ArkTcpDelayHttpTransport 注释） */
-export const FLCLASH_DELAY_USE_TCP_TRANSPORT: boolean = true;
+export const TUNBOX_DELAY_USE_TCP_TRANSPORT: boolean = true;
 
-/**
- * 一批目标应该用多少路并发。
- *
- * 语义：≤ 基线（32）时按目标数一波发完；超过基线后一路抬到「目标数」，
- * 但不超过上限（64）。即 24 → 24（一波）、40 → 40（一波）、80 → 64（2 波）、
- * 600 → 64（10 波，原来 32 并发时是 19 波）。
- *
- * ⚠ 2026-10-29 真机 A/B（飞鸟云 58/59 节点批，同一台机、同一 URL）：
- *   自适应 conc=59 → measured=18 timeout=16 failed=23 cancelled=2
- *   封顶 conc=32   → measured=14 timeout=21 failed=22 cancelled=1
- *   ⇒ 「高并发制造假失败」在本机型上**不成立**，封顶反而更差。
- *   那一屏「拨号失败/超时」是机场里真的有这么多死节点，不是抢资源。
- *   所以这里保持自适应，别再为了"减少失败"去压低并发（先做 A/B 再改）。
- */
-export function flclashDelayConcurrency(total: number): number {
-  if (total <= 0) {
-    return 1;
-  }
-  if (total <= FLCLASH_DELAY_CONCURRENCY) {
-    return total;
-  }
-  return Math.min(FLCLASH_DELAY_MAX_CONCURRENCY, total);
-}
-/**
- * 传给**内核**的单节点测速超时（mihomo `?timeout=` 参数）。
- *
- * 2026-10-26 用户拍板 3000ms（「等 5 秒太久」），与 `LatencyTimeout.DEFAULT_TIMEOUT_MS`
- * 同值（闸门 verify-flclash-delay 的 C0 断言两处相等，不要只改一边）。
- * 历史：5000（对齐三家 5s/8s/10s）→ **3000**（用户再次要求缩短）。
- */
-export const FLCLASH_DELAY_TIMEOUT_MS: number = 3000;
-/**
- * 客户端守护：一次 REST 往返最多等这么久，到期＝不作结论。
- *
- * FlClash 的 30s 包的是 core IPC；TunBox 走本地 REST，30s 的真实含义是
- * 「ArkTS http 栈卡死的请求会把整批墙钟钉在 30s」——2026-10-26 真机实测 80 节点
- * 批次 wall=30.1s、p90=27.7s、cancelled=2，这 2 条就是被 http 层挂死后由守护收尾。
- * 收紧到「内核 3s + 7s 余量」：正常请求 3s 内必回，卡死的最多拖 10s。
- */
-export const FLCLASH_DELAY_GUARD_MS: number = 10000;
 /** 默认测速 URL（mihomo defaultTestURL，调用方可按节点/组覆盖） */
 // 测速地址的真源在 commons/latency/LatencyTestUrl（ND06：默认地址常量只允许一处）。
 // 这里只是给 FlClash 复刻层一个本地命名，**不得**再写第二份字面量。
-export const FLCLASH_DELAY_URL: string = LatencyTestUrl.DEFAULT_URL;
+export const TUNBOX_DELAY_URL: string = LatencyTestUrl.DEFAULT_URL;
 
 /** delayTimedOut：内核对 context 超时的取值 */
-export const FLCLASH_DELAY_TIMED_OUT: number = -1;
+export const TUNBOX_DELAY_TIMED_OUT: number = -1;
 /** delayFailed：内核拨号/请求失败的取值 */
-export const FLCLASH_DELAY_FAILED: number = -2;
+export const TUNBOX_DELAY_FAILED: number = -2;
 
 /** delayTestKey 的分隔符（FlClash common/compute.dart：'$testUrl\u0000$proxyName'） */
 const DELAY_KEY_SEP: string = '\u0000';
@@ -127,18 +90,24 @@ export class DelayTarget {
   /** 真正被内核拨测的出口名（组链路末端节点名，由调用方解析） */
   proxyName: string = '';
   /** 该节点/该组配置的测速 URL */
-  testUrl: string = FLCLASH_DELAY_URL;
+  testUrl: string = TUNBOX_DELAY_URL;
   /** 去重键 = delayTestKey(testUrl, proxyName) */
   key: string = '';
-  /** 期望状态码（组的 `expected-status`，空串 = 内核默认 204） */
+  /**
+   * 废弃：FlClash 取的是空 expected-status 范围（core/delay.go:99），不再透传组
+   * 的 expected-status。字段保留仅供既有调用点赋值，引擎永不使用。
+   */
   expected: string = '';
-  /** Empty for static proxies; provider-owned proxies have a separate REST route. */
+  /**
+   * 废弃：provider 成员同样直测 /proxies（FlClash 无 provider 专属路由）。
+   * 字段保留仅供既有调用点赋值，引擎永不使用。
+   */
   providerName: string = '';
 
-  constructor(proxyName: string = '', testUrl: string = FLCLASH_DELAY_URL, key: string = '',
+  constructor(proxyName: string = '', testUrl: string = TUNBOX_DELAY_URL, key: string = '',
     expected: string = '', providerName: string = '') {
     this.proxyName = proxyName;
-    this.testUrl = testUrl.length > 0 ? testUrl : FLCLASH_DELAY_URL;
+    this.testUrl = testUrl.length > 0 ? testUrl : TUNBOX_DELAY_URL;
     this.key = key.length > 0 ? key : delayTestKey(this.testUrl, proxyName);
     this.expected = expected;
     this.providerName = providerName;
@@ -153,7 +122,7 @@ export class DelayResult {
   /** 本次使用的测速 URL */
   testUrl: string = '';
   /** >0 延迟 ms；-1 超时；-2 失败 */
-  value: number = FLCLASH_DELAY_FAILED;
+  value: number = TUNBOX_DELAY_FAILED;
   /** 内核返回的 HTTP 状态码（200 / 503 / 504 / 404 …） */
   httpCode: number = 0;
   /** 客户端侧观测到的往返耗时（从请求发出到响应抵达，ms） */
@@ -161,7 +130,7 @@ export class DelayResult {
 }
 
 /** 一批测速的汇总（total = measured + timedOut + failed + cancelled） */
-export class FlclashDelaySummary {
+export class TunBoxDelaySummary {
   /** 本批目标总数 */
   total: number = 0;
   /** 真正发出过请求的任务数（含被取消/守护到期而没结论的） */
@@ -176,6 +145,8 @@ export class FlclashDelaySummary {
    * 未产出结论的任务数：取消时在途被 abort、取消后未开始、30s 守护到期、传输层异常
    */
   cancelled: number = 0;
+  /** 只有 cancel() 置位；缺失回复本身不表示整批被取消。 */
+  wasCancelled: boolean = false;
   /**
    * 内核不可用判定。REST 通道无法把「内核没起来」与「单个节点失败」区分开
    * （404 是 proxy 不存在，503 是拨测失败，都不是内核不可用），
@@ -200,7 +171,7 @@ export class FlclashDelaySummary {
 /** 结果回调：每拿到一条真结论调用一次 */
 export type DelayResultSink = (result: DelayResult) => void;
 /** 批次结束回调：只调用一次（含取消后的收尾） */
-export type DelayDoneSink = (summary: FlclashDelaySummary) => void;
+export type DelayDoneSink = (summary: TunBoxDelaySummary) => void;
 
 /** 一次 HTTP 往返的回复 */
 export class DelayHttpReply {
@@ -339,15 +310,17 @@ function parseLocalHttpUrl(url: string): LocalHttpTarget {
  * 客户端并发要真正落到内核，必须自己开连接：每个 delay 请求一条 TCP 到本地内核。
  *
  * 语义与 ArkDelayHttpTransport 完全一致：拿到 HTTP 响应才 resolve（非 2xx 也 resolve），
- * 连接失败/超时/abort ⇒ reject。请求头带 `Connection: close`，靠内核关连接收尾。
+ * 连接失败/超时/abort ⇒ reject。每请求独立连接，按 HTTP 帧收全再主动关闭。
+ * 真机证实 close 可早于已排队的 message；不能靠 close 判定回复已收完。
  */
 export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
   send(url: string, headers: Record<string, string>, timeoutMs: number): DelayRequestHandle {
     const target: LocalHttpTarget = parseLocalHttpUrl(url);
     const tcp: socket.TCPSocket = socket.constructTCPSocketInstance();
-    const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
     let settled: boolean = false;
+    // 字符值逐一对应原始字节，Content-Length/chunk-size 不按 UTF-16 字符数计算。
     let text: string = '';
+    let peerClosed: boolean = false;
     let timer: number = -1;
     let resolveFn: (value: DelayHttpReply) => void = (): void => {};
     let rejectFn: (reason: Object) => void = (): void => {};
@@ -367,7 +340,7 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
     };
     const closeQuietly = (): void => {
       try {
-        tcp.close();
+        tcp.close().catch((): void => {});
       } catch (e) {
         // 已关闭：忽略
       }
@@ -381,14 +354,14 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
       closeQuietly();
       rejectFn(err);
     };
-    const succeed = (): void => {
+    const succeed = (reply: DelayHttpReply): void => {
       if (settled) {
         return;
       }
       settled = true;
       cleanup();
       closeQuietly();
-      resolveFn(ArkTcpDelayHttpTransport.parseReply(text));
+      resolveFn(reply);
     };
 
     const promise: Promise<DelayHttpReply> = new Promise<DelayHttpReply>(
@@ -398,39 +371,28 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
       });
 
     tcp.on('message', (info: socket.SocketMessageInfo): void => {
+      if (settled) { return; }
       try {
-        // 不传 DecodeWithStreamOptions（ArkTS 禁结构体字面量）；mihomo /delay 的
-        // 响应头与 JSON 体都是 ASCII（{"delay":n} / {"message":"Timeout"}），
-        // 分片独立解码不会出现半个多字节字符。
-        text += decoder.decodeWithStream(new Uint8Array(info.message));
+        const bytes = new Uint8Array(info.message);
+        if (text.length + bytes.length > 65536) { throw new Error('delay HTTP reply too large'); }
+        for (const byte of bytes) { text += String.fromCharCode(byte); }
+        const reply = ArkTcpDelayHttpTransport.parseReply(text);
+        if (reply.responseCode > 0) { succeed(reply); }
       } catch (e) {
         fail(e);
-        return;
-      }
-      // 提前收尾：Content-Length 已知且 body 已经收全就不等 close（省一次事件循环）
-      const headEnd: number = text.indexOf(HTTP_CRLF + HTTP_CRLF);
-      if (headEnd >= 0) {
-        const head: string = text.substring(0, headEnd);
-        // 不显式标注 RegExpMatchArray（ArkTS 禁结构类型，推断即可）
-        const m = /content-length:\s*(\d+)/i.exec(head);
-        if (m !== null) {
-          const need: number = parseInt(m[1], 10);
-          const have: number = text.length - (headEnd + 4);
-          if (need >= 0 && have >= need) {
-            succeed();
-          }
-        }
       }
     });
     tcp.on('close', (): void => {
-      succeed();
+      // close 不是收包队列的屏障。继续接收排队中的 message，完整帧才兑现。
+      // 真正缺失/截断的回复仍由现有 guard 收尾，不凭 EOF 伪造节点结论。
+      peerClosed = true;
     });
     tcp.on('error', (err: BusinessError): void => {
       fail(err);
     });
 
     timer = setTimeout((): void => {
-      fail(new Error('tcp transport timeout'));
+      fail(new Error(`tcp transport incomplete: bytes=${text.length} peerClosed=${peerClosed}`));
     }, timeoutMs);
 
     const requestLines: string[] = [];
@@ -441,7 +403,8 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
     if (auth !== undefined) {
       requestLines.push(`Authorization: ${auth}`);
     }
-    requestLines.push('Connection: close');
+    // 不要求服务端主动 EOF；收齐本次帧后仍立即关 socket，不引入复用池或重试。
+    requestLines.push('Connection: keep-alive');
     requestLines.push('');
     requestLines.push('');
     const payload: string = requestLines.join(HTTP_CRLF);
@@ -463,59 +426,96 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
     });
   }
 
-  /** `HTTP/1.1 200 OK
-Header: v
-
-body` → 状态码 + body */
+  /** 原始字节字符串 → 完整 HTTP 回复；不完整返回 0，格式错误抛错。 */
   static parseReply(raw: string): DelayHttpReply {
     const headEnd: number = raw.indexOf(HTTP_CRLF + HTTP_CRLF);
     if (headEnd < 0) {
       return new DelayHttpReply(0, '');
     }
     const head: string = raw.substring(0, headEnd);
-    const body: string = raw.substring(headEnd + 4);
+    let body: string = raw.substring(headEnd + 4);
     const firstLineEnd: number = head.indexOf(HTTP_CRLF);
     const statusLine: string = firstLineEnd >= 0 ? head.substring(0, firstLineEnd) : head;
-    const parts: string[] = statusLine.split(' ');
-    const code: number = parts.length >= 2 ? parseInt(parts[1], 10) : 0;
-    if (!(code > 0)) {
-      return new DelayHttpReply(0, '');
+    const status = /^HTTP\/1\.[01] (\d{3})(?: |$)/.exec(statusLine);
+    if (status === null) { throw new Error('invalid delay HTTP status'); }
+    const code = parseInt(status[1], 10);
+    if (code === 204 || code === 304) { return new DelayHttpReply(code, ''); }
+    const length = /(?:^|\r\n)content-length:[ \t]*(\d+)[ \t]*(?:\r\n|$)/i.exec(head);
+    const transfer = /(?:^|\r\n)transfer-encoding:[ \t]*([^\r\n]+)/i.exec(head);
+    if (transfer !== null) {
+      if (length !== null || transfer[1].trim().toLowerCase() !== 'chunked') {
+        throw new Error('unsupported delay HTTP framing');
+      }
+      let offset: number = 0;
+      let decoded: string = '';
+      while (true) {
+        const lineEnd = body.indexOf(HTTP_CRLF, offset);
+        if (lineEnd < 0) { return new DelayHttpReply(); }
+        const sizeText = body.substring(offset, lineEnd).split(';')[0];
+        if (!/^[0-9a-f]+$/i.test(sizeText)) { throw new Error('invalid delay HTTP chunk size'); }
+        const size = parseInt(sizeText, 16);
+        if (size > 65536) { throw new Error('delay HTTP chunk too large'); }
+        offset = lineEnd + 2;
+        if (size === 0) {
+          // 空 trailer 或完整的 trailer 区；不能把缺最后 CRLF 的帧当作完成。
+          if (body.substring(offset, offset + 2) !== HTTP_CRLF
+            && body.indexOf(HTTP_CRLF + HTTP_CRLF, offset) < 0) { return new DelayHttpReply(); }
+          body = decoded;
+          break;
+        }
+        if (body.length < offset + size + 2) { return new DelayHttpReply(); }
+        if (body.substring(offset + size, offset + size + 2) !== HTTP_CRLF) {
+          throw new Error('invalid delay HTTP chunk boundary');
+        }
+        decoded += body.substring(offset, offset + size);
+        offset += size + 2;
+      }
+    } else if (length !== null) {
+      const size = parseInt(length[1], 10);
+      if (size > 65536) { throw new Error('delay HTTP body too large'); }
+      if (body.length < size) { return new DelayHttpReply(); }
+      body = body.substring(0, size);
+    } else {
+      // 本地 /delay 是有边界的 JSON 响应；不凭乱序 close 猜测 close-delimited body。
+      throw new Error('missing delay HTTP body framing');
     }
-    // chunked 编解码不在此实现：mihomo 对 /delay 一律 Content-Length 明文 JSON
-    return new DelayHttpReply(code, body);
+    const bytes = new Uint8Array(body.length);
+    for (let i = 0; i < body.length; i++) { bytes[i] = body.charCodeAt(i); }
+    return new DelayHttpReply(code, util.TextDecoder.create('utf-8').decodeWithStream(bytes));
   }
 }
 
-/** 单批运行的策略（默认值 = FlClash 常量；缩小时仅供验证脚本压缩时间） */
-export class FlclashDelayPolicy {
-  /** 并发**上限**（默认 64；显式构造时按传入值封顶） */
-  concurrency: number = FLCLASH_DELAY_MAX_CONCURRENCY;
-  timeoutMs: number = FLCLASH_DELAY_TIMEOUT_MS;
-  guardMs: number = FLCLASH_DELAY_GUARD_MS;
+/** 单批运行的策略（默认值 = FlClash 常量；显式构造仅供验证脚本压缩时间） */
+export class TunBoxDelayPolicy {
+  /** 固定并发（默认 32；显式构造时按传入值封顶 —— 门禁压缩时间用） */
+  concurrency: number = TUNBOX_DELAY_CONCURRENCY;
+  /** 单节点超时：生产固定 5000；显式构造仅供验证脚本缩短等待。 */
+  timeoutMs: number = 0;
+  guardMs: number = TUNBOX_DELAY_GUARD_MS;
   /**
-   * 是否按目标数自适应并发（默认 true）。
-   *
-   * 关闭时行为与旧版完全一致（严格 policy.concurrency 路），验证脚本用这个
-   * 保留「固定 N 路」的行为用例。
+   * 废弃：FlClash 无自适应并发，恒为 min(32, total)。字段保留仅供旧调用点传参，
+   * 一律忽略，widthFor 永远取固定 32 封顶。
    */
-  adaptive: boolean = true;
+  adaptive: boolean = false;
 
-  constructor(concurrency: number = FLCLASH_DELAY_MAX_CONCURRENCY,
-    timeoutMs: number = FLCLASH_DELAY_TIMEOUT_MS,
-    guardMs: number = FLCLASH_DELAY_GUARD_MS,
-    adaptive: boolean = true) {
-    this.concurrency = concurrency > 0 ? concurrency : FLCLASH_DELAY_MAX_CONCURRENCY;
-    this.timeoutMs = timeoutMs > 0 ? timeoutMs : FLCLASH_DELAY_TIMEOUT_MS;
-    this.guardMs = guardMs > 0 ? guardMs : FLCLASH_DELAY_GUARD_MS;
+  constructor(concurrency: number = TUNBOX_DELAY_CONCURRENCY,
+    timeoutMs: number = 0,
+    guardMs: number = TUNBOX_DELAY_GUARD_MS,
+    adaptive: boolean = false) {
+    this.concurrency = concurrency > 0 ? concurrency : TUNBOX_DELAY_CONCURRENCY;
+    this.timeoutMs = timeoutMs;
+    this.guardMs = guardMs > 0 ? guardMs : TUNBOX_DELAY_GUARD_MS;
     this.adaptive = adaptive;
   }
 
-  /** 本批实际使用的并发路数 */
+  /** 本批实际使用的并发路数：固定 min(32, total)，无自适应 */
   widthFor(total: number): number {
-    if (!this.adaptive) {
-      return Math.max(1, Math.min(this.concurrency, total));
-    }
-    return Math.max(1, Math.min(this.concurrency, flclashDelayConcurrency(total)));
+    return Math.max(1, Math.min(this.concurrency, total));
+  }
+
+  /** 生产调用均使用缺省策略；测试可显式压缩等待。 */
+  effectiveTimeoutMs(): number {
+    return this.timeoutMs > 0 ? this.timeoutMs : TUNBOX_DELAY_DEFAULT_TIMEOUT_MS;
   }
 }
 
@@ -551,11 +551,11 @@ class DelayRunState {
  * 一批测速的运行体。语义等价于 FlClash 的 `_runDelayTests`：
  * TaskPool(32) + 逐节点 getDelay + guard 30s + cancel 只清状态不写结论。
  */
-export class FlclashDelayRun {
+export class TunBoxDelayRun {
   private baseUrl: string;
   private secret: string;
   private transport: DelayHttpTransport;
-  private policy: FlclashDelayPolicy;
+  private policy: TunBoxDelayPolicy;
   private running: boolean = false;
   private state: DelayRunState | undefined = undefined;
 
@@ -566,9 +566,9 @@ export class FlclashDelayRun {
    * @param policy  并发/超时/守护，默认 FlClash 常量
    */
   constructor(baseUrl: string, secret: string,
-    transport: DelayHttpTransport = FLCLASH_DELAY_USE_TCP_TRANSPORT
+    transport: DelayHttpTransport = TUNBOX_DELAY_USE_TCP_TRANSPORT
       ? new ArkTcpDelayHttpTransport() : new ArkDelayHttpTransport(),
-    policy: FlclashDelayPolicy = new FlclashDelayPolicy()) {
+    policy: TunBoxDelayPolicy = new TunBoxDelayPolicy()) {
     this.baseUrl = baseUrl;
     this.secret = secret;
     this.transport = transport;
@@ -697,7 +697,7 @@ export class FlclashDelayRun {
     if (state.cancelled) {
       return Promise.resolve();
     }
-    const url: string = this.delayUrl(target.proxyName, target.testUrl, target.expected, target.providerName);
+    const url: string = this.delayUrl(target.proxyName, target.testUrl);
     let handle: DelayRequestHandle;
     try {
       // 传输层自带的超时与守护同值：谁先到都等价于「不作结论」
@@ -705,7 +705,6 @@ export class FlclashDelayRun {
     } catch (e) {
       // 同步抛错 = 连请求都没发出去，同样不写结论
       AppLogger.warn(TAG, `send failed for ${target.proxyName}: ${AppLogger.errText(e)}`);
-      state.cancelledCount += 1;
       return Promise.resolve();
     }
     state.started += 1;
@@ -742,7 +741,7 @@ export class FlclashDelayRun {
         if (result !== null && !state.cancelled) {
           if (result.value > 0) {
             state.measured += 1;
-          } else if (result.value === FLCLASH_DELAY_TIMED_OUT) {
+          } else if (result.value === TUNBOX_DELAY_TIMED_OUT) {
             state.timedOut += 1;
           } else {
             state.failed += 1;
@@ -771,7 +770,10 @@ export class FlclashDelayRun {
         finish(null);
       }, this.policy.guardMs);
       handle.promise.then((reply: DelayHttpReply): void => {
-        finish(FlclashDelayRun.classify(target, reply, Date.now() - startedAt));
+        if (reply.responseCode <= 0) {
+          AppLogger.warn(TAG, `no HTTP reply for ${target.proxyName}: elapsed=${Date.now() - startedAt}ms`);
+        }
+        finish(TunBoxDelayRun.classify(target, reply, Date.now() - startedAt));
       }).catch((e: Object): void => {
         AppLogger.warn(TAG, `request error for ${target.proxyName}: ${AppLogger.errText(e)}`);
         finish(null);
@@ -798,12 +800,12 @@ export class FlclashDelayRun {
     result.httpCode = reply.responseCode;
     result.elapsedMs = elapsedMs;
     if (reply.responseCode === 200) {
-      const delay: number = FlclashDelayRun.parseDelay(reply.body);
-      result.value = delay > 0 ? delay : FLCLASH_DELAY_FAILED;
+      const delay: number = TunBoxDelayRun.parseDelay(reply.body);
+      result.value = delay > 0 ? delay : TUNBOX_DELAY_FAILED;
     } else if (reply.responseCode === 504) {
-      result.value = FLCLASH_DELAY_TIMED_OUT;
+      result.value = TUNBOX_DELAY_TIMED_OUT;
     } else {
-      result.value = FLCLASH_DELAY_FAILED;
+      result.value = TUNBOX_DELAY_FAILED;
     }
     return result;
   }
@@ -825,18 +827,19 @@ export class FlclashDelayRun {
     }
   }
 
-  private delayUrl(proxyName: string, testUrl: string, expected: string = '', providerName: string = ''): string {
+  /**
+   * 请求形态（FlClash core/delay.go:99）：直测 `/proxies/{name}/delay`，
+   * 空 expected-status 范围（不传 expected 参数），provider 成员同此路由。
+   * timeout 生产固定 5000；测试策略可显式缩短。
+   */
+  private delayUrl(proxyName: string, testUrl: string): string {
     let base: string = this.baseUrl;
     while (base.length > 0 && base.charAt(base.length - 1) === '/') {
       base = base.substring(0, base.length - 1);
     }
     const name: string = encodeURIComponent(proxyName);
     const url: string = encodeURIComponent(testUrl);
-    const tail: string = expected.length > 0 ? `&expected=${encodeURIComponent(expected)}` : '';
-    const path: string = providerName.length > 0
-      ? `/providers/proxies/${encodeURIComponent(providerName)}/${name}/healthcheck`
-      : `/proxies/${name}/delay`;
-    return `${base}${path}?url=${url}&timeout=${this.policy.timeoutMs}${tail}`;
+    return `${base}/proxies/${name}/delay?url=${url}&timeout=${this.policy.effectiveTimeoutMs()}`;
   }
 
   private authHeaders(): Record<string, string> {
@@ -848,14 +851,15 @@ export class FlclashDelayRun {
     return headers;
   }
 
-  private buildSummary(state: DelayRunState, total: number): FlclashDelaySummary {
-    const summary = new FlclashDelaySummary();
+  private buildSummary(state: DelayRunState, total: number): TunBoxDelaySummary {
+    const summary = new TunBoxDelaySummary();
     summary.total = total;
     summary.started = state.started;
     summary.measured = state.measured;
     summary.timedOut = state.timedOut;
     summary.failed = state.failed;
     summary.cancelled = state.cancelledCount;
+    summary.wasCancelled = state.cancelled;
     // ── 性能画像 ──
     summary.concurrency = this.policy.widthFor(total);
     summary.peakInflight = state.peakInflight;
@@ -864,8 +868,8 @@ export class FlclashDelayRun {
     summary.wallMs = Date.now() - state.beganAt;
     const sorted: number[] = state.elapsedSamples.slice();
     sorted.sort((a: number, b: number): number => a - b);
-    summary.p50ElapsedMs = FlclashDelayRun.percentile(sorted, 0.5);
-    summary.p90ElapsedMs = FlclashDelayRun.percentile(sorted, 0.9);
+    summary.p50ElapsedMs = TunBoxDelayRun.percentile(sorted, 0.5);
+    summary.p90ElapsedMs = TunBoxDelayRun.percentile(sorted, 0.9);
     AppLogger.info(TAG, `batch profile: concurrency=${summary.concurrency} peakInflight=${summary.peakInflight} `
       + `avgQueueWait=${summary.avgQueueWaitMs}ms p50=${summary.p50ElapsedMs}ms `
       + `p90=${summary.p90ElapsedMs}ms wall=${summary.wallMs}ms samples=${sorted.length}`);

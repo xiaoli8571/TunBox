@@ -41,6 +41,7 @@ export class SelectionHop {
 
 /** 内核里一个策略组的当前状态（唯一事实源，供「主组 → 当前出口」使用）。 */
 export class KernelGroupSelection {
+  dynamic: boolean = false;
   /** 实际采用的组名（指定组不存在时回退 GLOBAL / 首个 Selector）。 */
   group: string = '';
   /** 该组当前选中的条目名（可能是节点，也可能是子组）。 */
@@ -246,7 +247,10 @@ export class ClashApiService {
     this.secret = secret;
   }
 
-  /** Provider-owned proxies use the provider healthcheck route, not /proxies/{name}. */
+  /**
+   * 废弃同名保留：provider 成员已同直测 /proxies（FlClash 无 provider 专属特例）。
+   * 保留仅供既有调用点查询归属，测速路径不再用它选路由。
+   */
   providerForProxy(name: string): string {
     return this.proxyProviders.get(name) ?? '';
   }
@@ -273,7 +277,7 @@ export class ClashApiService {
     return `http://127.0.0.1:${this.apiPort}`;
   }
 
-  /** 内核 REST 基址（供 FlClash 等价测速引擎直连，`FlclashDelay` 需要裸 baseUrl）。 */
+  /** 内核 REST 基址（供 FlClash 等价测速引擎直连，`TunBoxDelay` 需要裸 baseUrl）。 */
   endpointBase(): string {
     return this.baseUrl();
   }
@@ -470,6 +474,7 @@ export class ClashApiService {
                 const selected = await this.readKernelSelection(groupName);
                 if (!current() || revision !== this.endpointRevision) { return false; }
                 const exit = selected === null ? undefined : after[selected.now] as Record<string, Object>;
+                if (selected !== null && selected.group === groupName && selected.dynamic) { return true; }
                 if (selected !== null && selected.group === groupName && selected.nowIsLeaf
                   && exit !== undefined
                   && !['Compatible', 'Reject', 'RejectDrop', 'Pass', 'PassRule'].includes(exit['type'] as string)) { return true; }
@@ -486,50 +491,9 @@ export class ClashApiService {
     return false;
   }
 
-  async selectNode(nodeName: string): Promise<boolean> {
-    // 有界收敛窗口（0.6.3 真机实证）：隧道已通（生成侧把目标节点 unshift 到 PROXY
-    // 组首位，内核默认就走它），但冷启动头一秒 GET /proxies 可能还没列出该节点 /
-    // 首个 PUT 偶发 400 —— 旧实现只重试一次（300ms）就把瞬态判成「钉不上」，连接
-    // 被 fail-fast 拒绝，用户看到「节点选择未生效」却明明能上网，重进一次才好。
-    // 窗口内每轮先走完整钉选+读回；若 PUT 链失败但内核真相已选中目标（store-
-    // selections 恢复 / unshift 首位默认），直接认定已生效 —— 比只信 PUT 204 更强，
-    // 且 b9「选点未生效不得标记成功」契约不变：false 只在窗口耗尽后返回。
-    const deadline = Date.now() + SELECT_CONVERGE_TIMEOUT_MS;
-    while (true) {
-      if (await this.selectNodeOnce(nodeName)) {
-        return true;
-      }
-      if (await this.kernelAlreadySelected(nodeName)) {
-        AppLogger.info(TAG, `selectNode: PUT path failed but kernel already routes via ${nodeName}`);
-        return true;
-      }
-      if (Date.now() >= deadline) {
-        return false;
-      }
-      await new Promise<void>((resolve) => setTimeout(() => resolve(), SELECT_CONVERGE_INTERVAL_MS));
-    }
-  }
-
-  /**
-   * 内核真相兜底（2026-10-25 扩展）：任何 **Selector** 组的 `now` 已等于目标即视为
-   * 已生效。旧实现只查 PROXY/GLOBAL —— 订阅原文接管模式下组名是机场自己起的
-   * （手动选择/🚀 节点选择...），这两个名字根本不存在，兜底恒失效。
-   */
-  private async kernelAlreadySelected(nodeName: string): Promise<boolean> {
-    const json = await this.proxiesJson();
-    if (json === null) { return false; }
-    try {
-      const parsed = JSON.parse(json) as Record<string, Object>;
-      const table = parsed['proxies'] as Record<string, Object>;
-      if (table === undefined || table === null) { return false; }
-      for (const group of Object.keys(table)) {
-        const entry = table[group] as Record<string, Object>;
-        if (entry === undefined || entry === null) { continue; }
-        if ((entry['type'] as string) !== 'Selector') { continue; }
-        if ((entry['now'] as string) === nodeName) { return true; }
-      }
-    } catch (e) { return false; }
-    return false;
+  /** Select only the active primary path; service groups retain their own policies. */
+  async selectNode(nodeName: string, groupName: string = 'PROXY'): Promise<boolean> {
+    return this.selectNodeInGroup(groupName, nodeName);
   }
 
   /**
@@ -609,10 +573,28 @@ export class ClashApiService {
     // now may be a child group. Follow the selected chain, never an arbitrary
     // first leaf, so the home label and live exit describe the same route.
     const selectedPath: Set<string> = new Set<string>();
+    const hasCandidate = (name: string, visited: Set<string>): boolean => {
+      if (visited.has(name)) { return false; }
+      visited.add(name);
+      const entry = table[name] as Record<string, Object>;
+      if (entry === undefined || entry === null) { return false; }
+      if (!groupNames.has(name)) {
+        return !['Compatible', 'Reject', 'RejectDrop', 'Pass', 'PassRule'].includes(entry['type'] as string);
+      }
+      const members = entry['all'];
+      if (!Array.isArray(members)) { return false; }
+      return (members as string[]).some((member: string): boolean => hasCandidate(member, visited));
+    };
+    if (groupEntry['type'] === 'Smart' && !out.members.includes(out.now)) { out.now = out.group; }
     while (groupNames.has(out.now) && !selectedPath.has(out.now)) {
       selectedPath.add(out.now);
       const child = table[out.now] as Record<string, Object>;
-      out.now = typeof child['now'] === 'string' ? child['now'] as string : '';
+      const next = typeof child['now'] === 'string' ? child['now'] as string : '';
+      if (child['type'] === 'Smart' && (!Array.isArray(child['all']) || !(child['all'] as string[]).includes(next))) {
+        out.dynamic = hasCandidate(out.now, new Set<string>());
+        break;
+      }
+      out.now = next;
     }
     for (const leaf of out.leafMembers) {
       if (leaf === out.now) { out.nowIsLeaf = true; break; }
@@ -694,68 +676,7 @@ export class ClashApiService {
       return null;
     }
     AppLogger.warn(TAG, `kernel fallback: pick "${target}" from group "${groupName}"`);
-    return (await this.selectNode(target)) ? target : null;
-  }
-
-  private async selectNodeOnce(nodeName: string): Promise<boolean> {
-    const json = await this.proxiesJson();
-    if (json === null) { return false; }
-    let table: Record<string, Object>;
-    try {
-      const parsed = JSON.parse(json) as Record<string, Object>;
-      table = parsed['proxies'] as Record<string, Object>;
-      if (table === undefined || table === null || table[nodeName] === undefined) { return false; }
-    } catch (e) { return false; }
-    // 只把 **Selector** hop 记入待钉清单；URLTest/Fallback/Smart 是策略组（内核按
-    // 延迟/评分自动切换，PUT 必 400），视为直通 —— 0.6.4 真机定案：机场组结构下
-    // 节点常只挂在自动组下，旧实现整链 PUT 永久失败 → 「节点选择未生效」。
-    const expected: Map<string, string> = new Map<string, string>();
-    let reachedViaAutoOnly = false;
-    for (const group of Object.keys(table)) {
-      const path = this.selectionPath(table, group, nodeName, []);
-      if (path.length === 0) { continue; }
-      let hasSelector = false;
-      // Pin leaves before their parents. A successful unrelated group or GLOBAL
-      // must never hide a failure in a rule-facing selector.
-      for (let i = path.length - 1; i >= 0; i--) {
-        const hop = path[i];
-        if (hop.type !== 'Selector') { continue; }
-        hasSelector = true;
-        const member = i + 1 < path.length ? path[i + 1].name : nodeName;
-        expected.set(hop.name, member);
-      }
-      if (path.length > 0 && !hasSelector) { reachedViaAutoOnly = true; }
-    }
-    if (expected.size === 0) {
-      if (reachedViaAutoOnly) {
-        // 节点只存在于策略组内：没有可钉的 Selector，内核按组策略自动调度 ——
-        // 这不是失败，诚实返回成功（连接可用性由组自身健康度保证）。
-        AppLogger.info(TAG, `selectNode: ${nodeName} only in policy groups; kernel auto-manages`);
-        return true;
-      }
-      return false;
-    }
-    // GLOBAL 必须与其他 Selector 一起钉选：mihomo 切到 global 模式后实际走 GLOBAL。
-    // 如果这里因为还存在其他 Selector 就删掉 GLOBAL，用户先选节点再切全局时 GLOBAL
-    // 会保留旧成员（甚至 DIRECT），表现为全局模式不生效。GLOBAL PUT 失败仍按下方逻辑
-    // 尽力而为，但只要组存在就必须尝试更新并在读回阶段确认。
-    for (const pair of expected) {
-      const group = pair[0];
-      const member = pair[1];
-      const ok = await this.selectInGroup(group, member);
-      if (!ok && group !== 'GLOBAL') { return false; }
-    }
-    const afterJson = await this.proxiesJson();
-    if (afterJson === null) { return false; }
-    try {
-      const parsed = JSON.parse(afterJson) as Record<string, Object>;
-      const after = parsed['proxies'] as Record<string, Object>;
-      for (const pair of expected) {
-        const entry = after[pair[0]] as Record<string, Object>;
-        if (entry === undefined || entry['now'] !== pair[1]) { return false; }
-      }
-    } catch (e) { return false; }
-    return true;
+    return (await this.selectNodeInGroup(named === undefined ? 'GLOBAL' : groupName, target)) ? target : null;
   }
 
   /**
@@ -853,7 +774,7 @@ export class ClashApiService {
    * 内核完整目录：合并 `GET /proxies` 与 `GET /providers/proxies`。
    *
    * FlClash 的节点/分组一律来自内核，App 不持有清单；TunBox 走同一份内核数据源，
-   * 由 `commons/flclash/CoreCatalog` 解析成组/节点模型。
+   * 由 `commons/tunbox/CoreCatalog` 解析成组/节点模型。
    *
    * 返回 null = 通道不可用（连接被拒 / 401 / 传输失败），调用方按「目录不可用」处理，
    * 绝不能当成「没有节点」。
@@ -1282,7 +1203,7 @@ export class ClashApiService {
     const endpoint = new LatencyKernelEndpoint();
     endpoint.baseUrl = this.baseUrl();
     endpoint.secret = this.secret;
-    endpoint.providerName = this.providerForProxy(nodeName);
+    // provider 成员同直测 /proxies（FlClash 无 provider 专属特例），此处不设 providerName。
     const transport = new ClashApiDelayTransport(this);
     // => 测速内核（commons/latency/LatencyProbe.ets）：**一次请求**语义 +
     //    单一失败分类表 + **完整失败响应体**进日志 + DNS 预检短路，

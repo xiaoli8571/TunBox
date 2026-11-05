@@ -384,25 +384,9 @@ export class UriNodeParser {
       return UriNodeParser.error(rawUri, protocol,
         `缺少必填参数（${missing.join('、')}）—— 整条节点不可用，绝不半条`, missing);
     }
-    // 「订阅信息条目」：机场把「剩余流量/到期时间/群链接」写成了节点（2026-10-20 真机事件）。
-    // 它们参数齐全 ⇒ 缺参检测抓不到 ⇒ 只能按**名字内容**判。
-    // 口径与 YAML 路径一致：不是节点 ⇒ 不进代理表、不进测速集合，但台账里留一条。
-    if (NodeUsability.isInfoEntry(name)) {
-      const infoRecord = new UnusableRecord();
-      infoRecord.subscriptionId = UriNodeParser.subId;
-      infoRecord.source = 'uri';
-      infoRecord.protocol = protocol;
-      infoRecord.name = name.length > 0 ? name : server;
-      infoRecord.server = server;
-      infoRecord.port = UriNodeParser.portNumber(portRaw);
-      infoRecord.category = UnusableCategory.INFO;
-      infoRecord.excluded = true;
-      infoRecord.reason = NodeUsability.infoReason(name);
-      infoRecord.detail = '订阅信息条目，非节点：机场把「剩余流量 / 到期时间 / 群链接」之类的信息'
-        + '当成了一个节点写进订阅。它不会进入内核代理表，也不会参与测速。';
-      UnusableLedger.record(infoRecord);
-      return UriNodeParser.error(rawUri, protocol, infoRecord.reason, []);
-    }
+    // FlClash 全量照抄（2026-11-05 任务3）：信息条目按名字过滤删除 —— 链接能解析
+    // 就转成节点进配置，准入以内核为准（FlClash 的 convert 链也只做协议解析，
+    // 不按名字内容剔除）。
     const node = new ParsedNode();
     node.protocol = protocol;
     node.name = name.length > 0 ? name : server;

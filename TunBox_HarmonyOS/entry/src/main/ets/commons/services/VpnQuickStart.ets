@@ -92,11 +92,10 @@ export class VpnQuickStart {
         }
       }
 
-      // 【2026-10-24 加固】首选节点可能是存量节点表里的订阅信息条目（「剩余流量：xxx」
-      // 这类，内核里无此名、钉选必失败）—— 视为未选中，回落到 fallback 的真节点。
-      // 【2026-10-25】改走 resolvePreferenceHint：跨订阅旧偏好判无效 + 刷新 id 漂移按名自愈。
+      // FlClash 照抄（2026-11-05）：信息条目过滤删除 —— 内核有此名即可选。
+      // 【2026-10-25】resolvePreferenceHint：跨订阅旧偏好判无效 + 刷新 id 漂移按名重锚。
       const preferred = await subscriptions.resolvePreferenceHint();
-      const node: ProxyNode | null = (preferred !== null && !NodeUsability.isInfoEntry(preferred.name))
+      const node: ProxyNode | null = preferred !== null
         ? preferred
         : subscriptions.fallbackConnectionNode();
       const nodeName = node === null ? '' : node.name;

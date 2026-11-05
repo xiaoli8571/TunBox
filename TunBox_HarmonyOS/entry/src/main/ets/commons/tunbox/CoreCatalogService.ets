@@ -202,7 +202,7 @@ export class CoreCatalogService {
   /** Restore scoped direct-member choices after startup's leaf pinning. YAML profile
    * merge can replace generated groups, so reordering generated YAML alone is insufficient. */
   static async restoreGroupSelections(api: ClashApiService, profileId: string, raw: string,
-    current: () => boolean = (): boolean => true): Promise<number> {
+    current: () => boolean = (): boolean => true, catalog: CoreCatalogModel | null = null): Promise<number> {
     const values = ProxyPanelMembers.selections(raw);
     const prefix = `${profileId}\u0000`;
     const keys = Object.keys(values).filter((key: string): boolean => key.startsWith(prefix));
@@ -210,8 +210,8 @@ export class CoreCatalogService {
     let applied = 0;
     const deadline = Date.now() + 4000;
     try {
-      const json = await api.proxiesJson();
-      const model = json === null ? null : CoreCatalog.parse(json);
+      const json = catalog === null ? await api.proxiesJson() : null;
+      const model = catalog ?? (json === null ? null : CoreCatalog.parse(json));
       if (model === null || !current()) { return 0; }
       for (const key of keys) {
         if (!current() || Date.now() >= deadline) { break; }
@@ -220,7 +220,13 @@ export class CoreCatalogService {
         const member = values[key];
         if (group === null || group.type !== 'Selector' || member === groupName
           || !group.all.some((node: CoreNode): boolean => node.name === member)) { continue; }
-        if (group.now === member || await api.selectProxyInGroup(groupName, member)) { applied++; }
+        if (group.now === member) { applied++; continue; }
+        if (await api.selectProxyInGroup(groupName, member) && current()) {
+          group.now = member;
+          const entry = model.byName[groupName];
+          if (entry !== undefined) { entry.now = member; }
+          applied++;
+        }
       }
     } catch (e) {
       // A stale saved choice or an unavailable controller cannot become a new

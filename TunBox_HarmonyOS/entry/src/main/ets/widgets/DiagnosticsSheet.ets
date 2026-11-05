@@ -346,7 +346,7 @@ export struct DiagnosticsSheet {
     if (status === HealthStatus.FAIL) {
       return Ui.error;
     }
-    return Ui.textTertiary;
+    return Ui.textTertiaryFor(this.themeRevision);
   }
 
   private overallLabel(): Resource {
@@ -385,22 +385,22 @@ export struct DiagnosticsSheet {
         Text($r('app.string.diagnostics_title'))
           .fontSize(17)
           .fontWeight(FontWeight.Bold)
-          .fontColor(Ui.textPrimary)
+          .fontColor(Ui.textPrimaryFor(this.themeRevision))
         Blank()
         Text($r('app.string.diagnostics_refresh'))
           .fontSize(14)
-          .fontColor(Ui.primary)
+          .fontColor(Ui.primaryFor(this.themeRevision))
           .onClick(() => this.onRefresh())
         Text($r('app.string.diagnostics_close'))
           .fontSize(14)
-          .fontColor(Ui.textSecondary)
+          .fontColor(Ui.textSecondaryFor(this.themeRevision))
           .onClick(() => this.onClose())
           .padding({ left: 16 })
       }
       .width('100%')
 
       Row() {
-        Text($r('app.string.diagnostics_core_running')).fontSize(14).fontColor(Ui.textSecondary).layoutWeight(1)
+        Text($r('app.string.diagnostics_core_running')).fontSize(14).fontColor(Ui.textSecondaryFor(this.themeRevision)).layoutWeight(1)
         Text(this.diag !== null && this.diag.coreRunning
           ? $r('app.string.diagnostics_core_ok') : $r('app.string.diagnostics_core_stopped'))
           .fontSize(14)
@@ -408,7 +408,7 @@ export struct DiagnosticsSheet {
       }.width('100%')
 
       Row() {
-        Text($r('app.string.diagnostics_vpn_active')).fontSize(14).fontColor(Ui.textSecondary).layoutWeight(1)
+        Text($r('app.string.diagnostics_vpn_active')).fontSize(14).fontColor(Ui.textSecondaryFor(this.themeRevision)).layoutWeight(1)
         Text(this.diag !== null && this.diag.vpnActive
           ? $r('app.string.diagnostics_vpn_on') : $r('app.string.diagnostics_vpn_off'))
           .fontSize(14)
@@ -416,7 +416,7 @@ export struct DiagnosticsSheet {
       }.width('100%')
 
       Row() {
-        Text($r('app.string.diagnostics_clash_api')).fontSize(14).fontColor(Ui.textSecondary).layoutWeight(1)
+        Text($r('app.string.diagnostics_clash_api')).fontSize(14).fontColor(Ui.textSecondaryFor(this.themeRevision)).layoutWeight(1)
         Text(this.diag !== null && this.diag.clashApiReachable
           ? $r('app.string.diagnostics_api_reachable', this.diag.clashApiPort)
           : $r('app.string.diagnostics_api_unreachable'))
@@ -425,9 +425,9 @@ export struct DiagnosticsSheet {
       }.width('100%')
 
       Row() {
-        Text($r('app.string.diagnostics_uptime')).fontSize(14).fontColor(Ui.textSecondary).layoutWeight(1)
+        Text($r('app.string.diagnostics_uptime')).fontSize(14).fontColor(Ui.textSecondaryFor(this.themeRevision)).layoutWeight(1)
         Text(`${this.diag !== null ? this.diag.uptimeSeconds : 0}s`)
-          .fontSize(14).fontColor(Ui.textPrimary)
+          .fontSize(14).fontColor(Ui.textPrimaryFor(this.themeRevision))
       }.width('100%')
 
       if (this.diag !== null && this.diag.lastError.length > 0) {
@@ -442,7 +442,7 @@ export struct DiagnosticsSheet {
       // ── 链路健康自检 ──
       Row() {
         Text($r('app.string.diagnostics_health_title'))
-          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(Ui.textPrimary)
+          .fontSize(14).fontWeight(FontWeight.Medium).fontColor(Ui.textPrimaryFor(this.themeRevision))
         if (this.hasReport) {
           Text(this.overallLabel())
             .fontSize(12)
@@ -454,7 +454,7 @@ export struct DiagnosticsSheet {
           ? $r('app.string.diagnostics_health_running')
           : $r('app.string.diagnostics_health_run_now'))
           .fontSize(13)
-          .fontColor(this.running ? Ui.textTertiary : Ui.primary)
+          .fontColor(this.running ? Ui.textTertiaryFor(this.themeRevision) : Ui.primaryFor(this.themeRevision))
           .padding({ left: 8, right: 8, top: 4, bottom: 4 })
           .borderRadius(10)
           .backgroundColor(Ui.surfaceTranslucent(this.themeRevision))
@@ -471,7 +471,7 @@ export struct DiagnosticsSheet {
           })
         Text($r('app.string.diagnostics_health_copy_report'))
           .fontSize(13)
-          .fontColor(Ui.textBlue)
+          .fontColor(Ui.textBlueFor(this.themeRevision))
           .padding({ left: 8, right: 8, top: 4, bottom: 4 })
           .onClick(() => this.copyReport())
       }
@@ -480,31 +480,31 @@ export struct DiagnosticsSheet {
       if (this.hasReport) {
         Row() {
           Text($r('app.string.diagnostics_health_counts', this.passCount, this.failCount, this.skipCount))
-            .fontSize(12).fontColor(Ui.textSecondary).layoutWeight(1)
+            .fontSize(12).fontColor(Ui.textSecondaryFor(this.themeRevision)).layoutWeight(1)
           Text($r('app.string.diagnostics_health_repair_steps'))
-            .fontSize(12).fontColor(Ui.textSecondary)
+            .fontSize(12).fontColor(Ui.textSecondaryFor(this.themeRevision))
           Text(this.repairCount > 0 ? `${this.repairCount}` : $r('app.string.diagnostics_health_repair_none'))
-            .fontSize(12).fontColor(Ui.textPrimary).padding({ left: 6 })
+            .fontSize(12).fontColor(Ui.textPrimaryFor(this.themeRevision)).padding({ left: 6 })
         }.width('100%')
       } else {
         Text($r('app.string.diagnostics_health_not_run'))
-          .fontSize(12).fontColor(Ui.textTertiary).width('100%')
+          .fontSize(12).fontColor(Ui.textTertiaryFor(this.themeRevision)).width('100%')
       }
 
       Row({ space: 12 }) {
         Row({ space: 4 }) {
-          Text($r('app.string.diagnostics_health_network')).fontSize(11).fontColor(Ui.textTertiary)
-          Text(this.netType.length > 0 ? this.netType : '-').fontSize(11).fontColor(Ui.textSecondary)
+          Text($r('app.string.diagnostics_health_network')).fontSize(11).fontColor(Ui.textTertiaryFor(this.themeRevision))
+          Text(this.netType.length > 0 ? this.netType : '-').fontSize(11).fontColor(Ui.textSecondaryFor(this.themeRevision))
         }
         Row({ space: 4 }) {
-          Text($r('app.string.diagnostics_health_generation')).fontSize(11).fontColor(Ui.textTertiary)
-          Text(`${this.generation}`).fontSize(11).fontColor(Ui.textSecondary)
+          Text($r('app.string.diagnostics_health_generation')).fontSize(11).fontColor(Ui.textTertiaryFor(this.themeRevision))
+          Text(`${this.generation}`).fontSize(11).fontColor(Ui.textSecondaryFor(this.themeRevision))
         }
         Row({ space: 4 }) {
-          Text($r('app.string.diagnostics_health_reconnect')).fontSize(11).fontColor(Ui.textTertiary)
+          Text($r('app.string.diagnostics_health_reconnect')).fontSize(11).fontColor(Ui.textTertiaryFor(this.themeRevision))
           Text(this.reconnectLabel())
             .fontSize(11)
-            .fontColor(this.reconnectActive || this.reconnectConnecting ? Ui.warning : Ui.textSecondary)
+            .fontColor(this.reconnectActive || this.reconnectConnecting ? Ui.warning : Ui.textSecondaryFor(this.themeRevision))
         }
       }
       .width('100%')
@@ -520,13 +520,13 @@ export struct DiagnosticsSheet {
                     .fontColor(this.statusColor(item.status))
                     .constraintSize({ minWidth: 30 })
                   Text(item.label)
-                    .fontSize(12).fontColor(Ui.textPrimary).layoutWeight(1).maxLines(1)
+                    .fontSize(12).fontColor(Ui.textPrimaryFor(this.themeRevision)).layoutWeight(1).maxLines(1)
                     .textOverflow({ overflow: TextOverflow.Ellipsis })
                   Text(`${item.durationMs}ms`)
-                    .fontSize(10).fontColor(Ui.textTertiary)
+                    .fontSize(10).fontColor(Ui.textTertiaryFor(this.themeRevision))
                 }.width('100%')
                 Text(item.detail.length > 0 ? item.detail : item.advice)
-                  .fontSize(10).fontColor(Ui.textSecondary).width('100%').maxLines(2)
+                  .fontSize(10).fontColor(Ui.textSecondaryFor(this.themeRevision)).width('100%').maxLines(2)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
               }
               .width('100%')
@@ -546,27 +546,27 @@ export struct DiagnosticsSheet {
         Text($r('app.string.diagnostics_log_title'))
           .fontSize(14)
           .fontWeight(FontWeight.Medium)
-          .fontColor(Ui.textPrimary)
+          .fontColor(Ui.textPrimaryFor(this.themeRevision))
         Blank()
         Text('运行日志')
           .fontSize(12)
           .fontWeight(this.logTab === LogTab.APP ? FontWeight.Bold : FontWeight.Normal)
-          .fontColor(this.logTab === LogTab.APP ? Ui.primary : Ui.textSecondary)
+          .fontColor(this.logTab === LogTab.APP ? Ui.primaryFor(this.themeRevision) : Ui.textSecondaryFor(this.themeRevision))
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .borderRadius(10)
           .backgroundColor(this.logTab === LogTab.APP ? Ui.selectedBackground(this.themeRevision) : Color.Transparent)
           .borderWidth(1)
-          .borderColor(this.logTab === LogTab.APP ? Ui.primary : Ui.border)
+          .borderColor(this.logTab === LogTab.APP ? Ui.primaryFor(this.themeRevision) : Ui.border)
           .onClick(() => this.switchLogTab(LogTab.APP))
         Text('内核日志')
           .fontSize(12)
           .fontWeight(this.logTab === LogTab.CORE ? FontWeight.Bold : FontWeight.Normal)
-          .fontColor(this.logTab === LogTab.CORE ? Ui.primary : Ui.textSecondary)
+          .fontColor(this.logTab === LogTab.CORE ? Ui.primaryFor(this.themeRevision) : Ui.textSecondaryFor(this.themeRevision))
           .padding({ left: 10, right: 10, top: 4, bottom: 4 })
           .borderRadius(10)
           .backgroundColor(this.logTab === LogTab.CORE ? Ui.selectedBackground(this.themeRevision) : Color.Transparent)
           .borderWidth(1)
-          .borderColor(this.logTab === LogTab.CORE ? Ui.primary : Ui.border)
+          .borderColor(this.logTab === LogTab.CORE ? Ui.primaryFor(this.themeRevision) : Ui.border)
           .onClick(() => this.switchLogTab(LogTab.CORE))
       }
       .width('100%')
@@ -578,7 +578,7 @@ export struct DiagnosticsSheet {
               Text(line)
                 .fontSize(11)
                 .fontFamily('monospace')
-                .fontColor(Ui.textSecondary)
+                .fontColor(Ui.textSecondaryFor(this.themeRevision))
                 .width('100%')
                 .padding({ top: 1, bottom: 1 })
             }
@@ -593,18 +593,18 @@ export struct DiagnosticsSheet {
               : (this.coreStreamState === 'connecting' ? '● 连接中…' : '● 未连接'))
               .fontSize(10)
               .fontColor(this.coreStreamState === 'open' ? Ui.success
-                : (this.coreStreamState === 'connecting' ? Ui.warning : Ui.textTertiary))
+                : (this.coreStreamState === 'connecting' ? Ui.warning : Ui.textTertiaryFor(this.themeRevision)))
             Blank()
             ForEach(CORE_LOG_LEVELS, (lv: string) => {
               Text(lv)
                 .fontSize(10)
                 .fontWeight(this.coreLevelFilter === lv ? FontWeight.Bold : FontWeight.Normal)
-                .fontColor(this.coreLevelFilter === lv ? Ui.primary : Ui.textTertiary)
+                .fontColor(this.coreLevelFilter === lv ? Ui.primaryFor(this.themeRevision) : Ui.textTertiaryFor(this.themeRevision))
                 .padding({ left: 6, right: 6, top: 2, bottom: 2 })
                 .borderRadius(8)
                 .backgroundColor(this.coreLevelFilter === lv ? Ui.selectedBackground(this.themeRevision) : Color.Transparent)
                 .borderWidth(1)
-                .borderColor(this.coreLevelFilter === lv ? Ui.primary : Ui.border)
+                .borderColor(this.coreLevelFilter === lv ? Ui.primaryFor(this.themeRevision) : Ui.border)
                 .onClick(() => {
                   this.coreLevelFilter = lv;
                 })
@@ -626,7 +626,7 @@ export struct DiagnosticsSheet {
               ? '暂无匹配日志。产生流量后此处会实时滚动内核日志（warning 级别优先出现）。'
               : '内核日志流未连接：连接 VPN 后打开本面板即可实时查看。')
               .fontSize(11)
-              .fontColor(Ui.textTertiary)
+              .fontColor(Ui.textTertiaryFor(this.themeRevision))
               .width('100%')
               .padding(8)
           } else {
@@ -637,12 +637,12 @@ export struct DiagnosticsSheet {
                     Text(line.level)
                       .fontSize(9)
                       .fontColor(line.level === 'error' ? Ui.error
-                        : (line.level === 'warning' ? Ui.warning : Ui.textTertiary))
+                        : (line.level === 'warning' ? Ui.warning : Ui.textTertiaryFor(this.themeRevision)))
                       .constraintSize({ minWidth: 44 })
                     Text(line.text)
                       .fontSize(10.5)
                       .fontFamily('monospace')
-                      .fontColor(Ui.textSecondary)
+                      .fontColor(Ui.textSecondaryFor(this.themeRevision))
                       .layoutWeight(1)
                   }.width('100%').padding({ top: 1, bottom: 1 })
                 }

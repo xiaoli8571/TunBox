@@ -51,7 +51,7 @@
 
 ## 二、改动文件
 
-**新增（`entry/src/main/ets/commons/flclash/`）**
+**新增（`entry/src/main/ets/commons/tunbox/`）**
 
 | 文件 | 作用 |
 |---|---|
@@ -61,8 +61,8 @@
 | `CoreCatalog.ets` | `/proxies` → 组/节点模型、组类型判定、GLOBAL hidden、排序、隐藏超时、文案/配色 |
 | `CoreCatalogService.ets` | 目录快照（800ms TTL）+ 拍平节点 + 组归属推断 + 选点 |
 | `CoreNodeBridge.ets` | CoreNode → ProxyNode 影子（`core:<name>`，名字/协议来自内核） |
-| `FlclashDelay.ets` | 32 并发测速引擎（transport 可注入，便于 Node 单测） |
-| `FlclashLatencyService.ets` | 测速服务（写 LatencyLiveView、批次进度、取消、`wait()`） |
+| `TunBoxDelay.ets` | 32 并发测速引擎（transport 可注入，便于 Node 单测） |
+| `TunBoxLatencyService.ets` | 测速服务（写 LatencyLiveView、批次进度、取消、`wait()`） |
 
 **改动**
 
@@ -79,15 +79,15 @@
 **验证脚本（新增）**
 
 - `scripts/verify-sub-converter.mjs`：107 项（含真实 mihomo `-t`）
-- `scripts/verify-flclash-delay.mjs`：9 项（桩内核：32 并发 / -1 / -2 / 取消 / 守护 / 排队不计时）
+- `scripts/verify-tunbox-delay.mjs`：9 项（桩内核：32 并发 / -1 / -2 / 取消 / 守护 / 排队不计时）
 - `scripts/verify-core-catalog.mjs`：39 项
-- `scripts/verify-flclash-profile.mjs`：merge 语义 + **真实内核接受**
+- `scripts/verify-tunbox-profile.mjs`：merge 语义 + **真实内核接受**
 
 **契约更新（过期断言改成当前口径）**
 
 - `scripts/verify-vpn-architecture.mjs`：`latency.group-test-single-entry` 改为
-  「唯一入口 = FlclashLatencyService.start」，并新增 `notHas(testGroupDetailedResult)` 与 32/5000/gstatic 断言。
-- `scripts/verify-config-single-source.mjs`：补 `../flclash/ProfileConfigMerger` 的转译映射。
+  「唯一入口 = TunBoxLatencyService.start」，并新增 `notHas(testGroupDetailedResult)` 与 32/5000/gstatic 断言。
+- `scripts/verify-config-single-source.mjs`：补 `../tunbox/ProfileConfigMerger` 的转译映射。
 
 ---
 
@@ -96,9 +96,9 @@
 | 项 | 结果 |
 |---|---|
 | `verify-sub-converter.mjs` | 107 passed, 0 failed（含真实内核 `-t` 接受 47 节点订阅转换结果） |
-| `verify-flclash-delay.mjs` | ALL PASS 9/9（桩内核实测：在途峰值 32、504→-1、503/404→-2、取消零结论、守护零结论、排队不计入） |
+| `verify-tunbox-delay.mjs` | ALL PASS 9/9（桩内核实测：在途峰值 32、504→-1、503/404→-2、取消零结论、守护零结论、排队不计入） |
 | `verify-core-catalog.mjs` | 39 passed |
-| `verify-flclash-profile.mjs` | ALL PASS（含真实内核 `-t`） |
+| `verify-tunbox-profile.mjs` | ALL PASS（含真实内核 `-t`） |
 | `verify-vpn-architecture.mjs` | 303 passed, 0 failed |
 | `verify-config-single-source.mjs` | 42 passed, 0 failed |
 | `verify-subscription-parse-integrity.mjs` | 71 passed, 0 failed |
@@ -114,8 +114,8 @@ ProfileStore: profiles dir ready: …/files/profiles current=268b99d0-…
 SubscriptionService: profile saved as-is: id=268b99d0-… bytes=30834 items=24
 ConnectionOrchestrator: profile base: id=268b99d0-… bytes=30834 exists=true
 RuntimeConfigBuilder: profile merged: mode=tunnel applied=proxies,proxy-groups,dns,rules items=24
-FlclashLatencyService: delay batch start: nodes=24 url=https://www.gstatic.com/generate_204 source=manual
-FlclashLatencyService: delay batch done: total=24 measured=24 timeout=0 failed=0 cancelled=0
+TunBoxLatencyService: delay batch start: nodes=24 url=https://www.gstatic.com/generate_204 source=manual
+TunBoxLatencyService: delay batch done: total=24 measured=24 timeout=0 failed=0 cancelled=0
 SubscriptionPage: core catalog nodes=26
 VpnExtensionAbility: core start result: true
 ConnectionOrchestrator: connect timing: prep=29ms prelaunch=35ms launch=278ms ready=574ms pinned=628ms total=628ms
@@ -152,7 +152,7 @@ VLESS | 81ms | VLESS | 82ms | 🇸🇬新加坡•移联02 | VLESS | 94ms | … 
 
 - 配置合并：`RuntimeConfigBuilder` 里 `profile.profileYaml` 为空即回到旧的 overlay 全量生成
   （`ProfileStore` 目录删掉 / current 置空即可）。
-- 测速：`BackgroundLatencyService` 的唯一入口是 `FlclashLatencyService.start`；
+- 测速：`BackgroundLatencyService` 的唯一入口是 `TunBoxLatencyService.start`；
   旧 `LatencyEngine` 仍在仓库里（未被调用），需要回退时可把入口改回 `LatencyEngine.start`。
 - 订阅：profile 文件是**新增**的旁路产物，删掉不影响已存节点表；旧解析链仍在（配置生成时会用它的 groups）。
 

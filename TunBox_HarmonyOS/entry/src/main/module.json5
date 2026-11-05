@@ -2,6 +2,7 @@
   "module": {
     "name": "entry",
     "type": "entry",
+    "srcEntry": "./ets/entryability/EntryStage.ets",
     "description": "$string:module_desc",
     "mainElement": "EntryAbility",
     "deviceTypes": ["phone", "tablet"],
@@ -33,6 +34,7 @@
     "abilities": [
       {
         "name": "EntryAbility",
+        "recoverable": true,
         "srcEntry": "./ets/entryability/EntryAbility.ets",
         "description": "$string:ability_desc",
         "icon": "$media:layered_image",
@@ -83,6 +85,7 @@
         // 长按图标「启动代理」与服务卡片点击的共同目标: 无界面宿主, 后台拨 VPN;
         // 连接成功后转为会话守护者(注册 dataTransfer 连续任务), 断开时才自毁, 不进 App
         "name": "QuickToggleAbility",
+        "recoverable": true,
         "srcEntry": "./ets/quicktoggleability/QuickToggleAbility.ets",
         "description": "$string:ability_desc",
         "icon": "$media:layered_image",

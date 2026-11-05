@@ -19,6 +19,22 @@
 import { ThemeService } from './ThemeService';
 
 export class TunBoxTextColors {
+  static primaryFor(rev: number): string {
+    return ThemeService.semanticPalette(rev).textPrimary;
+  }
+
+  static secondaryFor(rev: number): string {
+    return ThemeService.semanticPalette(rev).textSecondary;
+  }
+
+  static mutedFor(rev: number): string {
+    return ThemeService.semanticPalette(rev).textMuted;
+  }
+
+  static accentBlueFor(rev: number): string {
+    return ThemeService.semanticPalette(rev).brandText;
+  }
+
   /** L1 主标题 / 关键数值（如「内存占用」的 268 MB、节点名、订阅名） */
   static get primary(): string {
     return ThemeService.isDark() ? '#F8FAFC' : '#0F172A';

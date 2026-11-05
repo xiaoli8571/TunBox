@@ -179,4 +179,44 @@ await test('home mode handler suppresses stale writes and only refreshes IP afte
   await page.applyProxyMode('direct'); gate.resolve(); await first;
   assert.deepEqual(calls, ['direct','ip']); assert.equal(toasts.length,1); assert.equal(page.proxyMode,'direct');
 });
+await test('offline Smart selection immediately refreshes Home through the shared display without starting VPN', async h => {
+  h.orch.state=h.ConnState.DISCONNECTED;
+  h.platform.AutoSelectModes={AUTO:'auto',MANUAL:'manual'};
+  h.platform.ClashConfigGenerator={SMART_GROUP_NAME:'♻️ 自动选择'};
+  h.platform.SettingsService.patchSettings=async fn=>fn(h.settings);
+  h.platform.SettingsService.peek=()=>h.settings;
+  h.orch.smartAvailableFor=async()=>true;
+  h.orch.isSmartModelAvailable=()=>true;
+  const homeSource=source('pages/HomePage.ets');
+  const methods=['onNodeSwitched','refreshDisplayNode'].map(name=>
+    homeSource.match(new RegExp(`^  (?:private )?${name}\\([\\s\\S]*?^  }`,'m'))[0]);
+  const Home=evaluate(`(()=>{class Home{${methods.join('\n')}}return Home})()`,h.platform);
+  const home=Object.assign(new Home(),{orchestrator:h.orch,currentNodeName:'香港旧节点',nodeSwitchRevision:0});
+  const storage=new Map();
+  h.platform.AppStorage={get:key=>storage.get(key),setOrCreate(key,value){
+    storage.set(key,value);if(key==='node_switch_revision'){home.nodeSwitchRevision=value;home.onNodeSwitched();}
+  }};
+  assert.equal(await h.orch.selectSmartSubscription(h.profile,h.subs),false);
+  assert.equal(h.settings.autoSelectMode,'auto');assert.equal(home.currentNodeName,'♻️ 自动选择');
+  assert.equal(h.starts().length,0,'offline selection only saves intent');
+  h.orch.state=h.ConnState.CONNECTING;
+  assert.equal(h.orch.getCurrentNodeName(),'♻️ 自动选择');
+  h.orch.kernelSelection={nodeName:()=> 'live-exit',current:()=>({profileId:h.profile})};
+  h.orch.state=h.ConnState.CONNECTED;
+  assert.equal(h.orch.getCurrentNodeName(),'live-exit','online Smart must still show its real scoped exit');
+  h.orch.state=h.ConnState.DISCONNECTED;
+  h.subs.groupsOf=()=>[];h.subs.resolveUserPreference=()=>h.subs.nodes[0];
+  h.platform.CoreCatalogService={current:()=>null,profileIdOfSnapshot:()=>''};
+  h.settings.preferredNodeSubscriptionId='another-profile';
+  assert.notEqual(h.orch.getCurrentNodeName(),'♻️ 自动选择','Smart intent cannot leak between subscriptions');
+  h.settings.preferredNodeSubscriptionId=h.profile;
+  h.orch.isSmartModelAvailable=()=>false;
+  assert.notEqual(h.orch.getCurrentNodeName(),'♻️ 自动选择','missing/deleted model cannot leave stale Smart intent on Home');
+  h.orch.isSmartModelAvailable=()=>true;
+  const broken=source('commons/services/ConnectionOrchestrator.ets').match(/^  displayNodeName\([\s\S]*?^  }/m)[0]
+    .replace(/    if \(autoSelectMode === AutoSelectModes.AUTO[\s\S]*?^    }/m,'');
+  const Old=evaluate(`(()=>{class Old{${broken}}return Old})()`,h.platform);
+  const old=Object.assign(new Old(),{state:h.ConnState.DISCONNECTED,kernelSelection:h.orch.kernelSelection});
+  assert.notEqual(old.displayNodeName(h.settings.preferredNodeId,'auto'),'♻️ 自动选择','negative control reproduces the old stale leaf');
+});
 console.log(`PASS ${passed} selection/restart runtime scenarios (no HAP build or device mutation)`);

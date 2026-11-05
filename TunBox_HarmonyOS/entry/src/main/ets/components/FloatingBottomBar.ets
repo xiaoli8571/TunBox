@@ -141,6 +141,8 @@ const DOCK_SPARKS: DockSpark[] = buildSparks();
 export struct FloatingBottomBar {
   @StorageLink('theme_revision') @Watch('onThemeRevision') themeRevision: number = 0;
   @Link currentTab: number;
+  /** 开启快捷启动按钮时收缩到同行剩余空间，并减少各页签的水平留白。 */
+  @Prop compact: boolean = false;
   /** 点击回调（可选）：宿主据此控制切页签时机；不传则直接写 currentTab */
   onSelect?: (index: number) => void = undefined;
   /** 正在扩散光晕的项（-1 = 平静） */
@@ -356,7 +358,7 @@ export struct FloatingBottomBar {
 
   private sparkColor(tone: number): ResourceColor {
     if (tone === 0) {
-      return TunBoxColors.primary;
+      return TunBoxColors.primaryFor(this.themeRevision);
     }
     return tone === 1 ? TunBoxColors.dockSparkAlt : TunBoxColors.dockSparkSoft;
   }
@@ -483,7 +485,7 @@ export struct FloatingBottomBar {
             Row({ space: 6 }) {
               Image(item.icon)
                 .width(21).height(21)
-                .fillColor(this.currentTab === item.id ? TunBoxColors.primary : TunBoxColors.dockIconInactive)
+                .fillColor(this.currentTab === item.id ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.dockIconInactive)
               Text(item.title)
                 .fontSize(12)
                 // 2026-10-29 用户「字体略微加粗，要清楚一点」：整体上一档字重
@@ -491,15 +493,17 @@ export struct FloatingBottomBar {
                 // 没有 SemiBold）。12fp 的 Regular 笔画只有约 1 个物理像素宽，
                 // 压在模糊玻璃上边缘立刻被抹平。
                 .fontWeight(this.currentTab === item.id ? FontWeight.Bold : FontWeight.Medium)
-                .fontColor(this.currentTab === item.id ? TunBoxTextColors.accentBlue : TunBoxTextColors.secondary)
+                .fontColor(this.currentTab === item.id ? TunBoxTextColors.accentBlueFor(this.themeRevision) : TunBoxTextColors.secondaryFor(this.themeRevision))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
             .alignItems(VerticalAlign.Center)
-            .padding({ left: 16, right: 16, top: 8, bottom: 8 })
+            .padding({ left: this.compact ? 8 : 16, right: this.compact ? 8 : 16, top: 8, bottom: 8 })
             .borderRadius(TunBoxGeometry.pillRadius)
             // 2026-10-28 用户要求「高亮也改成透明的范围，带一点沉浸光感的底色就行」：
             // 由 primaryLight（浅色为实色 #EFF4FF）换成低 alpha 品牌蓝 —— 只染一层蓝调，
             // 底下玻璃与粒子仍透得出来（实色会把它们整块挡死）。
-            .backgroundColor(this.currentTab === item.id ? TunBoxColors.dockPillFill : Color.Transparent)
+            .backgroundColor(this.currentTab === item.id ? TunBoxColors.dockPillFillFor(this.themeRevision) : Color.Transparent)
             // 2026-10-29 用户「去掉描边」：原来这里还有 1px 的 `dockPillEdge` 描边，
             // 但填充 alpha 只有 0.09、描边 alpha 0.16，描边比填充还深 ⇒ 人眼只读到一道
             // 闭合的边，看起来像「一个透明的方框围住图标和文字」，而不是一块柔和底色。
@@ -530,7 +534,7 @@ export struct FloatingBottomBar {
       .height('100%')
     }
     // 2026-10-26 用户要求「三个按钮间距稍微缩小一点点」：92% → 86%（页签向中间靠一点）
-    .width('86%')
+    .width(this.compact ? '100%' : '86%')
     .height(TunBoxGeometry.dockHeight)
     .borderRadius(TunBoxGeometry.dockRadius)
     // ── 液态玻璃 ①a：真·背景模糊 + 微弱饱和度提升 ──

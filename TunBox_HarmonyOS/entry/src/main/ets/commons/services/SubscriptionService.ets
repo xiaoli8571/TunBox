@@ -20,12 +20,13 @@
  */
 import { RawBodyCache } from './RawProxyYaml';
 // FlClash 同构：订阅原文 = profile 文件（App 侧不再把节点当作权威来源）
-import { ProfileRepository } from '../flclash/ProfileRepository';
+import { ProfileRepository } from '../tunbox/ProfileRepository';
 import { coreBridge } from '../../core/CoreBridge';
 // convertProxies（mihomo convert.ConvertsV2Ray 的 ArkTS 移植）：base64 / URI 列表订阅
-import { SubConverter } from '../flclash/SubConverter';
-import { CoreCatalogService } from '../flclash/CoreCatalogService';
-import { CoreNodeBridge } from '../flclash/CoreNodeBridge';
+import { SubConverter } from '../tunbox/SubConverter';
+import { CoreCatalogService } from '../tunbox/CoreCatalogService';
+import { CoreNodeBridge } from '../tunbox/CoreNodeBridge';
+import { CoreNode } from '../tunbox/CoreCatalog';
 import { preferences } from '@kit.ArkData';
 import { asset } from '@kit.AssetStoreKit';
 import { util } from '@kit.ArkTS';
@@ -44,11 +45,11 @@ import { SubscriptionQuotaService } from './SubscriptionQuotaService';
 import { SettingsService } from './SettingsService';
 import { YamlMerger, MergedProxy, YamlMergeError, YamlNodeError } from './YamlMerger';
 import { ClashConfigGenerator, ProxyDropStats } from './ClashConfigGenerator';
-import { ProxyProviderEntry, ProxyProviderParser } from './ProxyProviderParser';
 import {
   RawProviderEntry, RawProviderStates, RawProviderStatus, RawSubscriptionStore, RawWriteResult
 } from './RawSubscriptionStore';
 import { LocalSubConverter } from './LocalSubConverter';
+import { ProfileOverrideStore } from './ProfileOverrideStore';
 import {
   CredentialStore, CredentialMigrationReport, NodeCredentialValues, SubscriptionCredentialSource,
   CRED_PREF_NAME, NODE_CRED_FIELDS, baseNodeName, nodeAlias, nodeCredentialId, setCredentialLogger, subAlias
@@ -61,8 +62,9 @@ import { BodyDispatch, BodyDispatchResult, BodyKind } from '../subscription/Body
 import { YamlNodeAdapter } from '../subscription/YamlNodeAdapter';
 // 2026-10-20（B6 旧解析器退场）：直链导入/凭据回退走**规范解析层**，不再走 ProxyNode.fromUri
 import { parse as parseUriNode, ParseError, ParsedNode } from '../subscription/UriNodeParser';
-import { NodeUsability, UnusableCategory } from '../subscription/NodeUsability';
-import { UnusableLedger, UnusableRecord } from '../subscription/UnusableLedger';
+// FlClash 全量照抄（2026-11-05 任务3）：节点准入不再过滤/记账，UnusableLedger
+// 只保留台账清空（刷新起点），NodeUsability/UnusableRecord 引用已全部移除。
+import { UnusableLedger } from '../subscription/UnusableLedger';
 
 const TAG = 'SubscriptionService';
 const PREF_NAME = 'tunbox_subscriptions';
@@ -243,6 +245,14 @@ export class SubscriptionService {
   credentialMissingCount: number = 0;
   /** 最近一次导入（刷新/本地 YAML/直链）的诊断, 供页面直接展示 */
   lastImportDiagnostics: SubscriptionImportDiagnostics = new SubscriptionImportDiagnostics();
+  /**
+   * 最近一次 `addLocalYaml` 实际解析出的**静态**节点数（0 = 仅 provider / 仅策略组）。
+   *
+   * 为什么要单独暴露：`addLocalYaml` 的返回值契约是「本次导入是否成功」
+   * （provider-only 配置也算成功，`Math.max(..., 1)` 保证 ≥1），调用方把它当节点数
+   * 就会谎报「解析出 1 个节点」。页面改用本字段区分两种成功。
+   */
+  lastLocalImportNodes: number = 0;
   /** 最近一次节点恢复（nodes_json → 内存）被丢弃的记录数与原因 */
   lastRestoreInvalidCount: number = 0;
   lastRestoreInvalidReasons: string = '';
@@ -344,11 +354,14 @@ export class SubscriptionService {
     // FlClash 同构：订阅原文落盘目录（filesDir/profiles/<id>.yaml）+ 当前 profile
     await ProfileRepository.init(context);
     ProfileRepository.attachPreparer((text: string): Promise<string> => coreBridge.prepareProfile(text));
-    // convertProxies：非 YAML 订阅（整体 base64 / 逐行分享链接）转成 proxies 列表
-    ProfileRepository.attachConverter((text: string): string => SubConverter.convert(text).proxiesYaml);
+    // convertProxies 已在原生 validateProfile 内完成（bridge/profile.go ConvertsV2Ray
+    // 回退，FlClash controller.validateProfile 同构）：App 侧不再注入转换器（§5.3）。
     // 本地转换订阅（设置页「订阅转换」产出的伪链接由它渲染）：必须在任何 fetch 之前就绪，
     // 否则首次刷新会读到空仓 → 被当成「一条不存在」的订阅
     await LocalSubConverter.init(context);
+    // 每订阅 Override 覆盖层（FlClash Profile.overrides 等价物）：配置生成前必须就绪，
+    // 否则冷启动第一次生成读不到覆盖层，表现为「重启后覆盖失效一次」。
+    await ProfileOverrideStore.init(context);
     this.store = await preferences.getPreferences(context, PREF_NAME);
     this.subscriptions = [];
     this.nodes = [];
@@ -385,15 +398,9 @@ export class SubscriptionService {
       const nodesRaw = await this.store.get(KEY_NODES, '[]') as string;
       const restoreDiagnostics = new SubscriptionImportDiagnostics();
       const restored = SubscriptionService.mapNodes(JSON.parse(nodesRaw) as Object, restoreDiagnostics);
-      // 存量表信息条目过滤（2026-10-25 真机实锤：冷启动显示「剩余流量：596.2GB」）：
-      // 解析/刷新路径已过滤（e3e7a37），但旧版本落盘的节点表在**水合**时原样回来，
-      // 假节点常驻表内直到下次成功刷新 —— 显示回退（nodes[0]）就会拿它当当前节点。
-      const infoBefore = restored.length;
-      this.nodes = restored.filter((n: ProxyNode): boolean => !NodeUsability.isInfoEntry(n.name));
-      if (this.nodes.length < infoBefore) {
-        AppLogger.warn(TAG, `hydrate dropped ${infoBefore - this.nodes.length} info-entry node(s) `
-          + '(e.g. 剩余流量/到期时间; persisted by pre-filter versions)');
-      }
+      // FlClash 全量照抄（2026-11-05 任务3）：水合不再过滤信息条目 —— 内核 /proxies
+      // 原样是节点集合的唯一真源，App 不滤不改（旧版过滤是自造准入）。
+      this.nodes = restored;
       this.lastRestoreInvalidCount = restoreDiagnostics.invalidCount;
       this.lastRestoreInvalidReasons = restoreDiagnostics.invalidReasons;
       if (restoreDiagnostics.invalidCount > 0) {
@@ -1540,17 +1547,9 @@ export class SubscriptionService {
   }
 
   /**
-   * 明文 HTTP 订阅是否被用户显式允许（默认拒绝，对齐 FlClash / Verge / CMFA）。
-   * 读设置失败一律按「不允许」处理 —— 安全开关的失败方向必须朝严格一侧。
+   * allowInsecureHttp 自创策略已删（§5.1）：仅 HTTPS 订阅可取回。
+   * **产品安全闸待确认** —— 此删除会改变 http 订阅行为，确认前勿放宽。
    */
-  private static async insecureSubscriptionHttpAllowed(): Promise<boolean> {
-    try {
-      const settings = await SettingsService.load();
-      return settings.allowInsecureSubscriptionHttp;
-    } catch (e) {
-      return false;
-    }
-  }
 
   /**
    * 双轨诊断汇总（「解析到 N / provider 读到 M」+ 生成配置时实际发出的 provider 条数）。
@@ -1661,35 +1660,33 @@ export class SubscriptionService {
     return status;
   }
 
+
   /**
-   * provider 内容按「普通订阅内容」解析：Clash YAML 走合并引擎，链接 / 整体 Base64
-   * 走统一解析器，统计并入同一次导入的 diagnostics（来源标注为 provider）。
+   * 落盘后用 Go `TunBoxGetProfileOutbounds` 投影构造影子节点（FlClash
+   * `core/profile_base.go handleGetProfileOutbounds` 语义，§5.5）：节点清单只
+   * 存在于内核，App 展示用只读影子（id=`core:<name>`，名字/类型与内核逐字一致，
+   * 不改名、不判协议、不因缺 server/port 丢弃）。投影失败回空（profile 已落盘
+   * ⇒ 刷新不失败，UI 节点由内核 /proxies 供给）。
    */
-  private static parseProviderBody(body: string, subscriptionId: string,
-    providerLabel: string, diagnostics: SubscriptionImportDiagnostics): ProxyNode[] {
-    YamlMerger.resetSkipStats();
-    // 先解码再判是不是 YAML 文档（base64 包裹的 Clash YAML 不能掉进链接分支）
-    const dispatch = BodyDispatch.classify(body);
-    if (dispatch.kind === BodyKind.YAML) {
-      const merged: MergedProxy[] = YamlMerger.merge([dispatch.body],
-        providerLabel.length > 0 ? providerLabel : 'provider', '');
-      SubscriptionService.absorbYamlMergeStats(diagnostics);
-      const nodes = SubscriptionService.mergedToNodes(merged, subscriptionId, diagnostics, dispatch.body);
-      diagnostics.inputCount = diagnostics.inputCount + nodes.length + diagnostics.invalidCount
-        + diagnostics.unsupportedCount;
-      return nodes;
+  static async projectShadowNodes(subscriptionId: string): Promise<ProxyNode[]> {
+    const out: ProxyNode[] = [];
+    try {
+      const projected = await coreBridge.getProfileOutbounds(ProfileRepository.pathOf(subscriptionId));
+      if (projected.proxies.length === 0) {
+        return out;
+      }
+      const coreNodes: CoreNode[] = [];
+      for (const item of projected.proxies) {
+        const c = new CoreNode();
+        c.name = item.name;
+        c.type = item.type.length > 0 ? item.type : 'unknown';
+        coreNodes.push(c);
+      }
+      return CoreNodeBridge.toProxyNodes(coreNodes, subscriptionId);
+    } catch (e) {
+      AppLogger.warn(TAG, `shadow projection failed for ${subscriptionId}: ${AppLogger.errText(e)}`);
+      return out;
     }
-    const parseResult = SubscriptionParser.parseDetailed(body, subscriptionId);
-    diagnostics.inputCount = diagnostics.inputCount + parseResult.diagnostics.inputCount;
-    diagnostics.duplicateCount = diagnostics.duplicateCount + parseResult.diagnostics.duplicateCount;
-    if (parseResult.diagnostics.invalidCount > 0) {
-      SubscriptionService.noteInvalidBulk(diagnostics, parseResult.diagnostics.invalidCount,
-        `provider 无效链接 ${parseResult.diagnostics.invalidCount} 条`);
-    }
-    diagnostics.unsupportedCount = diagnostics.unsupportedCount + parseResult.diagnostics.unsupportedCount;
-    diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
-      parseResult.diagnostics.unsupportedTypes);
-    return parseResult.nodes;
   }
 
   /**
@@ -1710,7 +1707,6 @@ export class SubscriptionService {
     diagnostics?: SubscriptionImportDiagnostics, sourceBody?: string): ProxyNode[] {
     const out: ProxyNode[] = [];
     let counter = 0;
-    let dropped = 0;
     // ── 映射 + 对账（不做裁决）──
     // plan 一次算清两件事：
     //   ① 每条合并结果的规范键视图（凭据映射/诊断）；
@@ -1765,15 +1761,7 @@ export class SubscriptionService {
         n.type = ProxyNodeType.UNKNOWN;
       }
       // direct 出站没有 server/port（mihomo 合法节点），不能按缺字段丢弃
-      if ((n.server.length > 0 && n.port > 0) || n.proxyType === 'direct') {
-        out.push(n);
-      } else {
-        dropped = dropped + 1;
-      }
-    }
-    if (dropped > 0) {
-      SubscriptionService.noteInvalid(diagnostics, `合并映射丢弃 ${dropped} 条（缺 server 或 port）`);
-      AppLogger.warn(TAG, `mergedToNodes dropped ${dropped} node(s) without server/port`);
+      out.push(n);
     }
     return out;
   }
@@ -1792,9 +1780,12 @@ export class SubscriptionService {
         continue;
       }
       const j = item as ProxyNodeJson;
+      // 影子节点（core:<name>）只读投影：server/port 恒为空 —— 水合校验不得删影子节点。
+      const isCoreShadow = j.id.startsWith('core:');
       // direct 出站允许 server 为空、port 为 0（mihomo 合法节点）
-      const isDirect = j.proxyType === 'direct';
-      const validType = j.type === 'ss' || j.type === 'ssr' || j.type === 'other';
+      const isDirect = isCoreShadow || j.proxyType === 'direct';
+      const validType = isCoreShadow || j.type === 'ss' || j.type === 'ssr'
+        || j.type === 'other' || j.type === 'unknown';
       if (!SubscriptionService.validString(j.id, 256, false)
         || !SubscriptionService.validString(j.subscriptionId, 256, false)
         || !SubscriptionService.validString(j.name, 4096)
@@ -2161,17 +2152,13 @@ export class SubscriptionService {
       // 本地 YAML 伪订阅没有网络源：串行阶段按既有语义以现有节点数报成功，这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
-    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url,
-      await SubscriptionService.insecureSubscriptionHttpAllowed())) {
+    if (!SubscriptionFetchPolicy.isValidSubscriptionUrl(sub.url)) {
       // 地址非法交给串行阶段按原样报错（提示文案与单条刷新逐字一致），这里不预取
       return RefreshPrepOutcome.skipped(id);
     }
     try {
-      // 明文 http 是否放行先取好再进实参：设置读取塞进实参既难读，
-      // 也会被静态检查的调用点参数扫描误判（嵌套括号会截断参数列表）。
-      const insecureAllowed: boolean = await SubscriptionService.insecureSubscriptionHttpAllowed();
       const fetched = await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
-        insecureAllowed, sub.etag);
+        sub.etag);
       this.prefetchCache.set(id,
         PrefetchedSubscription.body(sub.url, sub.headerName, sub.headerValue, fetched));
       return RefreshPrepOutcome.prefetched(id);
@@ -2268,7 +2255,7 @@ export class SubscriptionService {
     return mine;
   }
 
-  async refreshSubscription(id: string): Promise<SubscriptionRefreshResult> {
+  async refreshSubscription(id: string, requestAgeKey?: () => Promise<string>): Promise<SubscriptionRefreshResult> {
     const sub = this.subscriptions.find((s) => s.id === id);
     if (sub === undefined) {
       return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.HTTP_ERROR, 'subscription not found');
@@ -2289,11 +2276,10 @@ export class SubscriptionService {
       if (prefetched.hit && prefetched.hasError) {
         throw prefetched.error;
       }
-      const insecureAllowed: boolean = await SubscriptionService.insecureSubscriptionHttpAllowed();
       const fetched: SubscriptionFetchResult = prefetched.hit
         ? prefetched.fetched
         : await SubscriptionFetchPolicy.fetch(sub.url, sub.headerName, sub.headerValue,
-          insecureAllowed, sub.etag);
+          sub.etag);
       // 304：面板确认内容未变。直接按「未变更」返回，沿用已落盘节点，
       // **不重新解析**（没有响应体可解析），也绝不把空体会当成 EMPTY_RESPONSE 报错。
       if (fetched.notModified) {
@@ -2327,7 +2313,13 @@ export class SubscriptionService {
       // 时用 convertProxies（base64 / URI 列表）转成 proxies 列表再通过；两者都失败才拒。
       // 这里必须**先**判定，不能再用旧的 isClashBody 一刀切 —— 否则 base64 订阅会被
       // 误判成「非 Clash」而 FlClash 是能导入的。
-      const profileValidation = await ProfileRepository.validateAndStore(sub.id, body);
+      let profileValidation = await ProfileRepository.validateAndStore(sub.id, body);
+      if (profileValidation.needAgeSecretKey && requestAgeKey !== undefined) {
+        const key = (await requestAgeKey()).trim();
+        if (key.length > 0) {
+          profileValidation = await ProfileRepository.validateAndStore(sub.id, body, key);
+        }
+      }
       // 首个成功落盘的订阅立刻成为当前 Profile（FlClash putProfile 语义），
       // 必须在**生成配置之前**定下来，否则本次刷新生成的仍是旧的全量配置。
       if (profileValidation.ok) {
@@ -2343,17 +2335,11 @@ export class SubscriptionService {
         await this.persist();
         AppLogger.warn(TAG, `subscription profile rejected: ${SubscriptionFetchPolicy.redactUrl(sub.url)} `
           + `reason=${profileValidation.message}`);
-        // 把**真实原因**带给用户（不要统一说成「请开启代理」）：
-        // 面板返回 4 字节、返回 JSON、返回 base64 都会走到这里，三者处理方式不同。
-        const bodyLen = body.trim().length;
-        // 真机实证：部分机场的链接在无效/过期时返回一个换行
-        // （HTTP body = `Cg==` → 4 字节 base64，trim 后 0 字节）。这不是网络问题，
-        // 也不是 UA 问题 —— 必须让用户看到「空内容」，而不是「请开启代理」。
-        const reason = bodyLen < 16
-          ? `订阅地址返回空内容（${bodyLen} 字节）：请重新从机场面板复制 Clash 订阅链接`
-          : profileValidation.message;
+        // §5.6：原生校验失败的消息原样回 UI（不做 <16 字节自有改写）。
+        const reason = profileValidation.message;
         const rejected = SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PARSE_ERROR, reason);
-        rejected.advice = SubscriptionService.NON_CLASH_ADVICE;
+        rejected.advice = profileValidation.needAgeSecretKey
+          ? '此订阅需要 age 解密密钥，请手动刷新并输入密钥' : SubscriptionService.NON_CLASH_ADVICE;
         return rejected;
       }
       const rawWrite = RawSubscriptionStore.writeRaw(sub.id, body);
@@ -2399,32 +2385,9 @@ export class SubscriptionService {
       const dispatch = BodyDispatch.classify(ProfileRepository.read(sub.id));
       const structuredYaml = dispatch.kind === BodyKind.YAML;
       if (structuredYaml) {
-        // Clash YAML 订阅：走合并引擎（跨刷新保留节点名称，限额与去重对齐 upstream）
-        const prev = this.store !== null ? await this.store.get(`yaml_cache_${id}`, '') as string : '';
-        let merged: MergedProxy[] = [];
-        try {
-          merged = YamlMerger.merge([dispatch.body], sub.name, prev);
-        } catch (mergeError) {
-          if (mergeError instanceof YamlMergeError) {
-            // 合并引擎限额（10k 节点 / 1000 来源 / 字段长度 / 单条大小）属「超限」，
-            // 不能笼统报成解析失败：用户看到的应是「超限」而不是「内容坏了」。
-            diagnostics.limitCount = diagnostics.limitCount + 1;
-            SubscriptionService.appendInvalidReason(diagnostics, `合并超限：${mergeError.message}`);
-            sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
-            try {
-              await this.persist();
-            } catch (persistError) {
-              return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
-                `节点超限状态保存失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
-            }
-            return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.LIMIT_EXCEEDED,
-              `订阅内容超出合并限额：${mergeError.message}`, diagnostics);
-          }
-          throw mergeError as Error;
-        }
-        // 合并阶段被跳过的节点（不支持的协议类型）与逐条失败的原因并入同一次诊断
-        SubscriptionService.absorbYamlMergeStats(diagnostics);
-        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics, dispatch.body);
+        // FlClash 同构（§5.5）：YamlMerger.merge 已从主路径移除 —— 去重/改名/
+        // 协议判定不再影响节点。节点 = 落盘后 Go 出站投影的影子节点。
+        parsed = await SubscriptionService.projectShadowNodes(sub.id);
         parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, sub.id);
         // 订阅自带 rules/rule-providers 段落账（无规则段时清空旧值）
         SubscriptionService.applyRulesSections(sub, dispatch.body);
@@ -2432,10 +2395,6 @@ export class SubscriptionService {
         SubscriptionService.applyDnsSections(sub, dispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
-        if (this.store !== null) {
-          // 缓存只保存白名单结构化节点的安全 YAML，禁止缓存或回放订阅原文。
-          await this.store.put(`yaml_cache_${id}`, YamlMerger.toYaml(merged));
-        }
       } else {
         const parseResult = SubscriptionParser.parseDetailed(body, sub.id);
         parsed = parseResult.nodes;
@@ -2464,85 +2423,13 @@ export class SubscriptionService {
           + `duplicate keys (kept the first): ${YamlMerger.lastDuplicateKeyReasons.join('; ')}`);
       }
 
-      // ---- proxy-providers：节点放在 provider 段而 proxies 为空的配置也必须导入 ----
-      const providerEntries = ProxyProviderParser.parse(dispatch.body);
-      let providerImported = 0;
-      if (providerEntries.length > 0) {
-        const fetchable = ProxyProviderParser.fetchable(providerEntries);
-        diagnostics.providerSkippedCount = providerEntries.length - fetchable.length;
-        diagnostics.providerTypes = ProxyProviderParser.unsupportedTypes(providerEntries);
-        if (diagnostics.providerSkippedCount > 0) {
-          AppLogger.warn(TAG, `subscription ${id} has ${diagnostics.providerSkippedCount} proxy-provider(s) `
-            + `of unsupported type(s): ${diagnostics.providerTypes}`);
-        }
-        const missingUrl = ProxyProviderParser.missingUrl(providerEntries);
-        if (missingUrl > 0) {
-          diagnostics.providerFailedCount = diagnostics.providerFailedCount + missingUrl;
-          SubscriptionService.appendProviderFailure(diagnostics, `provider 缺少 url ${missingUrl} 个`);
-        }
-        for (let pi = 0; pi < fetchable.length; pi++) {
-          const entry = fetchable[pi];
-          try {
-            // 与主订阅完全相同的 UA 降级链 / 重定向校验 / 大小上限
-            const providerInsecureAllowed: boolean =
-              await SubscriptionService.insecureSubscriptionHttpAllowed();
-            const providerFetched = await SubscriptionFetchPolicy.fetch(
-              entry.url, sub.headerName, sub.headerValue, providerInsecureAllowed);
-            const providerNodes = SubscriptionService.parseProviderBody(providerFetched.body, sub.id,
-              entry.name, diagnostics);
-            // 节点来源标注为 provider（id 前缀 -p 与主订阅条目区分，避免 id 冲突）
-            for (let ni = 0; ni < providerNodes.length; ni++) {
-              providerNodes[ni].id = `${sub.id}-p${pi}-${ni}`;
-            }
-            if (providerNodes.length > 0) {
-              parsed = parsed.concat(providerNodes);
-              providerImported = providerImported + providerNodes.length;
-            }
-          } catch (providerError) {
-            diagnostics.providerFailedCount = diagnostics.providerFailedCount + 1;
-            SubscriptionService.appendProviderFailure(diagnostics,
-              `${entry.name.length > 0 ? entry.name : 'provider'}: `
-              + `${SubscriptionService.describeError(providerError)}`);
-            AppLogger.warn(TAG, `proxy-provider fetch/parse failed: `
-              + `${SubscriptionService.describeError(providerError)}`);
-          }
-        }
-        diagnostics.providerCount = providerImported;
-        diagnostics.inputCount = diagnostics.inputCount + providerImported;
-      }
-
-      // ── 订阅信息条目统一过滤（2026-10-24）────────────────────────────
-      // YAML 原文/provider 里的「剩余流量：xxx GB」类条目字段完整、会进内核代理表但
-      // 永远拨不通，还可能被选为连接目标（真机取证：connected to node 剩余流量：
-      // 596.2 GB）。URI 路径已在 UriNodeParser 拦截；此处统一覆盖 YAML 与 provider
-      // 引入的全部节点（parseClashYaml 源头过滤覆盖导入路径，此处覆盖刷新路径）。
-      if (parsed.length > 0) {
-        let infoDropped = 0;
-        const kept: ProxyNode[] = [];
-        for (const n of parsed) {
-          if (NodeUsability.isInfoEntry(n.name)) {
-            infoDropped = infoDropped + 1;
-            const infoRecord = new UnusableRecord();
-            infoRecord.subscriptionId = n.subscriptionId;
-            infoRecord.source = 'yaml';
-            infoRecord.protocol = n.proxyType;
-            infoRecord.name = n.name;
-            infoRecord.server = n.server;
-            infoRecord.port = n.port;
-            infoRecord.category = UnusableCategory.INFO;
-            infoRecord.excluded = true;
-            infoRecord.reason = NodeUsability.infoReason(n.name);
-            infoRecord.detail = '订阅信息条目，非节点（刷新统一过滤）：不进代理表、不参与测速。';
-            UnusableLedger.record(infoRecord);
-            continue;
-          }
-          kept.push(n);
-        }
-        if (infoDropped > 0) {
-          AppLogger.info(TAG, `subscription ${id}: dropped ${infoDropped} info-entry node(s)`);
-          parsed = kept;
-        }
-      }
+      // ── FlClash 全量照抄（2026-11-05）─────────────────────────────────
+      // ① provider 不再由 App 预取/解析：profile 文件里的 `proxy-providers` 原样
+      //    进内核，path 由 TunBoxProfileBuilder 收容（confineProviders 语义），
+      //    mihomo 按 url/interval/health-check 自己拉取（global-ua 单一 UA）。
+      //    此前 App 侧逐个 provider 拉取是自造实现，已删。
+      // ② 节点准入不做自有过滤：「剩余流量」类信息条目不再被 isInfoEntry 拦截
+      //    —— FlClash 的节点集合 = 内核 /proxies 原样，App 不滤不改名不推断。
 
       // ── 进程级刷新写锁：以下写路径（状态落盘/节点 concat/整表 persist/current
       // 指针）与并发批次 apply、其它单条刷新互斥。内段保持原缩进（闭包仅作互斥包裹）。
@@ -2567,13 +2454,10 @@ export class SubscriptionService {
       if (parsed.length === 0 && !profileReady) {
         // HTTP 200 但 0 条目：与「响应为空」「内容无法识别」区分，且给出 provider 专用提示
         sub.lastRefreshResult = SubscriptionRefreshStatus.EMPTY_ENTRIES;
-        let message = '内容未解析出节点（支持 ss/ssr/vless/vmess/trojan/hysteria2/tuic/hysteria '
-          + '与 Clash YAML）';
-        if (providerEntries.length > 0 && !structuredYaml) {
-          message = providerImported > 0
-            ? '配置未包含 proxies 节点，节点来自 proxy-providers'
-            : '配置只有 proxy-providers 段且未导入任何节点（请检查 provider 类型 http/https 与链接可用性）';
-        }
+        // FlClash 同构：profile 已落盘 ⇒ 节点由内核解析（含 provider 成员），
+        // App 解析层看不到节点不等于失败；provider-only 订阅的节点来自内核。
+        const message = '内容未解析出节点（支持 ss/ssr/vless/vmess/trojan/hysteria2/tuic/hysteria '
+          + '与 Clash YAML；provider 订阅的节点由内核拉取后可见）';
         try {
           await this.persist();
         } catch (persistError) {
@@ -2582,19 +2466,7 @@ export class SubscriptionService {
         }
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.EMPTY_ENTRIES, message, diagnostics);
       }
-      if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
-        sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
-        diagnostics.limitCount = diagnostics.limitCount + 1;
-        SubscriptionService.appendInvalidReason(diagnostics, `节点数量 ${parsed.length} 超过 2000 上限`);
-        try {
-          await this.persist();
-        } catch (persistError) {
-          return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
-            `节点超限状态保存失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
-        }
-        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.LIMIT_EXCEEDED,
-          `节点数量 ${parsed.length} 超过 2000 个上限，未写入任何节点`, diagnostics);
-      }
+      // FlClash 同构：无 2000 节点上限 —— 已落盘 profile 不得因节点数刷新失败（§5.5）。
       // 用户手动删除过的节点: 刷新后不再复活
       if (this.hiddenNodes.length > 0) {
         const visible = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
@@ -2655,18 +2527,21 @@ export class SubscriptionService {
       const msg = AppLogger.errText(e);
       let status = SubscriptionRefreshStatus.PARSE_ERROR;
       let advice = '';
+      // §5.6：错误传播保留原始类型/状态码/message；中文只在 UI 映射（advice）。
+      // 状态分类：isRateLimited 仅 429；403 → HTTP_ERROR（badResponse 同款）。
       if (e instanceof SubscriptionFetchError) {
         if (e.isRateLimited()) {
-          // HTTP 429/403：面板限流/拒绝访问，与「地址写错」的用户提示完全不同
           status = SubscriptionRefreshStatus.RATE_LIMITED;
-          advice = '面板限流或拒绝访问，请稍后重试或更换订阅链接。';
+          advice = '网络异常，请检查连接后重试';
         } else if (e.kind === SubscriptionFetchErrorKind.HTTP) {
           status = SubscriptionRefreshStatus.HTTP_ERROR;
+          advice = '网络异常，请检查连接后重试';
         } else if (e.kind === SubscriptionFetchErrorKind.EMPTY_RESPONSE) {
           status = SubscriptionRefreshStatus.EMPTY_RESPONSE;
           advice = '订阅响应为空，请确认订阅是否已过期或被重置。';
         } else if (e.kind === SubscriptionFetchErrorKind.DECODE) {
           status = SubscriptionRefreshStatus.DECODE_ERROR;
+          advice = '订阅响应解码失败，请检查订阅链接是否有效。';
         } else {
           status = SubscriptionRefreshStatus.NETWORK_ERROR;
           // 传输层失败的可读原因 + 下一步（拉取不走代理，被阻断域名必然失败）
@@ -2682,6 +2557,7 @@ export class SubscriptionService {
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.PERSIST_ERROR,
           `刷新失败且状态持久化失败：${SubscriptionService.describeError(persistError)}`, diagnostics);
       }
+      // message 恒为原始错误文本（FlClash rethrow 语义）；中文只经 advice 给 UI。
       const failure = SubscriptionRefreshResult.fail(status, msg, diagnostics);
       failure.advice = advice;
       return failure;
@@ -2693,64 +2569,6 @@ export class SubscriptionService {
    * 复用与网络订阅完全相同的解析链（Clash YAML proxies / base64 链接列表 /
    * 明文链接行, 含 hysteria2 全协议）。返回导入节点数, 0=解析失败。
    */
-  /**
-   * 拉取并解析 provider 列表，把节点追加进 parsed（id 前缀 -p 与主条目区分）。
-   * 单个 provider 失败只降级计数（静态节点仍在），绝不影响整份导入/刷新。
-   * 导入与本地刷新共用；URL 订阅刷新路径保留原内联实现（带订阅级 header）。
-   */
-  private async appendProviderNodes(providerEntries: ProxyProviderEntry[], subscriptionId: string,
-    headerName: string, headerValue: string, parsed: ProxyNode[],
-    diagnostics: SubscriptionImportDiagnostics): Promise<number> {
-    let providerImported = 0;
-    const fetchable = ProxyProviderParser.fetchable(providerEntries);
-    diagnostics.providerSkippedCount = diagnostics.providerSkippedCount
-      + providerEntries.length - fetchable.length;
-    diagnostics.providerTypes = SubscriptionService.mergeTypes(diagnostics.providerTypes,
-      ProxyProviderParser.unsupportedTypes(providerEntries));
-    const missingUrl = ProxyProviderParser.missingUrl(providerEntries);
-    if (missingUrl > 0) {
-      diagnostics.providerFailedCount = diagnostics.providerFailedCount + missingUrl;
-      SubscriptionService.appendProviderFailure(diagnostics, `provider 缺少 url ${missingUrl} 个`);
-    }
-    // 占位符/缺 scheme 的 url 不必发请求：拉取只会得到 unsupported protocol scheme，
-    // 用户看到的是笼统「拉取失败」。这里在拉取前就给出可执行文案（2026-11-03 模板报障）。
-    const badUrl = ProxyProviderParser.invalidUrlEntries(fetchable);
-    const fetchableValid: ProxyProviderEntry[] = fetchable.filter((entry: ProxyProviderEntry): boolean =>
-      ProxyProviderParser.invalidUrlReason(entry).length === 0);
-    for (const entry of badUrl) {
-      diagnostics.providerFailedCount = diagnostics.providerFailedCount + 1;
-      SubscriptionService.appendProviderFailure(diagnostics, ProxyProviderParser.invalidUrlReason(entry));
-      AppLogger.warn(TAG, `proxy-provider url invalid: ${entry.name} url=${entry.url}`);
-    }
-    for (let pi = 0; pi < fetchableValid.length; pi++) {
-      const entry = fetchableValid[pi];
-      try {
-        const providerInsecureAllowed: boolean =
-          await SubscriptionService.insecureSubscriptionHttpAllowed();
-        const providerFetched = await SubscriptionFetchPolicy.fetch(entry.url, headerName, headerValue,
-          providerInsecureAllowed);
-        const providerNodes = SubscriptionService.parseProviderBody(providerFetched.body, subscriptionId,
-          entry.name, diagnostics);
-        for (let ni = 0; ni < providerNodes.length; ni++) {
-          providerNodes[ni].id = `${subscriptionId}-p${pi}-${ni}`;
-        }
-        for (const pn of providerNodes) {
-          parsed.push(pn);
-        }
-        providerImported = providerImported + providerNodes.length;
-      } catch (providerError) {
-        diagnostics.providerFailedCount = diagnostics.providerFailedCount + 1;
-        SubscriptionService.appendProviderFailure(diagnostics,
-          `${entry.name.length > 0 ? entry.name : 'provider'}: `
-          + `${SubscriptionService.describeError(providerError)}`);
-        AppLogger.warn(TAG, `proxy-provider fetch/parse failed: `
-          + `${SubscriptionService.describeError(providerError)}`);
-      }
-    }
-    diagnostics.providerCount = diagnostics.providerCount + providerImported;
-    diagnostics.inputCount = diagnostics.inputCount + providerImported;
-    return providerImported;
-  }
 
   /**
    * 本地 YAML 伪订阅的刷新：优先读规范化完整 profile，再退双轨 raw/yaml_cache。
@@ -2797,8 +2615,8 @@ export class SubscriptionService {
       const dispatch = BodyDispatch.classify(await ProfileRepository.prepare(BodyDispatch.classify(body).body));
       const structuredYaml = dispatch.kind === BodyKind.YAML;
       if (structuredYaml) {
-        const merged: MergedProxy[] = YamlMerger.merge([dispatch.body], sub.name, '');        SubscriptionService.absorbYamlMergeStats(diagnostics);
-        parsed = SubscriptionService.mergedToNodes(merged, id, diagnostics, dispatch.body);
+        // FlClash 同构（§5.5）：主路径不走 YamlMerger.merge（去重/改名/协议判定）。
+        parsed = await SubscriptionService.projectShadowNodes(id);
         parsedGroups = SubscriptionParser.parseProxyGroups(dispatch.body, id);
         // 本地伪订阅刷新：自带 rules/rule-providers 段同样重新落账（原文可能已变化）
         SubscriptionService.applyRulesSections(sub, dispatch.body);
@@ -2820,13 +2638,8 @@ export class SubscriptionService {
         diagnostics.unsupportedTypes = SubscriptionService.mergeTypes(diagnostics.unsupportedTypes,
           parseResult.diagnostics.unsupportedTypes);
       }
-      const providerEntries = ProxyProviderParser.parse(dispatch.body);
-      if (providerEntries.length > 0) {
-        const providerImported = await this.appendProviderNodes(providerEntries, id,
-          '', '', parsed, diagnostics);
-        AppLogger.info(TAG, `local refresh imported ${providerImported} provider node(s) `
-          + `for subscription ${id}`);
-      }
+      // FlClash 全量照抄（2026-11-05）：provider 不再由 App 拉取 —— profile 原文里
+      // 的 `proxy-providers` 由内核自己拉（TunBoxProfileBuilder 收容 path）。
       // ── 进程级刷新写锁（与 refreshSubscription 主路径同一把链）：本地伪订阅的
       // 落地同样写 this.nodes / 整表 persist，不得与并发批次/其它单条刷新交错。
       return await this.runRefreshExclusive(async (): Promise<SubscriptionRefreshResult> => {
@@ -2835,13 +2648,7 @@ export class SubscriptionService {
         return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.EMPTY_ENTRIES,
           '重解析未得到节点（原文件内容可能已变化）', diagnostics);
       }
-      if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
-        sub.lastRefreshResult = SubscriptionRefreshStatus.LIMIT_EXCEEDED;
-        diagnostics.limitCount = diagnostics.limitCount + 1;
-        SubscriptionService.appendInvalidReason(diagnostics, `节点数量 ${parsed.length} 超过 2000 上限`);
-        return SubscriptionRefreshResult.fail(SubscriptionRefreshStatus.LIMIT_EXCEEDED,
-          `节点数量 ${parsed.length} 超过 2000 个上限，未写入任何节点`, diagnostics);
-      }
+      // FlClash 同构：无 2000 节点上限（§5.5）。
       if (this.hiddenNodes.length > 0) {
         parsed = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
       }
@@ -2880,16 +2687,19 @@ export class SubscriptionService {
     }
   }
 
-  async addLocalYaml(fileName: string, content: string): Promise<number> {
-    // 只接受 Clash 配置：JSON / CONF / 节点链接列表在入口就拦掉，
-    // 不要先建订阅再在刷新时失败（会留下一条永远刷不动的卡）。
-    if (!SubscriptionService.isClashBody(content)) {
-      throw new Error('请提供 YAML 订阅文件（Clash 配置）');
-    }
+  async addLocalYaml(fileName: string, content: string, requestAgeKey?: () => Promise<string>): Promise<number> {
+    // 2026-11-04 撤销"省事型"前置闸门（唯一边界：不得因省事造成导入异常）。
+    // 旧实现在入口用 isClashBody 一刀切，把「base64 包裹的 Clash YAML」「链接列表」
+    // 直接拒掉；而同一条内容走 URL 订阅却能被 validateAndStore 转换后接受 ——
+    // 同一份数据两条入口两种结论，用户看到的就是「文件导入失败」。
+    // 现在与 FlClash `validateProfile` 同口径：原文可被内核解析就落原文；
+    // 否则交 SubConverter 转换；两者都失败才拒绝，并带回真实原因。
+    // 落盘的是**转换后的 YAML**，所以刷新路径仍然拿得到可用 profile，不会留下刷不动的卡。
 
     // 三入口统一诊断：本地 YAML 与 URL 订阅 / 链接文本展示同一组指标
     const diagnostics = new SubscriptionImportDiagnostics();
     this.lastImportDiagnostics = diagnostics;
+    this.lastLocalImportNodes = 0;
     const base = fileName.replace(/\.(ya?ml|txt)$/i, '');
     const trimmed = content.trim();
     if (trimmed.length === 0) {
@@ -2900,7 +2710,13 @@ export class SubscriptionService {
       `本地:${base.length > 0 ? base : '订阅'}`, `local://${base}`);
     sub.sortOrder = this.subscriptions.length;
     // FlClash 同构：本地文件同样落成 profile 文件（内核直接吃原文）
-    const localProfile = await ProfileRepository.validateAndStore(sub.id, content);
+    let localProfile = await ProfileRepository.validateAndStore(sub.id, content);
+    if (localProfile.needAgeSecretKey && requestAgeKey !== undefined) {
+      const key = (await requestAgeKey()).trim();
+      if (key.length > 0) {
+        localProfile = await ProfileRepository.validateAndStore(sub.id, content, key);
+      }
+    }
     if (!localProfile.ok) {
       throw new Error(localProfile.message);
     }
@@ -2913,9 +2729,8 @@ export class SubscriptionService {
       const localDispatch = BodyDispatch.classify(ProfileRepository.read(sub.id));
       localEligible = localDispatch.kind === BodyKind.YAML;
       if (localEligible) {
-        const merged: MergedProxy[] = YamlMerger.merge([localDispatch.body], sub.name, '');
-        SubscriptionService.absorbYamlMergeStats(diagnostics);
-        parsed = SubscriptionService.mergedToNodes(merged, sub.id, diagnostics, localDispatch.body);
+        // FlClash 同构（§5.5）：主路径不走 YamlMerger.merge，影子投影见 helper。
+        parsed = await SubscriptionService.projectShadowNodes(sub.id);
         parsedGroups = SubscriptionParser.parseProxyGroups(localDispatch.body, sub.id);
         // 本地 YAML 导入：自带 rules/rule-providers 段随订阅一并落账
         SubscriptionService.applyRulesSections(sub, localDispatch.body);
@@ -2923,9 +2738,6 @@ export class SubscriptionService {
         SubscriptionService.applyDnsSections(sub, localDispatch.body);
         diagnostics.inputCount = diagnostics.inputCount + parsed.length + diagnostics.invalidCount
           + diagnostics.unsupportedCount;
-        if (this.store !== null) {
-          await this.store.put(`yaml_cache_${sub.id}`, YamlMerger.toYaml(merged));
-        }
       } else {
         const parseResult = SubscriptionParser.parseDetailed(trimmed, sub.id);
         parsed = parseResult.nodes;
@@ -2945,16 +2757,8 @@ export class SubscriptionService {
           + `of unsupported type(s): ${YamlMerger.lastSkippedTypes}`);
       }
 
-      // ---- proxy-providers：本地 YAML 的 provider 段同样拉取（对齐 mihomo 语义）----
-      // mihomo 的 include-all/use 组包含 provider 节点；本地导入不拉取的话，
-      // 「全部节点/国家组」与内核客户端（BettBox 等）的分组内容差距巨大。
-      const providerEntries = ProxyProviderParser.parse(localDispatch.body);
-      if (providerEntries.length > 0) {
-        const providerImported = await this.appendProviderNodes(providerEntries, sub.id,
-          '', '', parsed, diagnostics);
-        AppLogger.info(TAG, `local yaml imported ${providerImported} provider node(s) `
-          + `from ${providerEntries.length} provider declaration(s)`);
-      }
+      // FlClash 全量照抄（2026-11-05）：本地 YAML 的 provider 段同样原样进内核，
+      // 由 mihomo 自己拉取；App 不再预取（provider App 侧拉取是自造实现，已删）。
     } catch (e) {
       if (e instanceof YamlMergeError) {
         // 合并限额与解析失败分开：超限必须能被用户看见，而不是笼统「解析失败」
@@ -2971,12 +2775,7 @@ export class SubscriptionService {
       SubscriptionService.noteInvalid(diagnostics, '内容未解析出节点');
       return 0;
     }
-    if (!SubscriptionFetchPolicy.isNodeCountAllowed(parsed.length)) {
-      AppLogger.warn(TAG, `local import rejected: ${parsed.length} nodes exceed 2000 limit`);
-      diagnostics.limitCount = diagnostics.limitCount + 1;
-      SubscriptionService.appendInvalidReason(diagnostics, `节点数量 ${parsed.length} 超过 2000 上限`);
-      return 0;
-    }
+    // FlClash 同构：无 2000 节点上限（§5.5）。
     if (this.hiddenNodes.length > 0) {
       const visible = parsed.filter((n) => !this.hiddenNodes.includes(SubscriptionService.nodeKey(n)));
       diagnostics.hiddenCount = parsed.length - visible.length;
@@ -3012,6 +2811,7 @@ export class SubscriptionService {
       diagnostics.persistFailedCount = credentialFailed;
     }
     this.noteConfigDrops(diagnostics);
+    this.lastLocalImportNodes = parsed.length;
     AppLogger.info(TAG, `local yaml imported: ${sub.name} (${parsed.length} nodes)`);
     return Math.max(parsed.length, localProfile.nodeCount, 1);
   }
@@ -3395,8 +3195,9 @@ export class SubscriptionService {
     const current = ProfileRepository.currentId();
     // 【2026-10-24 加固】存量节点表可能残留订阅信息条目（「剩余流量：xxx GB」这类，
     // 旧解析混入、刷新后清除）——绝不能当连接目标（内核里没有这个名字，钉选必失败）。
+    // FlClash 照抄（2026-11-05）：不做信息条目过滤 —— 内核有的名字就是可选目标。
     const local = this.nodes.find((node: ProxyNode): boolean =>
-      node.subscriptionId === current && !NodeUsability.isInfoEntry(node.name)
+      node.subscriptionId === current
         && !['direct', 'reject', 'reject-drop', 'pass', 'compatible'].includes(node.proxyType.toLowerCase()));
     if (local !== undefined) { return local; }
     if (this.hasUsableProfile()) {
@@ -3503,7 +3304,6 @@ export class SubscriptionService {
     if (preferredName.length > 0) {
       const byName = this.nodes.find((n: ProxyNode): boolean =>
         n.name === preferredName
-          && !NodeUsability.isInfoEntry(n.name)
           && (current.length === 0 || n.subscriptionId === current));
       if (byName !== undefined) {
         return byName;
@@ -3573,8 +3373,7 @@ export class SubscriptionService {
     }
     if (s.preferredNodeName.length > 0 && current.length > 0) {
       const byName = this.nodes.find((n: ProxyNode): boolean =>
-        n.subscriptionId === current && n.name === s.preferredNodeName
-        && !NodeUsability.isInfoEntry(n.name));
+        n.subscriptionId === current && n.name === s.preferredNodeName);
       if (byName !== undefined) {
         await SettingsService.patchSettings((p: AppSettings): void => {
           p.preferredNodeId = byName.id;
@@ -3602,15 +3401,13 @@ export class SubscriptionService {
       return null;
     }
     const target = this.nodes.find((n: ProxyNode): boolean =>
-      n.subscriptionId === current && n.name === remembered
-      && !NodeUsability.isInfoEntry(n.name));
+      n.subscriptionId === current && n.name === remembered);
     if (target === undefined) {
       // Provider leaves and strategy groups need not exist in the static node
       // table. Keep the scoped intent until the running kernel can validate it.
       // Replacing it with the only static entry (often Direct) loses the pick.
       if (current.length === 0 || !ProfileRepository.exists(current)
-        || remembered.length === 0 || remembered.startsWith('__')
-        || NodeUsability.isInfoEntry(remembered)) { return null; }
+        || remembered.length === 0 || remembered.startsWith('__')) { return null; }
       const intent = new ProxyNode();
       intent.id = `core:${remembered}`;
       intent.name = remembered;

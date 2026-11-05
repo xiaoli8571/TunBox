@@ -258,12 +258,11 @@ if (importError.length > 0) {
 // ── 真跑 ──────────────────────────────────────────────────────────────────
 const res = Parser.parseDetailed(rawYaml, 'fixture');
 const got = res.nodes;
-const { UnusableLedger } = await import(`file://${path.join(stage, 'UnusableLedger.ts').replace(/\\/g, '/')}`);
-const excluded = UnusableLedger.listFor('fixture').filter(item => item.excluded && item.category === 'info');
-// Product contract excludes subscription status/advertisement rows, but only with an explicit
-// INFO ledger record. All other missing nodes remain failures; no blanket count allowance.
-const excludedKeys = new Set(excluded.map(item => `${item.name}|${item.server}|${item.port}`));
-console.log(`explicit INFO exclusions: ${excluded.length}`);
+// 2026-11-05（FlClash 全量照抄·任务3）：INFO 排除台账已删 —— 节点集合以内核为
+// 唯一真源，解析层不再按名字剔除「剩余流量」类条目。契约变为：**全部** mihomo
+// 节点都必须被解析（含信息条目），没有任何台账豁免。
+const excludedKeys = new Set();
+console.log(`explicit INFO exclusions: 0`);
 console.log(`app parsed: ${got.length} nodes, ${res.groups.length} groups`);
 console.log(`diagnostics: ${JSON.stringify(res.diagnostics)}`);
 
@@ -296,12 +295,12 @@ check('every mihomo node is parsed (name+server+port)', () => {
     `missing ${missing.length}/${expected.length}: ${missing.slice(0, 4).map(m => `${m.name}(${m.type})`).join(' / ')}`);
 });
 
-check('INFO exclusions have exact source identity and are absent from output', () => {
+check('INFO entries are parsed like any other node (no exclusion ledger)', () => {
+  // 旧契约（INFO 排除）已废：信息条目若出现在订阅里，必须原样出现在输出
   const sourceKeys = new Set(expected.map(e => `${e.name}|${e.server}|${e.port}`));
   const outputKeys = new Set(got.map(n => `${n.originalName || n.name}|${n.server}|${n.port}`));
-  for (const key of excludedKeys) {
-    ok(sourceKeys.has(key), 'INFO ledger record does not match an original row');
-    ok(!outputKeys.has(key), 'INFO ledger row leaked into output');
+  for (const key of sourceKeys) {
+    ok(outputKeys.has(key), `source row missing from output: ${key}`);
   }
 });
 

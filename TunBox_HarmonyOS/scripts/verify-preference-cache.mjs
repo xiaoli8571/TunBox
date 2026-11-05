@@ -68,7 +68,10 @@ console.log('[PC2] 连接路径：先读内核，再决定是否 PUT');
   ok('pc2.connect-found', body !== null, '找不到 connectExclusive');
   const text = body ?? '';
   const kernelAt = text.indexOf('readKernelSelection(');
-  const putAt = text.indexOf('this.api.selectNode(');
+  const putAt = Math.min(...[
+    text.indexOf('this.api.selectNodeInGroup('),
+    text.indexOf('this.api.selectNode('),
+  ].filter((i) => i >= 0));
   ok('pc2.kernel-read-before-put', kernelAt >= 0 && putAt >= 0 && kernelAt < putAt,
     '必须先 readKernelSelection 再 selectNode（否则又拿偏好覆盖内核真源）');
   ok('pc2.kernel-adopt', /adoptedByKernel/.test(text), '缺少「采用内核当前出口」的分支');

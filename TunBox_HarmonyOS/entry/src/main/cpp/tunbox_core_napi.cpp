@@ -152,16 +152,21 @@ struct ProfileWork {
     napi_deferred deferred = nullptr;
     std::string text;
     std::string result;
+    // dlsym 目标符号名：同一 worker 服务三个「字符串入 / JSON 出」导出——
+    //   prepareProfile -> TunBoxPrepareProfile（锚点展开，App 预览解析）
+    //   getProfileBase -> TunBoxGetProfileBase（mihomo 解析 profile，FlClash getConfig 同构）
+    //   decodeYaml     -> TunBoxDecodeYaml（YAML -> JSON map，App map 级 patch 解码）
+    std::string symbol = "TunBoxPrepareProfile";
 };
 
 static void ExecuteProfile(napi_env env, void *data)
 {
     auto *work = static_cast<ProfileWork *>(data);
     if (!loadCore()) { return; }
-    auto prepare = reinterpret_cast<char *(*)(char *)>(dlsym(g_core_handle, "TunBoxPrepareProfile"));
+    auto call = reinterpret_cast<char *(*)(char *)>(dlsym(g_core_handle, work->symbol.c_str()));
     auto release = reinterpret_cast<void (*)(char *)>(dlsym(g_core_handle, "TunBoxFreeString"));
-    if (prepare == nullptr || release == nullptr) { return; }
-    char *result = prepare(const_cast<char *>(work->text.c_str()));
+    if (call == nullptr || release == nullptr) { return; }
+    char *result = call(const_cast<char *>(work->text.c_str()));
     if (result != nullptr) { work->result = result; release(result); }
 }
 
@@ -173,6 +178,91 @@ static void CompleteProfile(napi_env env, napi_status status, void *data)
     napi_resolve_deferred(env, work->deferred, result);
     napi_delete_async_work(env, work->work);
     delete work;
+}
+
+// 订阅取回：异步调用 Go transport；就绪时显式传入本地代理端口。
+// FlClash 使用 Dart HttpClient，本实现使用 uTLS，两者 TLS 指纹并不相同。
+struct FetchWork {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string url;
+    std::string userAgent;
+    std::string authHeader;
+    int32_t proxyPort = 0;
+    std::string result;
+};
+
+static void ExecuteFetch(napi_env env, void *data)
+{
+    auto *work = static_cast<FetchWork *>(data);
+    if (!loadCore()) { return; }
+    auto fetch = reinterpret_cast<char *(*)(char *, char *, char *, int)>(dlsym(g_core_handle, "TunBoxFetchText"));
+    auto release = reinterpret_cast<void (*)(char *)>(dlsym(g_core_handle, "TunBoxFreeString"));
+    if (fetch == nullptr || release == nullptr) { return; }
+    char *result = fetch(const_cast<char *>(work->url.c_str()),
+        const_cast<char *>(work->userAgent.c_str()),
+        const_cast<char *>(work->authHeader.c_str()), work->proxyPort);
+    if (result != nullptr) { work->result = result; release(result); }
+}
+
+static void CompleteFetch(napi_env env, napi_status status, void *data)
+{
+    auto *work = static_cast<FetchWork *>(data);
+    napi_value result;
+    napi_create_string_utf8(env, work->result.c_str(), work->result.size(), &result);
+    napi_resolve_deferred(env, work->deferred, result);
+    napi_delete_async_work(env, work->work);
+    delete work;
+}
+
+static napi_value FetchText(napi_env env, napi_callback_info info)
+{
+    size_t argc = 4;
+    napi_value argv[4];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t urlLen = 0;
+    size_t uaLen = 0;
+    size_t authLen = 0;
+    int32_t proxyPort = 0;
+    if (argc != 4 ||
+        napi_get_value_string_utf8(env, argv[0], nullptr, 0, &urlLen) != napi_ok ||
+        urlLen == 0 || urlLen > 8192 ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &uaLen) != napi_ok ||
+        uaLen > 512 ||
+        napi_get_value_string_utf8(env, argv[2], nullptr, 0, &authLen) != napi_ok ||
+        authLen > 4096 ||
+        napi_get_value_int32(env, argv[3], &proxyPort) != napi_ok || proxyPort < 0 || proxyPort > 65535) {
+        napi_throw_error(env, nullptr, "Invalid fetch arguments");
+        return nullptr;
+    }
+    auto *work = new FetchWork();
+    work->proxyPort = proxyPort;
+    std::vector<char> urlBuf(urlLen + 1);
+    napi_get_value_string_utf8(env, argv[0], urlBuf.data(), urlBuf.size(), &urlLen);
+    work->url.assign(urlBuf.data(), urlLen);
+    if (uaLen > 0) {
+        std::vector<char> uaBuf(uaLen + 1);
+        napi_get_value_string_utf8(env, argv[1], uaBuf.data(), uaBuf.size(), &uaLen);
+        work->userAgent.assign(uaBuf.data(), uaLen);
+    }
+    if (authLen > 0) {
+        std::vector<char> authBuf(authLen + 1);
+        napi_get_value_string_utf8(env, argv[2], authBuf.data(), authBuf.size(), &authLen);
+        work->authHeader.assign(authBuf.data(), authLen);
+    }
+    napi_value promise, name;
+    napi_create_promise(env, &work->deferred, &promise);
+    napi_create_string_utf8(env, "FetchText", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_async_work(env, nullptr, name, ExecuteFetch, CompleteFetch, work, &work->work) != napi_ok ||
+        napi_queue_async_work(env, work->work) != napi_ok) {
+        napi_value result;
+        napi_create_string_utf8(env, "{\"body\":\"\",\"error\":\"fetch worker unavailable\"}",
+            NAPI_AUTO_LENGTH, &result);
+        napi_resolve_deferred(env, work->deferred, result);
+        if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
+        delete work;
+    }
+    return promise;
 }
 
 struct NetworkWork {
@@ -247,6 +337,7 @@ static napi_value PrepareProfile(napi_env env, napi_callback_info info)
     std::vector<char> buffer(length + 1);
     napi_get_value_string_utf8(env, argv[0], buffer.data(), buffer.size(), &length);
     work->text.assign(buffer.data(), length);
+    work->symbol = "TunBoxPrepareProfile";
     napi_value promise, name;
     napi_create_promise(env, &work->deferred, &promise);
     napi_create_string_utf8(env, "PrepareProfile", NAPI_AUTO_LENGTH, &name);
@@ -254,6 +345,192 @@ static napi_value PrepareProfile(napi_env env, napi_callback_info info)
         napi_queue_async_work(env, work->work) != napi_ok) {
         napi_value message;
         napi_create_string_utf8(env, "Profile worker unavailable", NAPI_AUTO_LENGTH, &message);
+        napi_reject_deferred(env, work->deferred, message);
+        if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
+        delete work;
+    }
+    return promise;
+}
+
+// getProfileBase(path) -> JSON 字符串（{"config":{...},"digest":...,"error":...}）。
+// FlClash `CoreController.getConfig`/`getProfileBase` 同构：内核用 mihomo 自己的
+// 解析器读 profile 文件，App 拿到 map 后做 patch（不再做任何文本级 YAML 手术）。
+static napi_value GetProfileBase(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t length = 0;
+    if (argc != 1 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &length) != napi_ok ||
+        length == 0 || length > MAX_CONFIG_PATH_BYTES) {
+        napi_throw_error(env, nullptr, "Invalid profile path");
+        return nullptr;
+    }
+    auto *work = new ProfileWork();
+    std::vector<char> buffer(length + 1);
+    napi_get_value_string_utf8(env, argv[0], buffer.data(), buffer.size(), &length);
+    work->text.assign(buffer.data(), length);
+    work->symbol = "TunBoxGetProfileBase";
+    napi_value promise, name;
+    napi_create_promise(env, &work->deferred, &promise);
+    napi_create_string_utf8(env, "GetProfileBase", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_async_work(env, nullptr, name, ExecuteProfile, CompleteProfile, work, &work->work) != napi_ok ||
+        napi_queue_async_work(env, work->work) != napi_ok) {
+        napi_value message;
+        napi_create_string_utf8(env, "Profile base worker unavailable", NAPI_AUTO_LENGTH, &message);
+        napi_reject_deferred(env, work->deferred, message);
+        if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
+        delete work;
+    }
+    return promise;
+}
+
+// decodeYaml(text) -> JSON 字符串（{"map":{...},"error":...}）。
+// 本项目复用内核 YAML 解析库（go.yaml.in/yaml/v3），减少双解析器差异；
+// 这是工程选择，并非 ArkTS/HarmonyOS 不允许接入 YAML 库。FlClash 的 Dart loadYaml
+// 承担，保证 map 级 patch 与内核对 YAML 的理解完全一致。
+static napi_value DecodeYaml(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t length = 0;
+    if (argc != 1 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &length) != napi_ok ||
+        length == 0 || length > MAX_PROFILE_BYTES) {
+        napi_throw_error(env, nullptr, "YAML size out of range");
+        return nullptr;
+    }
+    auto *work = new ProfileWork();
+    std::vector<char> buffer(length + 1);
+    napi_get_value_string_utf8(env, argv[0], buffer.data(), buffer.size(), &length);
+    work->text.assign(buffer.data(), length);
+    work->symbol = "TunBoxDecodeYaml";
+    napi_value promise, name;
+    napi_create_promise(env, &work->deferred, &promise);
+    napi_create_string_utf8(env, "DecodeYaml", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_async_work(env, nullptr, name, ExecuteProfile, CompleteProfile, work, &work->work) != napi_ok ||
+        napi_queue_async_work(env, work->work) != napi_ok) {
+        napi_value message;
+        napi_create_string_utf8(env, "Decode worker unavailable", NAPI_AUTO_LENGTH, &message);
+        napi_reject_deferred(env, work->deferred, message);
+        if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
+        delete work;
+    }
+    return promise;
+}
+
+// validateProfile(text, ageSecretKey, profilePath) -> JSON {"error":"..."}（空 = 通过）。
+// FlClash `Profile.saveFile` + controller `validateProfile` 的原生等价物
+// （mihomo bridge/profile.go ValidateProfile）：temp → age 解密（armor 头 + 空 key
+// 返回原始 `AgeSecretKeyRequired`）→ validateConfig → ConvertsV2Ray 回退 →
+// 通过后把最终字节**原样**写到 profilePath（不展开锚点）。
+struct ValidateProfileWork {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string text;
+    std::string ageSecretKey;
+    std::string profilePath;
+    std::string result;
+};
+
+static void ExecuteValidateProfile(napi_env env, void *data)
+{
+    (void)env;
+    auto *work = static_cast<ValidateProfileWork *>(data);
+    if (!loadCore()) { return; }
+    auto call = reinterpret_cast<char *(*)(char *, char *, char *)>(
+        dlsym(g_core_handle, "TunBoxValidateProfile"));
+    auto release = reinterpret_cast<void (*)(char *)>(dlsym(g_core_handle, "TunBoxFreeString"));
+    if (call == nullptr || release == nullptr) { return; }
+    char *result = call(const_cast<char *>(work->text.c_str()),
+        const_cast<char *>(work->ageSecretKey.c_str()),
+        const_cast<char *>(work->profilePath.c_str()));
+    if (result != nullptr) { work->result = result; release(result); }
+}
+
+static void CompleteValidateProfile(napi_env env, napi_status status, void *data)
+{
+    (void)status;
+    auto *work = static_cast<ValidateProfileWork *>(data);
+    napi_value result;
+    napi_create_string_utf8(env, work->result.c_str(), work->result.size(), &result);
+    napi_resolve_deferred(env, work->deferred, result);
+    napi_delete_async_work(env, work->work);
+    delete work;
+}
+
+static napi_value ValidateProfile(napi_env env, napi_callback_info info)
+{
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t textLen = 0;
+    size_t keyLen = 0;
+    size_t pathLen = 0;
+    if (argc != 3 ||
+        napi_get_value_string_utf8(env, argv[0], nullptr, 0, &textLen) != napi_ok ||
+        textLen == 0 || textLen > MAX_PROFILE_BYTES ||
+        napi_get_value_string_utf8(env, argv[1], nullptr, 0, &keyLen) != napi_ok ||
+        keyLen > 512 ||
+        napi_get_value_string_utf8(env, argv[2], nullptr, 0, &pathLen) != napi_ok ||
+        pathLen == 0 || pathLen > MAX_CONFIG_PATH_BYTES) {
+        napi_throw_error(env, nullptr, "Invalid validateProfile arguments");
+        return nullptr;
+    }
+    auto *work = new ValidateProfileWork();
+    std::vector<char> textBuf(textLen + 1);
+    napi_get_value_string_utf8(env, argv[0], textBuf.data(), textBuf.size(), &textLen);
+    work->text.assign(textBuf.data(), textLen);
+    if (keyLen > 0) {
+        std::vector<char> keyBuf(keyLen + 1);
+        napi_get_value_string_utf8(env, argv[1], keyBuf.data(), keyBuf.size(), &keyLen);
+        work->ageSecretKey.assign(keyBuf.data(), keyLen);
+    }
+    std::vector<char> pathBuf(pathLen + 1);
+    napi_get_value_string_utf8(env, argv[2], pathBuf.data(), pathBuf.size(), &pathLen);
+    work->profilePath.assign(pathBuf.data(), pathLen);
+    napi_value promise, name;
+    napi_create_promise(env, &work->deferred, &promise);
+    napi_create_string_utf8(env, "ValidateProfile", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_async_work(env, nullptr, name, ExecuteValidateProfile, CompleteValidateProfile,
+            work, &work->work) != napi_ok ||
+        napi_queue_async_work(env, work->work) != napi_ok) {
+        napi_value message;
+        napi_create_string_utf8(env, "Profile validate worker unavailable", NAPI_AUTO_LENGTH, &message);
+        napi_reject_deferred(env, work->deferred, message);
+        if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
+        delete work;
+    }
+    return promise;
+}
+
+// getProfileOutbounds(path) -> JSON {"proxies":[{"name","type"}],
+// "proxy-groups":[{"name","type"}],"error":"..."}。
+// FlClash `core/profile_base.go handleGetProfileOutbounds` 移植：只投影 name/type，
+// 供预览构造 core:<name> 影子节点（短命、服务端计数，与列表/账本对齐）。
+static napi_value GetProfileOutbounds(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    size_t length = 0;
+    if (argc != 1 || napi_get_value_string_utf8(env, argv[0], nullptr, 0, &length) != napi_ok ||
+        length == 0 || length > MAX_CONFIG_PATH_BYTES) {
+        napi_throw_error(env, nullptr, "Invalid profile path");
+        return nullptr;
+    }
+    auto *work = new ProfileWork();
+    std::vector<char> buffer(length + 1);
+    napi_get_value_string_utf8(env, argv[0], buffer.data(), buffer.size(), &length);
+    work->text.assign(buffer.data(), length);
+    work->symbol = "TunBoxGetProfileOutbounds";
+    napi_value promise, name;
+    napi_create_promise(env, &work->deferred, &promise);
+    napi_create_string_utf8(env, "GetProfileOutbounds", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_async_work(env, nullptr, name, ExecuteProfile, CompleteProfile, work, &work->work) != napi_ok ||
+        napi_queue_async_work(env, work->work) != napi_ok) {
+        napi_value message;
+        napi_create_string_utf8(env, "Profile outbounds worker unavailable", NAPI_AUTO_LENGTH, &message);
         napi_reject_deferred(env, work->deferred, message);
         if (work->work != nullptr) { napi_delete_async_work(env, work->work); }
         delete work;
@@ -610,8 +887,16 @@ static napi_value SetPhysicalNetId(napi_env env, napi_callback_info info)
     // otherwise every proxy would receive a misleading URLTest failure.
     if (ok && netId > 0) { ok = CanBindPhysicalNetwork(netId); }
     if (ok) {
-        g_physical_net_id.store(netId);
-        setBinder(reinterpret_cast<uintptr_t>(&BindPhysicalSocket));
+        if (netId > 0) {
+            g_physical_net_id.store(netId);
+            setBinder(reinterpret_cast<uintptr_t>(&BindPhysicalSocket));
+        } else {
+            // The headless batch has stopped. Remove the callback itself before
+            // invalidating its network: the process-wide Go DNS resolver also
+            // uses this hook for subscription downloads after the batch ends.
+            setBinder(0);
+            g_physical_net_id.store(-1);
+        }
     }
     napi_value result;
     napi_get_boolean(env, ok, &result);
@@ -625,6 +910,11 @@ static napi_value Init(napi_env env, napi_value exports)
         {"setPhysicalNetId", nullptr, SetPhysicalNetId, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"startCore", nullptr, StartCore, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"prepareProfile", nullptr, PrepareProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getProfileBase", nullptr, GetProfileBase, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"validateProfile", nullptr, ValidateProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getProfileOutbounds", nullptr, GetProfileOutbounds, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"decodeYaml", nullptr, DecodeYaml, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"fetchText", nullptr, FetchText, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"updateNetwork", nullptr, UpdateNetwork, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initProtect", nullptr, InitProtect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"readProtectSocketFd", nullptr, ReadProtectSocketFd, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -512,15 +512,13 @@ export class LatencyStore {
       view.text = '超时';
       view.level = LatencyViewLevel.BAD;
     } else if (kind === LatencyProbeKind.NETWORK_UNREACHABLE) {
-      // 「拨号失败」= 内核已经 dial 过这个节点但没拨通（有 dial 证据）。
-      // ⚠ 不用「网络不可达」——那是用户点名过的糊弄说法（把三类失败压成一句）；
-      // 也绝不能出现「域名」（域名问题有独立分类 dns_unresolved）。
-      view.text = '拨号失败';
+      // UI 统一为超时；保留内部原因用于诊断与重试。
+      view.text = '超时';
       view.level = LatencyViewLevel.BAD;
     } else if (failKind === LatencyProbeKind.DNS_UNRESOLVED) {
       // 域名解析不出来（2026-10-20 真机：四解析器全 NXDOMAIN）——
       // 与「网络不可达」**严格分开**：这多半是机场域名已下线，不是出口不通。
-      view.text = '域名无法解析（节点域名可能已下线）';
+      view.text = '超时';
       view.level = LatencyViewLevel.BAD;
     } else if (failKind === LatencyProbeKind.SWITCH_FAILED) {
       // 配置类结论：节点没进内核表 ≠ 节点坏 → 黄色「未生效」，不是红色失败。

@@ -58,6 +58,7 @@ export class CustomRuleSet {
 /** 持久化 JSON 形状（显式类，满足 arkts-no-untyped-obj-literals） */
 export class AppSettingsJson {
   themeMode: number = 0;
+  floatingQuickLaunchEnabled: boolean = false;
   autoConnectOnBoot: boolean = true;
   bypassDomesticApps: boolean = true;
   excludedApps: string[] = [];
@@ -99,6 +100,10 @@ export class AppSettingsJson {
   subscriptionUpdateIntervalMinutes: number = 360;
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
+  /**
+   * 单节点测速固定 5000ms；保留字段用于兼容旧备份。
+   */
+  delayTestTimeout: number = 5000;
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default' 订阅默认顺序 / 'auto' 按最近测速结果 / 'manual' 用户手动固定顺序 */
   nodeSortMode: string = 'default';
@@ -251,8 +256,15 @@ export class AppSettings {
   static readonly LEGACY_TEST_URL_GSTATIC: string = LatencyTestUrl.LEGACY_GSTATIC_HTTP;
   static readonly LEGACY_TEST_URL_CLOUDFLARE: string = LatencyTestUrl.LEGACY_CLOUDFLARE_HTTP;
 
+  /** 产品固定值；旧设置和备份导入均归一到 5000ms。 */
+  static readonly DELAY_TEST_TIMEOUT_OPTIONS: number[] = [5000];
+  /** 测速超时默认（FlClash `defaultDelayTestTimeout`，constant.dart:61）。 */
+  static readonly DEFAULT_DELAY_TEST_TIMEOUT: number = 5000;
+
   /** 跟随系统 / 暗色 / 亮色 */
   themeMode: number = 0; // 0=system, 1=dark, 2=light
+  /** 是否在主页面底栏右侧显示快捷连接按钮 */
+  floatingQuickLaunchEnabled: boolean = false;
   autoConnectOnBoot: boolean = true;
   bypassDomesticApps: boolean = true;
   excludedApps: string[] = [];
@@ -300,6 +312,10 @@ export class AppSettings {
   preferredNodeNamesBySubscription: string = '';
   selectedSubscriptionId: string = '';
   testLatencyUrl: string = LatencyTestUrl.DEFAULT_URL;
+  /**
+   * 单节点测速固定 5000ms；fromJson 同步迁移旧设置。
+   */
+  delayTestTimeout: number = 5000;
   /** 代理模式：rule = 规则 / global = 全局 / direct = 直连（对应 upstream settings.proxyMode） */
   proxyMode: string = 'rule';
   /** 节点列表排序模式: 'default'=订阅默认顺序, 'auto'=按最近测速结果, 'manual'=手动固定顺序 */
@@ -393,6 +409,7 @@ export class AppSettings {
   toJson(): AppSettingsJson {
     const j = new AppSettingsJson();
     j.themeMode = this.themeMode;
+    j.floatingQuickLaunchEnabled = this.floatingQuickLaunchEnabled;
     j.autoConnectOnBoot = this.autoConnectOnBoot;
     j.bypassDomesticApps = this.bypassDomesticApps;
     j.excludedApps = this.excludedApps;
@@ -412,6 +429,7 @@ export class AppSettings {
     j.subscriptionUpdateIntervalMinutes = this.subscriptionUpdateIntervalMinutes;
     j.selectedSubscriptionId = this.selectedSubscriptionId;
     j.testLatencyUrl = this.testLatencyUrl;
+    j.delayTestTimeout = AppSettings.DEFAULT_DELAY_TEST_TIMEOUT;
     j.proxyMode = this.proxyMode;
     j.nodeSortMode = this.nodeSortMode;
     j.nodeListSortMode = this.nodeListSortMode;
@@ -555,9 +573,17 @@ export class AppSettings {
     return raw;
   }
 
+  /**
+   * 兼容旧设置和备份：所有输入均归一为产品固定的 5000ms。
+   */
+  static normalizeDelayTestTimeout(value: number | undefined): number {
+    return AppSettings.DEFAULT_DELAY_TEST_TIMEOUT;
+  }
+
   static fromJson(j: AppSettingsJson): AppSettings {
     const s = new AppSettings();
     s.themeMode = j.themeMode === 1 || j.themeMode === 2 ? j.themeMode : 0;
+    s.floatingQuickLaunchEnabled = j.floatingQuickLaunchEnabled === true;
     s.autoConnectOnBoot = typeof j.autoConnectOnBoot === 'boolean' ? j.autoConnectOnBoot : true;
     s.bypassDomesticApps = typeof j.bypassDomesticApps === 'boolean' ? j.bypassDomesticApps : true;
     // 不能 filter 无效项：丢掉仅代理名单会扩大接管，丢掉绕过名单会改变用户边界。
@@ -613,6 +639,8 @@ export class AppSettings {
     // 用户明确填 https 也会被悄悄改掉。现在不再有任何降级路径。
     s.testLatencyUrl = AppSettings.upgradeLegacyTestUrl(
       typeof j.testLatencyUrl === 'string' ? j.testLatencyUrl : '');
+    // 旧设置、备份恢复统一迁移为固定 5000ms。
+    s.delayTestTimeout = AppSettings.normalizeDelayTestTimeout(j.delayTestTimeout);
     // ── 代理模式恢复：`direct` **不跨重启持久化**（2026-10-19 稳定性裁定）──
     //
     // `direct` 是 0.4.0 新增的第三态（首页「直连」按钮）。它的语义是「所有流量

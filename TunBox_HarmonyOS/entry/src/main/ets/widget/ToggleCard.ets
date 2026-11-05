@@ -50,32 +50,32 @@ struct ToggleCard {
   }
 
   build() {
-    Column({ space: 7 }) {
+    Column({ space: 4 }) {
       Row({ space: 6 }) {
         Text($r('app.string.app_name'))
-          .fontSize(13)
+          .fontSize(11)
           .fontWeight(FontWeight.Bold)
           .fontColor($r('app.color.form_text_primary'))
           .layoutWeight(1)
           .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
         Circle({ width: 9, height: 9 })
           .fill(this.statusColor())
           .accessibilityDescription(this.stateLabel)
+        Text(this.stateLabel)
+          .fontSize(10)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.statusColor())
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Text(this.stateLabel)
-        .width('100%')
-        .fontSize(18)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(this.statusColor())
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-
       Row({ space: 5 }) {
         Text($r('app.string.form_current_node'))
-          .fontSize(11)
+          .width(36)
+          .fontSize(10)
           .fontColor($r('app.color.form_text_secondary'))
         Text(this.nodeName)
           .fontSize(12)
@@ -89,8 +89,8 @@ struct ToggleCard {
 
       Button(this.actionLabel)
         .width('100%')
-        .height(34)
-        .fontSize(13)
+        .height(30)
+        .fontSize(12)
         .fontWeight(FontWeight.Medium)
         .fontColor($r('app.color.form_button_text'))
         .backgroundColor(this.busy ? $r('app.color.form_button_disabled') : $r('app.color.form_button_background'))
@@ -103,7 +103,7 @@ struct ToggleCard {
     }
     .width('100%')
     .height('100%')
-    .padding(14)
+    .padding({ left: 9, right: 9, top: 8, bottom: 8 })
     .justifyContent(FlexAlign.SpaceBetween)
     .backgroundColor($r('app.color.form_background'))
     // Form 卡片不支持 backgroundEffect / ThemeColorMode。

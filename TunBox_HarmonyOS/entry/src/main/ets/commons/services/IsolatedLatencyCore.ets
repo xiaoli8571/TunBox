@@ -1,9 +1,10 @@
-import { connection, socket } from '@kit.NetworkKit';
+import { connection } from '@kit.NetworkKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { coreBridge } from '../../core/CoreBridge';
 import { ClashApiService } from './ClashApiService';
 import { AppLogger } from '../utils/AppLogger';
 import { ensurePrivateDir, privateFs } from './PrivateFileStore';
+import { LocalPortProbe } from './LocalPortProbe';
 
 export class IsolatedLatencyPorts {
   apiPort: number = 0;
@@ -36,15 +37,6 @@ export class IsolatedLatencyCore {
     return IsolatedLatencyCore.netId > 0 && IsolatedLatencyCore.netId === IsolatedLatencyCore.physicalNetId();
   }
 
-  private static async free(port: number): Promise<boolean> {
-    const server = socket.constructTCPSocketServerInstance();
-    try {
-      await server.listen({ address: '127.0.0.1', port: port, family: 1 });
-      return true;
-    } catch (_e) { return false; }
-    finally { try { await server.close(); } catch (_e) {} }
-  }
-
   private static copyRuleCache(source: string, target: string, depth: number = 0): void {
     if (depth > 12) { throw new Error('规则缓存目录层级异常'); }
     ensurePrivateDir(target);
@@ -70,8 +62,8 @@ export class IsolatedLatencyCore {
       }
       const ports = new IsolatedLatencyPorts();
       for (let port = 19090; port < 19150; port += 3) {
-        if (await IsolatedLatencyCore.free(port) && await IsolatedLatencyCore.free(port + 1)
-          && await IsolatedLatencyCore.free(port + 2)) {
+        if (await LocalPortProbe.isFree(port) && await LocalPortProbe.isFree(port + 1)
+          && await LocalPortProbe.isFree(port + 2)) {
           ports.apiPort = port; ports.mixedPort = port + 1; ports.dnsPort = port + 2;
           break;
         }
@@ -79,6 +71,9 @@ export class IsolatedLatencyCore {
       if (ports.apiPort === 0) { throw new Error('独立测速端口不可用'); }
       const dir = `${context.cacheDir}/isolated-latency`;
       ensurePrivateDir(dir);
+      const secret = `isolated-${Date.now().toString(36)}-${Math.random().toString(36).substring(2)}`;
+      // 构建/校验会按最终 Smart 策略准备 Model.bin，必须先于隔离目录资源复制。
+      const yaml = await build(ports, secret);
       // Read-only resource copies; provider caches and logs stay in this directory.
       const resources: string[] = ['Model.bin', 'GeoIP.dat', 'GeoSite.dat', 'geoip.dat', 'geosite.dat',
         'Country.mmdb', 'geoip.metadb', 'geoip.db'];
@@ -101,8 +96,6 @@ export class IsolatedLatencyCore {
           throw new Error(`独立测速资源复制失败：${name}`);
         }
       }
-      const secret = `isolated-${Date.now().toString(36)}-${Math.random().toString(36).substring(2)}`;
-      const yaml = await build(ports, secret);
       if (!IsolatedLatencyCore.networkCurrent()) { throw new Error('网络已变化，请重新测速'); }
       IsolatedLatencyCore.path = `${dir}/config.yaml`;
       privateFs.writePrivate(IsolatedLatencyCore.path, yaml);

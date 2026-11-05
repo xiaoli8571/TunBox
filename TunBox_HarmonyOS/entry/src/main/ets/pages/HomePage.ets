@@ -41,13 +41,17 @@ export struct HomePage {
    * （2026-10-28 用户报障：选完节点要等启动后才更新）。
    */
   @StorageLink('node_switch_revision') @Watch('onNodeSwitched') nodeSwitchRevision: number = 0;
+  @StorageLink('smart_model_seq') @Watch('onNodeSwitched') smartModelSeq: number = 0;
 
   @State isConnected: boolean = false;
   @State isConnecting: boolean = false;
-  /** 乐观反馈（2026-10-17 用户反馈「点启动 1 秒多按钮才动」）：点击瞬间点亮「正在连接」，
-   *  覆盖订阅 hydrate 等待（冷启最多 ~1.5s）与 connect 进入 CONNECTING 前的空窗；
-   *  编排器状态翻转后由真实 isConnecting 接管，流程结束（含失败/无节点）即清除 */
+  /** 真实启动事务仍在准备或建连；不作为代理已就绪的依据。 */
   @State pendingStart: boolean = false;
+  /** 用户要求点击即显示已连接；只传给首页按钮，网络/守护/卡片仍消费真实连接态。 */
+  @State optimisticConnected: boolean = false;
+  @State pendingStop: boolean = false;
+  /** 页面准备阶段也必须可取消，避免订阅/节点查询晚到后重新启动。 */
+  private startRequestSeq: number = 0;
   /**
    * 冷启动节点尚未就绪（订阅 hydrate / 首次刷新还没出节点）。
    * true 时启动按钮显示「节点加载中…」，用户点了也不能直接连 —— 否则
@@ -142,9 +146,16 @@ export struct HomePage {
   }
 
   aboutToDisappear(): void {
+    this.invalidatePublicIpQueries();
     this.pageMounted = false;
     this.pageReady = false;
     this.stopNodeReadinessWatch();
+    if (this.pendingConnectAfterNodes) {
+      this.pendingConnectAfterNodes = false;
+      this.startRequestSeq++;
+      this.optimisticConnected = false;
+      this.syncMiniConnectionState();
+    }
     this.stopPublicIpRecover();
     SubscriptionService.offNodeSetChanged(this.nodeSetListener);
     if (this.shownBridge !== undefined) {
@@ -166,6 +177,16 @@ export struct HomePage {
 
 
   private applyOrchestratorState(): void {
+    // 卡片/快捷方式在页面准备期间发来停止，也必须作废尚未调用 connect 的启动。
+    if (this.orchestrator.state === ConnState.DISCONNECTING
+      && (this.optimisticConnected || this.pendingConnectAfterNodes || this.pendingStart)) {
+      this.startRequestSeq++;
+      this.optimisticConnected = false;
+      this.pendingConnectAfterNodes = false;
+      this.pendingStart = false;
+      this.stopNodeReadinessWatch();
+      this.syncMiniConnectionState();
+    }
     const wasConnected: boolean = this.isConnected;
     this.isConnected = this.orchestrator.state === ConnState.CONNECTED;
     // 连接状态翻转时作废在飞的 IP 查询（2026-10-19 稳定性）：
@@ -174,6 +195,9 @@ export struct HomePage {
     // 代次递增后，旧回调的结果会被 refreshPublicIp 直接丢弃。
     if (wasConnected !== this.isConnected) {
       this.invalidatePublicIpQueries();
+      this.publicIp = '';
+      this.publicIpError = '';
+      this.stopPublicIpRecover();
     }
     // 自动重连（切订阅/切节点）落到 CONNECTED 后补查一次出口 IP：
     // 重连窗口内发起的那次查询必然打在未就绪的隧道上，不补查就一直空着。
@@ -200,12 +224,16 @@ export struct HomePage {
     this.isConnecting = this.orchestrator.state === ConnState.CONNECTING
       || this.orchestrator.state === ConnState.DISCONNECTING
       || this.orchestrator.state === ConnState.RECOVERING;
-    // miniBar（P1-3a）宿主信号：AppStorage 键供 MainPage 的 @StorageLink 消费
-    AppStorage.setOrCreate('mini_conn_connected', this.isConnected);
-    AppStorage.setOrCreate('mini_conn_connecting', this.isConnecting);
-    AppStorage.setOrCreate('mini_conn_node', this.orchestrator.currentNodeName());
+    this.syncMiniConnectionState();
     this.errorMessage = this.orchestrator.lastError;
     this.refreshDisplayNode();
+  }
+
+  private syncMiniConnectionState(): void {
+    const optimistic: boolean = this.optimisticConnected;
+    AppStorage.setOrCreate('mini_conn_connected', this.isConnected || optimistic);
+    AppStorage.setOrCreate('mini_conn_connecting', this.pendingStop || (this.isConnecting && !optimistic));
+    AppStorage.setOrCreate('mini_conn_node', this.orchestrator.currentNodeName());
   }
 
   /** 订阅区块切换节点后刷新按钮内节点名（无需等连接） */
@@ -354,11 +382,11 @@ export struct HomePage {
       if (!this.pageMounted || !this.isConnected || this.publicIp.length > 0) {
         return;
       }
-      this.ipRecoverTries = this.ipRecoverTries + 1;
       if (this.publicIpRefreshing) {
         this.schedulePublicIpRecover();
         return;
       }
+      this.ipRecoverTries = this.ipRecoverTries + 1;
       this.refreshPublicIp('reconnect-recover', false)
         .then((): void => { this.schedulePublicIpRecover(); })
         .catch((): void => { this.schedulePublicIpRecover(); });
@@ -442,6 +470,9 @@ export struct HomePage {
         this.stopNodeReadinessWatch();
         if (this.pendingConnectAfterNodes) {
           this.pendingConnectAfterNodes = false;
+          this.startRequestSeq++;
+          this.optimisticConnected = false;
+          this.syncMiniConnectionState();
           promptAction.showToast({ message: '节点加载超时，请到主页「订阅」里刷新后再连接' });
         }
       }
@@ -454,10 +485,9 @@ export struct HomePage {
     this.stopNodeReadinessWatch();
     if (this.pendingConnectAfterNodes) {
       this.pendingConnectAfterNodes = false;
-      // 让「节点加载中…」先落一帧，再进入正在连接，避免按钮文案跳变
-      setTimeout((): void => {
-        this.toggleConnection();
-      }, 0);
+      this.syncMiniConnectionState();
+      // 继续原启动事务，不能再 toggle（第二次点击可能已取消，或已有真实连接）。
+      this.completeConnectionStart(this.startRequestSeq);
     }
   }
 
@@ -471,35 +501,71 @@ export struct HomePage {
   private async startConnectionIfNeeded(): Promise<void> {
     // 显式用户操作（快捷方式 start）：清除长时任务抑制态
     UiGuardian.clearExternalCancelSuppression();
-    if (this.isConnecting || this.isConnected || this.pendingStart) {
+    if (this.isConnecting || this.isConnected || this.pendingStart || this.pendingStop
+      || this.pendingConnectAfterNodes) {
       return;
     }
+    const request: number = ++this.startRequestSeq;
+    // 第一个 await 之前完成整颗按钮的连接态反馈；出口 IP 留空直到真实代理就绪。
+    this.optimisticConnected = true;
+    this.syncMiniConnectionState();
+    this.errorMessage = '';
+    this.invalidatePublicIpQueries();
+    this.publicIp = '';
+    this.publicIpError = '';
+    this.stopPublicIpRecover();
+    AppLogger.info(TAG, `start feedback: connected request=${request}`);
     // 冷启动快捷启动：节点未就绪时排队，就绪后由看门狗补连（不报节点未生效）。
     if (this.nodesLoading) {
       this.pendingConnectAfterNodes = true;
       this.startNodeReadinessWatch();
-      return;
+      if (this.nodesLoading) { return; }
+      this.pendingConnectAfterNodes = false;
     }
-    // 乐观反馈同 toggleConnection：快捷方式路径同样不出现无响应空窗
+    await this.completeConnectionStart(request);
+  }
+
+  private async completeConnectionStart(request: number): Promise<void> {
+    if (request !== this.startRequestSeq) { return; }
     this.pendingStart = true;
     try {
       await this.awaitSubsReady();
-      if (this.isConnecting || this.isConnected) {
+      if (request !== this.startRequestSeq || this.isConnecting || this.isConnected) {
         return;
       }
       const node = await this.selectedNode();
+      if (request !== this.startRequestSeq || this.isConnecting || this.isConnected) { return; }
+      const context = getContext(this) as Context;
       if (node === null) {
+        await FormStateSync.publish(context, FormStateSync.noNode());
+        if (request !== this.startRequestSeq) { return; }
         promptAction.showToast({ message: '暂无可用节点，请先在主页「订阅」里添加并刷新' });
         return;
       }
+      await FormStateSync.publish(context, FormStateSync.connecting(node.name));
+      if (request !== this.startRequestSeq) { return; }
       const ok = await this.orchestrator.connect(node, this.subs);
+      if (request !== this.startRequestSeq) { return; }
+      await FormStateSync.publish(context,
+        ok ? FormStateSync.connected(node.name) : FormStateSync.failed(node.name));
+      if (request !== this.startRequestSeq) { return; }
       if (ok) {
-        // 与 toggleConnection 同款：先作废启动期直连查询，再查隧道出口（并清掉旧值）。
         this.invalidatePublicIpQueries();
-        this.refreshPublicIp('after-connect-shortcut', true);
+        this.refreshPublicIp('after-connect', true);
+      } else if (this.orchestrator.lastError.length > 0) {
+        promptAction.showToast({ message: this.orchestrator.lastError });
       }
+    } catch (e) {
+      if (request !== this.startRequestSeq) { return; }
+      this.errorMessage = this.orchestrator.lastError || `启动失败：${AppLogger.errText(e)}`;
+      promptAction.showToast({ message: this.errorMessage });
+      AppLogger.warn(TAG, this.errorMessage);
     } finally {
-      this.pendingStart = false;
+      if (request === this.startRequestSeq) {
+        this.pendingStart = false;
+        this.optimisticConnected = false;
+        this.syncMiniConnectionState();
+      }
     }
   }
 
@@ -558,14 +624,22 @@ export struct HomePage {
     if (clearBefore) {
       this.publicIp = '';
     }
+    const state = this.orchestrator.state;
+    if (state !== ConnState.CONNECTED && state !== ConnState.DISCONNECTED && state !== ConnState.ERROR) {
+      this.publicIpRefreshing = false;
+      this.publicIpError = '';
+      return; // 拆建/恢复中不查询本机直连出口，CONNECTED 事件负责补查。
+    }
     this.publicIpRefreshing = true;
     this.publicIpError = '';
     try {
-      const info: PublicIpInfo = await PublicIpService.query(trigger);
+      const info: PublicIpInfo = await PublicIpService.query(trigger, state === ConnState.CONNECTED,
+        (): boolean => this.pageMounted && seq === this.ipQuerySeq && this.orchestrator.state === state);
       if (seq !== this.ipQuerySeq) {
         // 已有更新的一次查询在跑：本结果作废，绝不覆盖（这就是旧版的核心 bug）
         return;
       }
+      if (!this.pageMounted || this.orchestrator.state !== state) { return; }
       if (info.ip.length > 0) {
         this.publicIp = info.ip;
         this.publicIpError = '';
@@ -613,63 +687,46 @@ export struct HomePage {
   private async toggleConnection(): Promise<void> {
     // 显式用户操作（电源按钮/卡片 toggle）：清除长时任务抑制态
     UiGuardian.clearExternalCancelSuppression();
-    if (this.orchestrator.isRestarting()) {
-      await this.orchestrator.disconnect();
-      this.invalidatePublicIpQueries();
-      this.refreshPublicIp('cancel-restart', true);
+    if (this.pendingStop || this.orchestrator.state === ConnState.DISCONNECTING) { return; }
+    if (this.isConnected || this.isConnecting || this.pendingStart || this.optimisticConnected
+      || this.pendingConnectAfterNodes || this.orchestrator.isRestarting()) {
+      await this.stopConnectionFromUser();
       return;
     }
-    if (this.isConnecting || this.pendingStart) {
-      return;
-    }
-    // 冷启动节点还没就绪：不让用户白点一次再吃「节点选择未生效」。
-    // 记下意图，节点就绪后自动补连；再点一次可取消。
-    if (!this.isConnected && this.nodesLoading) {
-      this.startNodeReadinessWatch();
-      if (this.pendingConnectAfterNodes) {
-        this.pendingConnectAfterNodes = false;
-        promptAction.showToast({ message: '已取消本次自动连接' });
-      } else {
-        this.pendingConnectAfterNodes = true;
-        promptAction.showToast({ message: '节点加载中，就绪后自动连接…' });
-      }
-      return;
-    }
+    await this.startConnectionIfNeeded();
+  }
+
+  private async stopConnectionFromUser(): Promise<void> {
+    const request: number = ++this.startRequestSeq;
+    this.pendingConnectAfterNodes = false;
+    this.pendingStart = false;
+    this.optimisticConnected = false;
+    this.pendingStop = true;
+    this.syncMiniConnectionState();
+    this.stopNodeReadinessWatch();
+    this.invalidatePublicIpQueries();
+    this.publicIp = '';
+    this.publicIpError = '';
+    this.stopPublicIpRecover();
     const context = getContext(this) as Context;
-    // 乐观反馈：任何 await 之前先点亮「正在连接」—— 冷启订阅 hydrate 等待
-    // （最多 ~1.5s）绝不能变成按钮无响应的空窗
-    this.pendingStart = true;
+    const nodeName: string = this.currentNodeName;
+    // 立即撤销编排器事务/自愈意图，不能等节点查询或卡片写盘才发断开。
+    const stopTask: Promise<void> = this.orchestrator.disconnect();
+    FormStateSync.publish(context, FormStateSync.disconnecting(nodeName)).catch((): void => {});
     try {
-      await this.awaitSubsReady();
-      const node = await this.selectedNode();
-      const nodeName = node === null ? '' : node.name;
-      if (this.isConnected) {
-        await FormStateSync.publish(context, FormStateSync.disconnecting(nodeName));
-        await this.orchestrator.disconnect();
-        await FormStateSync.publish(context,
-          node === null ? FormStateSync.noNode() : FormStateSync.disconnected(nodeName));
-        this.refreshPublicIp('after-disconnect', true);
-        return;
-      }
-      if (node === null) {
-        await FormStateSync.publish(context, FormStateSync.noNode());
-        promptAction.showToast({ message: '暂无可用节点，请先在主页「订阅」里添加并刷新' });
-        return;
-      }
-      await FormStateSync.publish(context, FormStateSync.connecting(node.name));
-      const ok = await this.orchestrator.connect(node, this.subs);
+      await stopTask;
+      if (request !== this.startRequestSeq) { return; }
       await FormStateSync.publish(context,
-        ok ? FormStateSync.connected(node.name) : FormStateSync.failed(node.name));
-      if (ok) {
-        // 连接成功：先作废启动期那次「直连出口」的查询（结果已无意义，且可能仍在飞），
-        // 再发一次走隧道的查询。代次保证：即使旧查询晚到，也绝不会覆盖这次的结果。
-        // clearBefore=true：出口已经变了，旧值（本机宽带 IP）必须立刻丢弃 ——
-        // 万一这次也失败，宁可显示「未取到出口 IP」也不能显示一个错的出口。
-        this.invalidatePublicIpQueries();
-        this.refreshPublicIp('after-connect', true);
-      }
+        nodeName.length > 0 ? FormStateSync.disconnected(nodeName) : FormStateSync.noNode());
+    } catch (e) {
+      if (request !== this.startRequestSeq) { return; }
+      this.errorMessage = `断开失败：${AppLogger.errText(e)}`;
+      promptAction.showToast({ message: this.errorMessage });
     } finally {
-      this.pendingStart = false;
+      if (request === this.startRequestSeq) {
+        this.pendingStop = false;
+        this.syncMiniConnectionState();
+      }
     }
   }
 
@@ -711,15 +768,15 @@ export struct HomePage {
       Text(label)
         .fontSize(14)
         .fontWeight(this.proxyMode === mode ? FontWeight.Bold : FontWeight.Medium)
-        .fontColor(this.proxyMode === mode ? TunBoxTextColors.accentBlue : TunBoxTextColors.secondary)
+        .fontColor(this.proxyMode === mode ? TunBoxTextColors.accentBlueFor(this.themeRevision) : TunBoxTextColors.secondaryFor(this.themeRevision))
         .textAlign(TextAlign.Center)
         .height(34)
         .padding({ left: 20, right: 20 })
         .borderRadius(TunBoxGeometry.pillRadius)
-        .backgroundColor(this.proxyMode === mode ? TunBoxColors.modeChipFill : Color.Transparent)
+        .backgroundColor(this.proxyMode === mode ? TunBoxColors.modeChipFillFor(this.themeRevision) : Color.Transparent)
         .border({
           width: 1,
-          color: this.proxyMode === mode ? TunBoxColors.modeChipBorder : Color.Transparent
+          color: this.proxyMode === mode ? TunBoxColors.modeChipBorderFor(this.themeRevision) : Color.Transparent
         })
     }
     .layoutWeight(1)
@@ -747,10 +804,8 @@ export struct HomePage {
             // 首页下方（公网 IP / 模式按钮 / 订阅区块）因此整体上提。
             Column() {
               CelestialPowerOrb({
-                isConnected: $isConnected,
-                // 节点加载中不算「正在连接」：标题保持「开启连接」，副标题显示加载中，
-                // 节点就绪并自动补连后才切到「正在连接」。
-                isConnecting: this.isConnecting || (this.pendingStart && !this.nodesLoading),
+                isConnected: this.isConnected || this.optimisticConnected,
+                isConnecting: this.pendingStop || (this.isConnecting && !this.optimisticConnected),
                 nodeName: this.nodesLoading ? '节点加载中…' : this.currentNodeName,
                 // 出口 IP 现在画在按钮内部沿底部弧线（2026-10-28 用户要求）；未连接不显示
                 ipText: this.isConnected ? this.publicIp : '',
@@ -827,7 +882,7 @@ export struct HomePage {
           Button() {
             SymbolGlyph($r('sys.symbol.sun_max'))
               .fontSize(20)
-              .fontColor([TunBoxColors.textMuted])
+              .fontColor([TunBoxColors.textMutedFor(this.themeRevision)])
           }
           .width(40)
           .height(40)

@@ -97,10 +97,11 @@ await test('a late foreground response cannot restore a session stopped by the u
   assert.equal(h.orch.state, h.ConnState.DISCONNECTED); assert.equal(h.orch.startedAt, 0);
   assert.equal(h.timers.size, 0); assert.equal(h.writes, 0); h.stop();
 });
-await test('an unconfirmed cold runtime is neither shown connected nor erased', async () => {
+await test('an unconfirmed cold runtime preserves intent and schedules bounded recovery', async () => {
   const h = harness(); h.controller = false; h.orch.state = h.ConnState.DISCONNECTED; h.orch.startedAt = 0;
   await h.orch.restoreKilledSession({ cacheDir: '/sandbox' });
-  assert.equal(h.orch.state, h.ConnState.DISCONNECTED); assert.equal(h.orch.startedAt, 0);
+  assert.equal(h.orch.state, h.ConnState.RECOVERING);
+  assert.equal(h.orch.reconnectManager().snapshot().attempts, 1);
   assert.equal(h.snapshot.desiredConnected, true); assert.equal(h.writes, 0); h.stop();
 });
 await test('repeated foreground restoration preserves uptime and one monitor pair', async () => {

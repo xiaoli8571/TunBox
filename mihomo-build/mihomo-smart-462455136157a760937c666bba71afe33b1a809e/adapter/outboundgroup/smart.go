@@ -182,6 +182,10 @@ type connQuality struct {
 }
 
 func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C.Proxy, providers []provider.ProxyProvider) (*Smart, error) {
+	return newSmart(option, smartOption, emptyFallback, providers, true)
+}
+
+func newSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C.Proxy, providers []provider.ProxyProvider, initialize bool) (*Smart, error) {
 	if option.URL == "" {
 		option.URL = C.DefaultTestURL
 	}
@@ -227,7 +231,9 @@ func NewSmart(option GroupCommonOption, smartOption SmartOption, emptyFallback C
 		s.applyPolicyPriority(smartOption.PolicyPriority)
 	}
 
-	s.InitSmart()
+	if initialize {
+		s.InitSmart()
+	}
 
 	return s, nil
 }
@@ -2553,6 +2559,9 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 }
 
 func (s *Smart) Close() error {
+	if s.store == nil { // validation-only construction owns no process resources
+		return nil
+	}
 	if s.cancel != nil {
 		s.cancel()
 	}

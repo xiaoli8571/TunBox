@@ -505,11 +505,11 @@ check('H7 fromPins：命中=resolved / 试过没命中=unresolved / 没试过=un
   const v4 = modProbe.LatencyDnsVerdict.fromPins('n4', '', pins, attempted);
   eq(v4.status, 'unknown', 'IP 直连不需要 DNS');
 });
-check('H8 文案：dns_unresolved 与「网络不可达」严格区分', () => {
+check('H8 节点失败在 UI 统一显示超时，内部分类仍可诊断', () => {
   const dnsView = LatencyStore.describe('dns_unresolved', -1, Date.now(), Date.now());
-  eq(dnsView.text, '域名无法解析（节点域名可能已下线）', 'dns_unresolved 文案');
+  eq(dnsView.text, '超时', 'dns_unresolved 文案');
   const netView = LatencyStore.describe('network_unreachable', -1, Date.now(), Date.now());
-  ok(dnsView.text !== netView.text, '两者文案必须不同');
+  eq(netView.text, '超时', 'network_unreachable 文案');
   ok(netView.text.indexOf('域名') < 0, 'network_unreachable 不得出现「域名」字样');
   eq(dnsView.level, LatencyViewLevel.BAD, 'dns_unresolved 级别');
 });

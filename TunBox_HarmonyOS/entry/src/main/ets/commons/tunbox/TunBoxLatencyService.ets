@@ -1,7 +1,7 @@
 /**
  * FlClash 等价测速服务（UI/后台的唯一测速入口）
  *
- * 职责：把 `FlclashDelayRun`（32 并发、逐节点 `/proxies/{name}/delay`、-1/-2 语义）
+ * 职责：把 `TunBoxDelayRun`（32 并发、逐节点 `/proxies/{name}/delay`、-1/-2 语义）
  *       接到本仓库的展示层 `LatencyLiveView`，并提供与旧 `LatencyEngine` 同名的
  *       会话 API（isRunning / cancel / progress），让页面改动最小。
  *
@@ -25,20 +25,21 @@ import { LatencyContext, LatencyRecord, LatencyState, LatencyChannel } from '../
 import { LatencyLiveView } from '../services/LatencyLiveView';
 import { LatencyProbeKind, LatencyStrategy } from '../latency/LatencyKinds';
 import {
-  DelayResult, DelayTarget, FlclashDelayRun, FlclashDelaySummary,
-  FLCLASH_DELAY_TIMED_OUT, FLCLASH_DELAY_FAILED, FLCLASH_DELAY_URL
-} from '../flclash/FlclashDelay';
+  DelayResult, DelayTarget, TunBoxDelayRun, TunBoxDelaySummary,
+  TUNBOX_DELAY_TIMED_OUT, TUNBOX_DELAY_FAILED, TUNBOX_DELAY_URL
+} from '../tunbox/TunBoxDelay';
 
-const TAG = 'FlclashLatencyService';
+const TAG = 'TunBoxLatencyService';
 
 /** 进度快照（UI 只读这几个数，字段语义与 FlClash summary 一致）。 */
-export class FlclashLatencyProgress {
+export class TunBoxLatencyProgress {
   total: number = 0;
   started: number = 0;
   measured: number = 0;
   timeout: number = 0;
   failed: number = 0;
   cancelled: number = 0;
+  wasCancelled: boolean = false;
   running: boolean = false;
 
   done(): boolean {
@@ -46,10 +47,9 @@ export class FlclashLatencyProgress {
   }
 }
 
-export class FlclashLatencySession {
-  private readonly api: ClashApiService;
-  private readonly run: FlclashDelayRun;
-  private readonly progress: FlclashLatencyProgress = new FlclashLatencyProgress();
+export class TunBoxLatencySession {
+  private readonly run: TunBoxDelayRun;
+  private readonly progress: TunBoxLatencyProgress = new TunBoxLatencyProgress();
   private readonly source: string;
   private finished: boolean = false;
   private readonly targets: DelayTarget[];
@@ -78,22 +78,21 @@ export class FlclashLatencySession {
     LatencyLiveView.flushNow();
   }
   /** 完成信号（供调用方 await；取消同样会兑现，避免永远挂住）。 */
-  private resolveDone: (progress: FlclashLatencyProgress) => void = (): void => {};
-  private readonly donePromise: Promise<FlclashLatencyProgress>;
+  private resolveDone: (progress: TunBoxLatencyProgress) => void = (): void => {};
+  private readonly donePromise: Promise<TunBoxLatencyProgress>;
 
   constructor(api: ClashApiService, targets: DelayTarget[], source: string,
     runId: number, previous: Map<string, LatencyRecord>,
     contexts: Map<string, LatencyContext> = new Map<string, LatencyContext>(),
     current: () => boolean = (): boolean => true) {
-    this.api = api;
     this.contexts = contexts;
     this.current = current;
     this.targets = targets;
     this.runId = runId;
     this.previous = previous;
     this.source = source;
-    this.run = new FlclashDelayRun(api.endpointBase(), api.endpointSecret());
-    this.donePromise = new Promise<FlclashLatencyProgress>((resolve) => {
+    this.run = new TunBoxDelayRun(api.endpointBase(), api.endpointSecret());
+    this.donePromise = new Promise<TunBoxLatencyProgress>((resolve) => {
       this.resolveDone = resolve;
     });
     this.progress.total = targets.length;
@@ -102,20 +101,28 @@ export class FlclashLatencySession {
       (result: DelayResult): void => {
         this.apply(result);
       },
-      (summary: FlclashDelaySummary): void => {
-        this.progress.started = summary.started;
-        this.progress.measured = summary.measured;
-        this.progress.timeout = summary.timedOut;
-        this.progress.failed = summary.failed;
-        this.progress.cancelled = summary.cancelled;
-        this.progress.running = false;
-        this.finished = true;
-        this.clearOwnTesting();
-        this.resolveDone(this.progress);
-        AppLogger.info(TAG, `delay batch done: total=${summary.total} measured=${summary.measured} `
-          + `timeout=${summary.timedOut} failed=${summary.failed} cancelled=${summary.cancelled} `
-          + `wall=${summary.wallMs}ms conc=${summary.concurrency} peak=${summary.peakInflight}`);
+      (summary: TunBoxDelaySummary): void => {
+        this.complete(summary);
       });
+  }
+
+  private async complete(summary: TunBoxDelaySummary): Promise<void> {
+    if (this.finished) { return; }
+    // Upstream null/guard/cancel paths do not publish a node result. A healthy
+    // controller proves nothing about a missing URLTest reply; retain old data.
+    this.progress.started = summary.started;
+    this.progress.measured = summary.measured;
+    this.progress.timeout = summary.timedOut;
+    this.progress.failed = summary.failed;
+    this.progress.cancelled = summary.cancelled;
+    this.progress.wasCancelled = summary.wasCancelled;
+    this.progress.running = false;
+    this.finished = true;
+    this.clearOwnTesting();
+    this.resolveDone(this.progress);
+    AppLogger.info(TAG, `delay batch done: total=${summary.total} measured=${summary.measured} `
+      + `timeout=${summary.timedOut} failed=${summary.failed} cancelled=${summary.cancelled} `
+      + `wall=${summary.wallMs}ms conc=${summary.concurrency} peak=${summary.peakInflight}`);
   }
 
   private apply(result: DelayResult): void {
@@ -132,7 +139,7 @@ export class FlclashLatencySession {
       AppLogger.warn(TAG, `delay failed: ${result.proxyName} http=${result.httpCode} value=${result.value}`);
     }
     let failKind: string = LatencyProbeKind.TIMEOUT;
-    if (result.value !== FLCLASH_DELAY_TIMED_OUT) {
+    if (result.value !== TUNBOX_DELAY_TIMED_OUT) {
       // 404 = 内核里没有这个节点（名字对不上/没进配置）→「未生效」，不是节点坏；
       // 503/400/200-但-delay<=0 = 内核拨过但没拨通 →「拨号失败」。
       failKind = result.httpCode === 404
@@ -144,7 +151,7 @@ export class FlclashLatencySession {
     const rec: LatencyRecord = valid
       ? LatencyRecord.measured(result.proxyName, result.value, LatencyChannel.CORE, now)
       : LatencyRecord.failed(result.proxyName,
-        result.value === FLCLASH_DELAY_TIMED_OUT ? LatencyState.TIMEOUT : LatencyState.FAILED,
+        result.value === TUNBOX_DELAY_TIMED_OUT ? LatencyState.TIMEOUT : LatencyState.FAILED,
         now, LatencyChannel.CORE, failKind);
     rec.source = this.source;
     rec.context = context;
@@ -153,7 +160,7 @@ export class FlclashLatencySession {
     this.progress.started = this.progress.started + 1;
     if (valid) {
       this.progress.measured = this.progress.measured + 1;
-    } else if (result.value === FLCLASH_DELAY_TIMED_OUT) {
+    } else if (result.value === TUNBOX_DELAY_TIMED_OUT) {
       this.progress.timeout = this.progress.timeout + 1;
     } else {
       this.progress.failed = this.progress.failed + 1;
@@ -164,12 +171,12 @@ export class FlclashLatencySession {
     return !this.finished && this.run.isRunning();
   }
 
-  currentProgress(): FlclashLatencyProgress {
+  currentProgress(): TunBoxLatencyProgress {
     return this.progress;
   }
 
   /** 等本批结束（正常完成或取消都会兑现）。 */
-  wait(): Promise<FlclashLatencyProgress> {
+  wait(): Promise<TunBoxLatencyProgress> {
     return this.donePromise;
   }
 
@@ -180,6 +187,7 @@ export class FlclashLatencySession {
     }
     // 显式取消：收尾时未测完的节点不得盖章（新批马上会重测同一批节点）
     this.explicitCancel = true;
+    this.progress.wasCancelled = true;
     this.run.cancel();
     this.clearOwnTesting();
     this.progress.cancelled = Math.max(0, this.progress.total - this.progress.measured
@@ -191,8 +199,8 @@ export class FlclashLatencySession {
   }
 }
 
-export class FlclashLatencyService {
-  private static current: FlclashLatencySession | null = null;
+export class TunBoxLatencyService {
+  private static current: TunBoxLatencySession | null = null;
 
   /**
    * 启动一批测速（新批会取消旧批，与 FlClash「一个 job 一个 cancel 标记」一致）。
@@ -205,21 +213,21 @@ export class FlclashLatencyService {
     source: string = 'manual',
     perNodeUrl: Map<string, string> | null = null,
     expected: string = '', context: LatencyContext | null = null,
-    current: () => boolean = (): boolean => true): FlclashLatencySession {
-    const effectiveUrl = testUrl.length > 0 ? testUrl : FLCLASH_DELAY_URL;
+    current: () => boolean = (): boolean => true): TunBoxLatencySession {
+    const effectiveUrl = testUrl.length > 0 ? testUrl : TUNBOX_DELAY_URL;
     const targets: DelayTarget[] = [];
     for (const name of nodeNames) {
       const url = perNodeUrl !== null ? perNodeUrl.get(name) ?? effectiveUrl : effectiveUrl;
       targets.push(new DelayTarget(name, url || effectiveUrl, '', expected, api.providerForProxy(name)));
     }
-    return FlclashLatencyService.startTargets(api, targets, source, context, current);
+    return TunBoxLatencyService.startTargets(api, targets, source, context, current);
   }
 
   /** Explicit per-target policy; deduplication and ownership use the full identity. */
   static startTargets(api: ClashApiService, requested: DelayTarget[], source: string = 'manual',
     context: LatencyContext | null = null,
-    current: () => boolean = (): boolean => true): FlclashLatencySession {
-    if (FlclashLatencyService.current !== null) { FlclashLatencyService.current.cancel(); }
+    current: () => boolean = (): boolean => true): TunBoxLatencySession {
+    if (TunBoxLatencyService.current !== null) { TunBoxLatencyService.current.cancel(); }
     const targets: DelayTarget[] = [];
     const previous: Map<string, LatencyRecord> = new Map<string, LatencyRecord>();
     const contexts: Map<string, LatencyContext> = new Map<string, LatencyContext>();
@@ -239,25 +247,25 @@ export class FlclashLatencyService {
       if (old !== null && old.state !== LatencyState.TESTING) { previous.set(target.key, old); }
       LatencyLiveView.markTesting(target.proxyName, runId, scoped);
     }
-    const session = new FlclashLatencySession(api, targets, source, runId, previous, contexts, current);
-    FlclashLatencyService.current = session;
+    const session = new TunBoxLatencySession(api, targets, source, runId, previous, contexts, current);
+    TunBoxLatencyService.current = session;
     AppLogger.info(TAG, `delay batch start: targets=${targets.length} source=${source}`);
     return session;
   }
 
   static cancelCurrent(): void {
-    if (FlclashLatencyService.current !== null) {
-      FlclashLatencyService.current.cancel();
-      FlclashLatencyService.current = null;
+    if (TunBoxLatencyService.current !== null) {
+      TunBoxLatencyService.current.cancel();
+      TunBoxLatencyService.current = null;
     }
   }
 
   static isRunning(): boolean {
-    return FlclashLatencyService.current !== null && FlclashLatencyService.current.isRunning();
+    return TunBoxLatencyService.current !== null && TunBoxLatencyService.current.isRunning();
   }
 
-  static currentProgress(): FlclashLatencyProgress | null {
-    return FlclashLatencyService.current === null ? null : FlclashLatencyService.current.currentProgress();
+  static currentProgress(): TunBoxLatencyProgress | null {
+    return TunBoxLatencyService.current === null ? null : TunBoxLatencyService.current.currentProgress();
   }
 
   /**
@@ -265,14 +273,14 @@ export class FlclashLatencyService {
    * 返回被取消/未开始的节点数由 session 自己的 summary 负责。
    */
   static startGroup(api: ClashApiService, groupNodeNames: string[], testUrl: string,
-    source: string = 'manual', expected: string = ''): FlclashLatencySession {
-    return FlclashLatencyService.start(api, groupNodeNames, testUrl, source, null, expected);
+    source: string = 'manual', expected: string = ''): TunBoxLatencySession {
+    return TunBoxLatencyService.start(api, groupNodeNames, testUrl, source, null, expected);
   }
 }
 
 // 回收探针注册：组测速/订阅测速批进行中阻止编排器回收无头内核（顺延而非杀核）。
 // 注册在类外静态初始化，import 本模块即生效；重复注册由 includes 去重。
-const recycleProbe = (): boolean => FlclashLatencyService.isRunning();
+const recycleProbe = (): boolean => TunBoxLatencyService.isRunning();
 if (!ConnectionOrchestrator.testCoreBusyProbes.includes(recycleProbe)) {
   ConnectionOrchestrator.testCoreBusyProbes.push(recycleProbe);
 }

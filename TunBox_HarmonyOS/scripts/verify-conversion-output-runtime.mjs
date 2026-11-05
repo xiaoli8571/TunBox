@@ -18,10 +18,14 @@ function load(file, names) {
   Object.assign(ctx,result);return result;
 }
 load('commons/services/YamlMerger.ets','YamlMerger');
-load('commons/flclash/ProfileConfigMerger.ets','ProfileConfigMerger');
-load('commons/flclash/SubConverter.ets','SubConverter');
+load('commons/tunbox/ProfileConfigMerger.ets','ProfileConfigMerger');
+load('commons/tunbox/SubConverter.ets','SubConverter');
 load('commons/services/ImportFilePolicy.ets','ImportFilePolicy');
+// 失败提示的单点实现：importFromConvert 的 catch 分支引用它，沙箱里必须先加载。
+load('commons/services/ImportFailureSummary.ets','ImportFailureSummary');
 const ui=read('components/SubscriptionSection.ets');
+const skeletonFn=ui.match(/^function withExportSkeleton\([\s\S]*?^}/m)[0];
+vm.runInContext(stripTypeScriptTypes(skeletonFn,{mode:'transform'}),ctx);
 const method=ui.match(/^  private async importFromConvert\([\s\S]*?^  }/m)[0];
 const Panel=vm.runInContext(stripTypeScriptTypes(`(()=>{class Panel{${method}}return Panel})()`,{mode:'transform'}),ctx);
 const link='trojan://fixture-password@127.0.0.1:443#'+encodeURIComponent('台湾 测试🚀');

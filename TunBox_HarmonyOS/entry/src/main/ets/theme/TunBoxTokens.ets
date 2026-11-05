@@ -13,7 +13,7 @@
  */
 import { AppBgTheme, ThemeService } from './ThemeService';
 import { SafeArea } from './SafeArea';
-import { LatencyRecord, LatencyPolicy, LatencyState } from '../commons/services/LatencyState';
+import { LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore';
 
 /**
@@ -88,6 +88,34 @@ export class TunBoxColors {
 
   static get modeChipBorder(): ResourceColor {
     return ThemeService.isDark() ? 'rgba(59, 130, 246, 0.60)' : '#BACFFA';
+  }
+
+  static primaryFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).brandPrimary;
+  }
+
+  static primaryHoverFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).brandHover;
+  }
+
+  static primaryLightFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).brandLight;
+  }
+
+  static primaryBorderFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).brandBorder;
+  }
+
+  static dockPillFillFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).dockPillFill;
+  }
+
+  static modeChipFillFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).modeChipFill;
+  }
+
+  static modeChipBorderFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).modeChipBorder;
   }
 
   // ── 语义状态色 ──
@@ -273,6 +301,18 @@ export class TunBoxColors {
 
   static get textOnPrimary(): ResourceColor {
     return '#FFFFFF';
+  }
+
+  static textPrimaryFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).textPrimary;
+  }
+
+  static textSecondaryFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).textSecondary;
+  }
+
+  static textMutedFor(rev: number): ResourceColor {
+    return ThemeService.semanticPalette(rev).textMuted;
   }
 
   // ── 文档未逐字给出的控件底色（同设计语言派生，供分段器/标签/代码容器复用）──
@@ -696,9 +736,9 @@ export class TunBoxPing {
     return latencyMs !== null && (latencyMs <= 0 || latencyMs >= TunBoxPing.TIMEOUT_MS);
   }
 
-  static color(latencyMs: number | null): ResourceColor {
+  static color(latencyMs: number | null, rev: number = -1): ResourceColor {
     if (latencyMs === null) {
-      return TunBoxColors.textMuted;
+      return rev >= 0 ? TunBoxColors.textMutedFor(rev) : TunBoxColors.textMuted;
     }
     if (TunBoxPing.isTimeout(latencyMs)) {
       return TunBoxColors.danger;
@@ -730,6 +770,7 @@ export class TunBoxPing {
    * 用户明确要求「要么显示延迟多少、要么显示超时，不要第三种结果」——已经测出结论
    * 却显示成"没测过"，比显示超时更让人误会（用户会以为根本没测速）。
    */
+  /** 缓存结论直接显示，不附加旧标记；时间戳仍由调度/重测策略使用。 */
   static recordText(rec: LatencyRecord | null, nowMs: number): string {
     if (rec === null) {
       return '--';
@@ -739,12 +780,8 @@ export class TunBoxPing {
       if (rec.state === LatencyState.OFFLINE) {
         return `≈${body}`;
       }
-      return LatencyPolicy.isStale(rec, nowMs) ? `${body}·旧` : body;
+      return body;
     }
-    // 失败结论也可能是**上一轮**的（冷启动从持久化快照恢复）。
-    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」：
-    // 旧结论不能顶着一颗新鲜的红「超时」出现在列表里 → 标「·旧」并灰显，
-    // 与「123ms·旧」的既有口径一致（过期 = 中性，不是当前结论）。
     // 瞬态（测试中 / 已取消）不是结论 —— 用状态词，不查结论表。
     if (rec.state === LatencyState.TESTING) {
       return '测试中';
@@ -756,33 +793,23 @@ export class TunBoxPing {
     // 旧实现在这里另有一份 stateText 包装（两份一模一样 ⇒ 审计 LP05），
     // 现在只认内核那一张表：同一个 failKind 在任何来源都得到同一个文案与级别。
     const view = LatencyStore.describe(rec.failKind, rec.delayMs, rec.atMs, nowMs);
-    // 失败结论也可能是**上一轮**的（冷启动从持久化快照恢复）。
-    // 2026-10-20 真机反馈「刚打开软件还没测速就显示超时，测完发现节点是好的」：
-    // 旧结论不能顶着一颗新鲜的红「超时」出现在列表里 → 标「·旧」并灰显，
-    // 与「123ms·旧」的既有口径一致（过期 = 中性，不是当前结论）。
-    if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
-      return `${view.text}·旧`;
-    }
     return view.text;
   }
 
   /**
-   * 状态化配色：实测走阈值；过期结果中性；失败一律红（与 recordText 同口径）。
+   * 状态化配色：缓存与本次实测都走延迟阈值；失败一律红（与 recordText 同口径）。
    *
    * 例外：「节点未生效」（内核代理表里没有它 = 节点根本没进配置）用**警告色**而不是红 ——
    * 红=「节点坏了」，但这种情况节点可能是好的、只是配置生成把它丢了（真机 2026-10-19：
    * 36 个 anytls 被丢弃导致全红，用户以为节点坏了，实际可用）。用警告色把
    * 「配置问题」与「节点问题」在视觉上分开。
    */
-  static recordColor(rec: LatencyRecord | null, nowMs: number): ResourceColor {
+  static recordColor(rec: LatencyRecord | null, nowMs: number, rev: number = -1): ResourceColor {
     if (rec === null) {
-      return TunBoxColors.textMuted;
+      return rev >= 0 ? TunBoxColors.textMutedFor(rev) : TunBoxColors.textMuted;
     }
     if (rec.hasValue()) {
-      if (LatencyPolicy.isStale(rec, nowMs)) {
-        return TunBoxColors.textSecondary;
-      }
-      return TunBoxPing.color(rec.delayMs);
+      return TunBoxPing.color(rec.delayMs, rev);
     }
     // 结论的**级别**（严重程度）同样归真源：describe().level
     // WARN = 「未生效」（内核表里没有它 = 配置把它丢了，节点可能是好的）→ 警告色；
@@ -792,12 +819,8 @@ export class TunBoxPing {
       return TunBoxColors.warning;
     }
     if (view.level === LatencyViewLevel.BAD) {
-      // 陈旧的失败结论（上一轮的）→ 中性灰，不顶红字（与 recordText 同口径）
-      if (LatencyPolicy.isStaleConclusion(rec, nowMs)) {
-        return TunBoxColors.textSecondary;
-      }
       return TunBoxColors.danger;
     }
-    return TunBoxColors.textMuted;
+    return rev >= 0 ? TunBoxColors.textMutedFor(rev) : TunBoxColors.textMuted;
   }
 }

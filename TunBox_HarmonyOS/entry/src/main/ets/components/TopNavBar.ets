@@ -98,7 +98,7 @@ export struct TopNavBar {
         Button() {
           Image($r('app.media.ic_arrow_left'))
             .width(22).height(24)
-            .fillColor(TunBoxColors.textPrimary)
+            .fillColor(TunBoxColors.textPrimaryFor(this.themeRevision))
         }
         .type(ButtonType.Normal)
         .backgroundColor(Color.Transparent)
@@ -110,7 +110,7 @@ export struct TopNavBar {
       Text(this.title)
         .fontSize(20)
         .fontWeight(FontWeight.Bold)
-        .fontColor(TunBoxTextColors.primary)
+        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
         .margin({ left: this.hasBack ? 8 : 0 })
         // 2026-10-19 防溢出：标题与右侧操作区共存时，标题过长不得撑破导航条。
         // 用 layoutWeight(1) 让标题占用剩余空间并可被压缩（原 Blank() 与权重
@@ -125,7 +125,7 @@ export struct TopNavBar {
           Button() {
             Image(this.rightIcon)
               .width(22).height(22)
-              .fillColor(TunBoxColors.textPrimary)
+              .fillColor(TunBoxColors.textPrimaryFor(this.themeRevision))
           }
           .type(ButtonType.Circle)
           .backgroundColor(TunBoxColors.chipBg(this.themeRevision))

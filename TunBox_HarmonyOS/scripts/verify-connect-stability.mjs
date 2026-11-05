@@ -272,26 +272,31 @@ console.log('[B8] connect() 里 selectNode 先于 CONNECTED 且被 await');
   ok('b8.connect-found', connect !== null, '找不到 ConnectionOrchestrator.connect()');
   const ct = connect ? connect.text : '';
 
-  const awaitIdx = ct.indexOf('await this.api.selectNode(');
+  // Production uses the group-scoped API so nested selectors and provider-only
+  // groups are verified against the actual primary group.
+  const awaitIdx = Math.min(...[
+    ct.indexOf('await this.api.selectNodeInGroup('),
+    ct.indexOf('await this.api.selectNode('),
+  ].filter((i) => i >= 0));
   // 2026-10-27：状态写入收敛到 setState()（单入口 + 事件推送），两种写法都接受。
   const connectedRaw = ct.indexOf('this.state = ConnState.CONNECTED;');
   const connectedSet = ct.indexOf('this.setState(ConnState.CONNECTED);');
   const connectedIdx = connectedSet >= 0 ? connectedSet : connectedRaw;
   ok('b8.await-select-node-exists', awaitIdx >= 0,
-    'connect() 里没有 `await this.api.selectNode(`（钉选要么没做，要么没 await）');
+    'connect() 里没有被 await 的节点选择调用');
   ok('b8.connected-assignment-exists', connectedIdx >= 0,
     'connect() 里找不到置 CONNECTED 的语句（this.state = … 或 this.setState(…）');
   ok('b8.pin-before-connected', awaitIdx >= 0 && connectedIdx >= 0 && awaitIdx < connectedIdx,
     `钉选必须在置 CONNECTED 之前完成（await=${awaitIdx}, connected=${connectedIdx}）—— 否则「已连接」上屏时走的是旧节点`);
 
   // fire-and-forget 形态：`this.api.selectNode(...).then(` —— 0.4.0 的写法。
-  const fireAndForget = /this\.api\.selectNode\([\s\S]{0,240}?\)\s*\.then\s*\(/.test(ct);
+  const fireAndForget = /this\.api\.selectNode(?:InGroup)?\([\s\S]{0,240}?\)\s*\.then\s*\(/.test(ct);
   ok('b8.no-fire-and-forget-pin', !fireAndForget,
     '存在 `this.api.selectNode(...).then(...)` fire-and-forget 钉选（不等结果就上屏「已连接」）');
 
   // connect() 内每一处 selectNode 调用都必须被 await（不允许漏掉任何一处）。
-  const calls = ct.match(/(?:await\s+)?this\.api\.selectNode\(/g) || [];
-  const awaited = ct.match(/await\s+this\.api\.selectNode\(/g) || [];
+  const calls = ct.match(/(?:await\s+)?this\.api\.selectNode(?:InGroup)?\(/g) || [];
+  const awaited = ct.match(/await\s+this\.api\.selectNode(?:InGroup)?\(/g) || [];
   ok('b8.all-select-node-awaited', calls.length > 0 && calls.length === awaited.length,
     `connect() 里 ${calls.length} 处 selectNode 调用，只有 ${awaited.length} 处被 await`);
 }
@@ -338,7 +343,7 @@ console.log('[B9] 钉选失败不得静默（抛错或留痕 + 读回校验）')
   const apiText = apiRaw;
   ok('b9.graph-read-back', /const afterJson = await this.proxiesJson\(\)/.test(apiText),
     '选点后必须重新读取真实内核目录');
-  ok('b9.graph-verifies-members', /entry\['now'\] !== pair\[1\]/.test(apiText),
+  ok('b9.graph-verifies-members', /entry\['now'\] !== (?:pair\[1\]|member)/.test(apiText),
     '必须验证所有实际操作组的 now');
   ok('b9.no-fake-success', throws, '选点未生效必须阻止 CONNECTED');
   ok('b9.nested-path', /selectionPath\(/.test(apiText), '嵌套组必须沿组链设置');

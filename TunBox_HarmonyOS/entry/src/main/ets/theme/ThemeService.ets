@@ -15,9 +15,8 @@ export enum AppThemeMode {
 /**
  * 浅色模式背景配色（2026-10-28 用户要求：浅色下可选 Mint / Homebrew / Noctis Hibernus）。
  *
- * 三套配色都只替换**背景渐变**（顶部 → 底部）与页面平色底，卡片/文字/主色一律不动：
- * 卡片是纯白面，任何一套背景下对比度都够；若连卡片一起换色，等于把「浅色主题」
- * 变成三套独立主题，收益低而回归面大。
+ * 默认背景与三套彩色背景分别配套语义文字色和品牌色；卡片/输入表面仍按现有规则
+ * 从背景派生，避免大块纯白表面割裂页面。
  * 深色模式不受影响（深色只有一套已验证的夜间配色）。
  */
 export enum AppBgTheme {
@@ -40,6 +39,39 @@ export class BgThemeColors {
   }
 }
 
+/** Foreground and brand colors that stay legible against each light background. */
+export class ThemeSemanticPalette {
+  readonly backgroundVariant: boolean;
+  readonly textPrimary: string;
+  readonly textSecondary: string;
+  readonly textMuted: string;
+  readonly brandText: string;
+  readonly brandPrimary: string;
+  readonly brandHover: string;
+  readonly brandLight: string;
+  readonly brandBorder: string;
+  readonly dockPillFill: string;
+  readonly modeChipFill: string;
+  readonly modeChipBorder: string;
+
+  constructor(backgroundVariant: boolean, textPrimary: string, textSecondary: string, textMuted: string,
+    brandText: string, brandPrimary: string, brandHover: string, brandLight: string, brandBorder: string,
+    dockPillFill: string, modeChipFill: string, modeChipBorder: string) {
+    this.backgroundVariant = backgroundVariant;
+    this.textPrimary = textPrimary;
+    this.textSecondary = textSecondary;
+    this.textMuted = textMuted;
+    this.brandText = brandText;
+    this.brandPrimary = brandPrimary;
+    this.brandHover = brandHover;
+    this.brandLight = brandLight;
+    this.brandBorder = brandBorder;
+    this.dockPillFill = dockPillFill;
+    this.modeChipFill = modeChipFill;
+    this.modeChipBorder = modeChipBorder;
+  }
+}
+
 /**
  * 应用级主题服务。
  * 未手动选择时使用 COLOR_MODE_NOT_SET 跟随系统；手动选择后持久化 LIGHT/DARK。
@@ -57,6 +89,8 @@ export class ThemeService {
     ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
   /** 浅色模式背景配色（深色模式忽略，见 AppBgTheme 注释） */
   private static bgTheme: AppBgTheme = AppBgTheme.DEFAULT;
+  private static semanticPaletteKey: string = '';
+  private static semanticPaletteValue: ThemeSemanticPalette | null = null;
 
   static async init(context: common.UIAbilityContext): Promise<AppThemeMode> {
     ThemeService.context = context;
@@ -76,6 +110,43 @@ export class ThemeService {
 
   static currentBgTheme(): AppBgTheme {
     return ThemeService.bgTheme;
+  }
+
+  /** Resolve a revision-keyed palette so ArkUI callers can register theme_revision dependencies. */
+  static semanticPalette(rev: number): ThemeSemanticPalette {
+    const dark = ThemeService.isDark();
+    const theme = dark ? AppBgTheme.DEFAULT : ThemeService.bgTheme;
+    const key = `${rev}:${dark ? 'd' : 'l'}:${theme}`;
+    if (key === ThemeService.semanticPaletteKey && ThemeService.semanticPaletteValue !== null) {
+      return ThemeService.semanticPaletteValue;
+    }
+
+    let palette: ThemeSemanticPalette;
+    if (dark) {
+      palette = new ThemeSemanticPalette(false, '#F8FAFC', '#A8B6C8', '#7C8CA3', '#60A5FA',
+        '#3B82F6', '#60A5FA', 'rgba(59, 130, 246, 0.20)', 'rgba(59, 130, 246, 0.42)',
+        'rgba(96, 165, 250, 0.16)', 'rgba(59, 130, 246, 0.32)', 'rgba(59, 130, 246, 0.60)');
+    } else if (theme === AppBgTheme.MINT) {
+      palette = new ThemeSemanticPalette(true, '#12372F', '#31564D', '#49665D', '#05614F',
+        '#06715C', '#055C4B', '#E6F5EF', '#BFE4D7', 'rgba(6, 113, 92, 0.09)',
+        '#D9EFE7', '#B4DCCF');
+    } else if (theme === AppBgTheme.HOMEBREW) {
+      palette = new ThemeSemanticPalette(true, '#352820', '#5B4638', '#6D594C', '#96392F',
+        '#A84237', '#8F372E', '#F9E9E4', '#EAC9C0', 'rgba(168, 66, 55, 0.09)',
+        '#F3DDD6', '#E4BDB1');
+    } else if (theme === AppBgTheme.NOCTIS) {
+      palette = new ThemeSemanticPalette(true, '#2B2A45', '#4A4964', '#5C5A75', '#4B47A4',
+        '#5854B8', '#464398', '#EFEDFA', '#D4D0F0', 'rgba(88, 84, 184, 0.09)',
+        '#DFDCF6', '#C4C0E8');
+    } else {
+      palette = new ThemeSemanticPalette(false, '#0F172A', '#334155', '#475569', '#0A59F7',
+        '#0A59F7', '#0047D4', '#EFF4FF', '#D0E1FD', 'rgba(37, 99, 235, 0.09)',
+        '#E1EBFF', '#BACFFA');
+    }
+
+    ThemeService.semanticPaletteKey = key;
+    ThemeService.semanticPaletteValue = palette;
+    return palette;
   }
 
   /**

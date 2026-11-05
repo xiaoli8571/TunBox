@@ -13,7 +13,7 @@ import { ProxyGroup, ProxyGroupJson } from '../models/ProxyGroup';
 import { SettingsService } from './SettingsService';
 import { SubscriptionService, SubscriptionJson, ProxyNodeJson } from './SubscriptionService';
 import { CredentialStore, SubscriptionCredentialSource } from './CredentialStore';
-import { ProfileRepository } from '../flclash/ProfileRepository';
+import { ProfileRepository } from '../tunbox/ProfileRepository';
 import { ImportFilePolicy } from './ImportFilePolicy';
 import { AppLogger } from '../utils/AppLogger';
 

@@ -22,8 +22,6 @@
 import { router, promptAction, LengthMetrics } from '@kit.ArkUI';
 import { RulesEditorSnapshot, RulesPageParams } from '../commons/models/RulesEditorSnapshot';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
-import { common } from '@kit.AbilityKit';
-import { privacyManager } from '@kit.AppGalleryKit';
 import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { ThemeService, AppThemeMode, AppBgTheme, BgThemeColors } from '../theme/ThemeService';
@@ -37,8 +35,8 @@ import { GeoAssetStatus } from '../commons/services/ConnectionOrchestrator';
 import { LocalSubConverter } from '../commons/services/LocalSubConverter';
 // 订阅转换：URL 拉取 + 与订阅解析同一条转换实现（SubConverter = mihomo ConvertsV2Ray 移植）
 import { SubscriptionFetchPolicy } from '../commons/services/SubscriptionFetchPolicy';
-import { SubConverter } from '../commons/flclash/SubConverter';
-import { ProfileConfigMerger } from '../commons/flclash/ProfileConfigMerger';
+import { SubConverter } from '../commons/tunbox/SubConverter';
+import { ProfileConfigMerger } from '../commons/tunbox/ProfileConfigMerger';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { DiagnosticExportService } from '../commons/services/DiagnosticExportService';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
@@ -88,6 +86,7 @@ export struct SettingsView {
   @State ipv6Enabled: boolean = true;
   /** DNS 覆写开关（默认开）：关闭时优先保留订阅中的 DNS 上游与策略 */
   @State dnsOverrideEnabled: boolean = true;
+  /** FlClash 口径的测速超时（ms，默认 8000，白名单档 §5.7）。 */
   /**
    * 深浅色主题（2026-10-20 新增）：直接镜像 ThemeService 在 AppStorage 里的 theme_mode，
    * 因此主页太阳按钮改了它也会同步（StorageLink 双向）。
@@ -96,14 +95,16 @@ export struct SettingsView {
   @StorageLink('theme_mode') themeMode: AppThemeMode = AppThemeMode.SYSTEM;
   /** 浅色背景配色（2026-10-28 用户要求）：StorageLink 镜像 ThemeService，改完立即全 App 重绘 */
   @StorageLink('bg_theme') bgTheme: AppBgTheme = AppBgTheme.DEFAULT;
-  // ── 关于与隐私 ──
-  @State privacyUrl: string = '';
+  // ── 关于 ──
   @State collectingLogs: boolean = false;
+  @State floatingQuickLaunchEnabled: boolean = false;
   /** 顶栏标题（app.string.settings_title 的本地化取值；TopNavBar.title 为 string 型） */
   private settingsTitle: string = '';
 
   private settings: AppSettings = new AppSettings();
   private openingRules: boolean = false;
+  private floatingQuickLaunchWriteSequence: number = 0;
+  private persistedFloatingQuickLaunchEnabled: boolean = false;
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
   private subs: SubscriptionService = SubscriptionService.instance();
 
@@ -131,6 +132,9 @@ export struct SettingsView {
     await SettingsService.init(ctx);
     await this.subs.init(ctx);
     this.settings = await SettingsService.load();
+    this.floatingQuickLaunchEnabled = this.settings.floatingQuickLaunchEnabled;
+    this.persistedFloatingQuickLaunchEnabled = this.settings.floatingQuickLaunchEnabled;
+    AppStorage.setOrCreate('floating_quick_launch_enabled', this.settings.floatingQuickLaunchEnabled);
     this.refreshAppRoutingSummary();
     // 每次进入：从持久化读取真实值回填（缺字段/脏值由 AppSettings.fromJson 兜底）
     this.autoSelectMode = AutoSelectModes.normalize(this.settings.autoSelectMode);
@@ -139,7 +143,6 @@ export struct SettingsView {
     this.assetSource = this.settings.assetSource;
     this.refreshGeoStatuses();
     this.refreshNodeAndSwitchInfo();
-    this.refreshPrivacyLink();
   }
 
   private async exportDiagnosticLogs(): Promise<void> {
@@ -175,35 +178,6 @@ export struct SettingsView {
     } finally {
       this.openingRules = false;
     }
-  }
-
-  /** 查询华为应用市场托管的隐私声明链接（AppGallery Kit 隐私管理服务，官方要求应用内入口与弹窗内容一致） */
-  private refreshPrivacyLink(): void {
-    try {
-      const info: privacyManager.AppPrivacyMgmtInfo = privacyManager.getAppPrivacyMgmtInfo();
-      const links: privacyManager.AppPrivacyLink[] = info.privacyInfo;
-      for (let i = 0; i < links.length; i++) {
-        const url = links[i].url;
-        if (typeof url === 'string' && url.length > 0) {
-          this.privacyUrl = url;
-          break;
-        }
-      }
-    } catch (e) {
-      // 未关联隐私托管（debug 包 / 未在 AGC 生成协议）时接口抛错：保持空值，点击时给出提示
-    }
-  }
-
-  private openPrivacyPolicy(): void {
-    if (this.privacyUrl.length === 0) {
-      promptAction.showToast({ message: $r('app.string.settings_privacy_unavailable') });
-      return;
-    }
-    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    context.openLink(this.privacyUrl)
-      .catch(() => {
-        promptAction.showToast({ message: $r('app.string.settings_privacy_unavailable') });
-      });
   }
 
   /** 只展示当前模式对应的数量，切回本页时与保存结果同步。 */
@@ -293,6 +267,23 @@ export struct SettingsView {
     });
   }
 
+  private setFloatingQuickLaunchEnabled(v: boolean): void {    this.floatingQuickLaunchEnabled = v;
+    AppStorage.setOrCreate('floating_quick_launch_enabled', v);
+    const sequence = ++this.floatingQuickLaunchWriteSequence;
+    SettingsService.patchSettings((s: AppSettings): void => {
+      s.floatingQuickLaunchEnabled = v;
+    }).then((): void => {
+      this.persistedFloatingQuickLaunchEnabled = v;
+    }).catch((): void => {
+      if (sequence !== this.floatingQuickLaunchWriteSequence) {
+        return;
+      }
+      this.floatingQuickLaunchEnabled = this.persistedFloatingQuickLaunchEnabled;
+      AppStorage.setOrCreate('floating_quick_launch_enabled', this.persistedFloatingQuickLaunchEnabled);
+      promptAction.showToast({ message: $r('app.string.settings_save_failed_toast') });
+    });
+  }
+
 
   /**
    * 深浅色主题：默认跟随系统（SYSTEM）。关掉「跟随系统」时固定为当前外观，
@@ -374,7 +365,27 @@ export struct SettingsView {
       const err = await this.orchestrator.refreshGeoAsset(id, this.assetSource);
       promptAction.showToast({ message: err.length > 0 ? err : '更新完成' });
     } catch (e) {
-      promptAction.showToast({ message: '更新失败，请重试' });
+      promptAction.showToast({ message: id === 'model'
+        ? '模型下载失败，请先使用普通节点启动代理，再点击更新重试' : '更新失败，请重试' });
+    } finally {
+      this.geoUpdatingId = '';
+      this.refreshGeoStatuses();
+    }
+  }
+
+  private async deleteSmartModel(): Promise<void> {
+    if (this.geoUpdatingId.length > 0) { return; }
+    this.geoUpdatingId = 'model';
+    try {
+      const error = this.orchestrator.deleteGeoAsset('model');
+      if (error.length > 0) { promptAction.showToast({ message: error }); return; }
+      await SettingsService.patchSettings((settings: AppSettings): void => {
+        settings.autoSelectMode = AutoSelectModes.MANUAL;
+      });
+      this.autoSelectMode = AutoSelectModes.MANUAL;
+      promptAction.showToast({ message: '模型已删除，智能选择已关闭' });
+    } catch (e) {
+      promptAction.showToast({ message: '删除失败，请重试' });
     } finally {
       this.geoUpdatingId = '';
       this.refreshGeoStatuses();
@@ -399,18 +410,18 @@ export struct SettingsView {
               Row({ space: 8 }) {
                 Row() {
                   Image($r('app.media.ic_apps'))
-                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                    .width(16).height(16).fillColor(TunBoxColors.primaryFor(this.themeRevision))
                 }
                 .width(28).height(28).borderRadius(8)
-                .backgroundColor(TunBoxColors.primaryLight)
+                .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                 .justifyContent(FlexAlign.Center)
-                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+                Text('应用分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
-                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                  .width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text(this.appRoutingSummary)
-                .fontSize(12).fontColor(TunBoxTextColors.secondary).width('100%')
+                .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision)).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -423,18 +434,18 @@ export struct SettingsView {
               Row({ space: 8 }) {
                 Row() {
                   Image($r('app.media.ic_route'))
-                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                    .width(16).height(16).fillColor(TunBoxColors.primaryFor(this.themeRevision))
                 }
                 .width(28).height(28).borderRadius(8)
-                .backgroundColor(TunBoxColors.primaryLight)
+                .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                 .justifyContent(FlexAlign.Center)
-                Text('网站分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+                Text('网站分流').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
-                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                  .width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text(`代理 ${this.settings.forceProxySites.length} · 直连 ${this.settings.forceDirectSites.length}`)
-                .fontSize(12).fontColor(TunBoxTextColors.secondary).width('100%')
+                .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision)).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -442,23 +453,46 @@ export struct SettingsView {
             .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
             .onClick(() => router.pushUrl({ url: 'pages/SiteRoutingPage' }))
 
+            // ── DNS 查询：实时解析日志（FlClash DNS 查询页等价物）──
+            Column({ space: 6 }) {
+              Row({ space: 8 }) {
+                Row() {
+                  Image($r('app.media.ic_chart'))
+                    .width(16).height(16).fillColor(TunBoxColors.primaryFor(this.themeRevision))
+                }
+                .width(28).height(28).borderRadius(8)
+                .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
+                .justifyContent(FlexAlign.Center)
+                Text('DNS 查询').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+                Blank()
+                Image($r('app.media.ic_arrow_right'))
+                  .width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('实时查看内核 DNS 解析（域名 / IP / 命中）').fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision)).width('100%')
+            }
+            .width('100%').padding(TunBoxGeometry.cardPadding)
+            .borderRadius(TunBoxGeometry.cardRadius)
+            .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
+            .onClick(() => router.pushUrl({ url: 'pages/DnsQueryPage' }))
+
             // ── 广告拦截规则：进入统一页面配置（2026-10-17 自首页「规则模式」卡片迁入）──
             Column({ space: 6 }) {
               Row({ space: 8 }) {
                 Row() {
                   Image($r('app.media.ic_shield'))
-                    .width(16).height(16).fillColor(TunBoxColors.primary)
+                    .width(16).height(16).fillColor(TunBoxColors.primaryFor(this.themeRevision))
                 }
                 .width(28).height(28).borderRadius(8)
-                .backgroundColor(TunBoxColors.primaryLight)
+                .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
                 .justifyContent(FlexAlign.Center)
-                Text('路由与规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+                Text('路由与规则').fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
                 Blank()
                 Image($r('app.media.ic_arrow_right'))
-                  .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                  .width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text(this.adRulesSummary)
-                .fontSize(12).fontColor(TunBoxTextColors.secondary).width('100%')
+                .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision)).width('100%')
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -473,82 +507,81 @@ export struct SettingsView {
 
               Row() {
                 Text('IPv6 双栈')
-                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.ipv6Enabled })
-                  .selectedColor(TunBoxColors.primary)
+                  .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
                   .onChange((v: boolean): void => this.setIpv6Enabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('IPv6 也走代理；关闭则纯 IPv4。改动会自动重连。')
-                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
 
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
 
               Row() {
                 Text('DNS 覆写')
-                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.dnsOverrideEnabled })
-                  .selectedColor(TunBoxColors.primary)
+                  .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
                   .onChange((v: boolean): void => this.setDnsOverrideEnabled(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('开启后使用 TunBox 配置的加密上游（DoT）；关闭后优先保留订阅 DNS。改动会自动重连。')
-                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
 
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
-
-              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
-
-              // Smart 选点模型（原「数据与规则」里的 model 资产，2026-10-28 并入本分类）
               Row({ space: 8 }) {
-                Column({ space: 2 }) {
-                  Text('Smart 选点模型')
-                    .fontSize(14).fontColor(TunBoxTextColors.primary)
-                    .maxLines(1)
-                  Text(this.smartModelStatusText())
-                    .fontSize(11).fontColor(TunBoxTextColors.muted)
-                    .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-                }
-                .layoutWeight(1)
-                .alignItems(HorizontalAlign.Start)
-                Text(this.geoUpdatingId === 'model' ? '更新中…' : '更新')
-                  .fontSize(13).fontWeight(FontWeight.Medium)
-                  .fontColor(this.geoUpdatingId === 'model' ? TunBoxTextColors.muted : TunBoxTextColors.accentBlue)
-                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-                  .borderRadius(10)
-                  .backgroundColor(TunBoxColors.primaryLight)
-                  .onClick((): void => {
-                    if (this.geoUpdatingId.length === 0) {
-                      this.updateAsset('model');
-                    }
-                  })
-              }
-              .width('100%')
-              .alignItems(VerticalAlign.Center)
+                Column({ space: 4 }) {
+                  Text('Smart 选点模型').fontSize(14)
+                    .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+                  Text(this.smartModelStatusText()).fontSize(11)
+                    .fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
+                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
+                Button(this.geoUpdatingId === 'model' ? '处理中…' : '更新')
+                  .fontSize(12).height(32)
+                  .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(Color.White)
+                  .enabled(this.geoUpdatingId.length === 0)
+                  .onClick(() => this.updateAsset('model'))
+                Button('删除').fontSize(12).height(32)
+                  .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
+                  .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+                  .enabled(this.geoUpdatingId.length === 0)
+                  .onClick(() => this.deleteSmartModel())
+              }.width('100%').alignItems(VerticalAlign.Center)
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
             .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
             .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
-            // ── 关于与隐私 ──
+            // ── 关于 ──
             Column({ space: 12 }) {
               this.SectionHeader($r('app.media.ic_globe'), $r('app.string.settings_about_title'))
               Row() {
                 Text($r('app.string.settings_version_label'))
-                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
                 Text(AppInfo.version())
-                  .fontSize(13).fontColor(TunBoxTextColors.secondary)
+                  .fontSize(13).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
               }.width('100%')
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
-              // 2026-10-23 用户口径：主题跟随系统放在「版本」和「隐私政策」中间
+              // 主题设置紧跟版本信息，便于快速调整外观。
               Row() {
                 Text('主题跟随系统')
-                  .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
                 Toggle({ type: ToggleType.Switch, isOn: this.themeMode === AppThemeMode.SYSTEM })
-                  .selectedColor(TunBoxColors.primary)
+                  .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
                   .onChange((v: boolean): void => this.setFollowSystemTheme(v))
               }.width('100%').alignItems(VerticalAlign.Center)
               Text('关闭后由主页太阳按钮手动切换深浅色。')
-                .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+                .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
+              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
+              Row() {
+                Text('悬浮启动按钮')
+                  .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
+                Toggle({ type: ToggleType.Switch, isOn: this.floatingQuickLaunchEnabled })
+                  .selectedColor(TunBoxColors.primaryFor(this.themeRevision))
+                  .onChange((v: boolean): void => this.setFloatingQuickLaunchEnabled(v))
+              }.width('100%').alignItems(VerticalAlign.Center)
+              Text('在主页、数据和设置底栏右侧显示快捷连接按钮。')
+                .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               // 2026-10-28 用户要求：浅色模式下背景色可选 Mint / Homebrew / Noctis Hibernus
               // （深色只有一套夜间配色，故深色下这组选择器隐藏而不是置灰 —— 置灰会让人以为选不了是 bug）
@@ -556,19 +589,19 @@ export struct SettingsView {
                 this.BgThemePicker()
                 Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               }
-              // 2026-10-27：主页右上角「备份」迁到这里（关于与隐私卡内），功能不变。
+              // 2026-10-27：主页右上角「备份」迁到这里，功能不变。
               // 2026-11-03 用户反馈「点功能的其他位置没反应」：可点区域原来只有标题 Text 那一行
               // （约 15vp 高），标题上下留白与说明文字都不在命中区内。三行统一改成
               // 「标题 + 说明」整块 Column 绑定 onClick，并给上下 8vp 内边距撑到舒适点击区。
               Column({ space: 6 }) {
                 Row() {
-                  Text('配置备份与恢复')
-                    .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  Text('备份与恢复')
+                    .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
                   Image($r('app.media.ic_arrow_right'))
-                    .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                    .width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
                 }.width('100%').alignItems(VerticalAlign.Center)
                 Text('导出/导入订阅、节点与自定义规则；支持 AES-256 加密备份。')
-                  .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+                  .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
               }
               .width('100%')
               .padding({ top: 8, bottom: 8 })
@@ -580,32 +613,18 @@ export struct SettingsView {
               Divider().color(TunBoxColors.cardBorder(this.themeRevision))
               Column({ space: 6 }) {
                 Row() {
-                  Text(this.collectingLogs ? '正在收集日志…' : '一键收集并导出日志')
-                    .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+                  Text(this.collectingLogs ? '正在导出…' : '导出日志')
+                    .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
                   Image($r('app.media.ic_arrow_right'))
-                    .width(16).height(16).fillColor(TunBoxColors.textMuted)
+                    .width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
                 }.width('100%').alignItems(VerticalAlign.Center)
                 Text('收集应用、VPN、内核及资源记录，自动脱敏；不包含订阅配置。')
-                  .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+                  .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
               }
               .width('100%')
               .padding({ top: 8, bottom: 8 })
               .enabled(!this.collectingLogs)
               .onClick(() => this.exportDiagnosticLogs())
-              Divider().color(TunBoxColors.cardBorder(this.themeRevision))
-              Column({ space: 6 }) {
-                Row() {
-                  Text($r('app.string.settings_privacy_policy_row'))
-                    .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
-                  Image($r('app.media.ic_arrow_right'))
-                    .width(16).height(16).fillColor(TunBoxColors.textMuted)
-                }.width('100%').alignItems(VerticalAlign.Center)
-                Text($r('app.string.settings_privacy_policy_desc'))
-                  .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
-              }
-              .width('100%')
-              .padding({ top: 8, bottom: 8 })
-              .onClick(() => this.openPrivacyPolicy())
             }
             .width('100%').padding(TunBoxGeometry.cardPadding)
             .borderRadius(TunBoxGeometry.cardRadius)
@@ -638,8 +657,8 @@ export struct SettingsView {
   @Builder
   SectionHeader(icon: Resource, title: ResourceStr) {
     Row({ space: 8 }) {
-      Image(icon).width(18).height(18).fillColor(TunBoxColors.primary)
-      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primary)
+      Image(icon).width(18).height(18).fillColor(TunBoxColors.primaryFor(this.themeRevision))
+      Text(title).fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
       Blank()
     }
     .width('100%')
@@ -677,9 +696,9 @@ export struct SettingsView {
     Column({ space: 10 }) {
       Row() {
         Text('浅色背景')
-          .fontSize(14).fontColor(TunBoxTextColors.primary).layoutWeight(1)
+          .fontSize(14).fontColor(TunBoxTextColors.primaryFor(this.themeRevision)).layoutWeight(1)
         Text(this.bgThemeLabel(this.bgTheme))
-          .fontSize(12).fontColor(TunBoxTextColors.secondary)
+          .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
       }.width('100%').alignItems(VerticalAlign.Center)
       Row({ space: 10 }) {
         ForEach(BG_THEME_OPTIONS, (item: AppBgTheme) => {
@@ -693,11 +712,11 @@ export struct SettingsView {
               })
               .border({
                 width: this.bgTheme === item ? 2 : 1,
-                color: this.bgTheme === item ? TunBoxColors.primary : TunBoxColors.cardBorder(this.themeRevision)
+                color: this.bgTheme === item ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.cardBorder(this.themeRevision)
               })
             Text(this.bgThemeLabel(item))
               .fontSize(11)
-              .fontColor(this.bgTheme === item ? TunBoxTextColors.accentBlue : TunBoxTextColors.secondary)
+              .fontColor(this.bgTheme === item ? TunBoxTextColors.accentBlueFor(this.themeRevision) : TunBoxTextColors.secondaryFor(this.themeRevision))
               .fontWeight(this.bgTheme === item ? FontWeight.Medium : FontWeight.Regular)
           }
           .layoutWeight(1)
@@ -713,8 +732,8 @@ export struct SettingsView {
           })
         }, (item: AppBgTheme) => item)
       }.width('100%')
-      Text('只影响浅色模式：页面背景、卡片与输入框会一起换成同色系；文字与品牌色不变。深色模式固定一套夜间配色。')
-        .fontSize(11).fontColor(TunBoxTextColors.muted).width('100%')
+      Text('四套浅色背景分别配套文字与品牌色；深色模式使用独立夜间配色。')
+        .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).width('100%')
     }
     .width('100%')
   }

@@ -40,13 +40,13 @@ load('commons/latency/LatencyDnsVerdict.ets', 'LatencyDnsStatus,LatencyDnsVerdic
 load('commons/latency/LatencyProbe.ets', 'LatencyProbe,LatencyKernelEndpoint,LatencyHttpReply');
 ctx.CoreLatencyProbe = ctx.LatencyProbe;
 const { ClashApiService: Api } = load('commons/services/ClashApiService.ets', 'ClashApiService');
-const { CoreCatalog } = load('commons/flclash/CoreCatalog.ets', 'CoreCatalog');
+const { CoreCatalog } = load('commons/tunbox/CoreCatalog.ets', 'CoreCatalog');
 load('commons/models/ProxyNode.ets', 'ProxyNode,ProxyNodeType');
-load('commons/flclash/CoreNodeBridge.ets', 'CoreNodeBridge');
-const { ProxyPanelMembers: Members } = load('commons/flclash/ProxyPanelMembers.ets', 'ProxyPanelMembers');
-const { CoreCatalogService: Catalog } = load('commons/flclash/CoreCatalogService.ets', 'CoreCatalogService');
-const { DelayTarget, DelayHttpReply, DelayRequestHandle, FlclashDelayRun, FlclashDelayPolicy } =
-  load('commons/flclash/FlclashDelay.ets', 'DelayTarget,DelayHttpReply,DelayRequestHandle,FlclashDelayRun,FlclashDelayPolicy,FLCLASH_DELAY_TIMED_OUT,FLCLASH_DELAY_FAILED,FLCLASH_DELAY_URL,delayTestKey');
+load('commons/tunbox/CoreNodeBridge.ets', 'CoreNodeBridge');
+const { ProxyPanelMembers: Members } = load('commons/tunbox/ProxyPanelMembers.ets', 'ProxyPanelMembers');
+const { CoreCatalogService: Catalog } = load('commons/tunbox/CoreCatalogService.ets', 'CoreCatalogService');
+const { DelayTarget, DelayHttpReply, DelayRequestHandle, TunBoxDelayRun, TunBoxDelayPolicy } =
+  load('commons/tunbox/TunBoxDelay.ets', 'DelayTarget,DelayHttpReply,DelayRequestHandle,TunBoxDelayRun,TunBoxDelayPolicy,TUNBOX_DELAY_TIMED_OUT,TUNBOX_DELAY_FAILED,TUNBOX_DELAY_URL,delayTestKey');
 const targetSource = read('commons/config/RuntimeConfigBuilder.ets').match(/^export class ConnectionTarget \{[\s\S]*?^}/m)[0];
 Object.assign(ctx, evaluate(targetSource, 'ConnectionTarget'));
 const { KernelSelectionManager: Selection } = load('commons/services/KernelSelectionManager.ets', 'KernelSelectionManager');
@@ -81,7 +81,7 @@ await test('both delay engines use the encoded provider healthcheck route', asyn
   const urls = [], transport = { send(url) {
     urls.push(url); return new DelayRequestHandle(Promise.resolve(new DelayHttpReply(200,'{"delay":25}')),()=>{});
   } };
-  const engine = new FlclashDelayRun('http://127.0.0.1:9090','',transport,new FlclashDelayPolicy());
+  const engine = new TunBoxDelayRun('http://127.0.0.1:9090','',transport,new TunBoxDelayPolicy());
   const summary = await new Promise(resolve => engine.start([new DelayTarget(leaf,'https://example.test/204','','200-299',api.providerForProxy(leaf))],()=>{},resolve));
   assert.equal(summary.measured,1);
   assert.equal(new URL(urls[0]).pathname, `/providers/proxies/${encodeURIComponent(owner)}/${encodeURIComponent(leaf)}/healthcheck`);
@@ -94,10 +94,10 @@ await test('the actual latency service passes provider ownership to its engine a
   load('commons/services/LatencyLiveView.ets','LatencyLiveView');
   ctx.ConnectionOrchestrator={testCoreBusyProbes:[]};
   const urls=[];
-  ctx.FlclashDelayRun=class extends FlclashDelayRun {
+  ctx.TunBoxDelayRun=class extends TunBoxDelayRun {
     constructor(base,secret){super(base,secret,{send(url){urls.push(url);return new DelayRequestHandle(Promise.resolve(new DelayHttpReply(200,'{"delay":33}')),()=>{});}});}
   };
-  const {FlclashLatencyService:Service}=load('commons/flclash/FlclashLatencyService.ets','FlclashLatencyService');
+  const {TunBoxLatencyService:Service}=load('commons/tunbox/TunBoxLatencyService.ets','TunBoxLatencyService');
   const progress=await Service.start(api,[leaf],'https://example.test/204').wait();
   assert.equal(progress.total,1); assert.equal(progress.measured,1);
   assert.ok(urls[0].includes('/providers/proxies/')); assert.equal(ctx.LatencyLiveView.latencyFor(leaf),33);
@@ -188,7 +188,7 @@ try {
     assert.equal((await fetch(`${base}/proxies/wire-node/delay?url=${encodeURIComponent(url)}&timeout=3000`)).status,404);
     const transport={send(url,headers){const abort=new AbortController();return new DelayRequestHandle(
       fetch(url,{headers,signal:abort.signal}).then(async r=>new DelayHttpReply(r.status,await r.text())),()=>abort.abort());}};
-    const engine=new FlclashDelayRun(base,'',transport,new FlclashDelayPolicy());
+    const engine=new TunBoxDelayRun(base,'',transport,new TunBoxDelayPolicy());
     const results=[];
     const summary=await new Promise(resolve=>engine.start([new DelayTarget('wire-node',url,'','',live.providerForProxy('wire-node'))],r=>results.push(r),resolve));
     assert.equal(summary.measured,1); assert.ok(results[0].value>0); assert.equal(summary.failed,0);

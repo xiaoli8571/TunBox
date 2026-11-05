@@ -13,21 +13,106 @@ import { harness } from './orchestrator-runtime-harness.mjs';
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const sources = path.join(project, 'entry/src/main/ets');
 const core = path.join(project, '../mihomo-build/mihomo-smart-462455136157a760937c666bba71afe33b1a809e');
-const scratch = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'tunbox-review-regression-'));
+const scratch = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'tunbox-probe-review-regression-'));
 const helper = path.join(scratch, 'prepare.exe');
-const build = spawnSync('go', ['build', '-o', helper, path.join(project, 'scripts/fixtures/profile-prepare/main.go')],
+// Compile the production validator/projection, replacing only its package name.
+// PrepareProfile is stricter than the actual import validator and cannot stand
+// in for ValidateProfile without changing which subscriptions this gate accepts.
+const nativeSource = path.join(scratch, 'profile.go');
+const nativeMain = path.join(scratch, 'main.go');
+fs.writeFileSync(nativeSource, fs.readFileSync(path.join(core, 'bridge/profile.go'), 'utf8').replace(/^package bridge\r?$/m, 'package main'));
+fs.writeFileSync(nativeMain, `package main
+import ("encoding/json"; "io"; "os"; "github.com/metacubex/mihomo/config")
+func main() {
+  data, _ := io.ReadAll(os.Stdin)
+  reply := map[string]any{}
+  var err error
+  if len(os.Args) > 1 && os.Args[1] == "validate" {
+    var request struct { Content, Key, Path string }
+    err = json.Unmarshal(data, &request)
+    if err == nil { err = ValidateProfile([]byte(request.Content), request.Key, request.Path) }
+  } else if len(os.Args) > 1 && os.Args[1] == "base" {
+    var out *ProfileOutbounds
+    out, err = GetProfileOutbounds(string(data))
+    if err == nil { reply["proxies"] = len(out.Proxies) }
+  } else {
+    var prepared []byte
+    prepared, err = config.PrepareProfile(data)
+    reply["yaml"] = string(prepared)
+  }
+  if err != nil { reply["error"] = err.Error() }
+  _ = json.NewEncoder(os.Stdout).Encode(reply)
+}
+`);
+const build = spawnSync('go', ['build', '-o', helper, nativeMain, nativeSource],
   {cwd:core, encoding:'utf8', timeout:180000});
 assert.equal(build.status, 0, build.stderr);
-const logger = {info(){},warn(){},error(){},errText:String};
+const logger = {info(){},warn(){},error(){},errText:(e)=>String(e)+(e&&e.stack?String(e.stack):'')};
 const http = { RequestMethod:{GET:'GET',PUT:'PUT'}, response:null, createHttp(){
   return {request(...args){return http.response ? http.response(...args) : new Promise(()=>{});},destroy(){}};
 }};
+// 沙箱 fs：所有路径重定向进 scratch（validateAndStore 会写 <pathOf(id)>.validate.tmp，
+// VM 里 ProfileRepository.dirPath 未初始化 ⇒ 路径是盘根绝对形式，必须重定向）
+const sandboxFs = new Proxy({}, {
+  get(_t, prop) {
+    if (prop === 'OpenMode') {
+      // OHOS fileIo.OpenMode 的数字值（POSIX 同值），供 ProfileRepository 的位或表达式使用
+      return { READ_ONLY: 0, WRITE_ONLY: 1, READ_WRITE: 2, CREATE: 64, TRUNC: 512, APPEND: 1024 };
+    }
+    const real = fs[prop];
+    if (typeof real !== 'function') {
+      return real;
+    }
+    if (prop === 'openSync') {
+      // OHOS OpenMode 数字标志 -> node 字符串标志（READ_ONLY=0/WRITE_ONLY=1/
+      // READ_WRITE=2 + CREATE=64 + TRUNC=512 + APPEND=1024）
+      return (...args) => {
+        const mapped = args.map((x) => (typeof x === 'string' && /^([A-Za-z]:)?[\\/]/.test(x)
+          ? path.join(scratch, x.replace(/[\\/:]+/g, '_')) : x));
+        if (typeof mapped[1] === 'number') {
+          const f = mapped[1];
+          const create = (f & 64) !== 0;
+          const trunc = (f & 512) !== 0;
+          const append = (f & 1024) !== 0;
+          const rw = (f & 3) === 2;
+          const wo = (f & 3) === 1;
+          mapped[1] = append ? 'a+' : (rw ? (create ? (trunc ? 'w+' : 'r+') : 'r+') : (wo ? 'w' : 'r'));
+        }
+        const fd = real(...mapped);
+        // OHOS openSync 返回 File{fd}；node 返回数字。包一层保持调用方 .fd 可用。
+        return { fd };
+      };
+    }
+    if (prop === 'closeSync' || prop === 'fsyncSync') {
+      return (...args) => {
+        const mapped = args.map((x) => (x !== null && typeof x === 'object' && typeof x.fd === 'number' ? x.fd : x));
+        return real(...mapped);
+      };
+    }
+    return (...args) => {
+      const mapped = args.map((x) => (typeof x === 'string' && /^([A-Za-z]:)?[\\/]/.test(x)
+        ? path.join(scratch, x.replace(/[\\/:]+/g, '_')) : x));
+      return real(...mapped);
+    };
+  },
+});
 const sandbox = vm.createContext({setTimeout:(fn,ms)=>setTimeout(fn,ms===30000?25:ms),clearTimeout,
-  Date,Map,Set,Promise,JSON,Math,console,http,AppLogger:logger,
-  // FlclashLatencyService 末尾会把 recycleProbe 注册进这个静态表（模块级副作用）；
+  Date,Map,Set,Promise,JSON,Math,console,http,fs:sandboxFs,AppLogger:logger,
+  // TunBoxLatencyService 末尾会把 recycleProbe 注册进这个静态表（模块级副作用）；
   // vm 沙箱剥掉了 import，必须自带桩，否则 ReferenceError（存量红，2026-10-26 补）。
   ConnectionOrchestrator:{testCoreBusyProbes:[],instance:()=>({})},
-  LatencyTestUrl:{DEFAULT_URL:'https://www.gstatic.com/generate_204'}});
+  LatencyTestUrl:{DEFAULT_URL:'https://www.gstatic.com/generate_204'},
+  coreBridge:{ async validateProfile(content,key,target) {
+      const r=spawnSync(helper,['validate'],{input:JSON.stringify({Content:content,Key:key,Path:target}),encoding:'utf8',timeout:10000});
+      assert.equal(r.status,0,r.stderr);
+      const reply=JSON.parse(r.stdout);
+      if(reply.error) throw Error(reply.error);
+    }, async getProfileBase(p){
+      const r=spawnSync(helper,['base'],{input:p,encoding:'utf8',timeout:10000});
+      assert.equal(r.status,0,r.stderr);
+      const reply=JSON.parse(r.stdout||'{}');
+      if(reply.error) throw Error(reply.error);
+      return {config:{},digest:'sandbox',proxies:reply.proxies,proxyGroups:0,rules:0,matchRules:[]}; } }});
 function load(file, exports) {
   const code=fs.readFileSync(path.join(sources,file),'utf8').replace(/^import\b[\s\S]*?;\r?\n/gm,'').replace(/^export /gm,'');
   const result=vm.runInContext(stripTypeScriptTypes(`(()=>{${code}\nreturn {${exports}}})()`,{mode:'transform'}),sandbox);
@@ -43,14 +128,18 @@ function prepare(text) {
 let count=0;
 async function test(name, run){await run();count++;console.log('PASS '+name);}
 load('commons/services/YamlMerger.ets','YamlMerger');
-const {ProfileConfigMerger:M}=load('commons/flclash/ProfileConfigMerger.ets','ProfileConfigMerger');
+const {ProfileConfigMerger:M}=load('commons/tunbox/ProfileConfigMerger.ets','ProfileConfigMerger');
 load('commons/subscription/UriNodeParser.ets','UriNodeParser');
 load('commons/subscription/BodyDispatch.ets','BodyDispatch,BodyKind');
-const {SubConverter}=load('commons/flclash/SubConverter.ets','SubConverter');
-const {ProfileRepository:P}=load('commons/flclash/ProfileRepository.ets','ProfileRepository');
-P.attachConverter(text=>SubConverter.convert(text).proxiesYaml);
+// 2026-11-05（FlClash 照抄）：compose 的全局依赖（import 被剥掉，符号须在沙箱）
+sandbox.ClashConfigGenerator={SMART_GROUP_NAME:'♻️ 自动选择',SMART_INFO_NODE_FILTER:''};
+sandbox.tunboxUserAgent=()=>'TunBox/v-harness clash-verge Platform/OpenHarmony';
+const {TunBoxProfileBuilder,TunBoxProfileInput}=load('commons/tunbox/TunBoxProfileBuilder.ets','TunBoxProfileBuilder,TunBoxProfileInput');
+const {SubConverter}=load('commons/tunbox/SubConverter.ets','SubConverter');
+const {ProfileRepository:P}=load('commons/tunbox/ProfileRepository.ets','ProfileRepository');
 P.attachPreparer(async text=>prepare(text));
-const files=new Map(); P.write=(id,text)=>{files.set(id,text);return true;};
+P.dirPath=path.join(scratch,'profiles');
+const files={get:id=>fs.existsSync(P.pathOf(id)) ? fs.readFileSync(P.pathOf(id),'utf8') : undefined};
 const flow='proxies:\n  - {type: socks5, name: A, server: 127.0.0.1, port: 9}\n';
 const quoted="proxies:\n  - name: 'A''B'\n    type: socks5\n    server: 127.0.0.1\n    port: 9\n";
 const anchor='template: &t\n  type: socks5\n  server: 127.0.0.1\n  port: 9\nproxies:\n  - name: A\n    <<: *t\n';
@@ -60,51 +149,86 @@ await test('wrapped YAML is decoded before profile validation',async()=>{
   assert.equal((await P.validateAndStore('wrapped',Buffer.from(flow).toString('base64'))).ok,true);
   assert.equal(files.get('plain'),files.get('wrapped'));
 });
-await test('invalid outbound never overwrites the previous profile',async()=>{
+await test('malformed YAML never overwrites the previous profile',async()=>{
   const before=files.get('plain');
-  const result=await P.validateAndStore('plain','proxies:\n - {name: broken, type: invalid-protocol}\n');
+  const result=await P.validateAndStore('plain','proxies: [unterminated');
   assert.equal(result.ok,false);assert.equal(files.get('plain'),before);
 });
-await test('flow maps and escaped single-quoted names get valid group references',async()=>{
-  assert.ok(M.withSyntheticGroups(flow).includes('proxy-groups:'));
-  assert.ok(M.withSyntheticGroups(quoted).includes("A''B"));
-  for(const yaml of [flow,quoted]){const merged=M.merge(overlay,prepare(yaml));assert.equal(merged.ok,true);prepare(merged.yaml);}
+await test('native import validation preserves raw mappings; runtime validation determines dialability',async()=>{
+  const raw='proxies:\n - {name: unknown, type: invalid-protocol}\n';
+  assert.equal((await P.validateAndStore('raw-mapping',raw)).ok,true);
+  assert.equal(files.get('raw-mapping'),raw);
 });
-await test('anchors are resolved in the whole document before section merge',async()=>{
-  const normalized=prepare(anchor);assert.ok(!normalized.includes('*t'));
-  assert.ok(M.merge(overlay,normalized).ok);prepare(M.merge(overlay,normalized).yaml);
+await test('age key requests and wrong keys preserve the previous profile',async()=>{
+  const before=files.get('plain');
+  const encrypted='-----BEGIN AGE ENCRYPTED FILE-----\ninvalid\n-----END AGE ENCRYPTED FILE-----\n';
+  const missing=await P.validateAndStore('plain',encrypted);
+  assert.equal(missing.ok,false); assert.equal(missing.needAgeSecretKey,true);
+  assert.equal(files.get('plain'),before);
+  let saved=0; const save=P.setAgeSecretKey;
+  P.setAgeSecretKey=async()=>{saved++;};
+  const rejected=await P.validateAndStore('plain',encrypted,'invalid-secret-key');
+  assert.equal(rejected.ok,false); assert.equal(saved,0); assert.equal(files.get('plain'),before);
+  P.setAgeSecretKey=save;
 });
-await test('nested DNS and group headers keep their relative indentation',async()=>{
-  const profile=prepare(flow+'dns:\n  enable: true\n  nameserver:\n    - https://doh.pub/dns-query\n  nameserver-policy:\n    example.com:\n      - https://dns.alidns.com/dns-query\n');
-  prepare(M.merge(overlay,profile).yaml);
+await test('flow maps and escaped single-quoted names are accepted by the kernel validator',async()=>{
+  // FlClash 照抄：合并层消失，原文经内核 UnmarshalRawConfig 校验（helper 现编同步语义）
+  assert.ok((await P.validateAndStore('flow',flow)).ok);
+  assert.ok((await P.validateAndStore('quoted',quoted)).ok);
 });
-await test('explicit DNS enhanced modes are preserved without duplicate defaults',async()=>{
+await test('anchors are resolved by the kernel before validation',async()=>{
+  // 内核解析整份文档（yaml.v3 原生支持锚点/合并键）；helper 现编同源校验
+  assert.ok((await P.validateAndStore('anchor',anchor)).ok);
+});
+await test('nested DNS and group headers are parsed by the kernel',async()=>{
+  assert.ok((await P.validateAndStore('nested',
+    flow+'dns:\n  enable: true\n  nameserver:\n    - https://doh.pub/dns-query\n  nameserver-policy:\n    example.com:\n      - https://dns.alidns.com/dns-query\n')).ok);
+});
+await test('compose keeps explicit DNS enhanced modes verbatim (map = no duplicates)',async()=>{
   for(const mode of ['redir-host','fake-ip']) {
-    const profile=prepare(flow+`dns:\n  enable: true\n  enhanced-mode: ${mode}\n  fake-ip-range: 198.19.0.1/16\n  nameserver: [1.1.1.1]\n`);
-    const merged=M.merge(overlay,profile);assert.equal(merged.ok,true);
-    assert.equal((merged.yaml.match(/^  enhanced-mode:/gm)||[]).length,1);
-    assert.ok(merged.yaml.includes(`enhanced-mode: ${mode}`));
-    assert.equal((merged.yaml.match(/^  fake-ip-range:/gm)||[]).length,1);
-    assert.ok(merged.yaml.includes('198.19.0.1/16'));prepare(merged.yaml);
+    const baseConfig={'proxies':[{name:'A',type:'socks5',server:'127.0.0.1',port:9}],
+      'proxy-groups':[{name:'Main',type:'select',proxies:['A']}],'rules':['MATCH,Main'],
+      'dns':{'enable':true,'enhanced-mode':mode,'fake-ip-range':'198.19.0.1/16','nameserver':['1.1.1.1']}};
+    const r=TunBoxProfileBuilder.compose(
+      {config:baseConfig,digest:'t',proxies:1,proxyGroups:1,rules:1,matchRules:['MATCH,Main']},
+      {'mode':'rule'}, null,
+      Object.assign(new TunBoxProfileInput(),{profileId:'t',profilePath:'/t.yaml',profilesDir:'/profiles',
+       tunEnabled:true,mtu:1400}));
+    const doc=JSON.parse(r.yaml);
+    assert.equal(doc['dns']['enhanced-mode'],mode);
+    assert.equal(doc['dns']['fake-ip-range'],'198.19.0.1/16');
   }
 });
-await test('missing DNS mode adds only missing defaults and keeps the user filter',async()=>{
-  const profile=prepare(flow+'dns:\n  enable: true\n  fake-ip-range: 198.19.0.1/16\n  fake-ip-filter: [example.com]\n  nameserver: [1.1.1.1]\n');
-  const merged=M.merge(overlay,profile);assert.equal(merged.ok,true);
-  for(const key of ['enhanced-mode','fake-ip-range','fake-ip-filter']){
-    assert.equal((merged.yaml.match(new RegExp('^  '+key+':','gm'))||[]).length,1);
-  }
-  assert.ok(merged.yaml.includes('enhanced-mode: fake-ip'));assert.ok(merged.yaml.includes('example.com'));prepare(merged.yaml);
+await test('profile dns enabled stays verbatim; kernel fills its own defaults',async()=>{
+  // FlClash main：profile dns 启用 → 原样（不再由 App 补缺省键）；用户 filter 保留
+  const baseConfig={'proxies':[{name:'A',type:'socks5',server:'127.0.0.1',port:9}],
+    'proxy-groups':[{name:'Main',type:'select',proxies:['A']}],'rules':['MATCH,Main'],
+    'dns':{'enable':true,'fake-ip-range':'198.19.0.1/16','fake-ip-filter':['example.com'],'nameserver':['1.1.1.1']}};
+  const r=TunBoxProfileBuilder.compose(
+    {config:baseConfig,digest:'t',proxies:1,proxyGroups:1,rules:1,matchRules:['MATCH,Main']},
+    {'mode':'rule'}, null,
+    Object.assign(new TunBoxProfileInput(),{profileId:'t',profilePath:'/t.yaml',profilesDir:'/profiles',
+     tunEnabled:true,mtu:1400}));
+  const doc=JSON.parse(r.yaml);
+  assert.deepEqual(doc['dns']['fake-ip-filter'],['example.com']);
+  assert.equal(doc['dns']['fake-ip-range'],'198.19.0.1/16');
 });
 await test('provider-only YAML is accepted without fetching its URL',async()=>{
   const text='proxy-providers:\n  nodes:\n    type: http\n    url: https://example.invalid/proxies\n    interval: 3600\nproxy-groups:\n - {name: Main, type: select, use: [nodes]}\nrules:\n - MATCH,Main\n';
   assert.equal((await P.validateAndStore('provider',text)).ok,true);
 });
 load('commons/latency/LatencyKinds.ets','LatencyProbeKind,LatencyStrategy,LatencyTimeout');
-const {LatencyState,LatencyRecord,LatencyChannel}=load('commons/services/LatencyState.ets','LatencyState,LatencyRecord,LatencyChannel,LatencyPolicy');
+load('commons/models/AppSettings.ets','AppSettings');
+const {LatencyState,LatencyRecord,LatencyChannel}=load('commons/services/LatencyState.ets','LatencyState,LatencyRecord,LatencyChannel,LatencyPolicy,LatencyContext');
 const {LatencyLiveView:V}=load('commons/services/LatencyLiveView.ets','LatencyLiveView');
-load('commons/flclash/FlclashDelay.ets','FlclashDelayRun,DelayTarget,FLCLASH_DELAY_TIMED_OUT,FLCLASH_DELAY_FAILED,FLCLASH_DELAY_URL,delayTestKey');
-const {FlclashLatencyService:S}=load('commons/flclash/FlclashLatencyService.ets','FlclashLatencyService');
+const {TunBoxDelayRun,DelayRequestHandle,TunBoxDelayPolicy}=load('commons/tunbox/TunBoxDelay.ets','TunBoxDelayRun,DelayTarget,DelayResult,DelayRequestHandle,TunBoxDelayPolicy,TUNBOX_DELAY_TIMED_OUT,TUNBOX_DELAY_FAILED,TUNBOX_DELAY_URL,delayTestKey');
+sandbox.TunBoxDelayRun=class extends TunBoxDelayRun {
+  constructor(base,secret) {
+    super(base,secret,{send(){return new DelayRequestHandle(new Promise(()=>{}),()=>{});}},
+      new TunBoxDelayPolicy(32,5000,20));
+  }
+};
+const {TunBoxLatencyService:S}=load('commons/tunbox/TunBoxLatencyService.ets','TunBoxLatencyService');
 const api={endpointBase:()=> 'http://127.0.0.1:9090',endpointSecret:()=>'',providerForProxy:()=>''};
 await test('cancel restores the previous conclusion and clears owned spinners',async()=>{
   V.setRecord(LatencyRecord.measured('A',80,LatencyChannel.CORE,123));
@@ -144,7 +268,7 @@ await test('real Mihomo selection pins nested rule-facing groups and verifies th
   try{
     let ready=false;for(let i=0;i<100;i++){try{if((await fetch(`http://127.0.0.1:${port}/version`)).ok){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,50));}assert.ok(ready);
     http.response=async(url,options)=>{const r=await fetch(url,{method:options.method,headers:options.header,body:options.extraData});return {responseCode:r.status,result:await r.text()};};
-    const real=new ClashApiService();real.setEndpoint(port,'');assert.equal(await real.selectNode('A'),true);
+    const real=new ClashApiService();real.setEndpoint(port,'');assert.equal(await real.selectNode('A','Main'),true);
     const state=await (await fetch(`http://127.0.0.1:${port}/proxies`)).json();
     assert.equal(state.proxies.Main.now,'Aux');assert.equal(state.proxies.Aux.now,'A');
     assert.equal(await real.selectNode('does-not-exist'),false);
@@ -173,10 +297,14 @@ function subscriptionTestMethod() {
   assert.ok(start >= 0 && end > start, '必须提取现行 testSub 方法');
   return page.slice(start,end).replace('private async testSub','async testSub');
 }
+const progressSource=fs.readFileSync(path.join(sources,'commons/services/LatencyEngine.ets'),'utf8')
+  .replace(/\r\n/g,'\n').match(/^export class LatencyProgress \{[\s\S]*?^}/m)[0];
+const TestProgress=vm.runInContext(stripTypeScriptTypes(`(()=>{${progressSource.replace('export ','')}return LatencyProgress})()`,{mode:'transform'}),sandbox);
 async function runSubscriptionTest(result, failure, method=subscriptionTestMethod()) {
   const messages=[];
+  const progress=result===null?null:Object.assign(new TestProgress(),result);
   const pageContext=vm.createContext({getContext:()=>({}),AppLogger:logger,TAG:'test',ProfileRepository:{revisionOf:()=> 'r1'},
-    BackgroundLatencyService:{async testSubscription(){if(failure)throw new Error('测速通道未就绪');return result;}}});
+    BackgroundLatencyService:{async testSubscription(){if(failure)throw new Error('测速通道未就绪');return progress;}}});
   const Page=vm.runInContext(stripTypeScriptTypes(`(class {${method}})`,{mode:'transform'}),pageContext);
   const instance=new Page();Object.assign(instance,{testingIds:[],latencyRevision:0,profileRevisions:new Map(),
     isTestingSub(id){return this.testingIds.includes(id);},toast:t=>messages.push(t)});
@@ -194,13 +322,23 @@ await test('订阅区跳过测速不伪报完成，并以负对照验证守卫',
   assert.notEqual(broken,subscriptionTestMethod());
   assert.deepEqual(await runSubscriptionTest(null,false,broken),['测速失败，请重试']);
 });
-await test('订阅区全部节点失败必须如实显示失败数量',async()=>{
-  assert.deepEqual(await runSubscriptionTest({total:11,finished:11,measured:0,timeout:5,failed:6,cancelled:0,message:''},false),['未测得有效延迟：5 超时，6 失败，0 未完成（取消或未取得内核响应）']);
+await test('订阅区完成统计保留真实超时与失败分类',async()=>{
+  assert.deepEqual(await runSubscriptionTest({total:11,finished:11,measured:0,timeout:5,failed:6,cancelled:0,message:''},false),['测速完成：0成功，5超时，6失败']);
 });
-await test('部分目标跳过或未完成不能显示成全量测速成功',async()=>{
-  assert.deepEqual(await runSubscriptionTest({total:2,finished:2,measured:1,timeout:0,failed:0,cancelled:1,skipped:8,message:''},false),
-    ['测速完成：1 成功，0 超时，0 失败，8 跳过（节点未加载或策略无出口），1 未完成']);
+await test('完成提示不把个别缺回复说成整批中断，显式取消与准备失败仍单独提示',async()=>{
+  assert.deepEqual(await runSubscriptionTest({total:2,finished:2,measured:1,timeout:0,failed:1,cancelled:0,skipped:8,message:''},false),
+    ['测速完成：1成功，0超时，1失败']);
+  const partial={total:2,finished:2,measured:1,timeout:0,failed:0,cancelled:1,message:''};
+  const expected=['测速结束：1成功，0超时，1项未取得结果，请重试'];
+  assert.deepEqual(await runSubscriptionTest(partial,false),expected);
+  assert.deepEqual(await runSubscriptionTest({...partial,wasCancelled:true},false),['本次测速已取消，已完成的结果已保留']);
+  assert.deepEqual(await runSubscriptionTest({...partial,message:'测速通道未就绪'},false),['测速通道未就绪']);
+  const broken=subscriptionTestMethod().replace('this.toast(progress.completionMessage());',
+    "if(progress.cancelled > 0){this.toast('测速通道已中断，请重试');return;}this.toast(progress.completionMessage());");
+  assert.notEqual(broken,subscriptionTestMethod());
+  const messages=await runSubscriptionTest(partial,false,broken);
+  assert.throws(()=>assert.deepEqual(messages,expected),'negative control must reject the previous blanket interruption');
 });
 console.log(`ALL PASS ${count} review regression cases`);
 // Only this test's verified direct scratch directory may be removed.
-if(path.dirname(fs.realpathSync(scratch))===fs.realpathSync(os.tmpdir())&&path.basename(scratch).startsWith('tunbox-review-regression-'))fs.rmSync(scratch,{recursive:true});
+if(path.dirname(fs.realpathSync(scratch))===fs.realpathSync(os.tmpdir())&&path.basename(scratch).startsWith('tunbox-probe-review-regression-'))fs.rmSync(scratch,{recursive:true});

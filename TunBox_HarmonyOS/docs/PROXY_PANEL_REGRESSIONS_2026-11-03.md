@@ -61,7 +61,7 @@
 ## 改动文件
 
 - `entry/src/main/ets/commons/services/SubscriptionParser.ets`：`yamlScalar` 解码双引号转义。
-- `entry/src/main/ets/commons/flclash/ProxyPanelMembers.ets`：`delayNames` 对齐 FlClash（组员即目标）。
+- `entry/src/main/ets/commons/tunbox/ProxyPanelMembers.ets`：`delayNames` 对齐 FlClash（组员即目标）。
 - `entry/src/main/ets/commons/services/BackgroundLatencyService.ets`：空批次文案区分「组里没成员」与「订阅没代理」。
 - `entry/src/main/ets/commons/services/ProxyProviderParser.ets`：`invalidUrlReason` / `invalidUrlEntries`。
 - `entry/src/main/ets/commons/services/SubscriptionService.ets`：provider 拉取前静态校验占位符 url。
@@ -111,7 +111,7 @@
 CoreCatalogService: provider PQ: type=HTTP nodes=62
 BackgroundLatency: delay names group="默认代理" count=6 skipped=0/9:
   COMPATIBLE | 🇯🇵AWS日本01 | 电信移动联通推荐 | … | 🇸🇬AWS新加坡04 | 电信移动联通推荐
-FlclashLatencyService: delay failed: 🇸🇬新加坡01-0.1倍 | 电信联通推荐 http=404 value=-2
+TunBoxLatencyService: delay failed: 🇸🇬新加坡01-0.1倍 | 电信联通推荐 http=404 value=-2
 …（5 个 404）
 ```
 
@@ -124,7 +124,7 @@ FlclashLatencyService: delay failed: 🇸🇬新加坡01-0.1倍 | 电信联通�
 修后同一动作：`count=1 skipped=8/9`，`total=1 measured=1 failed=0`，不再刷红。
 
 新增诊断（只在日志里，不上 UI）：`CoreCatalogService.logProviders()` 打 `/providers/proxies`
-的每个 provider 类型与节点数；`FlclashLatencyService.apply()` 打失败明细 `名字 + http 码`。
+的每个 provider 类型与节点数；`TunBoxLatencyService.apply()` 打失败明细 `名字 + http 码`。
 
 ## 3. 内核库被截断的事故与修复
 
@@ -180,7 +180,7 @@ ld.lld: error: …/libgojni.so: section header table goes past the end of the fi
 | ④ 模式切换自动重启 | `pages/HomePage.ets`、`services/ConnectionOrchestrator.ets` | `applyProxyMode()` 返回 `ProxyModeApply`（hot/restarted/deferred/hot-failed）；连接态热更新失败 → `restartIfConnected('proxyMode=…')` 自动重连；toast 按落点措辞 |
 | ④′ 冷启动也能重启 | `services/ConnectionOrchestrator.ets` | `restartIfConnected` 不再在 `lastNode === null` 时静默返回：用 `lastNodeName` 从当前订阅/内核影子反查节点；仍查不到才 warn 跳过 |
 | ④″ 直连不开自动重启 | 同上 | `direct` 是运行期临时态（不落盘），重启会按磁盘值回到 `rule` → 直连热更新失败只如实报「内核未接受」，绝不重启 |
-| ⑤ 卡片去掉分组数 | `commons/flclash/ProxyPanelMembers.ets` | `summary(nodes)` 只返回 `N 节点` 或空串；新增 `proxyCount()`；`nodeCountText()` 用 `proxyCount()` 判「内核还没加载」，空时卡片只显示更新时间 |
+| ⑤ 卡片去掉分组数 | `commons/tunbox/ProxyPanelMembers.ets` | `summary(nodes)` 只返回 `N 节点` 或空串；新增 `proxyCount()`；`nodeCountText()` 用 `proxyCount()` 判「内核还没加载」，空时卡片只显示更新时间 |
 
 ## 8. 「选小组后出口还是真实 IP」定案
 

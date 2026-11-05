@@ -104,16 +104,30 @@ function stripEnums(text) {
 }
 
 function stageModule(sourceTransform) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tunbox-fetch-parity-'));
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tunbox-probe-fetch-parity-'));
   fs.writeFileSync(path.join(tmp, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
   fs.mkdirSync(path.join(tmp, 'shims'));
+  fs.mkdirSync(path.join(tmp, 'core'));
   fs.mkdirSync(path.join(tmp, 'services'));
   fs.mkdirSync(path.join(tmp, 'utils'));
   fs.mkdirSync(path.join(tmp, 'subscription'));
   fs.writeFileSync(path.join(tmp, 'shims/network.ts'), SHIM_NETWORK, 'utf8');
+  // Transport uses the Go core; this is not the Dart TLS stack used upstream.
+  // 门禁没有内核 —— 垫片默认抛错，用例经 globalThis.__fetchParityCore 注入假内核。
+  fs.writeFileSync(path.join(tmp, 'core/CoreBridge.ts'), `export const coreBridge = {
+  async fetchText(url, ua, auth, proxyPort) {
+    const hook = globalThis.__fetchParityCore;
+    if (hook === undefined || hook === null) {
+      throw new Error('fetch-parity: inject a fake core via globalThis.__fetchParityCore');
+    }
+    return hook.fetchText(url, ua, auth, proxyPort);
+  },
+};
+`, 'utf8');
   fs.writeFileSync(path.join(tmp, 'shims/arkts.ts'), SHIM_ARKTS, 'utf8');
   fs.writeFileSync(path.join(tmp, 'services/AppProxyRoute.ts'), `export class AppProxyRoute {
-  static activePort() { return -1; }
+  static isReady() { return globalThis.__fetchParityRoute?.ready ?? false; }
+  static activePort() { return globalThis.__fetchParityRoute?.port ?? -1; }
 }
 `, 'utf8');
   fs.writeFileSync(path.join(tmp, 'services/LocalSubConverter.ts'), `export class LocalSubConverter {
@@ -132,6 +146,11 @@ function stageModule(sourceTransform) {
   static version() { return '0.0.0-test'; }
 }
 `, 'utf8');
+  // 2026-11-05（§5.7）：delayTestTimeout/globalUa 读应用设置；门禁只需内存替身。
+  fs.writeFileSync(path.join(tmp, 'services/SettingsService.ts'), `export class SettingsService {
+  static async load() { return { globalUa: globalThis.__fetchParityUa ?? '' }; }
+}
+`, 'utf8');
   const codecText = fs.readFileSync(codecFile, 'utf8');
   fs.writeFileSync(path.join(tmp, 'subscription/HttpBodyCodec.ts'), codecText, 'utf8');
   const text = fs.readFileSync(srcFile, 'utf8');
@@ -142,6 +161,8 @@ function stageModule(sourceTransform) {
     .replace("from './LocalSubConverter'", "from './LocalSubConverter.ts'")
     .replace("from '../utils/AppLogger'", "from '../utils/AppLogger.ts'")
     .replace("from '../utils/AppInfo'", "from '../utils/AppInfo.ts'")
+    .replace("from './SettingsService'", "from './SettingsService.ts'")
+    .replace("from '../../core/CoreBridge'", "from '../core/CoreBridge.ts'")
     .replace("from '../subscription/HttpBodyCodec'", "from '../subscription/HttpBodyCodec.ts'");
   const finalText = stripEnums(sourceTransform === undefined ? patched : sourceTransform(patched));
   fs.writeFileSync(path.join(tmp, 'services/SubscriptionFetchPolicy.ts'), finalText, 'utf8');
@@ -166,18 +187,23 @@ function runChecks(Policy) {
     '不带 userinfo ⇒ 地址原样、不发 Authorization', `${noAuth.url}|${noAuth.header}`);
 
   const userOnly = Policy.authTarget('https://onlyuser@panel.example/sub');
-  ok(userOnly.header === `Basic ${Buffer.from('onlyuser:').toString('base64')}`,
-    '只有用户名 ⇒ Basic base64("user:")（与 FlClash 的 userinfo 拼接一致）', userOnly.header);
+  ok(userOnly.header === `Basic ${Buffer.from('onlyuser').toString('base64')}`,
+    '只有用户名 ⇒ 保留原样，不添加冒号（FlClash v0.9.3 downloadTarget）', userOnly.header);
+  for (const [encoded, decoded] of [['中文%40:密%3A码','中文@:密:码'],
+    ['a%4Z:b%40','a%4Z:b@'], ['a%E4%FF:b','a%E4%FF:b'], ['u:p:a%40','u:p:a@']]) {
+    ok(Policy.authTarget(`https://${encoded}@panel.example/sub`).header === `Basic ${Buffer.from(decoded).toString('base64')}`,
+      `strict Basic decoding: ${encoded}`);
+  }
 
   // 校验必须接受这种地址（旧规则 authority 含 '@' 直接拒 ⇒ 带 Basic 的订阅链接进不来）
   ok(Policy.isValidSubscriptionUrl('https://user:pass@panel.example/sub'),
     '带 Basic 凭据的订阅地址 ⇒ 校验通过（否则 authTarget 永远用不上）');
   ok(Policy.isValidSubscriptionUrl('https://user:pass@panel.example/sub', true),
     'https + Basic 凭据 ⇒ 校验通过');
-  ok(!Policy.isValidSubscriptionUrl('http://user:pass@panel.example/sub'),
-    '默认仍禁用明文 http（带凭据也不例外）');
-  ok(Policy.isValidSubscriptionUrl('http://user:pass@panel.example/sub', true),
-    '允许明文 http 时，带凭据的 http 地址也通过');
+  // FlClash 固定上游无 allowInsecureHttp 闸（§5.1）：明文 http 一律按原样取回，
+  // 只有私网/回环地址仍被守卫拦下。
+  ok(Policy.isValidSubscriptionUrl('http://user:pass@panel.example/sub'),
+    '明文 http + Basic 凭据 ⇒ 校验通过（上游无 allowInsecureHttp 闸）');
   ok(!Policy.isValidSubscriptionUrl('https://user:pass@192.168.1.10/sub'),
     '带凭据也不能绕开私网地址守卫');
   ok(!Policy.isValidSubscriptionUrl('https://user:pass@localhost/sub'),
@@ -276,6 +302,28 @@ async function main() {
   }
   console.log('── 订阅拉取层 FlClash 对齐闸门（Basic 鉴权 / content-disposition 标题）──');
   runChecks(mod.SubscriptionFetchPolicy);
+  const calls = [];
+  const body = ' \nproxies: []\n ';
+  globalThis.__fetchParityCore = {async fetchText(...args) {
+    calls.push(args); return {body, etag:'', userInfo:'total=123', disposition:'attachment; filename=sub.yaml'};
+  }};
+  globalThis.__fetchParityRoute = {ready:false, port:7890};
+  globalThis.__fetchParityUa = 'custom-ua';
+  const direct = await mod.SubscriptionFetchPolicy.fetch('https://u:p@panel.example/sub', 'X-Ignored', 'ignored', 'old-etag');
+  ok(calls.length === 1 && calls[0][0] === 'https://panel.example/sub' && calls[0][1] === 'custom-ua'
+    && calls[0][2] === `Basic ${Buffer.from('u:p').toString('base64')}` && calls[0][3] === 0,
+    'single direct fetch passes normalized URL, selected UA, Basic and explicit proxyPort=0');
+  ok(direct.body === body && direct.userInfo.totalBytes === 123, 'raw body whitespace and subscription metadata are preserved');
+  globalThis.__fetchParityRoute.ready = true;
+  await mod.SubscriptionFetchPolicy.fetch('https://panel.example/sub', '', '');
+  ok(calls.length === 2 && calls[1][3] === 7890, 'ready app proxy passes the current mixed port across NAPI');
+  for (const [message, kind, status] of [['HTTP 403', 'http', 403], ['HTTP 429', 'http', 429],
+    ['physical network socket bind failed: -1', 'network', 0]]) {
+    let attempts = 0, error;
+    globalThis.__fetchParityCore = {async fetchText() { attempts++; throw Error(message); }};
+    try { await mod.SubscriptionFetchPolicy.fetch('https://panel.example/sub', '', ''); } catch (e) { error = e; }
+    ok(attempts === 1 && error?.kind === kind && error?.httpStatus === status, `one attempt preserves ${kind}/${status} failure`);
+  }
   console.log(`  断言：${passed} passed, ${failed} failed`);
   if (failed > 0) {
     for (const line of lines) {

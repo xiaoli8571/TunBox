@@ -46,7 +46,7 @@
 
 - `components/SubscriptionSection.ets`
 - `commons/services/{ClashApiService,ConnectionOrchestrator,KernelSelectionManager,BackgroundLatencyService,BackupRestoreService}.ets`
-- `commons/flclash/{CoreCatalogService,ProxyPanelMembers,FlclashDelay,FlclashLatencyService}.ets`
+- `commons/tunbox/{CoreCatalogService,ProxyPanelMembers,TunBoxDelay,TunBoxLatencyService}.ets`
 - `commons/latency/LatencyProbe.ets`
 
 ## 首轮审查记录的剩余项（修复前历史）
@@ -63,7 +63,7 @@ FlClash 当前代码用 `testUrl + NUL + proxyName` 区分测速任务/结果；
 
 ### P2：父组测速没有完整继承子组的 URL
 
-`BackgroundLatencyService.execute` 取当前所选父组的 `url/expectedStatus`，随后对所有解析出的叶子使用这一个策略。虽然 `FlclashLatencyService.start` 有 `perNodeUrl` 参数，这条入口没有传入。
+`BackgroundLatencyService.execute` 取当前所选父组的 `url/expectedStatus`，随后对所有解析出的叶子使用这一个策略。虽然 `TunBoxLatencyService.start` 有 `perNodeUrl` 参数，这条入口没有传入。
 
 影响：一个父组内引用多个配置了不同测速 URL 的子组时，从父组测速与进入子组测速可能使用不同地址。FlClash 的 `_resolveDelayTestTargets` 会沿选择链取得有效 URL，再按 URL+出口去重。当前实现没有完成这部分，不应宣称完全等价。
 
