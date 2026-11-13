@@ -184,7 +184,8 @@ struct ConnectionsPage {
   build() {
     Stack() {
       Column().width('100%').height('100%')
-        .backgroundColor(TunBoxColors.background(this.themeRevision))
+        // 与其余页面同一条背景渐变：原来这页是平色，从设置页推进来时底部颜色会跳一下
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       Column() {
         // ── 顶栏（文档 §2.1 TopNavBar，右侧保留既有「关闭全部 / 刷新」入口）──

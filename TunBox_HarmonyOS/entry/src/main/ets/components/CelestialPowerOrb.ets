@@ -35,7 +35,7 @@
 import { curves } from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { vibrator } from '@kit.SensorServiceKit';
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxGlass } from '../theme/TunBoxTokens';
 import { ThemeService } from '../theme/ThemeService';
 import { OrbLayout } from './CelestialOrbLayout';
 
@@ -274,10 +274,6 @@ export struct CelestialPowerOrb {
 
   private blueHex(): string {
     return ThemeService.isDark() ? '#3B82F6' : '#0A59F7';
-  }
-
-  private greenHex(): string {
-    return ThemeService.isDark() ? '#10B981' : '#00BA66';
   }
 
   /** 当前强调色：连接态转翡翠绿，其余品牌蓝 */
@@ -613,7 +609,11 @@ export struct CelestialPowerOrb {
           .height(this.discSize)
           .borderRadius(this.discSize / 2)
           .backgroundEffect({
-            radius: 40,
+            radius: TunBoxGlass.BLUR_ORB,
+            // 与底栏同一组饱和度/亮度：圆盘背后是呼吸光晕，把它的颜色「吸」上来才像玻璃，
+            // 只模糊不提饱和度的话，盘面是一片发灰的雾。
+            saturation: TunBoxGlass.saturation(this.themeRevision),
+            brightness: TunBoxGlass.brightness(this.themeRevision),
             // 2026-10-21 二次收敛：绿色只留在**最内圈**（电源徽标小圆），
             // 盘面保持原玻璃色，避免整个按钮泛绿。
             color: ThemeService.isDark() ? 'rgba(30, 41, 66, 0.55)' : 'rgba(255, 255, 255, 0.52)'

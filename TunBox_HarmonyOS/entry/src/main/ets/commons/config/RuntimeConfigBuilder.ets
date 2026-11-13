@@ -35,6 +35,10 @@
  *   secret / mixed-port / external-controller / dns.listen / tun.enable / log-level
  * （闸门脚本按行比对，越界即失败。）
  *
+ * 唯一的有意例外（2026-11-11）：订阅自带的 http 规则集**本地还没缓存**时，测速核里
+ * 换成同名空 inline（TunBoxProfileInput.skipUncachedRuleProviders）。测速不走分流规则，
+ * 不该为它在启动时等规则集下载；缓存一旦存在，两份配置在这一段又完全相同。
+ *
  * ## 接线指南（ConnectionOrchestrator 侧）
  *
  * 隧道（connect / reloadRulesHot）：
@@ -222,6 +226,12 @@ export class RuntimeConfigResult {
   tunEnabled: boolean = false;
   /** hosts 条目数（诊断用）。 */
   hostsCount: number = 0;
+  /**
+   * 最终配置里由**内核自己加载**的 provider 数（proxy-providers + rule-providers，
+   * 不含 inline）。内核启动时同步加载它们，本地没缓存就联网拉、每个最多等 20s ——
+   * 启动路径据此向界面说明「内核在加载订阅规则集」，而不是让用户以为卡死。
+   */
+  providerCount: number = 0;
   /** 本次使用的决策（两种 mode 应完全一致）。 */
   options: RuntimeConfigOptions = new RuntimeConfigOptions();
   /**
@@ -568,6 +578,11 @@ export class RuntimeConfigBuilder {
       input.mtu = BASE_MTU;
       input.useSmart = options.useSmart;
       input.smartPolicyPriority = profile.settings.smartPolicyPriority;
+      // 测速核不等规则集下载：本地还没缓存的 http 规则集换成同名空 inline
+      //（2026-11-11 真机：14 个规则集下载超时，点了测速 21 秒后才开始测）。
+      // 测速只打 /proxies/{name}/delay，不走分流规则；隧道不受影响，仍由内核自己拉。
+      // 想恢复「测速核也下载规则集」，把这一行改成 false 即可。
+      input.skipUncachedRuleProviders = mode === RuntimeConfigMode.TEST;
       const built = await TunBoxProfileBuilder.build(input);
       if (!built.ok) {
         throw new Error(`订阅配置合并失败：${built.error}`);
@@ -576,7 +591,8 @@ export class RuntimeConfigBuilder {
       finalYaml = built.yaml;
       AppLogger.info(TAG, `flclash profile built: mode=${mode} applied=${built.applied} `
         + `proxies=${built.profileProxies} groups=${built.profileGroups} rules=${built.profileRules} `
-        + `providers=${built.confinedProviders} bytes=${finalYaml.length}`);
+        + `providers=${built.confinedProviders} offlineRuleProviders=${built.offlineRuleProviders} `
+        + `bytes=${finalYaml.length}`);
     }
 
     if (!profile.profileYaml.trim().length) {
@@ -599,6 +615,7 @@ export class RuntimeConfigBuilder {
     result.apiSecret = profile.apiSecret;
     result.tunEnabled = tunEnabled;
     result.hostsCount = Object.keys(hosts).length;
+    result.providerCount = builtProfile !== null ? builtProfile.confinedProviders : 0;
     result.options = options;
     // ── 钉选目标解析（2026-10-27 二次修，真机复现后定案）───────────────────
     // 旧实现把主组写死成字符串 PROXY：订阅原文接管后，规则指向
@@ -797,17 +814,6 @@ export class RuntimeConfigBuilder {
     const names: string[] = RuntimeConfigBuilder.parseProxyNames(yaml);
     for (const n of names) {
       if (n === want) { return n; }
-    }
-    return '';
-  }
-
-  /** 在候选名集合里找用户所选节点（FlClash 同构：精确名匹配，无命中即空）。 */
-  private static pickExisting(pool: string[], groupNames: Set<string>, preferred: string,
-    leafOnly: boolean): string {
-    if (pool.length === 0 || preferred.length === 0) { return ''; }
-    for (const name of pool) {
-      if (leafOnly && RuntimeConfigBuilder.isInfoOrGroup(name, groupNames)) { continue; }
-      if (name === preferred) { return name; }
     }
     return '';
   }

@@ -19,7 +19,7 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 /* Start of preamble from import "C" comments.  */
 
 
-#line 22 "cshared_main.go"
+#line 29 "cshared_main.go"
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -84,7 +84,50 @@ extern "C" {
 #endif
 
 extern char* TunBoxPrepareProfile(char* text);
+
+// TunBoxValidateProfile 是 FlClash Profile.saveFile + controller.validateProfile
+// 的原生等价物：字节→temp→age 解密（armor 头+空 key → AgeSecretKeyRequired 原始错）
+// → validateConfig → 失败走 convert.ConvertsV2Ray → 非空写 {'proxies':} 再 validate
+// → 仍失败返首次 issue → 通过后原生写 profiles/<id>.yaml（调用方给目标路径），
+// 不展开锚点。返回 JSON {"error":"..."}（空 = 成功），调用方用 TunBoxFreeString 释放。
+//
+extern char* TunBoxValidateProfile(char* text, char* ageSecretKey, char* profilePath);
+
+// TunBoxGetProfileOutbounds 是 FlClash `core/profile_base.go
+// handleGetProfileOutbounds` 的移植：只投影 name/type+组名，供 ArkTS
+// CoreNodeBridge 影子节点。返回 JSON：{"proxies":[{"name","type"}...],
+// "proxyGroups":[...],"error":"..."}，调用方用 TunBoxFreeString 释放。
+//
+extern char* TunBoxGetProfileOutbounds(char* path);
 extern void TunBoxFreeString(char* text);
+
+// TunBoxGetProfileBase 是 FlClash `core/hub.go handleGetConfig` +
+// `core/profile_base.go handleGetProfileBase` 的合并等价物：
+//
+//   - `config.UnmarshalRawConfig(buf)` —— mihomo 自己的解析器（锚点/合并键/类型
+//     与最终加载完全一致），错误原样带回（FlClash validateConfig 同款语义）；
+//   - RawConfig 经 encoding/json 序列化后把 `rule` 重命名为 `rules`
+//     （mihomo RawConfig.Rule 的 json tag 是 `rule`，FlClash Dart 侧按 `rules` 读）；
+//   - 附 sha256 digest 与 proxies/proxyGroups/rules/matchRules 计数
+//     （FlClash ProfileBase{Digest, MatchRules, Proxies, ProxyGroups, Rules}）。
+//
+// 返回 JSON：{"config":{...},"digest":"...","proxies":N,"proxyGroups":N,"rules":N,
+// "matchRules":[...],"error":"..."}，调用方用 TunBoxFreeString 释放。
+//
+extern char* TunBoxGetProfileBase(char* path);
+
+// TunBoxDecodeYaml 把 YAML 文本解成 JSON map（mihomo 同一 yaml 库口径）。
+// FlClash 在 Dart 里用 loadYaml 完成 map 级 patch；ArkTS 没有 YAML 解析器，
+// 由内核提供同一方言的解码（`common/yaml` 就是 go.yaml.in/yaml/v3 原样透出）。
+// 返回 JSON：{"map":{...},"error":"..."}，调用方用 TunBoxFreeString 释放。
+//
+extern char* TunBoxDecodeYaml(char* text);
+
+// TunBoxFetchText 用浏览器级 TLS 指纹（utls Chrome）拉取订阅 / provider 文本。
+// 与 FlClash 的下载语义一致：单一 UA，不做 UA 轮换。
+// 返回 JSON：{"body":"...","error":"..."}，调用方用 TunBoxFreeString 释放。
+//
+extern char* TunBoxFetchText(char* rawURL, char* userAgent, char* authHeader, int proxyPort);
 extern void TunBoxInit(char* homeDir, char* configFile);
 extern int TunBoxStart(char* configPath, long long tunFd);
 extern void TunBoxSetSocketBinder(uintptr_t callback);

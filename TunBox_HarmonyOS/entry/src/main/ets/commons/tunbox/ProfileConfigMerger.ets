@@ -26,48 +26,6 @@ import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'ProfileConfigMerger';
 
-/**
- * 需要「按键并集」而不是「整段替换」的 provider 段。
- *
- * 为什么两个都要：provider 是**按名字寻址的命名空间** —— overlay 的 rules 里有
- * `RULE-SET,hyper-adrules`、原文 rules 里也可能引用自己的 provider 名；声明段
- * 少一个，内核就整份拒载（`rule set [x] not found`，2026-10-23 真机报障）。
- * 所以两段都是「overlay 优先 + 原文补齐」的并集，而不是二选一。
- */
-const PROVIDER_MERGE_KEYS: string[] = ['proxy-providers', 'rule-providers'];
-
-/** 原文里允许进入运行配置的顶层键（其余一律丢弃，由 overlay 决定）。 */
-const PROFILE_KEYS: string[] = [
-  'proxies',
-  'proxy-groups',
-  'sub-rules',
-  'tunnels',
-  'listeners'
-];
-
-/** overlay 里必须被原文替换掉的键（先删后追加）。 */
-const REPLACE_KEYS: string[] = [
-  'proxies',
-  'proxy-groups',
-  'sub-rules',
-  'proxy-providers',
-  'rule-providers',
-  'tunnels',
-  'listeners',
-  'rules'
-];
-
-// Only listener ownership and platform integration belong to the application.
-// Everything else is a native mihomo capability, including future config keys.
-const RUNTIME_KEYS: string[] = [
-  'mixed-port', 'port', 'socks-port', 'redir-port', 'tproxy-port', 'allow-lan', 'bind-address',
-  'external-controller', 'external-controller-tls', 'external-controller-unix',
-  'external-controller-pipe', 'external-controller-cors', 'secret', 'external-ui',
-  'external-ui-url', 'external-ui-name', 'authentication', 'skip-auth-prefixes',
-  'lan-allowed-ips', 'lan-disallowed-ips', 'tun', 'interface-name', 'routing-mark',
-  'find-process-mode', 'ipv6', 'mode', 'log-level', 'dns', 'hosts'
-];
-
 export class ProfileMergeResult {
   ok: boolean = false;
   yaml: string = '';

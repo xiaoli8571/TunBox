@@ -51,7 +51,7 @@
  * 所以用 `onAreaChange` 量一次 `dockW`；量不到（=0）时直接不画光影，
  * 也不能按百分比猜位置 —— 百分比 `position` 不参与动画插值，会瞬移。
  */
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxGlass, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { ThemeService } from '../theme/ThemeService';
 import { ImmersiveMaterial, ImmersiveMaterialAttr } from '../theme/ImmersiveMaterial';
@@ -511,7 +511,7 @@ export struct FloatingBottomBar {
             // 现在只保留填充，选中态靠“底色 + 蓝色 Bold 文字”表达，不再有框线。
             // 按压兜底：HDS 点光源不显示时，0.96 的轻微内缩仍能确认「点到了」
             .scale({ x: this.litTab === item.id ? 0.96 : 1, y: this.litTab === item.id ? 0.96 : 1 })
-            .animation({ duration: 220, curve: Curve.EaseOut })
+            .animation(TunBoxMotion.stateChange())
           }
           // 沉浸光感（HDS 点光源）已下移到内层光晕 Column 上：
           // 页签 Stack 本身一旦挂 visualEffect，空闲时的空效果也会把整块胶囊合成进离屏图层，
@@ -542,9 +542,9 @@ export struct FloatingBottomBar {
     // 原来 1.9 + 1.06 会把通道推到削顶（实测底栏内部 G 通道恒为 255），观感发白、
     // 丢掉「玻璃应该跟着背后内容变」的信息 —— 透明感反而变差。
     .backgroundEffect({
-      radius: 26,
-      saturation: ThemeService.isDark() ? 1.18 : 1.28,
-      brightness: ThemeService.isDark() ? 0.98 : 1.0,
+      radius: TunBoxGlass.BLUR_DOCK,
+      saturation: TunBoxGlass.saturation(this.themeRevision),
+      brightness: TunBoxGlass.brightness(this.themeRevision),
       color: TunBoxColors.dockGlassTint(this.themeRevision)
     })
     // ── 液态玻璃 ①b：极淡染色渐变，把玻璃压进当前背景配色系（alpha 必须低，否则挡住模糊）──

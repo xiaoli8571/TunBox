@@ -10,7 +10,7 @@ import { router, promptAction, LengthMetrics } from '@kit.ArkUI';
 import { UnifiedScheduler } from '../commons/services/UnifiedScheduler';
 import { ConnEvent, ConnEventKind, ConnListener } from '../commons/services/ConnectionEvents';
 import { window } from '@kit.ArkUI';
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { TopNavBar } from '../components/TopNavBar';
 import { CelestialPowerOrb } from '../components/CelestialPowerOrb';
@@ -62,6 +62,11 @@ export struct HomePage {
   private pendingConnectAfterNodes: boolean = false;
   private nodeWatchTimer: number = -1;
   @State errorMessage: string = '';
+  /**
+   * 内核启动偏慢时的一句说明（空 = 不显示）。来源唯一：orchestrator.startupHint()。
+   * 订阅自带规则集时内核启动期要联网加载，可能几十秒 —— 不说出来用户会以为卡死。
+   */
+  @State startHint: string = '';
   @State publicIp: string = '';
   @State publicIpRefreshing: boolean = false;
   @State publicIpError: string = '';
@@ -95,6 +100,7 @@ export struct HomePage {
   private settings: AppSettings = new AppSettings();
   private readonly connectionListener: () => void = (): void => {
     this.applyOrchestratorState();
+    this.startHint = this.orchestrator.startupHint();
   };
   /** 类型化事件订阅（2026-10-27）：速率/出口/状态都走推送，页面不再自采样。 */
   private connEventsToken: number = -1;
@@ -778,11 +784,19 @@ export struct HomePage {
           width: 1,
           color: this.proxyMode === mode ? TunBoxColors.modeChipBorderFor(this.themeRevision) : Color.Transparent
         })
+        // 选中胶囊换色走过渡（底色 / 描边 / 字色一起淡过去），不再硬切
+        .animation(TunBoxMotion.stateChange())
     }
     .layoutWeight(1)
     .height(40)
     .justifyContent(FlexAlign.Center)
+    .clickEffect(TunBoxMotion.pressControl())
     .onClick(() => this.applyProxyMode(mode))
+  }
+
+  /** 关闭诊断面板（蒙层点击与面板内「关闭」共用；离场动画由 build 里的 transition 负责） */
+  private closeDiagnostics(): void {
+    this.showDiagnostics = false;
   }
 
   build() {
@@ -818,6 +832,18 @@ export struct HomePage {
             .alignItems(HorizontalAlign.Center)
             .padding({ top: 0, bottom: 0 })
 
+            // ── 内核启动偏慢说明：内核在加载订阅自带的规则集（不是卡死）──
+            if (this.startHint.length > 0) {
+              Text(this.startHint)
+                .width('100%')
+                .fontSize(12)
+                .fontColor(TunBoxColors.textMutedFor(this.themeRevision))
+                .textAlign(TextAlign.Center)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .transition(TunBoxMotion.revealDown())
+            }
+
             // ── 代理模式三段按钮：规则/全局/直连（2026-10-17 自分流模式卡片迁出，置于启动按钮下方）──
             Row({ space: 10 }) {
               this.ProxyModeButton('rule', '规则')
@@ -848,6 +874,8 @@ export struct HomePage {
               .padding(12)
               .borderRadius(TunBoxGeometry.cardRadius)
               .backgroundColor(TunBoxColors.dangerLight)
+              .clickEffect(TunBoxMotion.pressCard())
+              .transition(TunBoxMotion.revealDown())
               .onClick(() => {
                 this.showDiagnostics = true;
                 this.refreshDiagnostics();
@@ -894,8 +922,15 @@ export struct HomePage {
         .alignItems(VerticalAlign.Center)
       }
 
-      // 诊断面板（既有实现不动，仅蒙层色改令牌）
+      // 诊断面板：蒙层淡入淡出、面板从底边升起（离场原路返回）。
+      // 蒙层只负责画颜色；点击语义与改造前完全一致 —— 仍由下面这个全屏容器接管
+      // （面板以外的空白处点一下关闭），只是两者现在各有自己的转场。
       if (this.showDiagnostics) {
+        Column()
+          .width('100%')
+          .height('100%')
+          .backgroundColor(TunBoxColors.scrim)
+          .transition(TunBoxMotion.fade())
         Column() {
           Blank()
           DiagnosticsSheet({
@@ -903,14 +938,14 @@ export struct HomePage {
             onRefresh: () => {
               this.refreshDiagnostics();
             },
-            onClose: () => { this.showDiagnostics = false; }
+            onClose: () => { this.closeDiagnostics(); }
           })
             .height('78%')
         }
         .width('100%')
         .height('100%')
-        .backgroundColor(TunBoxColors.scrim)
-        .onClick(() => { this.showDiagnostics = false; })
+        .transition(TunBoxMotion.sheetRise())
+        .onClick(() => { this.closeDiagnostics(); })
       }
     }
     .width('100%')

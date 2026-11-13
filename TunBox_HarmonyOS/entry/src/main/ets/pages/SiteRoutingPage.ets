@@ -285,6 +285,8 @@ struct SiteRoutingPage {
     .justifyContent(FlexAlign.Center)
     .borderRadius(8)
     .backgroundColor(this.kind === kind ? TunBoxColors.surfaceCard(this.themeRevision) : Color.Transparent)
+    // 分段切换：选中块的底色淡过去，不再硬切
+    .animation(TunBoxMotion.stateChange())
     .onClick(() => this.switchKind(kind))
   }
 

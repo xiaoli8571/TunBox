@@ -19,10 +19,17 @@ import { LatencyStore, LatencyViewLevel } from '../commons/latency/LatencyStore'
 /**
  * 页面级动效参数（2026-10-17 用户规格：水平滑动 + 淡入淡出，时长 220–300ms，
  * 位移取屏宽 4%–8%；新页沿水平方向轻进入，旧页同步退出）。页签切换与路由推入式子页共用同一套。
+ *
+ * 2026-11-11 补齐两档节奏，组件不再各写各的毫秒数：
+ *  · `stateChange()` —— 颜色/选中态这类「原地变化」（胶囊高亮、按下反馈），180ms；
+ *  · `spatial()`     —— 出现/消失/位移这类「空间变化」（页面、面板、展开行），即原有基线 `ms`。
+ * 新增项一律用**方法/访问器**惰性取值：门禁脚本会在没有 ArkUI 全局量的沙箱里加载本文件。
  */
 export class TunBoxMotion {
   /** 设计基线时长（ms）—— 手机档（<8.5 英寸）实测观感定版值 */
   static readonly BASE_MS: number = 260;
+  /** 原地状态变化的时长（ms）：比空间位移短一档，颜色跟手、不拖泥带水 */
+  static readonly FAST_MS: number = 180;
 
   /**
    * 转场时长（ms）——按屏幕对角线英寸分档，且不低于设计基线。
@@ -46,6 +53,95 @@ export class TunBoxMotion {
   static readonly slideVp: number = 48;
   /** 转场曲线 */
   static readonly curve: Curve = Curve.Friction;
+
+  /** 原地状态变化（选中胶囊换色、按下高亮）的动画参数 */
+  static stateChange(): AnimateParam {
+    return { duration: TunBoxMotion.FAST_MS, curve: Curve.EaseOut };
+  }
+
+  /** 出现/消失/位移的动画参数（与页面转场同一条曲线、同一时长） */
+  static spatial(): AnimateParam {
+    return { duration: TunBoxMotion.ms, curve: TunBoxMotion.curve };
+  }
+
+  /** 内容出现：淡入 + 从上方 8vp 轻落（展开行、提示条） */
+  static revealDown(): TransitionEffect {
+    return TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ y: -8 }))
+      .animation(TunBoxMotion.spatial());
+  }
+
+  /** 纯淡入淡出（蒙层） */
+  static fade(): TransitionEffect {
+    return TransitionEffect.OPACITY.animation(TunBoxMotion.spatial());
+  }
+
+  /** 底部弹层：从底边升起，离场按同一路径落回 */
+  static sheetRise(): TransitionEffect {
+    return TransitionEffect.move(TransitionEdge.BOTTOM).animation(TunBoxMotion.spatial());
+  }
+
+  /**
+   * 全屏面板（订阅节点面板）：淡入 + 由 0.92 放大到位，离场原路返回。
+   * 交给系统转场驱动（`bindContentCover` 的 `transition`），展开与收起是同一条曲线 ——
+   * 旧实现用 `setTimeout(24ms)` 翻标志位做假动画，只有展开、没有收起。
+   */
+  static panelZoom(): TransitionEffect {
+    return TransitionEffect.OPACITY
+      .combine(TransitionEffect.scale({ x: 0.92, y: 0.92 }))
+      .animation(TunBoxMotion.spatial());
+  }
+
+  /**
+   * 按压反馈（系统 clickEffect：按下缩、松手弹回，由渲染线程驱动）。
+   * 整张卡片用 `card`（几乎看不出缩放，只给一点「按到了」的手感），
+   * 小胶囊/圆按钮用 `control`。
+   */
+  static pressCard(): ClickEffect {
+    return { level: ClickEffectLevel.LIGHT, scale: 0.985 };
+  }
+
+  static pressControl(): ClickEffect {
+    return { level: ClickEffectLevel.LIGHT, scale: 0.94 };
+  }
+}
+
+/**
+ * 玻璃材质参数的唯一真源（2026-11-11）。
+ *
+ * 之前底栏、快捷启动钮、首页圆盘、诊断面板各写各的模糊半径与饱和度
+ * （26 / 22 / 40 / 28，饱和度有的写有的不写），同一块屏上的几片「玻璃」折射力度不一样，
+ * 看起来像几种不同的材料。这里按「面积越大、离内容越远，模糊越重」分四档，
+ * 饱和度/亮度全应用只有一组（数值就是底栏真机调定的那组，底栏观感不变）。
+ *
+ * 口径沿用 FloatingBottomBar 头注释的真机结论：
+ *  · 玻璃感来自 `backgroundEffect` 的**模糊 + 饱和度提升**，染色层必须极淡；
+ *  · 不要再叠 `backgroundBlurStyle(COMPONENT_*)`：它自带近乎不透明的填充，会把上面两样整个盖掉。
+ */
+export class TunBoxGlass {
+  /** 小控件（圆按钮） */
+  static readonly BLUR_CONTROL: number = 22;
+  /** 底栏 */
+  static readonly BLUR_DOCK: number = 26;
+  /** 底部弹层 */
+  static readonly BLUR_SHEET: number = 28;
+  /** 首页圆盘（背后是光晕，要化得最开） */
+  static readonly BLUR_ORB: number = 40;
+
+  /** 饱和度提升：把背后的颜色「吸上来」。深色下收一档，避免暗部发脏 */
+  static saturation(_rev: number): number {
+    return ThemeService.isDark() ? 1.18 : 1.28;
+  }
+
+  /** 亮度：浅色不动，深色略压，防止玻璃在暗背景上泛灰 */
+  static brightness(_rev: number): number {
+    return ThemeService.isDark() ? 0.98 : 1.0;
+  }
+
+  /** 弹层上沿的受光棱线：与底栏镜面高光同一组颜色，深色只留一线微光 */
+  static rimLight(rev: number): ResourceColor {
+    return TunBoxColors.dockSheenStrong(rev);
+  }
 }
 
 export class TunBoxColors {
@@ -94,16 +190,8 @@ export class TunBoxColors {
     return ThemeService.semanticPalette(rev).brandPrimary;
   }
 
-  static primaryHoverFor(rev: number): ResourceColor {
-    return ThemeService.semanticPalette(rev).brandHover;
-  }
-
   static primaryLightFor(rev: number): ResourceColor {
     return ThemeService.semanticPalette(rev).brandLight;
-  }
-
-  static primaryBorderFor(rev: number): ResourceColor {
-    return ThemeService.semanticPalette(rev).brandBorder;
   }
 
   static dockPillFillFor(rev: number): ResourceColor {
@@ -241,24 +329,6 @@ export class TunBoxColors {
   }
 
   // ── 底栏底部渐隐底（2026-10-26 二次修正）──
-  /** 底栏下方一条全宽、无模糊的底部渐隐：从页面底色 0 透明度渐变到接近不透明，让滚到底的
-   *  内容文字自然淡出。基色跟随当前背景配色（浅色三套 / 深色一套），与页面无缝衔接。
-   *  2026-10-28 用户要求：去掉原来那条实化的渐隐条（内容直接透到栏体下方），
-   *  MainPage 不再挂 dockScrim；这里保留以免其它页面/后续入口引用时再次手写颜色。 */
-  static dockScrimTop(rev: number): ResourceColor {
-    TunBoxColors.syncPalette(rev);
-    return TunBoxColors.rgba(TunBoxColors.paletteEndHex, 0.0);
-  }
-
-  static dockScrimMid(rev: number): ResourceColor {
-    TunBoxColors.syncPalette(rev);
-    return TunBoxColors.rgba(TunBoxColors.paletteEndHex, 0.62);
-  }
-
-  static dockScrimBottom(rev: number): ResourceColor {
-    TunBoxColors.syncPalette(rev);
-    return TunBoxColors.rgba(TunBoxColors.paletteEndHex, 0.97);
-  }
 
   /** 卡片表面：浅色=纯白高光卡片（2026-10-17 用户浅色规范「核心卡片容器 #FFFFFF」+ 1px #E5EDF8 内描边）。
    *  2026-10-17 性能修正：不再逐卡挂 blur（30+ 离屏模糊层拖慢切页/滚动），玻璃感靠半透明填充+渐变底；Dock/弹层等背后有滚动内容的组件才保留 blur */
@@ -332,28 +402,12 @@ export class TunBoxColors {
     return TunBoxColors.lightSurface(0.34, '#E9EFF9', rev);
   }
 
-  /** 分段器选中块（文档：纯白） */
-  static controlThumb(rev: number): ResourceColor {
-    if (ThemeService.isDark()) {
-      return '#3A4453';
-    }
-    return TunBoxColors.lightSurface(0.86, '#FFFFFF', rev);
-  }
-
   /** 协议/类型标签底（文档 §3.2 #EFF3F9 / §3.3 #EEF2F8 / §3.5 #EFF4FD） */
   static chipBg(rev: number): ResourceColor {
     if (ThemeService.isDark()) {
       return '#2A323F';
     }
     return TunBoxColors.lightSurface(0.44, '#EFF3F9', rev);
-  }
-
-  /** 弹窗内选项行底（文档 §3.4 #F8FAFD） */
-  static rowFill(rev: number): ResourceColor {
-    if (ThemeService.isDark()) {
-      return '#232A35';
-    }
-    return TunBoxColors.lightSurface(0.74, '#F8FAFD', rev);
   }
 
   /** 代码/等宽容器底与描边（文档 §3.6 #F8FAFC / #E2E8F0） */
@@ -375,32 +429,6 @@ export class TunBoxColors {
     return ThemeService.isDark() ? '#D7DEE8' : '#1E293B';
   }
 
-  /** 速率曲线容器底（文档 §3.1 #F0F4FC） */
-  static chartBox(rev: number): ResourceColor {
-    if (ThemeService.isDark()) {
-      return '#0C1220';
-    }
-    return TunBoxColors.lightSurface(0.42, '#F0F4FC', rev);
-  }
-
-  // ── 顶部导航栏 / 底部悬浮栏（文档 §2.1 / §2.2）──
-  static navFill(rev: number): ResourceColor {
-    TunBoxColors.syncPalette(rev);
-    if (ThemeService.isDark()) {
-      return 'rgba(18, 21, 28, 0.90)';
-    }
-    return TunBoxColors.rgba(TunBoxColors.paletteStartHex, 0.90);
-  }
-
-  /** 底栏填充：半透明底，配合 FloatingBottomBar 的渐变与毛玻璃使用。 */
-  static dockFill(rev: number): ResourceColor {
-    TunBoxColors.syncPalette(rev);
-    if (ThemeService.isDark()) {
-      return 'rgba(15, 19, 29, 0.50)';
-    }
-    return TunBoxColors.rgba(TunBoxColors.paletteStartHex, 0.50);
-  }
-
   /**
    * 底栏渐变两端色 —— 液态玻璃的「染色层」。
    *
@@ -412,21 +440,6 @@ export class TunBoxColors {
    *
    * 终点色仍跟当前背景配色走（薄荷/暖米/暮蓝），否则选了彩色背景后底栏还留在蓝灰系，边边会脱开。
    */
-  /**
-   * 顶栏玻璃染色（2026-10-31 七修）。
-   *
-   * 前几版给的 alpha 是 0.22/0.05 这种量级，实测顶栏内部像素 (243,246,253)、页面底色
-   * (243,246,251) —— **差 0~2 级**，用户看到的就是「没有任何变化」。而底部 Dock 之所以明显，
-   * 是它比页面亮 15 级（内部 252 vs 页面 237）还带一道白光边。
-   * 这里直接按 Dock 的实测亮度反推 alpha：浅色要 ~0.55 才够，深色 ~0.34。
-   */
-  static headerGlassTop(rev: number): ResourceColor {
-    return ThemeService.isDark() ? 'rgba(38, 46, 66, 0.42)' : 'rgba(255, 255, 255, 0.62)';
-  }
-
-  static headerGlassBottom(rev: number): ResourceColor {
-    return ThemeService.isDark() ? 'rgba(24, 32, 48, 0.30)' : 'rgba(255, 255, 255, 0.34)';
-  }
 
   static dockGradientTop(rev: number): ResourceColor {
     TunBoxColors.syncPalette(rev);
@@ -475,6 +488,22 @@ export class TunBoxColors {
    */
   static dockGlassTint(rev: number): ResourceColor {
     return ThemeService.isDark() ? 'rgba(20, 26, 40, 0.10)' : 'rgba(255, 255, 255, 0.06)';
+  }
+
+  /**
+   * 底部弹层（诊断面板）的玻璃染色。
+   *
+   * 与 `dockGlassTint` 同一种材质，但 alpha 高得多：底栏上只有三个 12fp 的页签，
+   * 弹层里是成屏的 10~13fp 文字，背后内容透得太多就读不清。
+   * 取值让「模糊后的背景」仍占约三成，既看得出是玻璃，又不牺牲正文对比度；
+   * 基色跟当前背景配色走（薄荷/暖米/暮蓝下不会冒出一块蓝灰板）。
+   */
+  static sheetGlassTint(rev: number): ResourceColor {
+    TunBoxColors.syncPalette(rev);
+    if (ThemeService.isDark()) {
+      return 'rgba(18, 24, 38, 0.74)';
+    }
+    return TunBoxColors.rgba(TunBoxColors.mixToWhite(TunBoxColors.paletteStartHex, 0.55), 0.72);
   }
 
   // ── 顶栏玻璃（2026-10-30 二修：用户「往上滑动被上面完全遮挡」+「感觉不够透明」）────────────
@@ -567,17 +596,6 @@ export class TunBoxColors {
   }
 
   // ── 顶部浮动提示胶囊（2026-10-18 用户要求：不要黑色底，跟软件整体配色一致）──
-  /**
-   * 底色：浅色=卡片白（与订阅卡/概览卡同一种表面），深色=半透明深卡底。
-   * 旧实现是写死的 rgba(15,23,42,0.92) 黑底 —— 在浅色主题里像一块外来的黑膏药，
-   * 用户明确要求换成与整体配色一致的底与字色。
-   */
-  static toastBg(rev: number): ResourceColor {
-    if (ThemeService.isDark()) {
-      return 'rgba(20, 28, 46, 0.94)';
-    }
-    return TunBoxColors.lightSurface(0.80, '#FFFFFF', rev);
-  }
 
   /** 文字：跟随正文色（浅色墨黑 / 深色近白），不再一律白字 */
   static get toastText(): ResourceColor {
@@ -602,13 +620,10 @@ export class TunBoxGeometry {
   /** 卡片曲率 20~24vp（标准卡 22 / 次级卡 20 / 大卡 26） */
   static readonly cardRadius: number = 22;
   static readonly cardRadiusSmall: number = 20;
-  static readonly cardRadiusLarge: number = 26;
   /** 胶囊/小组件圆角 100vp（Full Pill） */
   static readonly pillRadius: number = 100;
   /** 控件圆角 14vp（按钮/输入框） */
   static readonly controlRadius: number = 14;
-  /** 列表间距 12vp */
-  static readonly listGap: number = 12;
   /**
    * 滚动容器两端「渐隐」长度 vp（2026-10-30 用户：往上滑动会被顶栏完全遮挡，要渐变模糊）。
    *
@@ -626,38 +641,6 @@ export class TunBoxGeometry {
    */
   static headerReserve(): number {
     return SafeArea.topPad() + TunBoxGeometry.navHeight;
-  }
-
-  /**
-   * 顶栏「渐变模糊」的半径上限（vp）—— 2026-10-31 十三修。
-   *
-   * 走的是官方 `linearGradientBlur(radius, { fractionStops, direction })`：
-   * 系统按停靠点插值算模糊，天生连续，**不会**出现分带拼接出来的条块/马赛克
-   * （那是逐条 `backgroundEffect` 各自取样才有的毛病，见 docs/HEADER_GRADIENT_BLUR_2026-10-31.md）。
-   * 渐变模糊作用在滚动容器的内容上：越靠顶越糊，到顶栏下沿附近归零。
-   */
-  static topBlurRadius(): number {
-    return 16;
-  }
-
-  /**
-   * 渐变模糊停靠点 `[模糊度, 位置]`，位置按**滚动容器高度**归一化（0=顶部，1=底部）。
-   *
-   * 关键约束（2026-10-31 十五修，用户报「点订阅后第一个节点变模糊了」）：
-   * 模糊区**必须收在 `headerReserve()` 以内**。列表静止时的首项正好从
-   * `headerReserve()` 这一行开始，一旦把收口点放到 1.15×，首项顶边就落进模糊区
-   * —— 于是静止状态也糊，看起来像坏了。现在收到 1.0×（再留 2% 余量防取整）：
-   *   - 静止：首项完全在清晰区；
-   *   - 滚动：内容进入顶栏那一段才逐渐糊，出顶栏即清晰。
-   * 位置必须严格递增，否则系统按非法值记日志并忽略。
-   */
-  static topBlurStops(): Array<[number, number]> {
-    const measured: number = AppStorage.get<number>(SafeArea.KEY_SCREEN_VP) ?? 0;
-    const base: number = measured > 200 ? measured : 800;
-    const reserve: number = TunBoxGeometry.headerReserve();
-    const solid: number = Math.min(0.85, (reserve * 0.50) / base);
-    const clear: number = Math.min(0.95, (reserve * 0.98) / base);
-    return [[1, 0], [1, solid], [0, clear]];
   }
 
 
@@ -688,8 +671,6 @@ export class TunBoxGeometry {
     return SafeArea.dockSink();
   }
 
-  /** 底栏底部渐隐底高度：盖住底栏本体 + 上方一段过渡，让内容在进入底栏前淡出 */
-  static readonly dockScrimHeight: number = 170;
   /**
    * 页面底部为悬浮栏留白（栏高 + 下边距 + 余量）。
    *

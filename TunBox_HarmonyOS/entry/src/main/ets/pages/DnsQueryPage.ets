@@ -1,4 +1,4 @@
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { TopNavBar } from '../components/TopNavBar';
 import { CoreLogLine, CoreLogListener, CoreLogStream } from '../commons/services/CoreLogStream';
@@ -109,6 +109,14 @@ struct DnsQueryPage {
       return '连接中…';
     }
     return '未连接内核';
+  }
+
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
+  pageTransition() {
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
   }
 
   build() {

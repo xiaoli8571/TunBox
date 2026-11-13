@@ -559,18 +559,6 @@ export class FormStateSync {
     return result;
   }
 
-  private static async readFormIds(context: Context): Promise<string[]> {
-    const store = await preferences.getPreferences(context, FORM_PREF);
-    const raw = await store.get(FORM_IDS_KEY, '[]') as string;
-    return FormStateSync.parseIds(raw);
-  }
-
-  private static async writeFormIds(context: Context, ids: string[]): Promise<void> {
-    const store = await preferences.getPreferences(context, FORM_PREF);
-    await store.put(FORM_IDS_KEY, JSON.stringify(ids));
-    await store.flush();
-  }
-
   private static parseIds(raw: string): string[] {
     const result: string[] = [];
     try {

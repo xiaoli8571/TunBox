@@ -41,6 +41,7 @@ import {
   ContinuousTaskVerdict
 } from '../commons/services/BackgroundTaskWatch';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { CORE_READY_WAIT_MS } from '../commons/services/VpnRecoveryPolicy';
 import { FormStateSync } from '../commons/services/FormStateSync';
 import { ShortcutOutcomeLog, ShortcutOutcomeRecord } from '../commons/services/ShortcutOutcomeLog';
 import { AppLogger } from '../commons/utils/AppLogger';
@@ -56,8 +57,12 @@ const COLOR_TRANSPARENT = '#00000000';
 /**
  * 兜底寿命守护：无页面能力一旦悬留就是一块黑屏，任何异常路径都不允许它常驻。
  * 覆盖最慢建连路径（扩展拉起 + 就绪 + DNS 可达上限），守护模式接管后撤销。
+ *
+ * 就绪窗口取 CORE_READY_WAIT_MS（从内核原生时限派生），其余环节沿用原有 30s 余量
+ * —— 不能再写死 60s：订阅自带规则集时内核启动期要联网加载，就绪可能超过 30s，
+ * 写死的守护会在连接进行到一半时把宿主能力连同连接一起终止。
  */
-const MAX_LIFETIME_MS = 60000;
+const MAX_LIFETIME_MS = CORE_READY_WAIT_MS + 30000;
 /** 自毁前等待 windowStage 就绪的上限（极快的「已连接」短路会早于窗口创建） */
 const WINDOW_STAGE_GRACE_MS = 1500;
 /** 轮询 windowStage 就绪的步长 */

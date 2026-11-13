@@ -1,0 +1,3 @@
+# Local device signing configuration contains signing credentials.
+# Keep this exclusion in the repository, not only in .git/info/exclude.
+.device-signing.local.json5

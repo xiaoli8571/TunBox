@@ -31,6 +31,42 @@ export const RECOVERY_MAX_DELAY_MS: number = 8000;
 export const REBUILD_BASE_DELAY_MS: number = 1500;
 export const REBUILD_MAX_DELAY_MS: number = 8000;
 
+// ── 内核启动时限（2026-11-11 真机定案）──────────────────────────────────────
+// 应用侧所有「等内核启动」的超时都必须**从内核自己的原生时限派生**，不许另拍数字。
+// 真机实证：带 14 个 rule-providers 的订阅，内核合法地在等规则集下载（单次上限 20s），
+// 应用 15s 的外层超时先到 → 把扩展连同内核一起销毁 → 永远「测速通道未就绪」。
+// 其他客户端跑的是同一段同步加载代码，只是没有比内核更短的外层超时。
+
+/**
+ * 单个 provider 一次 HTTP 拉取的上限。
+ * mihomo `component/resource/vehicle.go:20`：`DefaultHttpTimeout = time.Second * 20`，
+ * 由 `adapter/provider/parser.go` / `rules/provider/parse.go` 写死传入，**不是配置项**；
+ * 超时后只记日志、不阻断启动（`hub/executor/executor.go` loadProvider）。
+ */
+export const CORE_PROVIDER_FETCH_TIMEOUT_MS: number = 20000;
+/**
+ * 启动期同步加载 provider 的阶段数。
+ * `hub/executor/executor.go` ApplyConfig：`loadProvider(cfg.Providers)` →
+ * `loadProvider(cfg.RuleProviders)` 串行两段；arm64 上段内全并发
+ * （`concurrent_load_unlimit.go`：concurrentCount = MaxInt），所以每段最坏 = 一次拉取上限。
+ */
+export const CORE_PROVIDER_LOAD_PHASES: number = 2;
+/** `bridge/bridge.go` Start()：ApplyConfig 之后等 controller 监听的上限（controllerDeadline = 10s）。 */
+export const CORE_CONTROLLER_WAIT_MS: number = 10000;
+/** 配置解析 / 监听器 / 线程调度余量。正常启动真机实测 84~116ms。 */
+export const CORE_START_SLACK_MS: number = 5000;
+/**
+ * 内核 Start() 的原生最坏耗时上界 = 扩展进程内 startCore 的硬超时。
+ * 超过它才是真正的「native 挂死」，在此之前内核只是在按自己的规则等下载。
+ */
+export const CORE_START_TIMEOUT_MS: number =
+  CORE_PROVIDER_FETCH_TIMEOUT_MS * CORE_PROVIDER_LOAD_PHASES + CORE_CONTROLLER_WAIT_MS + CORE_START_SLACK_MS;
+/**
+ * UI 进程等扩展上报启动结果的窗口。必须**长于** CORE_START_TIMEOUT_MS：
+ * 让扩展先把真实原因写回来，UI 的通用超时文案只做最后兜底（差值覆盖扩展进程拉起）。
+ */
+export const CORE_READY_WAIT_MS: number = CORE_START_TIMEOUT_MS + 5000;
+
 /** Kept as a compatibility API; the effective MTU no longer depends on bearer. */
 export function mtuForNetType(_netType: string): number {
   return BASE_MTU;
@@ -180,19 +216,21 @@ export function friendlyVpnStartError(code: number, rawMessage: string): string 
       + '若持续出现请通过官方在线提单渠道反馈。';
   }
   // 内核配置解析失败(带 code=-1 走这里)：给出可行动的指引，而不是原始 Go 报错。
+  // 用户可见文案里不写版本号：这些说明原来带着「5.5.5 起…」「5.5.6 起…」，
+  // 那是旧版本线的编号，当前应用是 0.8.x，用户看到的是一个不存在的版本。
   if (rawMessage.indexOf('has unset fields') >= 0) {
     return '内核拒绝了订阅中的节点配置（存在缺少 password/uuid 等必填凭据的节点，'
-      + '5.5.5 起此类节点会在生成配置前被隔离并计数）。请到主页「订阅」里刷新；'
+      + '此类节点正常会在生成配置前被隔离并计数）。请到主页「订阅」里刷新；'
       + '若仍失败，请删除日志中提示的节点。原始错误: ' + rawMessage;
   }
   if (rawMessage.indexOf('control characters are not allowed') >= 0) {
-    return '内核拒绝了配置文件（文本含非法控制字符）。5.5.5 已修复蜂窝网络下扩展进程'
-      + '改写 MTU 时损坏配置文件的根因；如仍出现，请到主页「订阅」里刷新后重连。原始错误: '
+    return '内核拒绝了配置文件（文本含非法控制字符）。'
+      + '请到主页「订阅」里刷新后重连；若仍出现，请导出诊断日志反馈。原始错误: '
       + rawMessage;
   }
   if (rawMessage.indexOf('应用分流参数缺失或冲突') >= 0) {
     return '系统在拉起 VPN 扩展时丢失了本次连接的路由参数（新装首连的授权弹窗链路偶发；'
-      + '5.5.6 起扩展会自动回退读取参数快照并重试一次）。请再点一次连接；若仍出现，'
+      + '扩展已自动回退读取参数快照并重试过一次）。请再点一次连接；若仍出现，'
       + '重启应用后再连。原始错误: ' + rawMessage;
   }
   // 零节点硬门禁（5.6.0）：连接漏斗在 nodes 为空时直接拒绝，根本没拉起扩展。

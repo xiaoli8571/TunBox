@@ -50,7 +50,9 @@ const MAX_REDIRECTS = 5;
  * 即 UA 轮换对这类拦截无效，它是自造行为，已按 FlClash 删除。
  */
 export function tunboxUserAgent(): string {
-  return `TunBox/v${AppInfo.version()} clash-verge Platform/OpenHarmony`;
+  // Lead with the mature Clash-Verge token: some panels parse the first product/version pair.
+  // Keeping TunBox metadata after it avoids being classified as an obsolete client.
+  return `clash-verge/v2.4.2 TunBox/v${AppInfo.version()} Platform/OpenHarmony`;
 }
 
 /**

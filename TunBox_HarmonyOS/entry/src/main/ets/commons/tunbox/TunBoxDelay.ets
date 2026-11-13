@@ -64,6 +64,17 @@ export const TUNBOX_DELAY_DEFAULT_TIMEOUT_MS: number = AppSettings.DEFAULT_DELAY
 export const TUNBOX_DELAY_GUARD_MS: number = 30000;
 /** 是否用 TCP 直连传输层（false = 回退 @ohos.net.http，见 ArkTcpDelayHttpTransport 注释） */
 export const TUNBOX_DELAY_USE_TCP_TRANSPORT: boolean = true;
+/**
+ * 对端关闭连接后，还愿意等「已排队但尚未投递的 message」多久（ms）。
+ *
+ * 真机证实 close 事件可能早于已排队的 message，所以不能一收到 close 就放弃；
+ * 但也不能像旧实现那样继续等满 30s 守护 —— 请求用的是 keep-alive，内核不会在
+ * 回包前主动断开，对端关闭只意味着**内核没了**（测速核被回收 / 被切换订阅作废）。
+ * 2026-11-11 真机：批测进行到第 4 秒时用户点了另一张订阅卡，测速核随即被作废重建，
+ * 5 个在途请求全部 `bytes=0 peerClosed=true`，却干等到 30s 才收尾（界面一直转圈，
+ * 最后这 5 个节点显示 `--`）。结论口径不变：仍然是「不作结论」，只是不再白等。
+ */
+export const TUNBOX_DELAY_PEER_CLOSE_GRACE_MS: number = 1000;
 
 /** 默认测速 URL（mihomo defaultTestURL，调用方可按节点/组覆盖） */
 // 测速地址的真源在 commons/latency/LatencyTestUrl（ND06：默认地址常量只允许一处）。
@@ -322,6 +333,7 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
     let text: string = '';
     let peerClosed: boolean = false;
     let timer: number = -1;
+    let closeTimer: number = -1;
     let resolveFn: (value: DelayHttpReply) => void = (): void => {};
     let rejectFn: (reason: Object) => void = (): void => {};
 
@@ -329,6 +341,10 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
       if (timer >= 0) {
         clearTimeout(timer);
         timer = -1;
+      }
+      if (closeTimer >= 0) {
+        clearTimeout(closeTimer);
+        closeTimer = -1;
       }
       try {
         tcp.off('message');
@@ -383,9 +399,15 @@ export class ArkTcpDelayHttpTransport implements DelayHttpTransport {
       }
     });
     tcp.on('close', (): void => {
-      // close 不是收包队列的屏障。继续接收排队中的 message，完整帧才兑现。
-      // 真正缺失/截断的回复仍由现有 guard 收尾，不凭 EOF 伪造节点结论。
+      // close 不是收包队列的屏障。继续接收排队中的 message，完整帧才兑现；
+      // 不凭 EOF 伪造节点结论。但对端已关就不可能再有新数据：给排队中的 message
+      // 一个短宽限，到点仍没收齐就按「没拿到响应」收尾，不再干等整段守护。
       peerClosed = true;
+      if (settled || closeTimer >= 0) { return; }
+      closeTimer = setTimeout((): void => {
+        closeTimer = -1;
+        fail(new Error(`tcp transport incomplete: bytes=${text.length} peerClosed=true (peer closed before a full reply)`));
+      }, TUNBOX_DELAY_PEER_CLOSE_GRACE_MS);
     });
     tcp.on('error', (err: BusinessError): void => {
       fail(err);

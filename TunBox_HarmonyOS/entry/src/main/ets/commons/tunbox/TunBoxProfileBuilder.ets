@@ -85,6 +85,19 @@ export class TunBoxProfileInput {
   appendSystemDns: boolean = false;
   /** global-ua 设置值（FlClash realPatchConfig.globalUa；空 = 默认 UA）。 */
   globalUa: string = '';
+  /**
+   * 测速核专用（隧道恒 false）：订阅自带的 http 规则集**本地还没缓存**时，
+   * 换成同名的空 inline 规则集，让内核启动时不去联网下载它。
+   *
+   * 为什么（2026-11-11 真机，cfnew 订阅）：内核启动要**同步**等所有规则集加载完，
+   * 没缓存就联网拉、每个最多等 20s。14 个规则集全部 `TLS handshake timeout` ⇒
+   * 点了测速 21 秒后才开始测。而测速只是逐节点打 `/proxies/{name}/delay`，
+   * 不经过分流规则 —— 这 21 秒等来的东西测速根本用不上。
+   *
+   * 名字和 behavior 原样保留，所以 `RULE-SET,名字,…` 规则和 DNS 里的 `rule-set:名字`
+   * 引用照样能解析。已经有缓存的规则集不动（本地加载是毫秒级，且与隧道一致）。
+   */
+  skipUncachedRuleProviders: boolean = false;
 }
 
 /** 构建结果（ok=false 时 error 说明原因，调用方必须拒绝启动）。 */
@@ -99,6 +112,8 @@ export class TunBoxProfileResult {
   applied: string = '';
   /** 收容了 path 的 provider 数（proxy + rule）。 */
   confinedProviders: number = 0;
+  /** 测速核里被换成空 inline 的规则集数（见 TunBoxProfileInput.skipUncachedRuleProviders）。 */
+  offlineRuleProviders: number = 0;
   /** legacy→新 provider 缓存迁移（旧 URL-only MD5 → name@url MD5；build best-effort 改名）。 */
   providerMigrations: TunBoxProviderMigration[] = [];
   /** 内核解析出的节点/组/规则计数（ProfileBase，节点数显示用）。 */
@@ -680,7 +695,12 @@ export class TunBoxProfileBuilder {
     //     全部非 inline（含 file 型）→ path = <profiles>/providers/<id>/<type>/<md5(key)>
     //     有 URL：key = name@url；无 URL：key = section/name（proxies/rules 归属）。
     //     有 URL 的旧 URL-only 缓存记一笔迁移（build 侧 best-effort 改名）。
+    //
+    //     测速核例外（input.skipUncachedRuleProviders）：http 规则集的缓存文件还不在盘上时，
+    //     换成同名空 inline —— 内核不为它联网，测速不必先等规则集下载（每个最多 20s）。
+    //     只动 rule-providers；proxy-providers 是节点来源，必须照常加载。
     let confined = 0;
+    let offlineRules = 0;
     const providerSections: string[][] = [['proxy-providers', 'proxies'], ['rule-providers', 'rules']];
     for (const pair of providerSections) {
       const section = pair[0];
@@ -700,11 +720,30 @@ export class TunBoxProfileBuilder {
         const url = provider['url'];
         const hasUrl = typeof url === 'string' && url.length > 0;
         const key = hasUrl ? `${name}@${url}` : `${section}/${name}`;
-        provider['path'] = `${input.profilesDir}/providers/${input.profileId}/${type}/${md5Hex(key)}`;
+        const cachePath = `${input.profilesDir}/providers/${input.profileId}/${type}/${md5Hex(key)}`;
+        const legacyPath = hasUrl
+          ? `${input.profilesDir}/providers/${input.profileId}/${type}/${md5Hex(url as string)}` : '';
+        // behavior 不是字符串的条目不碰：内核本来就会拒它，报错要保持是内核的原话。
+        const behavior = provider['behavior'];
+        if (input.skipUncachedRuleProviders && section === 'rule-providers'
+          && provider['type'] === 'http' && typeof behavior === 'string'
+          && !TunBoxProfileBuilder.fileExists(cachePath)
+          // 旧路径上有缓存也算有：build() 随后会把它改名到新路径
+          && !(legacyPath.length > 0 && TunBoxProfileBuilder.fileExists(legacyPath))) {
+          const placeholder: Record<string, Object> = {};
+          const emptyPayload: string[] = [];
+          placeholder['type'] = 'inline';
+          placeholder['behavior'] = behavior;
+          placeholder['payload'] = emptyPayload;
+          providers[name] = placeholder;
+          offlineRules += 1;
+          continue;
+        }
+        provider['path'] = cachePath;
         if (hasUrl) {
           const migration = new TunBoxProviderMigration();
-          migration.from = `${input.profilesDir}/providers/${input.profileId}/${type}/${md5Hex(url as string)}`;
-          migration.to = provider['path'] as string;
+          migration.from = legacyPath;
+          migration.to = cachePath;
           out.providerMigrations.push(migration);
         }
         confined += 1;
@@ -712,6 +751,7 @@ export class TunBoxProfileBuilder {
       applied.push(section);
     }
     out.confinedProviders = confined;
+    out.offlineRuleProviders = offlineRules;
 
     // 3.6 geox-url / global-ua（FlClash task.dart:280-281）：
     //     geox-url 整段取补丁值（profile 自己的值丢弃）；
@@ -866,6 +906,18 @@ export class TunBoxProfileBuilder {
       out.error = `配置序列化失败：${String(e)}`;
     }
     return out;
+  }
+
+  /**
+   * provider 缓存文件是否已经在盘上且非空（查不了一律按「没有」，不抛）。
+   * 空文件按「没有」：内核解析它会失败，然后照样回落到联网下载。
+   */
+  private static fileExists(path: string): boolean {
+    try {
+      return fs.statSync(path).size > 0;
+    } catch (e) {
+      return false;
+    }
   }
 
   /** 目标键覆盖（浅合并；undefined 值跳过）。 */

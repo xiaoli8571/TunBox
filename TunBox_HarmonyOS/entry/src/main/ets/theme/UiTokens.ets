@@ -9,14 +9,6 @@ import { AppBgTheme, ThemeService } from './ThemeService';
 /** 随系统深浅模式自动解析的语义设计令牌。 */
 export class Ui {
   static readonly background: ResourceColor = $r('app.color.ui_background');
-  static readonly backgroundRaised: ResourceColor = $r('app.color.ui_background_raised');
-  /** 主页三张信息磁贴专用底色/渐变：深色主题下更实、去白纱，避免「透白」不协调 */
-  static readonly tileFill: ResourceColor = $r('app.color.ui_tile_fill');
-  static readonly tileGloss: ResourceColor = $r('app.color.ui_tile_gloss');
-  static readonly tileDeep: ResourceColor = $r('app.color.ui_tile_deep');
-  static readonly glassHighlight: ResourceColor = $r('app.color.ui_glass_highlight');
-  static readonly glassHighlightSoft: ResourceColor = $r('app.color.ui_glass_highlight_soft');
-  static readonly glassGlow: ResourceColor = $r('app.color.ui_glass_glow');
   static readonly primary: ResourceColor = $r('app.color.ui_primary');
   static readonly primaryBlue: ResourceColor = $r('app.color.ui_primary_blue');
   static readonly primaryBlueFill: ResourceColor = $r('app.color.ui_primary_blue_fill');
@@ -27,32 +19,18 @@ export class Ui {
   static readonly textPrimary: ResourceColor = $r('app.color.ui_text_primary');
   static readonly textSecondary: ResourceColor = $r('app.color.ui_text_secondary');
   static readonly textTertiary: ResourceColor = $r('app.color.ui_text_tertiary');
-  static readonly textOnBrand: ResourceColor = $r('app.color.ui_text_on_brand');
   static readonly textBlue: ResourceColor = $r('app.color.ui_text_blue');
-  static readonly textError: ResourceColor = $r('app.color.ui_text_error');
   static readonly textViolet: ResourceColor = $r('app.color.ui_text_violet');
   static readonly border: ResourceColor = $r('app.color.ui_border');
   static readonly borderStrong: ResourceColor = $r('app.color.ui_border_strong');
   static readonly buttonDisabled: ResourceColor = $r('app.color.ui_button_disabled');
   static readonly overlay: ResourceColor = $r('app.color.ui_overlay');
   static readonly shadow: ResourceColor = $r('app.color.ui_shadow');
-  static readonly navBackground: ResourceColor = $r('app.color.ui_nav_background');
   static readonly statusTint: ResourceColor = $r('app.color.ui_status_tint');
-  static readonly powerGlowActive: ResourceColor = $r('app.color.ui_power_glow_active');
-  static readonly powerGlowIdle: ResourceColor = $r('app.color.ui_power_glow_idle');
-  static readonly powerRingActive: ResourceColor = $r('app.color.ui_power_ring_active');
-  static readonly powerRingIdle: ResourceColor = $r('app.color.ui_power_ring_idle');
-  static readonly powerInnerActive: ResourceColor = $r('app.color.ui_power_inner_active');
-  static readonly powerInnerIdle: ResourceColor = $r('app.color.ui_power_inner_idle');
 
   static primaryFor(rev: number): ResourceColor {
     const palette = ThemeService.semanticPalette(rev);
     return palette.backgroundVariant ? palette.brandPrimary : Ui.primary;
-  }
-
-  static primaryBlueFor(rev: number): ResourceColor {
-    const palette = ThemeService.semanticPalette(rev);
-    return palette.backgroundVariant ? palette.brandPrimary : Ui.primaryBlue;
   }
 
   static primaryBlueFillFor(rev: number): ResourceColor {
@@ -120,11 +98,6 @@ export class Ui {
     return Ui.tinted(0.80, $r('app.color.ui_surface_strong'), rev);
   }
 
-  /** 半透表面（原 ui_surface_translucent） */
-  static surfaceTranslucent(rev: number): ResourceColor {
-    return Ui.tinted(0.55, $r('app.color.ui_surface_translucent'), rev);
-  }
-
   /** 凹槽/次级底（原 ui_surface_muted） */
   static surfaceMuted(rev: number): ResourceColor {
     return Ui.tinted(0.30, $r('app.color.ui_surface_muted'), rev);
@@ -147,32 +120,7 @@ export class Ui {
 
   static readonly pagePadding: number = 20;
   static readonly cardRadius: number = 24;
-  static readonly dialogRadius: number = 28;
   static readonly controlRadius: number = 14;
-  static readonly glassBlurRadius: number = 28;
-  /** 全局液态玻璃光学参数，避免各页面出现不同的雾化、亮度和景深。 */
-  static readonly glassSaturation: number = 1.26;
-  static readonly glassBrightness: number = 1.06;
-  /** 次级卡片与浮层使用的轻量液态玻璃参数。 */
-  static readonly glassSaturationSoft: number = 1.20;
-  static readonly glassBrightnessSoft: number = 1.04;
-  static readonly glassControlBlurRadius: number = 18;
-  static readonly glassControlSaturation: number = 1.12;
-  static readonly glassControlBrightness: number = 1.03;
-  static readonly glassShadowRadius: number = 30;
-  static readonly glassShadowOffsetY: number = 14;
-  static readonly glassPressScale: number = 0.985;
-  static readonly compactBreakpoint: number = 460;
-  static readonly pageMaxWidth: number = 440;
-  static readonly bottomNavMaxWidth: number = 380;
-  static readonly currentNodeMaxWidth: number = 320;
-
-  /** 背景渐变由 base/dark 同名资源自动切换。 */
-  static readonly backdropColors: Array<[ResourceColor, number]> = [
-    [$r('app.color.ui_backdrop_start'), 0.0],
-    [$r('app.color.ui_backdrop_middle'), 0.48],
-    [$r('app.color.ui_backdrop_end'), 1.0]
-  ];
 }
 
 /** 延迟配色与文案（对齐 tunbox_node_selection_node_card / current_node_card 阈值） */

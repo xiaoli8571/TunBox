@@ -100,7 +100,10 @@ export class IsolatedLatencyCore {
       IsolatedLatencyCore.path = `${dir}/config.yaml`;
       privateFs.writePrivate(IsolatedLatencyCore.path, yaml);
       const ok = await coreBridge.startCore(IsolatedLatencyCore.path);
-      if (!ok) { throw new Error('独立测速内核启动失败'); }
+      if (!ok) {
+        const reason = await coreBridge.lastError();
+        throw new Error(`独立测速内核启动失败：${reason || 'native start returned false'}`);
+      }
       const api = new ClashApiService();
       api.setEndpoint(ports.apiPort, secret);
       const deadline = Date.now() + 5000;

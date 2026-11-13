@@ -14,7 +14,7 @@
  */
 import { promptAction , LengthMetrics} from '@kit.ArkUI';
 import { fileIo as fs } from '@kit.CoreFileKit';
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { TopNavBar } from '../components/TopNavBar';
 import { TabLifecycleBridge } from '../commons/utils/TabLifecycleBridge';
@@ -43,6 +43,12 @@ const TICK_MS: number = 1000;
 const PERSIST_EVERY: number = 5;
 /** 内存端点轮询间隔（tick 数） */
 const MEMORY_EVERY: number = 2;
+/** 速率卡数值行的种类：TrafficMetricRow 凭它在 @Builder 内部直接读 @State（见文件头「真机踩坑」） */
+const METRIC_PEAK: number = 0;
+const METRIC_AVG: number = 1;
+const METRIC_SESSION: number = 2;
+const METRIC_LIFETIME: number = 3;
+const METRIC_TODAY: number = 4;
 
 function zeroRatePoints(): number[] {
   const out: number[] = [];
@@ -136,6 +142,87 @@ struct StatsRateChart {
   }
 }
 
+/** 清零日滚轮的选项：「1 日」…「28 日」（下标 = 日 - 1） */
+function resetDayLabels(): string[] {
+  const out: string[] = [];
+  for (let d = 1; d <= 28; d++) {
+    out.push(`${d} 日`);
+  }
+  return out;
+}
+
+/**
+ * 每月清零日选择弹窗：滚轮滑动选 1–28 日，「确定」才生效。
+ *
+ * 2026-11-12 用户要求：原来是点一下加一天，想回退或跨很多天要连点十几二十次；
+ * 且每点一次就立刻落盘并触发一次「是否到清零日」判定。改成弹出滚轮，一次选定。
+ */
+@CustomDialog
+struct ResetDayDialog {
+  controller?: CustomDialogController;
+  /** 仅供配色 token 登记重绘依赖（themeRevision 必须在 build 表达式里被读到） */
+  @StorageLink('theme_revision') themeRevision: number = 0;
+  /** 打开时的清零日（滚轮初始位置）；每次弹出在 aboutToAppear 里从存储现读 */
+  private initialDay: number = 1;
+  /** 滚轮当前停留的日 */
+  @State day: number = 1;
+  onPick: (day: number) => void = (_day: number) => {};
+
+  aboutToAppear(): void {
+    this.initialDay = TrafficStatsStore.resetDayValue();
+    this.day = this.initialDay;
+  }
+
+  build() {
+    Column({ space: 12 }) {
+      Text('每月清零日')
+        .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+        .width('100%')
+      Text(`每月 ${this.day} 日 00:00 自动清零累计总量`)
+        .fontSize(11.5).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
+        .width('100%')
+      TextPicker({ range: resetDayLabels(), selected: this.initialDay - 1 })
+        .width('100%')
+        .height(180)
+        .canLoop(true)
+        .disappearTextStyle({ color: TunBoxTextColors.mutedFor(this.themeRevision) })
+        .textStyle({ color: TunBoxTextColors.secondaryFor(this.themeRevision) })
+        .selectedTextStyle({ color: TunBoxTextColors.primaryFor(this.themeRevision) })
+        .onChange((_value: string | string[], index: number | number[]): void => {
+          if (typeof index === 'number') {
+            this.day = index + 1;
+          }
+        })
+      Row({ space: 10 }) {
+        Button('取消')
+          .layoutWeight(1).height(38).borderRadius(8)
+          .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
+          .fontColor(TunBoxTextColors.mutedFor(this.themeRevision)).fontSize(13)
+          .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
+          .onClick((): void => {
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+          })
+        Button('确定')
+          .layoutWeight(1).height(38).borderRadius(8)
+          .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(Color.White).fontSize(13)
+          .onClick((): void => {
+            const picked: number = this.day;
+            if (this.controller !== undefined) {
+              this.controller.close();
+            }
+            this.onPick(picked);
+          })
+      }
+      .width('100%')
+    }
+    .padding(20)
+    .borderRadius(20)
+    // 沉浸光感：材质由系统托管，根容器不设不透明底色/模糊/自定义阴影（与其余弹窗一致）。
+  }
+}
+
 @Component
 export struct StatsPage {
   @StorageLink('theme_revision') themeRevision: number = 0;
@@ -193,6 +280,12 @@ export struct StatsPage {
   private ready: boolean = false;
   private windowUpPeak: number = 1;
   private windowDownPeak: number = 1;
+  /** 清零日滚轮弹窗（初始位置由弹窗自己在 aboutToAppear 里读存储，不靠这里传值） */
+  private resetDayDialog: CustomDialogController = new CustomDialogController({
+    builder: ResetDayDialog({
+      onPick: (day: number): void => { this.applyResetDay(day); }
+    })
+  });
 
   aboutToAppear(): void {
     this.pageMounted = true;
@@ -503,6 +596,27 @@ export struct StatsPage {
     return `${this.formatBytes(bps)}/s`;
   }
 
+  /**
+   * 速率卡数值行的文本。**只能在 @Builder 内部调用**：在那里读到的 @State 才会登记成
+   * 该 Text 的依赖，数值变化才会重渲染。在调用处拼好字符串再当值参数传进 @Builder，
+   * 得到的是首帧快照（2026-11-12：峰值 / 平均 / 本次连接恒为 0 的根因）。
+   */
+  private trafficMetricText(kind: number): string {
+    if (kind === METRIC_PEAK) {
+      return `${this.formatSpeed(this.peakDown)} / ${this.formatSpeed(this.peakUp)}`;
+    }
+    if (kind === METRIC_AVG) {
+      return `${this.formatSpeed(this.avgDown)} / ${this.formatSpeed(this.avgUp)}`;
+    }
+    if (kind === METRIC_SESSION) {
+      return `↓ ${this.formatBytes(this.sessionDown)}   ↑ ${this.formatBytes(this.sessionUp)}`;
+    }
+    if (kind === METRIC_LIFETIME) {
+      return `↓ ${this.formatBytes(this.lifetimeDown)}   ↑ ${this.formatBytes(this.lifetimeUp)}`;
+    }
+    return `↓ ${this.formatBytes(this.todayDown)}   ↑ ${this.formatBytes(this.todayUp)}`;
+  }
+
   private async testEntry(entry: ConnectivityEntry): Promise<void> {
     const marked: ConnectivityEntry[] = this.entries.slice();
     for (let i = 0; i < marked.length; i++) {
@@ -581,11 +695,14 @@ export struct StatsPage {
     await this.persistHosts();
   }
 
-  private async cycleResetDay(): Promise<void> {
-    const next: number = this.resetDay >= 28 ? 1 : this.resetDay + 1;
-    await TrafficStatsStore.setResetDay(next);
+  /** 滚轮弹窗点「确定」后落盘清零日（1–28）。日子没变就什么都不做。 */
+  private async applyResetDay(day: number): Promise<void> {
+    if (day === this.resetDay) {
+      return;
+    }
+    await TrafficStatsStore.setResetDay(day);
     this.reloadStats();
-    promptAction.showToast({ message: `每月 ${next} 日 00:00 清零累计` });
+    promptAction.showToast({ message: `每月 ${this.resetDay} 日 00:00 清零累计` });
   }
 
   private probeStateText(state: ProbeState): string {
@@ -643,6 +760,28 @@ export struct StatsPage {
     .alignItems(VerticalAlign.Center)
   }
 
+  /**
+   * 速率卡的数值行：版式与 MetricRow 相同，但数值按 kind 在这里现读 @State。
+   * MetricRow 的 value 是值参数，只在外层重建时才会换新，每秒变化的数值不能走它。
+   */
+  @Builder
+  TrafficMetricRow(icon: Resource, label: string, kind: number) {
+    Row({ space: 6 }) {
+      Image(icon).width(13).height(13).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+      Text(label)
+        .fontSize(11).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+        .maxLines(1)
+      Blank()
+      Text(this.trafficMetricText(kind))
+        .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+        .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Center)
+  }
+
   @Builder
   SpeedCard() {
     Column({ space: 10 }) {
@@ -678,25 +817,20 @@ export struct StatsPage {
 
       StatsRateChart({ upPoints: this.upPoints, downPoints: this.downPoints })
 
-      this.MetricRow($r('app.media.ic_bolt'), '峰值',
-        `${this.formatSpeed(this.peakDown)} / ${this.formatSpeed(this.peakUp)}`)
-      this.MetricRow($r('app.media.ic_sort'), '平均',
-        `${this.formatSpeed(this.avgDown)} / ${this.formatSpeed(this.avgUp)}`)
+      this.TrafficMetricRow($r('app.media.ic_bolt'), '峰值', METRIC_PEAK)
+      this.TrafficMetricRow($r('app.media.ic_sort'), '平均', METRIC_AVG)
 
       Divider().color(TunBoxColors.cardBorder(this.themeRevision)).strokeWidth(1)
 
-      this.MetricRow($r('app.media.ic_swap'), '本次连接',
-        `↓ ${this.formatBytes(this.sessionDown)}   ↑ ${this.formatBytes(this.sessionUp)}`)
-      this.MetricRow($r('app.media.ic_doc'), '累计总量',
-        `↓ ${this.formatBytes(this.lifetimeDown)}   ↑ ${this.formatBytes(this.lifetimeUp)}`)
-      this.MetricRow($r('app.media.ic_globe'), '今日',
-        `↓ ${this.formatBytes(this.todayDown)}   ↑ ${this.formatBytes(this.todayUp)}`)
+      this.TrafficMetricRow($r('app.media.ic_swap'), '本次连接', METRIC_SESSION)
+      this.TrafficMetricRow($r('app.media.ic_doc'), '累计总量', METRIC_LIFETIME)
+      this.TrafficMetricRow($r('app.media.ic_globe'), '今日', METRIC_TODAY)
 
-      Text(`每月 ${this.resetDay} 日 00:00 自动清零累计（点按切换 1–28 日）`)
+      Text(`每月 ${this.resetDay} 日 00:00 自动清零累计（点按选择 1–28 日）`)
         .fontSize(10).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
         .width('100%')
         .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-        .onClick((): void => { this.cycleResetDay(); })
+        .onClick((): void => { this.resetDayDialog.open(); })
     }
     .width('100%')
     .padding(TunBoxGeometry.cardPaddingLarge)
@@ -896,6 +1030,8 @@ export struct StatsPage {
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
+        // 「添加」输入行：淡入 + 轻落，收起原路返回（原来是直接弹出/消失，下面的列表跟着跳一下）
+        .transition(TunBoxMotion.revealDown())
       }
 
       if (this.entries.length > 0) {

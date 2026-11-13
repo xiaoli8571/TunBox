@@ -408,6 +408,8 @@ struct AppRoutingPage {
       .fontColor(this.mode === mode ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.textSecondaryFor(this.themeRevision))
       .padding({ top: 8, bottom: 8 }).layoutWeight(1).textAlign(TextAlign.Center).borderRadius(8)
       .backgroundColor(this.mode === mode ? TunBoxColors.surfaceCard(this.themeRevision) : Color.Transparent)
+      // 分段切换：选中块的底色淡过去，不再硬切
+      .animation(TunBoxMotion.stateChange())
       .onClick(() => this.selectMode(mode))
   }
 

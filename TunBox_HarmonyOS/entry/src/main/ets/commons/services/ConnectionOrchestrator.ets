@@ -13,7 +13,7 @@ import { LatencyTestUrl } from '../latency/LatencyTestUrl';
  */
 import { vpnExtension, http, webSocket, connection } from '@kit.NetworkKit';
 import { LocalPortProbe } from './LocalPortProbe';
-import { isNonRetryableStartupError } from './VpnRecoveryPolicy';
+import { isNonRetryableStartupError, CORE_READY_WAIT_MS } from './VpnRecoveryPolicy';
 import { UnifiedScheduler } from './UnifiedScheduler';
 import type Want from '@ohos.app.ability.Want';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -40,10 +40,10 @@ import { TunBoxNotifier } from './TunBoxNotifier';
 import { TaskProgressUpdater } from './TaskProgressUpdater';
 import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
-  MAX_STATE_FILE_BYTES, PRIVATE_TEST_CONFIG_FILE,
-  SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText
+  MAX_STATE_FILE_BYTES,
+  SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText, testConfigFileName
 } from './RuntimeFilePolicy';
-import { chmodPrivate, ensurePrivateDir, privateFs } from './PrivateFileStore';
+import { chmodPrivate, ensurePrivateDir, privateFs, removeTestConfigs } from './PrivateFileStore';
 import { ConnState } from './connection/ConnState';
 import { ConnectionStateMachine } from './connection/ConnectionStateMachine';
 import { ConnectionAttempt, ConnectionAttemptClock } from './connection/ConnectionAttempt';
@@ -51,7 +51,7 @@ import {
   ReconnectAttemptOutcome, ReconnectHost, ReconnectManager, ReconnectRuntimeState, ReconnectTelemetry
 } from './connection/ReconnectManager';
 
-import { SingleFlightTestCore, TestCoreStatus } from './TestCoreFlight';
+import { SingleFlightTestCore } from './TestCoreFlight';
 import { NetworkStateWatcher, NetworkStateListener, NetTypes } from './NetworkStateWatcher';
 import {
   LinkHealthReport, LinkHealthSummary, runLinkHealthCheck, summarize, repairSteps, RepairActions
@@ -278,8 +278,25 @@ const TRAFFIC_POLL_INTERVAL_MS = 2000;
 /** 测速内核停扩展的重试次数与间隔：停失败必须重试，或至少让下次启动能正确重建 */
 const TEST_CORE_STOP_ATTEMPTS = 2;
 const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
-/** 测速内核启动失败后的负缓存冷却：避免每次测速都白等一次 15~20s 启动超时 */
+/** 测速内核启动失败后的负缓存冷却：只拦自动预热，避免后台反复白等一次启动窗口 */
 const TEST_CORE_NEGATIVE_COOLDOWN_MS = 45000;
+/**
+ * 测速核「拉起前准备」的预算：DoH 预解析（RuntimeConfigBuilder.DOH_BUDGET_MS = 6s）
+ * + 生成/校验配置 + 停旧扩展（600ms 宽限）+ 拉起扩展进程。真机实测合计 1~3s。
+ * 这是旧的 15s 外层超时原本要覆盖的那一段（它没算内核自己的启动时间）。
+ */
+const TEST_CORE_LAUNCH_PREP_MS = 15000;
+/**
+ * 单航班外层超时 = 准备预算 + 等内核就绪的窗口。
+ *
+ * 2026-11-11 真机定案：旧值写死 15000，比内核单个规则集的原生下载上限（20s）还短。
+ * 订阅自带 rule-providers 且本地还没缓存时，内核在合法等待，外层先到点把扩展连同
+ * 内核一起销毁 → 永远「测速通道未就绪」，重试也一样。外层必须**晚于**里面的就绪
+ * 窗口（CORE_READY_WAIT_MS，从内核常量派生），它只兜「准备阶段卡死」这一种情况。
+ */
+const TEST_CORE_FLIGHT_TIMEOUT_MS = TEST_CORE_LAUNCH_PREP_MS + CORE_READY_WAIT_MS;
+/** 等内核启动超过这么久，才向界面透出「内核在加载订阅规则集」（正常启动 < 150ms） */
+const CORE_START_HINT_AFTER_MS = 3000;
 /**
  * 预热/测速内核的空闲回收窗口（毫秒）。
  *
@@ -507,6 +524,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private pendingProfileId: string = '';
   private pendingProfileRevision: string = '';
   private appliedProfileRevision: string = '';
+  /**
+   * 「内核接受了一份配置」的序号：隧道起核 / 热重载 / 测速核就绪 / 热重载回滚各 +1。
+   *
+   * 供界面判断「内核节点目录是否可能已变」。只看 profile id 与出口名不够：同一份订阅
+   * 刷新后热重载、或只改规则的热重载，id 与出口名都不变，但内核里的节点与各组的当前
+   * 选择已经换了一批。
+   */
+  private kernelConfigSeqValue: number = 0;
   private recoveryAttempts: number = 0; // 内核恢复退避计数（对应 core_recovery_policy）
   private lastNodeName: string = '';
 
@@ -582,15 +607,26 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
+  /**
+   * 节点集变化监听（**稳定引用**，只注册一次）。
+   *
+   * 2026-11-11 修：`init()` 原来每次调用都新建一个箭头函数去注册，而
+   * `SubscriptionService.onNodeSetChanged` 按**引用**去重 —— 新闭包永远不相等，
+   * 于是 init() 被调几次就挂上几个监听（页面进入、每次测速、卡片刷新都会调 init）。
+   * 后果：一次订阅变化触发 N 次「作废测速核 + 预热」，真机日志里同一毫秒出现
+   * 4 条 `latency channel: headless test core ready`、8 条 `negative cache cooling down`。
+   */
+  private readonly nodeSetListener: (reason: string) => void = (reason: string): void => {
+    this.onSubscriptionNodeSetChanged(reason);
+  };
+
   init(context: Context): void {
     this.context = context;
     this.invalidateStateProbeCache();
     // 第二阶段集成点①：进程级启动网络状态监听（幂等，失败静默降级）
     this.startNetworkWatch();
     // 节点集变化 → 作废测速核（幂等注册：同一回调只入队一次）
-    SubscriptionService.onNodeSetChanged((reason: string): void => {
-      this.onSubscriptionNodeSetChanged(reason);
-    });
+    SubscriptionService.onNodeSetChanged(this.nodeSetListener);
   }
 
   /**
@@ -1045,7 +1081,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppRoutingPolicy.runtime(settings.appRoutingMode, settings.includedApps,
         settings.excludedApps, settings.appRoutingNeedsReview);
       let target = node;
-      if (target === null) { target = await subs.resolvePreferenceHint(); }
+      if (target === null && settings.autoSelectMode !== AutoSelectModes.AUTO) {
+        target = await subs.resolvePreferenceHint();
+      }
+      if (target === null && settings.autoSelectMode === AutoSelectModes.AUTO) {
+        // Auto mode must not replay the last manual node; the Smart group chooses.
+        target = new ProxyNode();
+        target.id = `profile:${profileId}`;
+        target.subscriptionId = profileId;
+        target.name = '';
+      }
       if (!current() || seq !== this.connectSeq) { return false; }
       if (target === null) {
         target = this.lastNode !== null ? this.lastNode : this.findNodeByName(subs, this.lastNodeName);
@@ -1331,6 +1376,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
       if (!pinned) {
         const restored = await this.api.reloadFromPath(rollbackPath);
+        // 回滚成功同样是「内核换了一份配置」（暂存配置已被它加载过，各组选择已重置）。
+        if (restored) { this.kernelConfigSeqValue++; }
         if (!this.isRuleSessionCurrent(seq, generation)) { return false; }
         if (restored) { await this.api.selectNode(this.lastNodeName, this.kernelSelection.groupName()); }
         AppLogger.warn(TAG, `[hot-reload] selection failed; rollback accepted=${restored}`);
@@ -1405,11 +1452,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return task;
   }
 
-  /** 热重载后尽力把运行时模式对齐持久化设置，忽略单次失败（不影响隧道连续性）。 */
-  private applyProxyModeSilent(mode: string): void {
-    this.api.setMode(mode).catch((): void => {});
-  }
-
   /**
    * 规则变更统一入口：优先热重载，失败回退完整重连（保证最终生效）。
    * 应用排除/白名单（包名级）变更仍需重建 TUN，不走此路径。
@@ -1427,6 +1469,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.appliedProfileId;
   }
 
+  /** 内核接受配置的序号（见 `kernelConfigSeqValue`）；只增不减，变了说明节点目录可能已变。 */
+  kernelConfigSeq(): number {
+    return this.kernelConfigSeqValue;
+  }
+
   /**
    * 内核确认配置生效时调用（connect readiness / reloadFromPath 成功 / 测速核 ready）。
    *
@@ -1435,6 +1482,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * （用户实锤：来回切订阅后节点串到别的订阅下面）。
    */
   private confirmProfileApplied(stage: string): void {
+    // 先记序号再判空：内核已经换了配置这件事，不取决于我们手里有没有待确认的 profile id。
+    this.kernelConfigSeqValue++;
     if (this.pendingProfileId.length === 0) {
       return;
     }
@@ -1514,29 +1563,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 这里统一要求 profile 发生切换时执行完整 reconnect，
     // 让当前出口、内核选择、主页显示、订阅页状态始终收敛到同一事实来源。
     return true;
-  }
-
-  /**
-   * 当前出口节点是否属于指定 profile。
-   *
-   * 名字是跨数据源唯一稳定的节点标识（内核影子节点 id 是 `core:<name>`，与解析节点 id
-   * 不同），因此按名字 + 订阅作用域判定，而不是比 id。
-   */
-  private exitBelongsToProfile(profileId: string): boolean {
-    if (profileId.length === 0) {
-      return false;
-    }
-    const target: ConnectionTarget | null = this.kernelSelection.current();
-    const name: string = target !== null && target.nodeName.length > 0
-      ? target.nodeName : this.lastNodeName;
-    if (name.length === 0) {
-      // 没有可靠出口记录：按「不属于」处理，重连一次把事实落定，别让显示层继续挂旧值。
-      return false;
-    }
-    const subs: SubscriptionService = this.lastSubs !== null
-      ? this.lastSubs : SubscriptionService.instance();
-    return subs.nodes.some((n: ProxyNode): boolean =>
-      n.subscriptionId === profileId && n.name === name);
   }
 
   /**
@@ -2856,9 +2882,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return age >= 0 && age < HEARTBEAT_STALE_MS;
   }
 
-  /** headless 测速内核: 未连接时预启动真实协议栈做端到端测速 */
-  /** @deprecated 仅作兼容读出口，真实状态看 testCoreFlight.getStatus() */
-  testCoreActive: boolean = false;
+  /** headless 测速内核: 未连接时预启动真实协议栈做端到端测速（真实状态看 testCoreFlight） */
   private testCoreSecret: string = '';
   /**
    * 测速核**实际**使用的 api 端口（可能与隧道核不同 —— 测速核用自己探测的端口，
@@ -2869,7 +2893,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private testCoreFlight: SingleFlightTestCore | null = null;
   /**
    * 启动失败后的负缓存截止时间戳（ms）。0 = 无冷却。
-   * 内核确实拉不起来时不能每次测速都白等 15~20s 的启动超时；冷却期内直接返回
+   * 内核确实拉不起来时自动预热不能反复白等一次启动窗口；冷却期内直接返回
    * false，页面按既有约定降级成「端口可达」，绝不冒充代理延迟。
    */
   private testCoreNegativeUntil: number = 0;
@@ -2889,10 +2913,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.testCoreFlight = new SingleFlightTestCore({
         startFn: (): Promise<boolean> => this.launchTestCore(),
         cancelFn: (): Promise<void> => this.teardownTestCore(),
-        timeoutMs: 15000,
-        onStatusChange: (status: TestCoreStatus): void => {
-          this.testCoreActive = status === TestCoreStatus.ACTIVE;
-        }
+        timeoutMs: TEST_CORE_FLIGHT_TIMEOUT_MS
       });
     }
     return this.testCoreFlight;
@@ -3216,7 +3237,10 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       AppLogger.warn(TAG,
         `ensureTestCore authority probe failed: ${AppLogger.errText(error)}`);
     }
-    if (this.isTestCoreNegativeCached()) {
+    // The cool-down only throttles automatic prewarm. A test the user asked for
+    // always gets a real start attempt: one failed start must not turn the next
+    // 45s of taps into "channel not ready" without trying.
+    if (!manual && this.isTestCoreNegativeCached()) {
       AppLogger.info(TAG, 'ensureTestCore skipped: negative cache cooling down');
       return false;
     }
@@ -3242,12 +3266,79 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return this.testCoreStartError;
   }
 
+  /** 正在等内核启动的起点（0 = 没在等）；与 coreStartProviders 一起决定要不要透出提示 */
+  private coreStartWaitSince: number = 0;
+  /** 本次启动的配置里，内核要在启动期加载的 provider 数（订阅自带的规则集/节点集） */
+  private coreStartProviders: number = 0;
+  private coreStartHintAnnounced: boolean = false;
+  /** 等待令牌：只有发起本次等待的一方能结束它（测速核与隧道的启动可能先后交叠） */
+  private coreStartWaitToken: number = 0;
+
+  /**
+   * 内核启动偏慢时给界面的一句话（空串 = 没有需要说的）。
+   *
+   * 内核启动时会同步加载订阅自带的 provider，本地没缓存就要联网拉，每个最多等 20s
+   * （内核常量）。这段时间应用没有卡死，只是在等内核 —— 必须说出来，否则用户会以为
+   * 点了没反应（其他客户端在这里显示的是「正在加载」）。
+   */
+  startupHint(): string {
+    if (this.coreStartWaitSince <= 0 || this.coreStartProviders <= 0) {
+      return '';
+    }
+    const waited = Date.now() - this.coreStartWaitSince;
+    // 上界防呆：任何等待都不会超过就绪窗口；超过说明等待已结束，提示不得常驻。
+    if (waited < CORE_START_HINT_AFTER_MS || waited > CORE_READY_WAIT_MS + 5000) {
+      return '';
+    }
+    return `内核正在加载订阅规则集（${this.coreStartProviders} 个），首次较慢…`;
+  }
+
+  private beginCoreStartWait(providers: number): number {
+    this.coreStartWaitSince = Date.now();
+    this.coreStartProviders = providers > 0 ? providers : 0;
+    this.coreStartHintAnnounced = false;
+    this.coreStartWaitToken = this.coreStartWaitToken + 1;
+    return this.coreStartWaitToken;
+  }
+
+  /** 就绪轮询里每圈调一次：提示从无到有的那一刻通知界面一次（不重复刷） */
+  private announceCoreStartHint(token: number): void {
+    if (token !== this.coreStartWaitToken || this.coreStartHintAnnounced
+      || this.startupHint().length === 0) {
+      return;
+    }
+    this.coreStartHintAnnounced = true;
+    AppLogger.info(TAG, `core start is slow: kernel still loading ${this.coreStartProviders} provider(s) `
+      + `after ${Date.now() - this.coreStartWaitSince}ms`);
+    this.notify();
+  }
+
+  private endCoreStartWait(token: number): void {
+    if (token !== this.coreStartWaitToken || this.coreStartWaitSince <= 0) {
+      return;
+    }
+    const announced = this.coreStartHintAnnounced;
+    this.coreStartWaitSince = 0;
+    this.coreStartProviders = 0;
+    this.coreStartHintAnnounced = false;
+    if (announced) {
+      this.notify();
+    }
+  }
+
   /** 内核日志流（/logs WebSocket）：测速诊断用，随 teardown 释放 */
   private coreLogSocket: webSocket.WebSocket | null = null;
 
-  /** 订阅内核日志流并转发进 AppLogger（hilog 可远程排查拨号失败原因） */
-  private startCoreLogStream(secret: string): void {
-    if (this.coreLogSocket !== null) {
+  /**
+   * 订阅内核日志流并转发进 AppLogger（hilog 可远程排查拨号失败原因）。
+   *
+   * @param port 内核 controller 的**实际**端口。测速核用的是自己探测的端口
+   *   （pickPorts 会刻意避开隧道端口 this.apiPort），不能用共享字段 —— 旧实现连的是
+   *   this.apiPort，那个端口上根本没有内核，于是每次都在「测速内核就绪」后立刻报
+   *   一条消息为空的 `core log stream error`，内核日志一行也拿不到（2026-11-11 真机）。
+   */
+  private startCoreLogStream(port: number, secret: string): void {
+    if (this.coreLogSocket !== null || port <= 0) {
       return;
     }
     try {
@@ -3267,14 +3358,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
       });
       ws.on('error', (err: BusinessError) => {
-        AppLogger.warn(TAG, `core log stream error: ${err.message ?? ''}`);
+        // errText 带上错误码：系统 WebSocket 的错误对象经常只有 code 没有 message
+        AppLogger.warn(TAG, `core log stream error: port=${port} ${AppLogger.errText(err)}`);
         if (this.coreLogSocket === ws) {
           this.coreLogSocket = null;
         }
       });
-      ws.connect(`ws://127.0.0.1:${this.apiPort}/logs?token=${encodeURIComponent(secret)}`, (err: BusinessError) => {
+      ws.connect(`ws://127.0.0.1:${port}/logs?token=${encodeURIComponent(secret)}`, (err: BusinessError) => {
         if (err) {
-          AppLogger.warn(TAG, `core log stream connect failed: ${err.message ?? ''}`);
+          AppLogger.warn(TAG, `core log stream connect failed: port=${port} ${AppLogger.errText(err)}`);
           if (this.coreLogSocket === ws) {
             this.coreLogSocket = null;
           }
@@ -3343,6 +3435,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     const generation = ++this.testCoreLaunchGeneration;
     const seq = this.connectSeq;
+    // 0 = 还没开始等内核（finally 里对 0 是空操作）
+    let startWaitToken: number = 0;
     try {
 
       let hosts: Record<string, string> = {};
@@ -3398,7 +3492,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const yaml = testBuilt.yaml;
       // 登记「这份配置对应哪个节点集」：复用测速核前要比对，不一致就重建。
       this.testCoreNodeFingerprint = SubscriptionService.nodeSetFingerprint(subs.nodes);
-      const configPath = `${this.context.cacheDir}/${PRIVATE_TEST_CONFIG_FILE}`;
+      // 每次启动用**自己的**配置文件名（时间 + 启动代次 + 随机数；冷启动后代次会归 1，
+      // 所以必须带时间）。共用固定文件名时，正在退出的旧扩展会把这份刚写好的配置
+      // 当成「自己的临时配置」删掉 → 新扩展 `config file missing`
+      // （2026-11-11 真机：刚测完速 → 冷启动 → 再点测速必失败）。见 testConfigFileName。
+      const configName = testConfigFileName(`${Date.now().toString(36)}-${generation}-`
+        + Math.floor(Math.random() * 0xFFFFFF).toString(36));
+      const configPath = `${this.context.cacheDir}/${configName}`;
       // 最小权限私有目录 + 0600 文件（含 api secret 与节点口令）
       ensurePrivateDir(this.context.cacheDir);
       // 写盘前闸门：测速核用的是同一套生成器，坏配置同样会让内核整份拒载
@@ -3440,13 +3540,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.invalidateStateProbeCache();
       this.testCoreApiPort = testPorts.apiPort;
       this.api.setEndpoint(this.testCoreApiPort, this.testCoreSecret);
-      const deadline = Date.now() + 20000;
+      // 就绪窗口从内核原生时限派生（CORE_READY_WAIT_MS）：内核启动期要同步加载订阅
+      // 自带的 provider，每个最多等 20s。窗口必须长于扩展内的 startCore 硬超时，
+      // 让扩展先把真实原因写回来；这里的通用超时只做最后兜底。
+      const deadline = Date.now() + CORE_READY_WAIT_MS;
+      startWaitToken = this.beginCoreStartWait(testBuilt.providerCount ?? 0);
       let readinessDelayMs = 0;
       while (Date.now() < deadline) {
         if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
+        this.announceCoreStartHint(startWaitToken);
         const extErr = this.readStartError();
         if (extErr.length > 0) {
-          throw new Error(`测速内核启动失败: ${extErr}`);
+          throw new Error(ConnectionOrchestrator.testCoreStartFailure(extErr));
         }
         const probe = this.readStartOk() ? await this.api.probeController(1000) : null;
         if (probe !== null && probe.reachable && (probe.httpCode === 401 || probe.httpCode === 403)) {
@@ -3455,10 +3560,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (probe !== null && probe.secretAccepted) {
           if (!this.isCurrentTestCoreLaunch(generation, seq)) { return false; }
           AppLogger.info(TAG, 'headless test core ready');
+          // 以前各次启动留下的测速配置（含旧版固定文件名）到这里才清：里面有 secret 与节点口令。
+          // 不能在写完新配置时就清 —— 上一次启动的扩展可能还没读到它自己那份
+          //（刚被拉起、还没进 onCreate），提前删掉会让它报 config file missing，
+          // 那条错误又会被本次启动的轮询读到。本次的配置留着，由扩展退出时自己删。
+          removeTestConfigs(this.context.cacheDir, configName);
           this.confirmProfileApplied('test-core');
           // 挂载内核日志流: 拨号失败的真实原因(DNS/握手/路由)只在内核日志里,
           // API 的 503 响应体是固定文案。转发进 AppLogger → hilog 可远程排查。
-          this.startCoreLogStream(this.testCoreSecret);
+          this.startCoreLogStream(this.testCoreApiPort, this.testCoreSecret);
           return true;
         }
         readinessDelayMs = nextReadinessDelayMs(readinessDelayMs);
@@ -3470,14 +3580,25 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       const finalError = this.readStartError();
       if (finalError.length > 0) {
-        throw new Error(`测速内核启动失败: ${finalError}`);
+        throw new Error(ConnectionOrchestrator.testCoreStartFailure(finalError));
       }
-      throw new Error('测速内核就绪超时(20s)');
+      throw new Error(`测速内核就绪超时(${Math.round(CORE_READY_WAIT_MS / 1000)}s)`);
     } catch (e) {
       this.testCoreStartError = AppLogger.errText(e);
       AppLogger.warn(TAG, `ensureTestCore failed: ${this.testCoreStartError}`);
       return false;
+    } finally {
+      this.endCoreStartWait(startWaitToken);
     }
+  }
+
+  /**
+   * 扩展回写的启动错误 → 给用户看的一句话。
+   * 扩展那边已经带了「测速内核启动失败:」前缀，这里不再套第二层
+   * （原来界面上是「测速内核启动失败: 测速内核启动失败: …」）。
+   */
+  private static testCoreStartFailure(extErr: string): string {
+    return extErr.indexOf('测速内核启动失败') === 0 ? extErr : `测速内核启动失败: ${extErr}`;
   }
 
   private isCurrentTestCoreLaunch(generation: number, seq: number): boolean {
@@ -3527,7 +3648,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   resetTestCoreChannelState(): void {
     this.testCoreSecret = '';
     this.api.setEndpoint(this.apiPort, '');
-    this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
     this.testCoreNodeFingerprint = '';
     this.invalidateStateProbeCache();
@@ -3566,7 +3686,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.testCoreLaunchGeneration++;
     this.testCoreNegativeUntil = 0;
     this.testCoreSecret = '';
-    this.testCoreActive = false;
     this.testCoreNodeFingerprint = '';
     if (this.testCoreFlight !== null) {
       this.testCoreFlight.resetIdle();
@@ -3629,7 +3748,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.context === null) {
       return [];
     }
-    return clearPrivateArtifacts(this.context.cacheDir, privateFs);
+    const removed = clearPrivateArtifacts(this.context.cacheDir, privateFs);
+    // 测速配置每次启动一个文件名：固定名清理覆盖不到，按模式再扫一遍
+    return removed.concat(removeTestConfigs(this.context.cacheDir));
   }
 
   async stopTestCore(): Promise<void> {
@@ -3643,7 +3764,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.flushTrafficAccounting();
     await this.testCoreFlight.stop();
     // 状态机只负责状态位；secret / endpoint / 负缓存 / 单飞复位统一在这里显式清零
-    this.testCoreActive = false;
     this.testCoreNegativeUntil = 0;
     this.testCoreNodeFingerprint = '';
     if (this.testCoreFlight.isActive()) {
@@ -4012,8 +4132,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // ── 硬门禁：一个节点都没有时，绝不拉起 VPN 扩展 ─────────────────────────
     // 全新安装的典型路径：订阅已添加但尚未拉取成功 → subs.nodes 为空。
     // 旧实现不做拦截，直接生成一份 1861 字节的空壳配置拉起扩展，内核在
-    // 「没有任何可用 outbound」的启动路径上 20s 无响应（CORE_START_TIMEOUT_MS），
-    // 最终抛「内核启动超时（20s 无响应）」，再被 VpnRecoveryPolicy 翻译成
+    // 「没有任何可用 outbound」的启动路径上一直无响应直到 CORE_START_TIMEOUT_MS，
+    // 最终抛「内核启动超时」，再被 VpnRecoveryPolicy 翻译成
     // 「卡在联网下载，请等 10 秒后再点一次连接」—— 真机实证该文案是误判，
     // 用户被指向完全无关的方向，而且重试必然同样失败（订阅仍是空的）。
     // 正确做法：先自动补一次订阅拉取，仍为空就明确报错并立刻返回，
@@ -4456,16 +4576,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
 
       this.api.resetTrafficBaseline();
       this.api.setEndpoint(this.apiPort, this.apiSecret);
-      const deadline = Date.now() + 30000;
+      // 就绪窗口从内核原生时限派生（旧值写死 30s）：订阅自带 provider 时内核启动期
+      // 要同步加载两段（节点集 → 规则集），每段最多等 20s；扩展内 startCore 的硬超时
+      // 同源（CORE_START_TIMEOUT_MS）且更短，真实失败原因会先于这里的兜底文案到达。
+      const deadline = Date.now() + CORE_READY_WAIT_MS;
+      const startWaitToken: number = this.beginCoreStartWait(built.providerCount ?? 0);
       let apiReady = false;
       let readinessDelayMs = 0;
       let launchRetryDone = false;
       try {
       while (Date.now() < deadline) {
         if (seq !== this.connectSeq) {
+          this.endCoreStartWait(startWaitToken);
           await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
           return false;
         }
+        this.announceCoreStartHint(startWaitToken);
         // 1) 失败信号优先：扩展进程回写的错误
         const extErr = this.readStartError();
         if (extErr.length > 0) {
@@ -4530,9 +4656,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         if (this.readStartOk()) {
           throw new Error(`内核已启动但 API 探测失败（端口 ${this.apiPort} 跨进程不可达），请反馈日志`);
         }
-        throw new Error('Clash API 未就绪（30s 超时）：VPN 扩展未上报启动结果，请重试或反馈日志');
+        throw new Error(`Clash API 未就绪（${Math.round(CORE_READY_WAIT_MS / 1000)}s 超时）：`
+          + 'VPN 扩展未上报启动结果，请重试或反馈日志');
       }
       } catch (startError) {
+        this.endCoreStartWait(startWaitToken);
         // 内核拒载（parse config / unmarshal）⇒ 落盘这份配置是坏的。
         // 回滚到最后一份真正连上过的配置，用户下一次点连接就能起来，
         // 而不是每次都被同一份坏配置挡住（内核对坏配置是整份拒载）。
@@ -4558,6 +4686,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         }
         throw new Error(errorText);
       }
+      this.endCoreStartWait(startWaitToken);
       tReady = Date.now() - connectT0;
       this.confirmProfileApplied('tunnel');
       // 内核已经成功吃到这份配置（含 rule-provider）→ 当前规则集记为 last-good，
@@ -4636,7 +4765,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       let fallbackNode: ProxyNode | null = null;
       let pinned: boolean = false;
       if (built.smartGroupName.length > 0) {
-        pinned = await this.api.selectNodeInGroup(startupGroupName, built.smartGroupName, selectionCurrent,
+        pinned = await this.api.selectSmartInGroup(startupGroupName, built.smartGroupName, selectionCurrent,
           Math.max(0, PIN_PHASE_BUDGET_MS - (Date.now() - pinT0)));
         if (!selectionCurrent()) { return false; }
         if (!pinned) { throw new Error('智能选择未生效，请检查本订阅的节点或 provider 是否已加载'); }
@@ -5774,7 +5903,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.clearTunnelMarkers();
     // 凭据清理：主配置 + 测速配置（内含 API secret / 节点口令）随隧道一并删除。
     // 逐文件独立容错: 任一文件不存在或删除失败都不阻断其余文件。
-    const removed = clearPrivateArtifacts(this.context.cacheDir, privateFs);
+    const removed = clearPrivateArtifacts(this.context.cacheDir, privateFs)
+      .concat(removeTestConfigs(this.context.cacheDir));
     this.apiSecret = '';
     AppLogger.info(TAG, `runtime artifacts cleared: ${removed.join(',')}`);
   }

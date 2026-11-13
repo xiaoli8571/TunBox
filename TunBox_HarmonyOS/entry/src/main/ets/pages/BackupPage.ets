@@ -8,7 +8,7 @@
 import { promptAction , LengthMetrics} from '@kit.ArkUI';
 import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { TopNavBar } from '../components/TopNavBar';
 import { SettingsService } from '../commons/services/SettingsService';
 import { AppSettings } from '../commons/models/AppSettings';
@@ -42,7 +42,7 @@ struct BackupPasswordDialog {
           .fontSize(16).fontWeight(FontWeight.Bold).fontColor(TunBoxColors.textPrimaryFor(this.themeRevision)).layoutWeight(1)
       }.width('100%')
       if (this.mode === 'export') {
-        Text('使用 AES-256-GCM 加密备份。留空则导出明文；密码至少 4 个字符，遗忘后无法恢复。')
+        Text(this.attemptHint.length > 0 ? this.attemptHint : '使用 AES-256-GCM 加密备份。留空则导出明文；密码至少 4 个字符，遗忘后无法恢复。')
           .fontSize(11.5).fontColor(TunBoxColors.textMutedFor(this.themeRevision)).width('100%')
       } else {
         Text(this.attemptHint.length > 0 ? this.attemptHint : '此备份已加密，请输入导出时设置的密码。')
@@ -70,7 +70,7 @@ struct BackupPasswordDialog {
           .layoutWeight(1).height(38).borderRadius(8)
           .backgroundColor(TunBoxColors.primaryFor(this.themeRevision)).fontColor(Color.White).fontSize(13)
           .onClick(() => {
-            if (this.mode === 'import' && this.password.length < 4) {
+            if ((this.mode === 'import' || this.password.length > 0) && this.password.length < 4) {
               this.attemptHint = '密码至少 4 个字符，请重新输入。';
               return;
             }
@@ -147,6 +147,10 @@ struct BackupPage {
   private async doExport(): Promise<void> {
     try {
       const password = this.exportPassword;
+      if (password.length > 0 && password.length < 4) {
+        promptAction.showToast({ message: '密码至少 4 个字符，请重新输入。' });
+        return;
+      }
       const docPicker = new picker.DocumentViewPicker(getContext(this) as Context);
       const opts = new picker.DocumentSaveOptions();
       opts.newFileNames = [BackupRestoreService.defaultFileName()];
@@ -306,6 +310,14 @@ struct BackupPage {
     .borderWidth(1).borderColor(TunBoxColors.cardBorder(this.themeRevision))
   }
 
+  /** 路由推入式子页统一转场：水平滑动 + 淡入淡出（与页签切换同规格，见 TunBoxMotion） */
+  pageTransition() {
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
+  }
+
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       Column().width('100%').height('100%')
@@ -347,6 +359,7 @@ struct BackupPage {
                 .padding({ left: 12, right: 12, top: 6, bottom: 6 })
                 .borderRadius(9999).backgroundColor(TunBoxColors.success)
                 .width('100%').textAlign(TextAlign.Center)
+                .transition(TunBoxMotion.revealDown())
             }
             Blank().height(TunBoxGeometry.dockClearance())
           }

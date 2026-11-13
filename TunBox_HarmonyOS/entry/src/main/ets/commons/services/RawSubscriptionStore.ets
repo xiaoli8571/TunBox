@@ -202,9 +202,14 @@ export class RawSubscriptionStore {
    * 返回删除的文件数（常态为 0）。
    */
   static setEnabled(value: boolean, purgeOnDisable: boolean = false): number {
+    // 只在开关**真的变化**时记日志：SettingsService 每次 load()/save() 都会同步一次闸门
+    // （load 有 39 个调用点），无条件打印会在一次页面进入里刷出十来条一模一样的行。
+    const changed: boolean = RawSubscriptionStore.enabled !== value;
     RawSubscriptionStore.enabled = value;
     if (value || !purgeOnDisable) {
-      AppLogger.info(TAG, `raw provider store ${value ? 'enabled' : 'disabled (keep files)'}`);
+      if (changed) {
+        AppLogger.info(TAG, `raw provider store ${value ? 'enabled' : 'disabled (keep files)'}`);
+      }
       return 0;
     }
     return RawSubscriptionStore.removeAll();

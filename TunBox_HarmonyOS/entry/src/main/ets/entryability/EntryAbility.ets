@@ -29,8 +29,8 @@ export default class EntryAbility extends UIAbility {
   private windowReady: boolean = false;
   /** 自愈编排单航班：冷启动与回前台都走它，避免重复拉起隧道 */
   private healTask: Promise<string> | null = null;
-  /** 冷启动空闲预热测速通道的定时器（-1 = 未挂） */
-  private latencyPrewarmTimer: number = -1;
+  /** 冷启动空闲预热测速通道是否已排入（进程内只排一次） */
+  private latencyPrewarmScheduled: boolean = false;
 
   /**
    * 按屏幕对角线英寸设置转场时长的规范下限（华为应用市场上架要求）：
@@ -122,7 +122,8 @@ export default class EntryAbility extends UIAbility {
   }
 
   /**
-   * 冷启动后**空闲预热测速通道**（2026-10-26，用户要求「点了测速立刻开测」）。
+   * 冷启动后**空闲预热测速通道**（2026-10-26，用户要求「点了测速立刻开测」；
+   * 2026-11-12 按审计第 2 项调整触发点）。
    *
    * 未连接时测速走 headless 测速内核，冷启动这套流程（读 1.1MB profile →
    * 合并生成配置 → 停/启扩展 → 就绪轮询 → 预热窗口）在真机上要 2~5s，
@@ -130,21 +131,30 @@ export default class EntryAbility extends UIAbility {
    * 不存在这个等待。
    *
    * 这里把这段准备挪到**用户还没点测速**的时候：
-   *  - 首帧后延迟 1s：避开首页 bootstrap，尽早准备用户接下来要用的通道；
+   *  - 触发点：等 `SubscriptionService.init()` 的进程内记忆化 Promise 落定后
+   *    **让出一帧**再预热。原实现是「onCreate 末尾起一个固定 1s 定时器」，与订阅
+   *    初始化、首帧都无关联；真机上订阅与首屏约 0.4s 就绪，定时器还要空等 ~0.6s
+   *    （2026-11-12 审计归因）。让出一帧是因为预热里读 profile + 生成配置
+   *    有主线程同步段，不能和首帧抢同一帧；
    *  - 只预热、不探测：`prewarmChannel` 不写任何延迟结论、不动排序；
    *  - 已连接/连接中：`ensureTestCore` 的安全门禁直接跳过，不会碰用户的隧道；
    *  - 失败静默：预热失败不影响任何功能，用户真点测速时照常按需启动。
    */
   private scheduleLatencyPrewarm(): void {
-    if (this.latencyPrewarmTimer >= 0) {
+    if (this.latencyPrewarmScheduled) {
       return;
     }
-    this.latencyPrewarmTimer = setTimeout((): void => {
-      this.latencyPrewarmTimer = -1;
-      BackgroundLatencyService.prewarmChannel(this.context).catch((e: Object): void => {
-        AppLogger.warn(TAG, `latency prewarm failed: ${AppLogger.errText(e)}`);
-      });
-    }, 1000);
+    this.latencyPrewarmScheduled = true;
+    SubscriptionService.instance().init(this.context).then((): void => {
+      // 让出一帧：预热的配置生成有主线程同步段，不能和首帧抢同一帧
+      setTimeout((): void => {
+        BackgroundLatencyService.prewarmChannel(this.context).catch((e: Object): void => {
+          AppLogger.warn(TAG, `latency prewarm failed: ${AppLogger.errText(e)}`);
+        });
+      }, 0);
+    }).catch((e: Object): void => {
+      AppLogger.warn(TAG, `latency prewarm skipped: ${AppLogger.errText(e)}`);
+    });
   }
 
   onSaveState(reason: AbilityConstant.StateType, wantParam: Record<string, Object>): AbilityConstant.OnSaveResult {

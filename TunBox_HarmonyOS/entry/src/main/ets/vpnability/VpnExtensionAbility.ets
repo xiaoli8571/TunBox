@@ -60,11 +60,13 @@ import { AppLogger } from '../commons/utils/AppLogger';
 import { NetworkSnapshot, NetworkStateListener, NetworkStateWatcher, NetTypes } from '../commons/services/NetworkStateWatcher';
 import {
   mtuForNetType, coreRecoveryDelayMs, tunnelRebuildDelayMs,
-  BASE_MTU, RECOVERY_STABLE_MS, MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS, friendlyVpnStartError
+  BASE_MTU, RECOVERY_STABLE_MS, MAX_CORE_RECOVERY_ATTEMPTS, MAX_TUNNEL_REBUILDS, friendlyVpnStartError,
+  CORE_START_TIMEOUT_MS
 } from '../commons/services/VpnRecoveryPolicy';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { AbilityConstant } from '@kit.AbilityKit';
 import { AppRoutingModes, AppRoutingPolicy, AppRoutingRuntime } from '../commons/services/AppRoutingPolicy';
+import { isTestConfigFileName, isTestConfigPath } from '../commons/services/RuntimeFilePolicy';
 import { SettingsService } from '../commons/services/SettingsService';
 
 const TAG = 'VpnExtensionAbility';
@@ -147,13 +149,20 @@ const CORE_DEATH_CONFIRMATIONS = 2;
 /** Extension 主导的权威运行态文件（事件驱动写入，UI 打开时直接读取真实状态）。 */
 const STATUS_FILE = 'vpn_status.json';
 /**
- * 内核启动硬超时。mihomo 的 TunBoxStart() 若在启动路径里联网（典型：rule-provider /
- * MMDB 本地文件缺失时同步拉取远端），会一直阻塞不返回也不报错——UI 侧只能等到
- * 30s deadline 拿到"未上报启动结果"这种无用文案。这里在内核调用外加一层超时，
- * 把「静默挂起」转成明确错误并回传（真机实证 2026-09-19 全新安装首连）。
- * 取 20s：正常启动（含 attachTun/protect）实测 < 1s，留足弱网余量。
+ * 内核启动硬超时 = VpnRecoveryPolicy.CORE_START_TIMEOUT_MS（从 mihomo 原生常量派生）。
+ *
+ * mihomo 的 Start() 在启动路径里**同步**加载 proxy-providers 与 rule-providers，本地
+ * 没有缓存文件时会联网拉取，每个 provider 最多等 20s（内核常量，不是配置项），超时
+ * 只少一份规则、不影响启动。这层超时只负责把「native 真的挂死」转成明确错误回传。
+ *
+ * 2026-11-11 真机定案：旧值 20s 与内核单次下载上限相等、且小于两阶段之和 —— 订阅
+ * 自带规则集又有一个地址慢时，内核还在合法等待就被判了超时。现在取内核原生上界。
  */
-const CORE_START_TIMEOUT_MS = 20000;
+/** 启动耗时超过它就把 core.log 尾部转进进程日志（正常启动真机实测 < 150ms） */
+const CORE_START_SLOW_MS = 3000;
+/** 转存 core.log 尾部的字节上限 / 行数上限 */
+const CORE_LOG_TAIL_BYTES = 6144;
+const CORE_LOG_TAIL_LINES = 24;
 /** protect 轮询自适应节奏：命中请求后回到底线 10ms；空闲时指数退避、封顶 100ms */
 const PROTECT_POLL_BASE_MS = 10;
 const PROTECT_POLL_MAX_MS = 100;
@@ -314,11 +323,17 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private cleanupPromise: Promise<void> | null = null;
   /** 本次会话的配置路径（onDestroy 时删除含 API secret 的 YAML） */
   private configPathForCleanup: string = '';
-  /** 该配置是否为临时测速配置（由 UI 侧生成为 mihomo_test_config.yaml） */
+  /** 该配置是否为临时测速配置（UI 侧每次启动生成一份 mihomo_test_config.<token>.yaml） */
   private configIsTransient: boolean = false;
 
   /**
    * 删除含凭据的运行时配置。每个文件独立容错，缺失即跳过。
+   *
+   * 只删 `configPathForCleanup` —— 也就是**本实例启动时拿到的那一份**。测速配置每次
+   * 启动一个文件名（RuntimeFilePolicy.testConfigFileName），所以这里不可能删到
+   * 下一个实例的配置。旧版共用固定文件名时，正在退出的实例会把 UI 刚为下一轮写好的
+   * 配置删掉（2026-11-11 真机：冷启动后点测速 `config file missing`）。
+   *
    * @param force 内核启动失败/无头测速失败时即使不是临时配置也删除
    */
   private removePrivateConfig(force: boolean): void {
@@ -335,9 +350,41 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     }
   }
 
-  /** 判断配置是否为测速用临时文件（UI 侧命名约定） */
+  /** 判断配置是否为测速用临时文件（UI 侧命名约定，新旧两种文件名都认） */
   private static isTransientConfig(path: string): boolean {
-    return path.endsWith('mihomo_test_config.yaml');
+    return isTestConfigPath(path);
+  }
+
+  /**
+   * cacheDir 里最新的一份测速配置（绝对路径）；没有则返回 ''。
+   * 只在 want 参数整体丢失时用来恢复意图。按 mtime 取最新，mtime 相同（秒级精度）
+   * 时取文件名较大的 —— token 以时间开头，名字大的就是后写的。
+   */
+  private static newestTestConfig(cacheDir: string): string {
+    let best: string = '';
+    let bestMtime: number = -1;
+    let names: string[] = [];
+    try {
+      names = fs.listFileSync(cacheDir);
+    } catch (e) {
+      return '';
+    }
+    for (const name of names) {
+      if (!isTestConfigFileName(name)) {
+        continue;
+      }
+      let mtime: number = -1;
+      try {
+        mtime = fs.statSync(`${cacheDir}/${name}`).mtime;
+      } catch (e) {
+        continue;
+      }
+      if (mtime > bestMtime || (mtime === bestMtime && name > best)) {
+        best = name;
+        bestMtime = mtime;
+      }
+    }
+    return best.length > 0 ? `${cacheDir}/${best}` : '';
   }
 
   /**
@@ -505,12 +552,52 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
 
   /** 带硬超时的内核启动：把 native 侧的静默挂起转成可回传的明确错误 */
   private async startCoreWithTimeout(configPath: string): Promise<boolean> {
+    const startedAt = Date.now();
     const outcome = await this.runStage('startCore', coreBridge.startCore(configPath), CORE_START_TIMEOUT_MS);
+    this.logCoreTailIfNeeded('startCore', outcome, Date.now() - startedAt);
     if (outcome.timedOut) {
       // 超时后不在此处 stopCore：native 可能仍在启动路径里，交给 cleanupResources 统一回收
-      throw new Error('内核启动超时（20s 无响应），请导出诊断日志查看启动阶段');
+      throw new Error(`内核启动超时（${Math.round(CORE_START_TIMEOUT_MS / 1000)}s 无响应），请导出诊断日志查看启动阶段`);
     }
     return outcome.ok;
+  }
+
+  /**
+   * 启动失败 / 超时 / 明显偏慢时，把内核 core.log 的尾部转进本进程日志（vpn.log）。
+   *
+   * 为什么需要它（2026-11-11 真机取证的诊断盲区）：core.log 是 0600、属主为应用 UID，
+   * hdc 读不到；而「内核卡在哪个 provider、因为什么失败」只写在那里 —— 之前只能靠
+   * 时间戳猜。扩展进程与内核同 UID，可以读；AppLogger 会照常脱敏（URL / IP / 凭据）。
+   * 只在异常路径触发，正常启动零开销。
+   */
+  private logCoreTailIfNeeded(label: string, outcome: StageOutcome, elapsedMs: number): void {
+    if (!outcome.timedOut && outcome.ok && elapsedMs < CORE_START_SLOW_MS) {
+      return;
+    }
+    AppLogger.warn(TAG, `stage ${label} took ${elapsedMs}ms (ok=${outcome.ok} timedOut=${outcome.timedOut}); `
+      + 'dumping core.log tail');
+    try {
+      const path = `${this.context.cacheDir}/core.log`;
+      const size = Number(fs.statSync(path).size);
+      if (size <= 0) {
+        AppLogger.warn(TAG, 'core.log is empty');
+        return;
+      }
+      const offset = Math.max(0, size - CORE_LOG_TAIL_BYTES);
+      let content = fs.readTextSync(path, { offset: offset, length: Math.min(size, CORE_LOG_TAIL_BYTES) });
+      if (offset > 0) {
+        // 丢掉被截断的首行（可能是半条记录）
+        const newline = content.indexOf('\n');
+        content = newline >= 0 ? content.substring(newline + 1) : '';
+      }
+      const lines = content.split('\n').filter((line: string): boolean => line.trim().length > 0);
+      const from = Math.max(0, lines.length - CORE_LOG_TAIL_LINES);
+      for (let i = from; i < lines.length; i++) {
+        AppLogger.warn('CoreLogTail', lines[i]);
+      }
+    } catch (e) {
+      AppLogger.warn(TAG, `core.log tail unavailable: ${AppLogger.errText(e)}`);
+    }
   }
 
   /** 把扩展进程内的启动失败原因写回 UI 可读的目录（跨进程无法直接共享内存） */
@@ -1198,7 +1285,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.startProtectMonitor();
       this.ensureConfigMtu();
       // 恢复/重建路径与 onCreate 同样可能因 provider/MMDB 联网下载而永不 settle，
-      // 必须套 20s 硬超时（onCreate 路径的 startCoreWithTimeout 就是为此而设）。
+      // 必须套硬超时（CORE_START_TIMEOUT_MS；onCreate 路径的 startCoreWithTimeout 就是为此而设）。
       const ok = await this.startCoreWithTimeout(this.configPathForCleanup);
       if (!current()) { return; }
       if (!ok) {
@@ -1494,7 +1581,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       if (!protectReady) { throw new Error('core recovery initProtect failed'); }
       this.startProtectMonitor();
       this.ensureConfigMtu();
-      // 热恢复路径同样要 20s 硬超时（与 onCreate/rebuild 同口径）：
+      // 热恢复路径同样要硬超时（CORE_START_TIMEOUT_MS，与 onCreate/rebuild 同口径）：
       // provider/规则集联网下载阻塞时 startCore 可能永不 settle。
       const ok = await this.startCoreWithTimeout(this.configPathForCleanup);
       if (!current()) { return; }
@@ -1575,7 +1662,8 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     if (this.recoveryFlight !== null) { await this.recoveryFlight; }
     if (this.networkUpdateFlight !== null) { await this.networkUpdateFlight; }
     this.protectCandidate = null;
-    // 临时测速配置随扩展退出删除（无头测速无 TUN，配置不会被内核长期需要）
+    // 临时测速配置随扩展退出删除（无头测速无 TUN，配置不会被内核长期需要）。
+    // 删的只是本实例自己的那份（文件名每次启动唯一，见 removePrivateConfig 注释）。
     this.removePrivateConfig(false);
     try {
       await coreBridge.stopCore();
@@ -1630,14 +1718,17 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       // 表现为 configPath/headless 全空 → 走隧道分支建 TUN → 因找不到配置失败）。
       // 按 mtime 消歧恢复意图：测速配置较新 → headless；隧道配置存在 → 隧道。
       const cacheDir = this.context.cacheDir;
-      const testCfg = `${cacheDir}/mihomo_test_config.yaml`;
+      // 测速配置每次启动一个文件名：取目录里最新的那份
+      const testCfg = TunBoxVpnExtension.newestTestConfig(cacheDir);
       const tunCfg = `${cacheDir}/mihomo_config.yaml`;
       let testMtime = -1;
       let tunMtime = -1;
-      try {
-        testMtime = fs.statSync(testCfg).mtime;
-      } catch (e) {
-        testMtime = -1;
+      if (testCfg.length > 0) {
+        try {
+          testMtime = fs.statSync(testCfg).mtime;
+        } catch (e) {
+          testMtime = -1;
+        }
       }
       try {
         tunMtime = fs.statSync(tunCfg).mtime;
@@ -1821,12 +1912,14 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private async runHeadless(configPath: string): Promise<void> {
     try {
       AppLogger.info(TAG, 'headless test-core starting (no TUN / no VPN permission)');
-      // 测速核同样可能被"启动期联网下载"卡住：这里也加硬超时，避免 20s 就绪窗口内
-      // 只能报"就绪超时"而看不到真实原因（真机实证：全新安装 ruleset 缺失）。
+      // 测速核同样会在启动期同步加载订阅自带的 provider：硬超时取内核原生上界
+      // （CORE_START_TIMEOUT_MS），早于它的都是内核在合法等待，不能打断。
+      const startedAt = Date.now();
       const outcome = await this.runStage('headless startCore', coreBridge.startCore(configPath),
         CORE_START_TIMEOUT_MS);
+      this.logCoreTailIfNeeded('headless startCore', outcome, Date.now() - startedAt);
       if (outcome.timedOut) {
-        throw new Error('测速内核启动超时（20s 无响应），请导出诊断日志查看启动阶段');
+        throw new Error(`测速内核启动超时（${Math.round(CORE_START_TIMEOUT_MS / 1000)}s 无响应），请导出诊断日志查看启动阶段`);
       }
       if (!outcome.ok) {
         const coreErr = await coreBridge.lastError();
@@ -1840,7 +1933,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       AppLogger.error(TAG, `headless start failed: ${msg}`);
       // 失败路径清理测速配置，但**保留** START_ERROR_FILE：reportStartError 刚把真实
       // 原因写进去给 UI 轮询读（UI 步长 ≥40ms），同 tick 删掉等于错误通道失效，
-      // UI 只能白等 20s 报通用超时。错误文件由 UI 侧消费或下次启动覆盖，不含凭据。
+      // UI 只能白等到就绪窗口结束报通用超时。错误文件由 UI 侧消费或下次启动覆盖，不含凭据。
       this.removePrivateConfig(true);
       await this.cleanupResources();
     }

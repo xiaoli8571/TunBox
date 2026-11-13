@@ -119,3 +119,6 @@ agconnect-services.json
 # Agent 真机取证截图（大体积二进制，不入库）
 .pi-captures/
 **/.pi-captures/
+
+# 真机取证日志（hilog / vpn.log / core.log 尾部，大体积；上传闸门也禁止 .log 入库）
+TunBox_HarmonyOS/docs/evidence/

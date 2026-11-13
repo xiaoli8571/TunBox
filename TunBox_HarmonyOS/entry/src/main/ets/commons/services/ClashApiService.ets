@@ -397,23 +397,21 @@ export class ClashApiService {
    *  GLOBAL 是**尽力而为**（部分配置不声明 GLOBAL 组，PUT 会 404，属正常）。
    *  失败时重试一次：内核刚起时首个 PUT 偶发 400/超时，重试即可收敛。
    */
-  /** Find a member chain, including intermediate groups, with cycle protection.
-   *  返回外层组→内层组的 hop 链（末个 hop 的下一跳就是目标节点）。
-   *  每个 hop 带 type：只有 Selector 可 PUT（2026-10-25 定案：URLTest/Fallback/Smart
-   *  是策略组，mihomo 对它们的 PUT 一律 400 —— 机场组结构下按整链 PUT 必挂）。 */
+  /** Resolve an exact member chain. Native SelectAble is implemented by Selector,
+   * URLTest, Fallback and Smart (adapter/outboundgroup/util.go); let PUT decide.
+   * LoadBalance has no Set method and cannot be pinned to a single member. */
   private selectionPath(table: Record<string, Object>, group: string, target: string,
-    visited: string[], selectorsOnly: boolean = false): SelectionHop[] {
+    visited: string[] = []): SelectionHop[] {
     if (visited.includes(group) || visited.length > 32) { return []; }
     const entry = table[group] as Record<string, Object>;
     if (entry === undefined || entry === null || !Array.isArray(entry['all'])) { return []; }
     const type = entry['type'] as string;
     if (!['Selector', 'URLTest', 'Fallback', 'Smart'].includes(type)) { return []; }
-    if (selectorsOnly && type !== 'Selector') { return []; }
     const members = entry['all'] as string[];
     if (members.includes(target)) { return [new SelectionHop(group, type)]; }
     const next = visited.concat([group]);
     for (const member of members) {
-      const path = this.selectionPath(table, member, target, next, selectorsOnly);
+      const path = this.selectionPath(table, member, target, next);
       if (path.length > 0) { return [new SelectionHop(group, type)].concat(path); }
     }
     return [];
@@ -452,7 +450,7 @@ export class ClashApiService {
           const parsed = JSON.parse(json) as Record<string, Object>;
           const table = parsed['proxies'] as Record<string, Object>;
           const path: SelectionHop[] = table === undefined || table[nodeName] === undefined ? []
-            : this.selectionPath(table, groupName, nodeName, [], true);
+            : this.selectionPath(table, groupName, nodeName);
           let accepted = path.length > 0 || (groupName === nodeName && table !== undefined
             && table[nodeName] !== undefined);
           for (let i = path.length - 1; i >= 0 && accepted; i--) {
@@ -489,6 +487,69 @@ export class ClashApiService {
       await new Promise<void>((resolve) => setTimeout((): void => resolve(), SELECT_CONVERGE_INTERVAL_MS));
     }
     return false;
+  }
+
+  /** Resume native Smart policy; parent selection alone retains cached fixed pins.
+   * Uses the existing unfixedProxy route, never deletes cache.db or other choices. */
+  async selectSmartInGroup(groupName: string, smartName: string,
+    current: () => boolean = (): boolean => true,
+    timeoutMs: number = SELECT_CONVERGE_TIMEOUT_MS): Promise<boolean> {
+    if (groupName.length === 0 || smartName.length === 0 || !current()) { return false; }
+    const revision = this.endpointRevision;
+    const deadline = Date.now() + Math.max(0, Math.min(12000, timeoutMs));
+    const scopedCurrent = (): boolean => current() && revision === this.endpointRevision;
+    try {
+      const json = await this.proxiesJson();
+      if (!scopedCurrent() || json === null) { return false; }
+      const table = (JSON.parse(json) as Record<string, Object>)['proxies'] as Record<string, Object>;
+      if (table === undefined || table === null) { return false; }
+      const smart = table[smartName] as Record<string, Object>;
+      if (smart === undefined || smart === null || smart['type'] !== 'Smart'
+        || typeof smart['fixed'] !== 'string') { return false; }
+      if (groupName !== smartName && this.selectionPath(table, groupName, smartName).length === 0) { return false; }
+      if (smart['fixed'] !== '') {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0 || !scopedCurrent()) { return false; }
+        const req = http.createHttp();
+        try {
+          const response = await req.request(`${this.baseUrl()}/proxies/${encodeURIComponent(smartName)}`, {
+            method: http.RequestMethod.DELETE,
+            header: this.authHeader(),
+            connectTimeout: Math.min(SELECT_CONVERGE_TIMEOUT_MS, remaining),
+            readTimeout: Math.min(SELECT_CONVERGE_TIMEOUT_MS, remaining),
+            usingCache: false
+          });
+          if (!scopedCurrent() || (response.responseCode !== 204 && response.responseCode !== 200)) { return false; }
+        } finally { req.destroy(); }
+        const clearedJson = await this.proxiesJson();
+        if (!scopedCurrent() || clearedJson === null) { return false; }
+        const clearedTable = (JSON.parse(clearedJson) as Record<string, Object>)['proxies'] as Record<string, Object>;
+        const cleared = clearedTable === undefined || clearedTable === null ? undefined
+          : clearedTable[smartName] as Record<string, Object>;
+        if (cleared === undefined || cleared === null || cleared['type'] !== 'Smart' || cleared['fixed'] !== '') { return false; }
+      }
+      if (!scopedCurrent() || !await this.selectNodeInGroup(groupName, smartName, scopedCurrent,
+        Math.max(0, deadline - Date.now())) || !scopedCurrent()) { return false; }
+      // Verify the root path and Smart fixed state in the same authenticated snapshot.
+      const finalJson = await this.proxiesJson();
+      if (!scopedCurrent() || finalJson === null) { return false; }
+      const finalTable = (JSON.parse(finalJson) as Record<string, Object>)['proxies'] as Record<string, Object>;
+      if (finalTable === undefined || finalTable === null) { return false; }
+      const finalSmart = finalTable[smartName] as Record<string, Object>;
+      if (finalSmart === undefined || finalSmart === null || finalSmart['type'] !== 'Smart'
+        || finalSmart['fixed'] !== '') { return false; }
+      const path = this.selectionPath(finalTable, groupName, smartName);
+      if (groupName !== smartName && path.length === 0) { return false; }
+      for (let i = 0; i < path.length; i++) {
+        const entry = finalTable[path[i].name] as Record<string, Object>;
+        const member = i + 1 < path.length ? path[i + 1].name : smartName;
+        if (entry === undefined || entry['now'] !== member) { return false; }
+      }
+      return scopedCurrent();
+    } catch (e) {
+      AppLogger.warn(TAG, `restore Smart automatic selection failed: ${AppLogger.errText(e)}`);
+      return false;
+    }
   }
 
   /** Select only the active primary path; service groups retain their own policies. */
@@ -680,66 +741,6 @@ export class ClashApiService {
   }
 
   /**
-   * 从 `/proxies` 里找出**包含该节点**的组名，顺序：PROXY → 非 GLOBAL → GLOBAL。
-   * 返回空数组表示拿不到快照（调用方退回旧路径）。
-   */
-  private async groupsContaining(nodeName: string): Promise<string[]> {
-    const json = await this.proxiesJson();
-    if (json === null) {
-      return [];
-    }
-    const out: string[] = [];
-    try {
-      const parsed = JSON.parse(json) as Record<string, Object>;
-      const proxies = parsed['proxies'];
-      if (proxies === undefined || proxies === null) {
-        return [];
-      }
-      const table = proxies as Record<string, Object>;
-      const head: string[] = [];
-      const tail: string[] = [];
-      const names = Object.keys(table);
-      for (const name of names) {
-        const entry = table[name] as Record<string, Object>;
-        if (entry === null || entry === undefined) {
-          continue;
-        }
-        const all = entry['all'];
-        if (!Array.isArray(all)) {
-          continue;
-        }
-        const members = all as Object[];
-        let hit = false;
-        for (const member of members) {
-          if (typeof member === 'string' && member === nodeName) {
-            hit = true;
-            break;
-          }
-        }
-        if (!hit) {
-          continue;
-        }
-        if (name === 'PROXY') {
-          head.push(name);
-        } else if (name === 'GLOBAL') {
-          tail.push(name);
-        } else {
-          head.push(name);
-        }
-      }
-      for (const name of head) {
-        out.push(name);
-      }
-      for (const name of tail) {
-        out.push(name);
-      }
-    } catch (e) {
-      return [];
-    }
-    return out;
-  }
-
-  /**
    * 读回某代理组当前选中的成员（GET /proxies/{group} 的 `now` 字段）。
    * 返回 null 表示内核不可达/组不存在；空串表示组存在但没有选中项。
    * 用途：连接后确认「选点真的生效了」，而不是只信 PUT 的 204。
@@ -846,7 +847,6 @@ export class ClashApiService {
               occupied.add(name);
               owners.set(name, providerName);
             }
-            AppLogger.info(TAG, `provider ${providerName}: nodes=${proxies.length}`);
           }
         }
       } catch (e) {

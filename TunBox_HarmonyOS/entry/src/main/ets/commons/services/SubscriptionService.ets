@@ -1395,20 +1395,6 @@ export class SubscriptionService {
     SubscriptionService.appendInvalidReason(d, reason);
   }
 
-  /** 把 YamlMerger 的跳过/无效统计并入统一诊断（不再只写日志） */
-  private static absorbYamlMergeStats(d: SubscriptionImportDiagnostics): void {
-    if (YamlMerger.lastSkippedCount > 0) {
-      d.unsupportedCount = d.unsupportedCount + YamlMerger.lastSkippedCount;
-      d.unsupportedTypes = SubscriptionService.mergeTypes(d.unsupportedTypes, YamlMerger.lastSkippedTypes);
-    }
-    if (YamlMerger.lastInvalidCount > 0) {
-      const detail = YamlMerger.lastInvalidReasons.join('；');
-      SubscriptionService.noteInvalidBulk(d, YamlMerger.lastInvalidCount,
-        `YAML 节点无效 ${YamlMerger.lastInvalidCount} 条：`
-        + `${detail.length > 0 ? detail : '字段缺失或格式错误'}`);
-    }
-  }
-
   /** 逗号分隔的类型清单合并（去重，保持原有顺序） */
   private static mergeTypes(current: string, extra: string): string {
     if (extra.length === 0) {
@@ -1428,28 +1414,6 @@ export class SubscriptionService {
       out.push(t);
     }
     return out.join(',');
-  }
-
-  /** provider 拉取/解析失败明细（去重、最多 3 条、';' 分隔） */
-  private static appendProviderFailure(d: SubscriptionImportDiagnostics, reason: string): void {
-    const text = reason.trim();
-    if (text.length === 0) {
-      return;
-    }
-    if (d.providerFailureReasons.length === 0) {
-      d.providerFailureReasons = text;
-      return;
-    }
-    const parts = d.providerFailureReasons.split(';');
-    if (parts.length >= 3) {
-      return;
-    }
-    for (const it of parts) {
-      if (it === text) {
-        return;
-      }
-    }
-    d.providerFailureReasons = `${d.providerFailureReasons};${text}`;
   }
 
   /** 统一异常文案（不输出 URL / 凭据，只输出错误消息） */

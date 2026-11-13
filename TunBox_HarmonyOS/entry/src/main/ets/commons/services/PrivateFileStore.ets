@@ -9,10 +9,41 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import fileIo from '@ohos.fileio';
 import { util } from '@kit.ArkTS';
 import {
-  MAX_STATE_FILE_BYTES, PrivateFs, SyncReadResult
+  MAX_STATE_FILE_BYTES, PrivateFs, SyncReadResult, isTestConfigFileName
 } from './RuntimeFilePolicy';
 
 const TAG = 'PrivateFileStore';
+
+/**
+ * 删除目录里的测速配置（`mihomo_test_config*.yaml`，含 api secret 与节点口令）。
+ *
+ * 测速配置现在每次启动一个文件名，所以清理不能再按固定名字删，要按模式扫一遍。
+ * 逐文件独立容错；目录读不了时返回空表（不抛）。
+ *
+ * @param keepName 要保留的文件名（刚为本次启动写好的那份）；'' = 全部删除
+ * @returns 实际删掉的文件名
+ */
+export function removeTestConfigs(dir: string, keepName: string = ''): string[] {
+  const removed: string[] = [];
+  let names: string[] = [];
+  try {
+    names = fs.listFileSync(dir);
+  } catch (e) {
+    return removed;
+  }
+  for (const name of names) {
+    if (name === keepName || !isTestConfigFileName(name)) {
+      continue;
+    }
+    try {
+      fs.unlinkSync(`${dir}/${name}`);
+      removed.push(name);
+    } catch (e) {
+      // 已被扩展进程删掉属正常
+    }
+  }
+  return removed;
+}
 
 /**
  * 收窄权限位（目录 0700 / 文件 0600）。

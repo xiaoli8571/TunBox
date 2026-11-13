@@ -12,6 +12,7 @@
  *   - 「复制脱敏报告」：复用既有 LogRedactor 脱敏能力 + AppLogger 已脱敏日志
  */
 import { Ui } from '../theme/UiTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxGlass, TunBoxMotion } from '../theme/TunBoxTokens';
 import { AppDiagnostics } from '../commons/models/PublicIpInfo';
 import { AppLogger, LogRedactor } from '../commons/utils/AppLogger';
 import { promptAction } from '@kit.ArkUI';
@@ -457,11 +458,10 @@ export struct DiagnosticsSheet {
           .fontColor(this.running ? Ui.textTertiaryFor(this.themeRevision) : Ui.primaryFor(this.themeRevision))
           .padding({ left: 8, right: 8, top: 4, bottom: 4 })
           .borderRadius(10)
-          .backgroundColor(Ui.surfaceTranslucent(this.themeRevision))
-          .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-            colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-          })
-          .backgroundEffect({ radius: Ui.glassControlBlurRadius, saturation: Ui.glassControlSaturation, brightness: Ui.glassControlBrightness })
+          // 面板本身已经是玻璃：里面的小按钮只用一层淡填充，不再各自开一层背板模糊
+          // （玻璃上再叠玻璃没有可折射的内容，只多一个离屏图层）。
+          .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
+          .clickEffect(TunBoxMotion.pressControl())
           .borderWidth(1)
           .borderColor(Ui.glassEdge(this.themeRevision))
           .onClick(() => {
@@ -657,18 +657,22 @@ export struct DiagnosticsSheet {
       }
     }
     .padding(20)
-    .backgroundColor(Ui.surfaceTranslucent(this.themeRevision))
-    .backgroundBlurStyle(BlurStyle.COMPONENT_THICK, {
-      colorMode: ThemeColorMode.SYSTEM, adaptiveColor: AdaptiveColor.DEFAULT
-    })
+    // ── 玻璃材质（2026-11-11 与底栏同一套口径，见 TunBoxGlass）──
+    // 之前这里叠了三层：半透明填充（浅色 82% 白）+ `backgroundBlurStyle(COMPONENT_THICK)` +
+    // `backgroundEffect`。COMPONENT_THICK 自带一层近乎不透明的填充，把后面的模糊与饱和度
+    // 提升整个盖掉 —— 所以这块弹层实际是一张实心板，和旁边的底栏不是同一种材质。
+    // 现在只留一层 `backgroundEffect`：背后内容被模糊并提饱和度，再压一层能保证小字
+    // 对比度的染色（面板里是密集的 10~13fp 日志，染色不能像底栏那么薄）。
     .backgroundEffect({
-      radius: Ui.glassBlurRadius,
-      saturation: Ui.glassSaturationSoft,
-      brightness: Ui.glassBrightnessSoft
+      radius: TunBoxGlass.BLUR_SHEET,
+      saturation: TunBoxGlass.saturation(this.themeRevision),
+      brightness: TunBoxGlass.brightness(this.themeRevision),
+      color: TunBoxColors.sheetGlassTint(this.themeRevision)
     })
+    // 上沿受光棱线：与底栏镜面高光同一组颜色
     .borderWidth({ top: 1 })
-    .borderColor(Ui.glassEdge(this.themeRevision))
+    .borderColor(TunBoxGlass.rimLight(this.themeRevision))
     .shadow({ radius: 32, color: Ui.shadow, offsetY: -10 })
-    .borderRadius({ topLeft: 20, topRight: 20 })
+    .borderRadius({ topLeft: TunBoxGeometry.cardRadius, topRight: TunBoxGeometry.cardRadius })
   }
 }

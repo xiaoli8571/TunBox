@@ -114,7 +114,8 @@ struct NodeEditPage {
     Stack() {
       Column()
         .width('100%').height('100%')
-        .backgroundColor(TunBoxColors.background(this.themeRevision))
+        // 与其余页面同一条背景渐变（原来是平色，转场时与渐变页之间底部颜色会跳）
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         // 背景延伸到状态栏/底部导航条之下, 消除底部白条
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 

@@ -14,7 +14,7 @@ import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 import scanBarcode from '@hms.core.scan.scanBarcode';
-import { TunBoxColors, TunBoxGeometry, TunBoxPing } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion, TunBoxPing } from '../theme/TunBoxTokens';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { SubscriptionSummary } from '../commons/utils/SubscriptionSummary';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
@@ -59,8 +59,6 @@ function fileNameFromUri(uri: string): string {
     return raw;
   }
 }
-/** 节点行高（vp） */
-const NODE_ROW_H: number = 52;
 
 /** 仅在原生校验明确要求密钥时打开，取消不会修改旧配置。 */
 @CustomDialog
@@ -550,15 +548,20 @@ export struct SubscriptionSection {
    */
   private suppressClick: boolean = false;
   /**
-   * 覆盖层展开/收起动画标志。
+   * 覆盖层展开/收起动画。
    * 2026-10-28 用户报障「第一条订阅展开是从上往下、后面的订阅展开效果不一样」：
    * 旧实现按卡片在列表中的下标算了一个 `panelOriginY` 作为展开起点偏移，
    * 首条（下标 0）偏移为 0、后面的卡片偏移越来越大 → 同一个弹层出现多种展开轨迹。
-   * 现在**统一用首条订阅的展开效果**（纯缩放 + 淡入，无纵向位移）。
+   * 之后统一成**纯缩放 + 淡入，无纵向位移**。
+   *
+   * 2026-11-11：原先靠一个 `panelAnimating` 标志位 + `setTimeout(24ms)` 翻转来「假装」
+   * 入场动画（收起时没有任何动画，面板直接消失）。现在交给 `bindContentCover` 的
+   * `transition`（TunBoxMotion.panelZoom()），展开与收起是同一条曲线，也不再有定时器。
    */
-  @State private panelAnimating: boolean = false;
   /** 状态栏高度（vp）：全屏覆盖层内容要从状态栏之下起排 */
   @State private statusBarH: number = 24;
+  /** 冷启动补重载的定时器句柄（aboutToDisappear 里统一取消） */
+  private reloadTimers: number[] = [];
 
   // ── 长按拖动排序（2026-10-30 用户要求：长按订阅可以拖动排序）──
   /** 正在拖动的订阅 id（'' = 未拖动）；同时用作「是否处于拖动中」的总闸门 */
@@ -681,9 +684,15 @@ export struct SubscriptionSection {
   private nodeSetBound: boolean = false;
   private readonly orchListener: () => void = (): void => {
     this.reload();
-    this.refreshCoreCatalog();
+    this.syncCoreCatalog();
   };
   private orchBound: boolean = false;
+  /** 最近一次**成功落地**的内核目录对应的变化戳（见 `coreCatalogStamp`）；空串 = 还没落地过。 */
+  private coreCatalogSyncedStamp: string = '';
+  /** 正在拉取的那一戳；空串 = 没有在途拉取。 */
+  private coreCatalogPendingStamp: string = '';
+  /** 上次渲染所依据的共享快照时间（别处刷新了快照时用它发现并重绘）。 */
+  private coreCatalogSeenAt: number = 0;
 
   aboutToAppear(): void {
     this.profileRevisions.clear();
@@ -700,15 +709,21 @@ export struct SubscriptionSection {
       ConnectionOrchestrator.instance().addListener(this.orchListener);
     }
     this.reload();
-    this.refreshCoreCatalog();
+    this.syncCoreCatalog();
     this.measureStatusBar();
     if (this.subs.length === 0) {
-      setTimeout((): void => { this.reload(); }, 600);
-      setTimeout((): void => { this.reload(); }, 1600);
+      // 冷启动时订阅 hydrate 可能还没完成：补两次重载。句柄要留着 —— 组件在这 1.6s 内
+      // 被销毁（切走页签前的重建）时必须取消，否则 reload() 会跑在已销毁的组件上。
+      this.reloadTimers.push(setTimeout((): void => { this.reload(); }, 600));
+      this.reloadTimers.push(setTimeout((): void => { this.reload(); }, 1600));
     }
   }
 
   aboutToDisappear(): void {
+    for (const id of this.reloadTimers) {
+      clearTimeout(id);
+    }
+    this.reloadTimers = [];
     this.finishAgeKey('');
     this.ageKeyDialog.close();
     if (this.latencyBound) {
@@ -723,6 +738,8 @@ export struct SubscriptionSection {
       this.orchBound = false;
       ConnectionOrchestrator.instance().removeListener(this.orchListener);
     }
+    // 让在途拉取的结果作废（组件已销毁，不能再写状态）。
+    this.coreCatalogPendingStamp = '';
   }
 
   /** 取系统状态栏高度（px → vp），失败保持默认 24vp */
@@ -897,17 +914,74 @@ export struct SubscriptionSection {
    * 内核对不上当前选择时不刷新：快照保持旧戳，`coreCatalogFor` 判假，UI 自动退回
    * 「本订阅本地节点」这条已经写好且绝对隔离的分支。
    */
-  private async refreshCoreCatalog(): Promise<void> {
+  private async refreshCoreCatalog(): Promise<boolean> {
     const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
     if (orch.state !== ConnState.CONNECTED && orch.state !== ConnState.CONNECTING) {
-      return;
+      // 没有可问的内核：不拉，旧快照原样保留（它的归属戳自己会挡住别的订阅）。
+      return true;
     }
     const appliedId: string = orch.appliedProfile();
     const profileId: string = appliedId.length > 0 ? appliedId : ProfileRepository.currentId();
     const model = await CoreCatalogService.refresh(orch.api, false, profileId);
-    if (model !== null) {
-      this.coreRevision = this.coreRevision + 1;
+    if (model === null) {
+      return false;
     }
+    this.coreCatalogSeenAt = CoreCatalogService.fetchedAtMs();
+    this.coreRevision = this.coreRevision + 1;
+    return true;
+  }
+
+  /**
+   * 「内核节点目录可能已变」的变化戳：连接状态、内核实例、生效的订阅、内核接受配置的
+   * 序号、当前出口，任一变化即视为可能已变。全部是内存读取，不碰内核。
+   */
+  private coreCatalogStamp(): string {
+    const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+    return `${orch.state}|${orch.startedAt}|${orch.appliedProfile()}|${ProfileRepository.currentId()}`
+      + `|${orch.kernelConfigSeq()}|${orch.connectionTargetLabel()}`;
+  }
+
+  /**
+   * 编排器通知的统一入口：**只在节点数据真的可能变了**时才去拉内核目录。
+   *
+   * 2026-11-12 真机取证：编排器的流量轮询每 2 秒成功一次就 `notify()` 一次，而这里原来
+   * 每次通知都无条件刷新目录 —— 连接期间每 2 秒 `GET /proxies` + `GET /providers/proxies`、
+   * 两次 JSON 解析、一次序列化、再解析成模型，并逐 provider 打一行日志；`app.log` 约
+   * 30 分钟写满 1MB，三个轮转文件里 99% 是 `provider X: nodes=N`。
+   *
+   * 现在按变化戳去重：戳没变就不拉。戳只在**拉取成功后**才记为已同步，所以内核还没
+   * 就绪、或本次拉取被别处的刷新顶掉时，下一次通知会重试，不会停在旧目录上。
+   */
+  private syncCoreCatalog(): void {
+    const stamp: string = this.coreCatalogStamp();
+    if (stamp === this.coreCatalogSyncedStamp) {
+      // 目录没变。但共享快照可能被别处刷新过（节点页选点、测速前取目录）—— 只重绘，不再拉。
+      const at: number = CoreCatalogService.fetchedAtMs();
+      if (at !== this.coreCatalogSeenAt) {
+        this.coreCatalogSeenAt = at;
+        this.coreRevision = this.coreRevision + 1;
+      }
+      return;
+    }
+    if (this.coreCatalogPendingStamp.length > 0) {
+      // 已有在途拉取：等它落定。期间戳若又变了，落定后的下一次通知会发现并再拉。
+      return;
+    }
+    this.coreCatalogPendingStamp = stamp;
+    this.refreshCoreCatalog().then((landed: boolean): void => {
+      if (this.coreCatalogPendingStamp !== stamp) {
+        return;
+      }
+      this.coreCatalogPendingStamp = '';
+      if (landed) {
+        this.coreCatalogSyncedStamp = stamp;
+      }
+    }).catch((e: Error): void => {
+      if (this.coreCatalogPendingStamp === stamp) {
+        this.coreCatalogPendingStamp = '';
+      }
+      AppLogger.warn(TAG, `core catalog refresh failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   private activeGroupOf(subId: string): ProxyGroup | null {
@@ -1221,11 +1295,8 @@ export struct SubscriptionSection {
     this.selectedGroup = groups.length > 0 ? groups[0].name : '';
     // 面板一打开就要算出「♻️ 自动选择」入口要不要出现/是否已选中
     // 不再按卡片下标算展开起点：所有订阅统一使用同一条（首条）展开动画。
-    this.panelAnimating = true;
+    // 展开/收起动画由 bindContentCover 的系统转场驱动（见 build() 末尾的 TunBoxMotion.panelZoom()）。
     this.showPanel = true;
-    setTimeout((): void => {
-      this.panelAnimating = false;
-    }, 24);
     if (this.currentProfileId !== sub.id) {
       this.activateProfile(sub.id).catch((e: Object): void => {
         AppLogger.warn(TAG, `activate profile failed: ${AppLogger.errText(e)}`);
@@ -1235,7 +1306,6 @@ export struct SubscriptionSection {
 
   private closePanel(): void {
     this.showPanel = false;
-    this.panelAnimating = false;
   }
 
   private async activateProfile(id: string): Promise<void> {
@@ -1319,6 +1389,8 @@ export struct SubscriptionSection {
       return;
     }
     this.testingIds = this.testingIds.concat([subId]);
+    // 测速核启动偏慢（内核在加载订阅自带规则集）时的说明由首页统一显示
+    // （HomePage.startHint ← orchestrator.startupHint()），这里不再另弹一份。
     try {
       const context: Context = getContext(this) as Context;
       const groupName = this.showPanel && this.panelSubId === subId ? this.selectedGroup : '';
@@ -2008,6 +2080,7 @@ export struct SubscriptionSection {
       width: sub.id === this.currentProfileId ? 1.5 : 1,
       color: sub.id === this.currentProfileId ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.cardBorder(this.themeRevision)
     })
+    .clickEffect(TunBoxMotion.pressCard())
     .onClick((): void => {
       if (tapToClose) {
         this.closePanel();
@@ -2031,8 +2104,11 @@ export struct SubscriptionSection {
       .padding({ left: 12, right: 12, top: 6, bottom: 6 })
       .borderRadius(TunBoxGeometry.pillRadius)
       .backgroundColor(this.selectedGroup === name ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.chipBg(this.themeRevision))
+      // 选中分组换色走过渡，不再硬切
+      .animation(TunBoxMotion.stateChange())
       .maxLines(1)
       .flexShrink(0)
+      .clickEffect(TunBoxMotion.pressControl())
       .onClick((): void => { this.selectedGroup = name; })
   }
 
@@ -2347,7 +2423,7 @@ export struct SubscriptionSection {
       .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
       .borderRadius({ topLeft: 20, topRight: 20 })
       .padding({ bottom: 22 })
-      .transition(TransitionEffect.move(TransitionEdge.BOTTOM).animation({ duration: 240, curve: Curve.EaseOut }))
+      .transition(TunBoxMotion.sheetRise())
     }
     .width('100%')
     // ⚠ 绝不能写 .height('100%')：本 builder 是面板 Stack 的最后一个孩子，
@@ -2509,9 +2585,6 @@ export struct SubscriptionSection {
     .height('100%')
     .backgroundColor(TunBoxColors.background(this.themeRevision))
     .padding({ top: this.statusBarH })
-    .opacity(this.panelAnimating ? 0 : 1)
-    .scale({ x: this.panelAnimating ? 0.88 : 1, y: this.panelAnimating ? 0.88 : 1 })
-    .animation({ duration: 260, curve: Curve.EaseOut })
 
     if (this.deleteSheetOn) {
       this.NodeDeleteBar()
@@ -2549,13 +2622,16 @@ export struct SubscriptionSection {
             this.SubCard(sub, false)
           }
           .width('100%')
-          .translate({ y: this.dragSubId === sub.id ? this.dragDy : 0 })
-          .zIndex(this.dragSubId === sub.id ? 2 : 0)
+          // 拖起/放下：缩放、透明度、投影走过渡（.animation 只作用于它**之前**声明的属性）；
+          // 跟手位移与层级必须写在它之后 —— 位移一旦被动画接管，卡片就会滞后于手指。
           .opacity(this.dragSubId === sub.id ? 0.96 : 1)
           .scale(this.dragSubId === sub.id ? { x: 1.02, y: 1.02 } : { x: 1, y: 1 })
           .shadow(this.dragSubId === sub.id
             ? { radius: 16, color: '#33000000', offsetX: 0, offsetY: 6 }
             : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
+          .animation(TunBoxMotion.stateChange())
+          .translate({ y: this.dragSubId === sub.id ? this.dragDy : 0 })
+          .zIndex(this.dragSubId === sub.id ? 2 : 0)
           .onAreaChange((_oldArea: Area, nextArea: Area): void => {
             this.subCardHeights[index] = Number(nextArea.height);
           })
@@ -2581,7 +2657,10 @@ export struct SubscriptionSection {
     .width('100%')
     .alignItems(HorizontalAlign.Start)
     .bindContentCover(this.showPanel, this.NodePanelCover(), {
-      modalTransition: ModalTransition.NONE,
+      // 自定义转场优先于 modalTransition；留着 DEFAULT 是兜底 —— 万一某个系统版本
+      // 不认 transition，面板仍有系统默认的升起/落下动画，而不是直接闪现。
+      modalTransition: ModalTransition.DEFAULT,
+      transition: TunBoxMotion.panelZoom(),
       backgroundColor: TunBoxColors.background(this.themeRevision),
       onDisappear: (): void => {
         this.showPanel = false;

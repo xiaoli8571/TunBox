@@ -9,7 +9,7 @@
  *  - onBack 缺省时回退 router.back()，与文档 onBack?: () => void 一致。
  */
 import { router } from '@kit.ArkUI';
-import { TunBoxColors, TunBoxGeometry } from '../theme/TunBoxTokens';
+import { TunBoxColors, TunBoxGeometry, TunBoxMotion } from '../theme/TunBoxTokens';
 import { ThemeService } from '../theme/ThemeService';
 import { TunBoxTextColors } from '../theme/TextColors';
 import { SafeArea } from '../theme/SafeArea';
@@ -26,18 +26,15 @@ export struct TopNavBar {
   onRightClick?: () => void;
   @BuilderParam rightSlot: () => void = this.emptyRight;
   /**
-   * 2026-10-31 十四修 —— 摸清了平台真正支持的东西，把前几版的土办法全删了。
+   * 顶栏只有一层**连续的淡染色**，自己不做任何背景模糊。
    *
-   * 官方文档 / SDK（`common.d.ts:19107`、`LinearGradientBlurOptions:23786`）：
-   *   `linearGradientBlur(radius, { fractionStops: [[模糊度, 位置], ...], direction })`
-   * 是**系统按停靠点插值**算的渐变模糊，位置取组件的 0..1，天生连续。
-   * 它作用在「组件自身的内容」上，所以正确用法是**对滚动容器用**：
-   * 内容越靠近顶栏越糊，往下逐渐清晰 —— 这正是「渐变模糊」，
-   * 而且完全没有逐条取样拼接的问题。
-   *
-   * 顶栏自己因此只剩一层淡染色（下面那个 linearGradient），
-   * 不再有任何 `backgroundEffect` 横带：那些横带每条各自对背景取样，
-   * 拼缝就是用户反复看到的马赛克，靠调参数是救不回来的。
+   * 历史（2026-10-30 ~ 10-31，十五轮）：
+   *  · 把背景切成横带、逐条 `backgroundEffect` → 每条各自取样，拼缝就是马赛克，调参救不回来；
+   *  · 换成对滚动内容用官方 `linearGradientBlur` → 列表静止时首项也落进模糊区
+   *    （用户报「点订阅后第一个节点变模糊了」），已整体撤掉。
+   * 现在内容滚到顶栏下方时的柔化由各页滚动容器的 `fadingEdge`
+   * （`TunBoxGeometry.scrollFadeEdge`）负责：边缘渐隐，没有接缝，也不会糊到静止内容。
+   * 门禁 `verify-bottom-dock-immersive` 锁着「顶栏与三张页签页不得再出现 linearGradientBlur」。
    */
   private static readonly TINT_TOP_LIGHT: number = 0.20;
   private static readonly TINT_TOP_DARK: number = 0.12;
@@ -78,14 +75,8 @@ export struct TopNavBar {
 
   build() {
     Stack({ alignContent: Alignment.Top }) {
-      // ── 染色：只是一条很淡的连续渐变，**不再自己做背景模糊** ──
-      // 2026-10-31 十四修（用户：「怎么又变成马赛克了…你去查官方文档」）：
-      // 背景模糊改由官方 `linearGradientBlur` 作用在滚动内容上（见 TunBoxGeometry.topBlurStops），
-      // 系统按停靠点插值，天生连续。顶栏自己只剩这一层淡染色 —— 越往顶越白，到顶栏下沿归零。
-      // 之前那些「把背景切成横带分别 backgroundEffect」的做法已全部删除：
-      // 逐条取样必然在拼缝处露出条块，这就是用户看到的马赛克，靠调参救不回来。
-
       // ── 染色：一整条连续渐变，两端斜率都归零（见 tintAt 的注释），终点 alpha = 0 ──
+      // 越往顶越白，到顶栏下沿归零；顶栏自己不做背景模糊（原因见上方类注释）。
       Column()
         .width('100%')
         .height('100%')
@@ -105,6 +96,7 @@ export struct TopNavBar {
         .padding(0)
         .width(36).height(36)
         .accessibilityText('返回')
+        .clickEffect(TunBoxMotion.pressControl())
         .onClick(() => this.handleBack())
       }
       Text(this.title)
@@ -144,8 +136,8 @@ export struct TopNavBar {
     // 2026-10-30 二修：顶栏从「实底一条」变成**浮层玻璃**。
     //  · 状态栏那段让白改用 padding（margin 只挪布局、画不到背景，玻璃就盖不住状态栏区）；
     //  · 高度 = 行高 + 让白，padding 让出同样的量，标题仍竖居中在 56vp 行里；
-    //  · `backgroundEffect` 真·背景模糊 + 极淡染色渐变，下缘收到全透明 → 内容滚过去时是
-    //    「渐变模糊」而不是「被一块板完全遮挡」（用户 2026-10-30 两条反馈）。
+    //  · 顶栏只有淡染色、没有实底：内容滚过去时靠滚动容器的 fadingEdge 渐隐，
+    //    而不是「被一块板完全遮挡」（用户 2026-10-30 两条反馈）。
     .height(TunBoxGeometry.navHeight + (this.avoidActive ? 0 : Math.max(0, this.insetTop - 12)))
     .padding({
       left: TunBoxGeometry.pagePadding,

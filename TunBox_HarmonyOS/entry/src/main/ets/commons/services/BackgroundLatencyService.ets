@@ -96,18 +96,6 @@ export class BackgroundLatencyService {
     }
   }
 
-  /** 兼容旧调用点：手动测速优先（新引擎单航班，新批自然抢占旧批） */
-  static beginManualPriority(): void {
-    BackgroundLatencyService.cancelCurrent();
-  }
-
-  static endManualPriority(_context: Context): void {
-  }
-
-  static isManualPriorityActive(): boolean {
-    return false;
-  }
-
   /** 本批测速 URL（唯一真源 `effectiveTestUrl`，默认 gstatic https 204） */
   static resolveTestUrl(settings: AppSettings): string {
     return effectiveTestUrl(settings);

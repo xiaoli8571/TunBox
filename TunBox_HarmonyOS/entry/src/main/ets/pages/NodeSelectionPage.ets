@@ -169,14 +169,14 @@ struct NodeSelectionPage {
    * （真机取证 2026-10-20：通道准备 = DoH 预解析 + 启扩展 + 就绪轮询 + 预热）。
    */
   @State latencyPreparing: boolean = false;
+  /** 准备阶段偏慢时的说明（内核在加载订阅自带规则集）；空 = 用默认文案 */
+  @State latencyPrepareHint: string = '';
   /**
    * 本轮是否被取消（用户点取消 / 页面退出）。
    * 引擎的 LatencyProgress 只统计「取消时正好在探测的节点」，无法回答"这一批是否
    * 被取消"，所以取消动作在这里记账：被取消的批次不是完整结论 → 不落盘、不弹完成 toast。
    */
   private batchCancelled: boolean = false;
-  /** 组测速的 api 引用（供「取消」abort 组测请求） */
-  private groupTestApi: ClashApiService | null = null;
   /** 排序模式: default 订阅顺序 / auto 按持久化的最近测速结果 / manual 手动固定顺序。
    *  进页面时由 AppSettings.nodeSortMode + nodeSortSnapshot 恢复，测速完成后落盘。 */
   @State sortMode: string = NodeSortModes.DEFAULT;
@@ -898,6 +898,11 @@ struct NodeSelectionPage {
       for (const batch of byProfile) {
         if (this.batchCancelled) { break; }
         timer = UnifiedScheduler.every((): void => {
+          // 准备阶段：内核启动偏慢（在加载订阅规则集）时把原因说出来
+          if (this.latencyPreparing) {
+            const hint = this.orchestrator.startupHint();
+            if (hint !== this.latencyPrepareHint) { this.latencyPrepareHint = hint; }
+          }
           const current = TunBoxLatencyService.currentProgress();
           if (driveHeader && current !== null && current.running) {
             this.latencyDone = progress.finished + current.started;
@@ -931,6 +936,7 @@ struct NodeSelectionPage {
       if (timer >= 0) { UnifiedScheduler.clear(timer); }
       progress.running = false;
       this.latencyRunActive = false; this.latencyPreparing = false;
+      this.latencyPrepareHint = '';
       if (driveHeader) { this.batchTesting = false; }
       LatencyStoreBridge.flushNow();
     }
@@ -953,42 +959,6 @@ struct NodeSelectionPage {
       // The shared service persists each result with its exact test context.
     } finally {
       this.testingName = '';
-    }
-  }
-
-  /**
-   * 进页面自动补测：force=false，只补没有新鲜结果的节点。
-   *
-   * 不 await（不能阻塞首屏渲染）、不弹任何 toast：全部新鲜时引擎立刻以
-   * skipped === total 结束，绝不能再出现「全部节点使用缓存，无需重新测速」这种
-   * 让用户以为点坏了的提示。已有批次在跑就直接让位（引擎是单航班）。
-   */
-  private async autoTestMissing(): Promise<void> {
-    if (BackgroundLatencyService.isRunning()) {
-      return;
-    }
-    // ── 频率闸门 ────────────────────────────────────────────────────
-    // 旧行为：每次进页面都补测（onPageShow → bootstrap → 这里）。用户明确要求
-    // 「只在软件重新启动时测一次，或导入订阅时自动测一次」。
-    //
-    // AppStorage 只在**进程内存**里，app 冷启动即清空 —— 正好表达"本次启动还没测过"。
-    // 订阅变化用 subscriptionRevision 表达（导入/刷新会 +1），它变了就再测一次。
-    const testedStamp = AppStorage.get<string>('latency_session_stamp') ?? '';
-    const stamp = `${AppStorage.get<number>('subscription_revision') ?? 0}`;
-    if (testedStamp === stamp) {
-      return;
-    }
-    // 先占位再测：autoTestMissing 可能被并发触发（快速切页），
-    // 不先写入会出现两轮同时启动。
-    AppStorage.setOrCreate('latency_session_stamp', stamp);
-    const list = this.targetNodes();
-    if (list.length === 0) {
-      return;
-    }
-    try {
-      await this.runLatency(list, false, true);
-    } catch (e) {
-      AppLogger.warn(TAG, `auto latency failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -1361,7 +1331,8 @@ struct NodeSelectionPage {
     Stack() {
       Column()
         .width('100%').height('100%')
-        .backgroundColor(TunBoxColors.background(this.themeRevision))
+        // 与其余页面同一条背景渐变（原来是平色，转场时与渐变页之间底部颜色会跳）
+        .linearGradient({ angle: 180, colors: [[TunBoxColors.bgGradientStart(this.themeRevision), 0.0], [TunBoxColors.bgGradientEnd(this.themeRevision), 1.0]] })
         // 背景延伸到状态栏/底部导航条之下, 消除底部白条
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
@@ -1410,6 +1381,8 @@ struct NodeSelectionPage {
           .width('100%')
           .height(56)
           .padding({ left: 16, right: 16 })
+          // 进入/退出多选：操作栏淡入轻落，退出原路返回（原来是直接弹出，下面整页跟着跳 56vp）
+          .transition(TunBoxMotion.revealDown())
         }
 
         // ── 顶栏（对齐原版: 返回 + 当前节点 + 刷新/闪电图标组） ──
@@ -1480,7 +1453,7 @@ struct NodeSelectionPage {
             Row({ space: 8 }) {
               if (this.latencyPreparing) {
                 // 通道还没就绪（要拉起测速内核，秒级）：明确告诉用户在等什么
-                Text('准备测速通道…')
+                Text(this.latencyPrepareHint.length > 0 ? this.latencyPrepareHint : '准备测速通道…')
                   .fontSize(11)
                   .fontColor(Ui.textSecondaryFor(this.themeRevision))
               } else if (this.latencyCoreUnavailable) {

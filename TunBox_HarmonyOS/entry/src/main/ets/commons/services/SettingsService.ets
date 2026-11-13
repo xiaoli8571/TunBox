@@ -139,8 +139,6 @@ export class SettingsService {
   private static flushTimer: number = -1;
   /** 防抖窗口：UI 连点/批量开关只落一次盘；进后台/退出前由 flushNow 强制刷。 */
   private static readonly FLUSH_DELAY_MS: number = 300;
-  /** 本进程内「双轨 provider」开关的上一次生效值：用于识别开关变化并同步落盘仓闸门 */
-  private static lastRawProviderFlag: boolean = false;
 
   static async init(context: Context): Promise<void> {
     SettingsService.store = await preferences.getPreferences(context, PREF_NAME);
@@ -595,8 +593,8 @@ export class SettingsService {
    * 要清磁盘只有两个显式入口：删除订阅（remove + drop）与诊断面板的 purgeRawProviders()。
    */
   private static syncRawProviderGate(enabled: boolean): void {
+    // 「是否变化」由 RawSubscriptionStore.setEnabled 自己判断（只在变化时记日志）。
     RawSubscriptionStore.setEnabled(enabled, false);
-    SettingsService.lastRawProviderFlag = enabled;
   }
 
   /** apiSecret 只允许存入系统加密 AssetStore，禁止降级到明文 Preferences。 */
