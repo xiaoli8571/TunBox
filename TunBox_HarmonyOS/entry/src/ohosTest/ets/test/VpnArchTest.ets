@@ -43,12 +43,14 @@ function statusText(phase: string, mtu: number, netType: string, coreAlive: bool
 export function vpnArchTest() {
   describe('VpnArchTest', () => {
 
-    // ── 按承载动态 MTU（网络类型驱动）────────────────────────────────
-    it('mtu_cellular_lower_than_wifi', 0, () => {
+    // ── 统一 MTU：承载切换不改 MTU（切 Wi-Fi/蜂窝不需要重建 TUN）────────────
+    // 旧用例名 mtu_cellular_lower_than_wifi 与最后一条「蜂窝 < Wi-Fi」断言是按承载分档
+    // 时代的口径；BASE_MTU 统一为 1360 之后那条断言恒为假，本用例每次必挂。
+    it('mtu_is_uniform_across_bearers', 0, () => {
       expect(mtuForNetType(NetTypes.CELLULAR)).assertEqual(CELLULAR_MTU);
       expect(mtuForNetType(NetTypes.WIFI)).assertEqual(BASE_MTU);
       expect(mtuForNetType(NetTypes.ETHERNET)).assertEqual(BASE_MTU);
-      expect(mtuForNetType(NetTypes.CELLULAR) < mtuForNetType(NetTypes.WIFI)).assertTrue();
+      expect(mtuForNetType(NetTypes.CELLULAR)).assertEqual(mtuForNetType(NetTypes.WIFI));
     });
 
     // ── 恢复退避：指数增长且封顶（弱网重连风暴抑制）──────────────────
@@ -168,6 +170,7 @@ export function vpnArchTest() {
       const settings = new AppSettings();
       const node = new ProxyNode();
       node.name = 'UT-HK';
+      node.proxyType = 'ss';
       node.server = 'h.example.com';
       node.port = 443;
       node.method = 'aes-128-gcm';

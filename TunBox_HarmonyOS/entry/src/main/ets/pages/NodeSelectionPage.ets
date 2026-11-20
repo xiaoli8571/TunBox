@@ -18,9 +18,9 @@ import { AppSettings, AutoSelectModes } from '../commons/models/AppSettings';
 import { ProxyNode, ProxyNodeType } from '../commons/models/ProxyNode';
 import { ProxyGroup } from '../commons/models/ProxyGroup';
 import { ClashApiService } from '../commons/services/ClashApiService';
+import { ArrayDataSource } from '../commons/utils/ArrayDataSource';
 import { ConnectionOrchestrator, ConnState } from '../commons/services/ConnectionOrchestrator';
-import { LatencyChannel, LatencyContext, LatencyPolicy, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
-import { LatencyProgress } from '../commons/services/LatencyEngine';
+import { LatencyChannel, LatencyContext, LatencyPolicy, LatencyProgress, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { TunBoxLatencyService } from '../commons/tunbox/TunBoxLatencyService';
 import { effectiveTestUrl } from '../commons/latency/LatencyProbe';
@@ -136,22 +136,22 @@ struct NodeBatchDeleteDialog {
 @Entry
 @Component
 struct NodeSelectionPage {
-  @StorageLink('theme_revision') themeRevision: number = 0;
+  @StorageLink('theme_revision') @Watch('syncListSources') themeRevision: number = 0;
   @StorageLink('smart_model_seq') @Watch('refreshSmartEntry') smartModelSeq: number = 0;
   @State smartVisible: boolean = false;
   @State smartSelected: boolean = false;
   @State smartSelecting: boolean = false;
   private smartRefreshRevision: number = 0;
-  @State nodes: NodeRow[] = [];
-  @State groupRows: ProxyGroupRow[] = [];
-  @State expandedGroupKeys: string[] = [];
+  @State @Watch('syncListSources') nodes: NodeRow[] = [];
+  @State @Watch('syncListSources') groupRows: ProxyGroupRow[] = [];
+  @State @Watch('syncListSources') expandedGroupKeys: string[] = [];
   @State filterSubId: string = ''; // '' = 全部
   /** 节点搜索（P1-4）：输入即过滤本页 flat 列表，大小写不敏感 */
-  @State searchText: string = '';
+  @State @Watch('syncListSources') searchText: string = '';
   private listScroller: Scroller = new Scroller();
   @State subChips: SubChip[] = [];
-  @State selectedName: string = '';
-  @State testingName: string = '';
+  @State @Watch('syncListSources') selectedName: string = '';
+  @State @Watch('syncListSources') testingName: string = '';
   @State batchTesting: boolean = false;
   /**
    * 本轮测速进度（顶栏进度条直接绑定）。
@@ -187,8 +187,8 @@ struct NodeSelectionPage {
    * 长按任一节点进入选择态 —— 顶栏切成「取消 · 已选 N · 全选 · 删除」，行前出现勾选圆点；
    * 删除走一次确认后逐个 removeNode（复用「刷新后不再出现」的本地屏蔽台账）。
    */
-  @State selectMode: boolean = false;
-  @State selectedNodeIds: string[] = [];
+  @State @Watch('syncListSources') selectMode: boolean = false;
+  @State @Watch('syncListSources') selectedNodeIds: string[] = [];
   /** 确认框正文：把选中节点名摘要成一句（>3 个折叠为「A、B、C 等 N 个节点」） */
   @State batchDeleteSummary: string = '';
   private batchDeleteDialog: CustomDialogController = new CustomDialogController({
@@ -208,7 +208,14 @@ struct NodeSelectionPage {
   @State refreshFail: number = 0;
   @State isConnected: boolean = false;
 
-  @State latencyTick: number = 0;
+  @State @Watch('syncListSources') latencyTick: number = 0;
+  private nodesSource: ArrayDataSource<NodeRow> = new ArrayDataSource<NodeRow>();
+  private groupRowsSource: ArrayDataSource<ProxyGroupRow> = new ArrayDataSource<ProxyGroupRow>();
+
+  private syncListSources(): void {
+    this.groupRowsSource.replaceAll(this.groupRows);
+    this.nodesSource.replaceAll(this.searchFiltered(this.nodes));
+  }
   /** 固定监听器实例，避免每次返回节点页都追加匿名监听，造成重复刷新和页面卡顿。 */
   private readonly latencyListener: () => void = (): void => {
     this.latencyTick = this.latencyTick + 1;
@@ -1593,7 +1600,7 @@ struct NodeSelectionPage {
           .margin({ top: 120 })
         } else if (this.groupRows.length > 0) {
           List({ space: 9, scroller: this.listScroller }) {
-            ForEach(this.groupRows, (groupRow: ProxyGroupRow) => {
+            LazyForEach(this.groupRowsSource, (groupRow: ProxyGroupRow) => {
               ListItem() {
                 Column({ space: 7 }) {
                   Row({ space: 10 }) {
@@ -1674,9 +1681,12 @@ struct NodeSelectionPage {
                 }
                 .width('100%')
               }
-            }, (groupRow: ProxyGroupRow) => this.groupKey(groupRow.group) + '#'
-              + this.expandedGroupKeys.join('|') + '#' + this.testingName)
-          }.edgeEffect(EdgeEffect.Spring)
+            }, (groupRow: ProxyGroupRow): string => this.groupKey(groupRow.group) + '#'
+              + this.expandedGroupKeys.join('|') + '#' + this.selectedStrategyName(groupRow.group)
+              + '#' + this.testingName + '#' + this.selectedName + '#'
+              + (this.selectMode ? this.selectedNodeIds.join(',') : '') + '#'
+              + this.latencyTick + '#' + this.themeRevision)
+          }.cachedCount(6).edgeEffect(EdgeEffect.Spring)
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })
@@ -1690,7 +1700,7 @@ struct NodeSelectionPage {
             .padding({ left: 12, right: 12 })
             .margin({ left: 18, right: 18, top: 4 })
           List({ space: 7, scroller: this.listScroller }) {
-            ForEach(this.searchFiltered(this.nodes), (row: NodeRow) => {
+            LazyForEach(this.nodesSource, (row: NodeRow) => {
               ListItem() {
                 this.NodeCard(row)
               }
@@ -1702,8 +1712,11 @@ struct NodeSelectionPage {
                 // 长按进入批量多选（2026-10-20）
                 this.enterSelectMode(row.node.id);
               }))
-            }, (row: NodeRow) => row.node.id + '#' + this.testingName + '#' + this.statusKey(row.status))
-          }.edgeEffect(EdgeEffect.Spring)
+            }, (row: NodeRow): string => row.node.id + '#' + this.testingName + '#' + this.statusKey(row.status)
+              + '#' + (this.selectedName === row.node.name ? '1' : '0')
+              + '#' + (this.selectMode ? (this.selectedNodeIds.indexOf(row.node.id) >= 0 ? 's1' : 's0') : 'n')
+              + '#' + this.latencyTick + '#' + this.themeRevision)
+          }.cachedCount(6).edgeEffect(EdgeEffect.Spring)
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .layoutWeight(1)
           .padding({ left: 18, right: 18, top: 8, bottom: 20 })

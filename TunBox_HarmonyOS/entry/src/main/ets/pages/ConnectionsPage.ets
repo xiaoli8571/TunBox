@@ -14,6 +14,7 @@ import { AppLogger } from '../commons/utils/AppLogger';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { ConnectionEntry } from '../commons/services/ClashApiService';
+import { ArrayDataSource } from '../commons/utils/ArrayDataSource';
 
 const TAG = 'ConnectionsPage';
 /** 轮询周期与主页流量采样一致（TRAFFIC_POLL_INTERVAL_MS 语义） */
@@ -22,10 +23,15 @@ const POLL_INTERVAL_MS = 2000;
 @Entry
 @Component
 struct ConnectionsPage {
-  @StorageLink('theme_revision') themeRevision: number = 0;
-  @State entries: ConnectionEntry[] = [];
+  @StorageLink('theme_revision') @Watch('syncEntriesSource') themeRevision: number = 0;
+  @State @Watch('syncEntriesSource') entries: ConnectionEntry[] = [];
   @State reachable: boolean = true;
   @State refreshing: boolean = false;
+  private entriesSource: ArrayDataSource<ConnectionEntry> = new ArrayDataSource<ConnectionEntry>();
+
+  private syncEntriesSource(): void {
+    this.entriesSource.replaceAll(this.entries);
+  }
   /** 已知节点名（用于把 chains 还原成真实出口节点名；空数组 = 不做交集过滤） */
   private knownNames: string[] = [];
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
@@ -232,7 +238,7 @@ struct ConnectionsPage {
           Blank().layoutWeight(1)
         } else {
           List({ space: 8 }) {
-            ForEach(this.entries, (entry: ConnectionEntry) => {
+            LazyForEach(this.entriesSource, (entry: ConnectionEntry) => {
               ListItem() {
                 Column({ space: 4 }) {
                   Row({ space: 8 }) {
@@ -278,8 +284,9 @@ struct ConnectionsPage {
                 .borderWidth(1)
                 .borderColor(Ui.glassEdge(this.themeRevision))
               }
-            }, (entry: ConnectionEntry) => entry.id)
-          }.edgeEffect(EdgeEffect.Spring)
+            }, (entry: ConnectionEntry): string =>
+              `${entry.id}#${entry.upload}#${entry.download}#${this.themeRevision}`)
+          }.cachedCount(6).edgeEffect(EdgeEffect.Spring)
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
           .width('100%').layoutWeight(1)
           .padding({ left: 18, right: 18, top: 10, bottom: 20 })

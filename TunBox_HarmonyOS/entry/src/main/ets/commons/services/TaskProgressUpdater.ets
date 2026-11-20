@@ -67,6 +67,10 @@ export class TaskProgressUpdater {
   private static taskNotificationId: number = -1;
   /** 5 分钟进度心跳定时器句柄 */
   private static timer: number = -1;
+  /** 1 秒轻量通知时钟（仅在内存按 startedAt 重算运行时长，与后台 15s 流量轮询解耦） */
+  private static clockTimer: number = -1;
+  /** 当前活跃连接起始时间戳（ms）；0 = 未连接 */
+  private static sessionStartedAt: number = 0;
   /** 最近一次内容（节点名 / 速率 / 时长），断连重连时用于首帧补齐 */
   private static lastNodeText: string = 'TunBox';
   private static lastSpeedLine: string = '隧道已连接 · 持续保护中';
@@ -74,9 +78,100 @@ export class TaskProgressUpdater {
   /** 圆环进度：订阅配额已用比例 0~1；-1 表示没有配额信息（圆环留空） */
   private static quotaRatio: number = -1;
   private static lastFailLogAt: number = 0;
+  /** 是否处于后台（仅用于状态追踪与回前台即时补刷；运行时长刷新不再受 15s 门禁阻断）。 */
+  private static inBackground: boolean = false;
+  private static lastPushAt: number = 0;
+  private static lastPushKey: string = '';
+  private static lastPushedNode: string = '';
+  private static readonly LIVE_CLOCK_INTERVAL_MS: number = 1000;
+  private static readonly MIN_PUSH_MS: number = 850;
+  private static readonly UNCHANGED_RESEND_MS: number = 60000;
+
+  static setBackground(inBackground: boolean): void {
+    TaskProgressUpdater.inBackground = inBackground;
+    if (!inBackground) {
+      TaskProgressUpdater.lastPushAt = 0;
+      TaskProgressUpdater.lastPushKey = '';
+      if (TaskProgressUpdater.taskNotificationId >= 0 || TaskProgressUpdater.sessionStartedAt > 0) {
+        TaskProgressUpdater.refreshNow(true);
+      }
+    }
+  }
 
   /**
-   * 实况内容更新（连接期间由流量轮询每 2s 调用）。
+   * 同步当前会话连接起始时刻（ms）；>0 启动 1s 轻量通知时钟，<=0 停止。
+   * 后台流量轮询保持 15s 省电节拍，而通知栏运行时长由本时钟每秒本地计算刷新。
+   */
+  static setSessionStartedAt(startedAt: number): void {
+    const normalized: number = (typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0)
+      ? startedAt : 0;
+    TaskProgressUpdater.sessionStartedAt = normalized;
+    if (normalized > 0) {
+      TaskProgressUpdater.ensureClockTimer();
+    } else {
+      TaskProgressUpdater.stopClockTimer();
+      TaskProgressUpdater.lastDurationText = '';
+    }
+  }
+
+  /** 按当前节点/速率与实时计算的运行时长立即刷新通知（实况窗优先，否则应用常驻卡）。 */
+  static refreshNow(force: boolean = true): void {
+    if (TaskProgressUpdater.taskNotificationId >= 0) {
+      TaskProgressUpdater.push(force);
+      return;
+    }
+    if (TaskProgressUpdater.sessionStartedAt <= 0 || TunBoxNotifier.isTakenOver()) {
+      return;
+    }
+    const speed = TaskProgressUpdater.compactSpeed(TaskProgressUpdater.lastSpeedLine);
+    const duration = TaskProgressUpdater.currentDurationText();
+    const liveLine = duration.length > 0 ? `${speed} · ${duration}` : speed;
+    TunBoxNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`,
+      TaskProgressUpdater.lastNodeText,
+      liveLine, force).catch((): void => {});
+  }
+
+  private static ensureClockTimer(): void {
+    if (TaskProgressUpdater.clockTimer >= 0 || TaskProgressUpdater.sessionStartedAt <= 0) {
+      return;
+    }
+    TaskProgressUpdater.clockTimer = UnifiedScheduler.every((): void => {
+      TaskProgressUpdater.tickClock();
+    }, TaskProgressUpdater.LIVE_CLOCK_INTERVAL_MS);
+  }
+
+  private static stopClockTimer(): void {
+    if (TaskProgressUpdater.clockTimer >= 0) {
+      UnifiedScheduler.clear(TaskProgressUpdater.clockTimer);
+      TaskProgressUpdater.clockTimer = -1;
+    }
+  }
+
+  private static tickClock(): void {
+    if (TaskProgressUpdater.sessionStartedAt <= 0) {
+      TaskProgressUpdater.stopClockTimer();
+      return;
+    }
+    TaskProgressUpdater.refreshNow(false);
+  }
+
+  private static formatDuration(startedAt: number): string {
+    const elapsedSec: number = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    const h: number = Math.floor(elapsedSec / 3600);
+    const m: number = Math.floor((elapsedSec % 3600) / 60);
+    const s: number = elapsedSec % 60;
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+
+  private static currentDurationText(): string {
+    if (TaskProgressUpdater.sessionStartedAt > 0) {
+      return TaskProgressUpdater.formatDuration(TaskProgressUpdater.sessionStartedAt);
+    }
+    return TaskProgressUpdater.lastDurationText;
+  }
+
+  /**
+   * 实况内容更新（连接期间由流量轮询调用；运行时长另由 1s 轻量时钟实时驱动）。
    *
    * 拿到了长时任务通知 id（dataTransfer）→ 推实况窗，圆环随配额走；
    * 否则（taskKeeping / 未挂上）→ 退回应用自有常驻通知，绝不发 1600004 风暴。
@@ -87,14 +182,15 @@ export class TaskProgressUpdater {
     TaskProgressUpdater.lastSpeedLine = speedLine;
     TaskProgressUpdater.lastDurationText = durationText;
     if (TaskProgressUpdater.taskNotificationId >= 0) {
-      TaskProgressUpdater.push();
+      TaskProgressUpdater.push(force);
       return;
     }
     // 折叠态只渲染「标题 + 正文」两处：速率与时长合并成一行（"↓56KB/s · 0:06:41"），
     // additionalText 仍放节点名，展开态多一行不丢信息。
     const speed = TaskProgressUpdater.compactSpeed(TaskProgressUpdater.lastSpeedLine);
-    const liveLine = TaskProgressUpdater.lastDurationText.length > 0
-      ? `${speed} · ${TaskProgressUpdater.lastDurationText}`
+    const duration = TaskProgressUpdater.currentDurationText();
+    const liveLine = duration.length > 0
+      ? `${speed} · ${duration}`
       : speed;
     TunBoxNotifier.update(`TunBox · ${TaskProgressUpdater.lastNodeText}`,
       TaskProgressUpdater.lastNodeText,
@@ -139,9 +235,12 @@ export class TaskProgressUpdater {
         TunBoxNotifier.cancel().catch((): void => {});
       }
     }, 1200);
-    TaskProgressUpdater.push();
+    TaskProgressUpdater.lastPushAt = 0;
+    TaskProgressUpdater.lastPushKey = '';
+    TaskProgressUpdater.lastPushedNode = '';
+    TaskProgressUpdater.push(true);
     TaskProgressUpdater.timer = UnifiedScheduler.every((): void => {
-      TaskProgressUpdater.push();
+      TaskProgressUpdater.push(true);
     }, UPDATE_INTERVAL_MS);
     AppLogger.info(TAG,
       `live view attached (taskNotificationId=${notificationId} type=${kind})`);
@@ -155,6 +254,9 @@ export class TaskProgressUpdater {
     }
     TaskProgressUpdater.taskNotificationId = -1;
     TaskProgressUpdater.kind = ContinuousTaskKind.NONE;
+    TaskProgressUpdater.lastPushAt = 0;
+    TaskProgressUpdater.lastPushKey = '';
+    TaskProgressUpdater.lastPushedNode = '';
     // 实况窗不再接管：应用自有卡恢复可发布（断开时由 FormStateSync 负责撤卡）
     TunBoxNotifier.release();
   }
@@ -180,7 +282,7 @@ export class TaskProgressUpdater {
     }
     TaskProgressUpdater.quotaRatio = next;
     if (TaskProgressUpdater.taskNotificationId >= 0) {
-      TaskProgressUpdater.push();
+      TaskProgressUpdater.push(true);
     }
   }
 
@@ -230,25 +332,42 @@ export class TaskProgressUpdater {
       .trim();
   }
 
-  /** 单帧实况窗更新（失败绝不抛出，只做节流日志）。 */
-  private static push(): void {
+  /** 单帧实况窗更新（失败绝不抛出，只做节流日志；按 startedAt 实时计算运行时长）。 */
+  private static push(force: boolean = false): void {
     const id = TaskProgressUpdater.taskNotificationId;
     if (id < 0) {
       return;
     }
     const nodeText = TaskProgressUpdater.lastNodeText;
     const speed = TaskProgressUpdater.compactSpeed(TaskProgressUpdater.lastSpeedLine);
-    const duration = TaskProgressUpdater.lastDurationText;
+    const duration = TaskProgressUpdater.currentDurationText();
     const liveLine = duration.length > 0 ? `${speed} · ${duration}` : speed;
 
     // 圆环数据：订阅配额已用百分比。每次推送都重算（fidelity 高于缓存），
     // 没有配额时不写 progressValue → 模板圆环留空，不显示假进度。
     TaskProgressUpdater.quotaRatio = TaskProgressUpdater.refreshQuotaRatio();
+    const quotaPct: number = TaskProgressUpdater.quotaRatio >= 0
+      ? Math.round(TaskProgressUpdater.quotaRatio * 100) : -1;
+    const now: number = Date.now();
+    const pushKey: string = `${nodeText}|${liveLine}|${quotaPct}`;
+    if (!force && TaskProgressUpdater.lastPushAt > 0) {
+      const elapsed: number = now - TaskProgressUpdater.lastPushAt;
+      if (nodeText === TaskProgressUpdater.lastPushedNode && elapsed < TaskProgressUpdater.MIN_PUSH_MS) {
+        return;
+      }
+      if (pushKey === TaskProgressUpdater.lastPushKey && elapsed < TaskProgressUpdater.UNCHANGED_RESEND_MS) {
+        return;
+      }
+    }
+    TaskProgressUpdater.lastPushAt = now;
+    TaskProgressUpdater.lastPushKey = pushKey;
+    TaskProgressUpdater.lastPushedNode = nodeText;
+
     const data: Record<string, Object> = {};
     data['title'] = nodeText;
     data['fileName'] = liveLine;
-    if (TaskProgressUpdater.quotaRatio >= 0) {
-      data['progressValue'] = Math.round(TaskProgressUpdater.quotaRatio * 100);
+    if (quotaPct >= 0) {
+      data['progressValue'] = quotaPct;
     }
 
     const request: notificationManager.NotificationRequest = {
@@ -267,12 +386,17 @@ export class TaskProgressUpdater {
         data: data
       }
     };
+    const attemptedAt: number = now;
     notificationManager.publish(request).then((): void => {
       TaskProgressUpdater.lastFailLogAt = 0;
     }).catch((e: Object): void => {
-      const now = Date.now();
-      if (now - TaskProgressUpdater.lastFailLogAt > FAIL_LOG_THROTTLE_MS) {
-        TaskProgressUpdater.lastFailLogAt = now;
+      if (TaskProgressUpdater.lastPushAt === attemptedAt) {
+        TaskProgressUpdater.lastPushAt = 0;
+        TaskProgressUpdater.lastPushKey = '';
+      }
+      const failNow = Date.now();
+      if (failNow - TaskProgressUpdater.lastFailLogAt > FAIL_LOG_THROTTLE_MS) {
+        TaskProgressUpdater.lastFailLogAt = failNow;
         AppLogger.warn(TAG, `live view update failed: ${AppLogger.errText(e)}`);
       }
     });

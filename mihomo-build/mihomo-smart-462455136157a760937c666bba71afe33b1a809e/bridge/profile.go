@@ -92,31 +92,20 @@ func validateConfigBytes(buf []byte) error {
 // ValidateProfile implements FlClash Profile.saveFile + controller
 // validateProfile natively:
 //
-//	bytes -> temp file -> age decrypt (if armor) -> validateConfig ->
-//	if invalid, convert.ConvertsV2Ray -> if non-empty, write {'proxies':...}
-//	YAML to temp and revalidate -> if still failing return the FIRST issue ->
-//	on success copy the final bytes verbatim to profilePath.
+//	bytes -> age decrypt (if armor) -> validateConfig -> if invalid,
+//	convert.ConvertsV2Ray -> if non-empty, revalidate {'proxies':...} YAML ->
+//	if still failing return the FIRST issue -> on success store the final
+//	bytes verbatim at profilePath.
 //
-// The copy is byte-verbatim (anchors are NOT expanded): FlClash copies the
-// temp file, it does not Run PrepareProfile. Errors keep the original
+// The stored bytes are verbatim (anchors are NOT expanded): FlClash copies
+// the validated file, it does not Run PrepareProfile. Errors keep the original
 // type/message; an armor header with empty key returns
 // ErrAgeSecretKeyRequired (FlClash AgeSecretKeyRequiredException).
+//
+// Validation runs on the bytes in memory. Nothing is staged in os.TempDir():
+// the OpenHarmony Go port defaults it to /data/local/tmp, which belongs to the
+// shell user, not to the application sandbox.
 func ValidateProfile(content []byte, ageSecretKey string, profilePath string) error {
-	tmp, err := os.CreateTemp("", "profile-validate-*.yaml")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-
 	// Age: armor header + empty key -> AgeSecretKeyRequired (original).
 	if bytes.HasPrefix(content, []byte(age.FileHeader)) {
 		if strings.TrimSpace(ageSecretKey) == "" {
@@ -127,13 +116,10 @@ func ValidateProfile(content []byte, ageSecretKey string, profilePath string) er
 			return decErr
 		}
 		content = plaintext
-		if err := os.WriteFile(tmpName, content, 0o600); err != nil {
-			return err
-		}
 	}
 
 	if issue := validateConfigBytes(content); issue == nil {
-		return copyProfileBytes(tmpName, profilePath)
+		return writeProfileBytes(content, profilePath)
 	} else {
 		firstIssue := issue
 		proxies, convErr := convert.ConvertsV2Ray(content)
@@ -144,25 +130,35 @@ func ValidateProfile(content []byte, ageSecretKey string, profilePath string) er
 		if yamlErr != nil {
 			return firstIssue
 		}
-		if err := os.WriteFile(tmpName, converted, 0o600); err != nil {
-			return err
-		}
 		if validateConfigBytes(converted) != nil {
 			return firstIssue
 		}
-		return copyProfileBytes(tmpName, profilePath)
+		return writeProfileBytes(converted, profilePath)
 	}
 }
 
-func copyProfileBytes(tmpName, profilePath string) error {
-	if err := os.MkdirAll(filepath.Dir(profilePath), 0o755); err != nil {
+// writeProfileBytes stages the validated bytes beside the destination (inside
+// the application's own profile directory) and renames them into place. Rename
+// is the commit point: a failed write cannot truncate the last working profile.
+func writeProfileBytes(data []byte, profilePath string) error {
+	dir := filepath.Dir(profilePath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := os.ReadFile(tmpName)
+	tmp, err := os.CreateTemp(dir, filepath.Base(profilePath)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(profilePath, data, 0o600)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, profilePath)
 }
 
 // ProfileOutbound is the name/type projection of one FlClash outbound.

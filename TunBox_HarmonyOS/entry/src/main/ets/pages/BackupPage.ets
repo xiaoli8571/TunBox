@@ -161,7 +161,7 @@ struct BackupPage {
       }
       let json = await BackupRestoreService.exportJsonWithSettings(this.settings);
       if (password.length >= 4) {
-        const enc = BackupCrypto.encrypt(json, password);
+        const enc = await BackupCrypto.encryptAsync(json, password);
         if (!enc.ok) {
           promptAction.showToast({ message: enc.message });
           return;
@@ -215,7 +215,7 @@ struct BackupPage {
         const buf = new ArrayBuffer(Number(stat.size));
         let readLen = 0;
         while (readLen < Number(stat.size)) {
-          const chunk = fs.readSync(file.fd, buf, { offset: readLen, length: Number(stat.size) - readLen });
+          const chunk = await fs.read(file.fd, buf, { offset: readLen, length: Number(stat.size) - readLen });
           if (chunk <= 0) {
             break;
           }
@@ -239,8 +239,8 @@ struct BackupPage {
   }
 
   /** 对导入文本尝试解密：成功→继续导入；失败→重开密码弹窗（最多 3 次） */
-  private decryptImportedBackup(text: string, password: string): void {
-    const dec = BackupCrypto.decrypt(text, password);
+  private async decryptImportedBackup(text: string, password: string): Promise<void> {
+    const dec = await BackupCrypto.decryptAsync(text, password);
     if (dec.ok) {
       this.importPendingText = '';
       this.importAttempt = 0;

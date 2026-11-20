@@ -91,9 +91,24 @@ export class ThemeService {
   private static bgTheme: AppBgTheme = AppBgTheme.DEFAULT;
   private static semanticPaletteKey: string = '';
   private static semanticPaletteValue: ThemeSemanticPalette | null = null;
+  /** Ability 创建与窗口加载共用一次主题恢复；失败后允许下一次生命周期调用重试。 */
+  private static initTask: Promise<AppThemeMode> | null = null;
 
   static async init(context: common.UIAbilityContext): Promise<AppThemeMode> {
     ThemeService.context = context;
+    if (ThemeService.initTask !== null) {
+      await ThemeService.initTask;
+      return ThemeService.mode;
+    }
+    const pending: Promise<AppThemeMode> = ThemeService.initImpl(context);
+    ThemeService.initTask = pending;
+    pending.catch((): void => {
+      if (ThemeService.initTask === pending) { ThemeService.initTask = null; }
+    });
+    return pending;
+  }
+
+  private static async initImpl(context: common.UIAbilityContext): Promise<AppThemeMode> {
     ThemeService.store = await preferences.getPreferences(context, { name: PREF_NAME });
     const saved = await ThemeService.store.get(KEY_THEME_MODE, AppThemeMode.SYSTEM) as string;
     ThemeService.mode = ThemeService.parseMode(saved);

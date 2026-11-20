@@ -120,7 +120,8 @@ class ClashApiDelayTransport implements LatencyHttpTransport {
         header: headers,
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       reply.responseCode = resp.responseCode;
       if (typeof resp.result === 'string') {
@@ -326,7 +327,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 3000,
         readTimeout: 3000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       const body: string = typeof resp.result === 'string' ? resp.result as string : '';
       if (resp.responseCode !== 200) {
@@ -376,7 +378,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 1500,
         readTimeout: 1500,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       return resp.responseCode === 200;
     } catch (e) {
@@ -517,7 +520,8 @@ export class ClashApiService {
             header: this.authHeader(),
             connectTimeout: Math.min(SELECT_CONVERGE_TIMEOUT_MS, remaining),
             readTimeout: Math.min(SELECT_CONVERGE_TIMEOUT_MS, remaining),
-            usingCache: false
+            usingCache: false,
+            usingProxy: false
           });
           if (!scopedCurrent() || (response.responseCode !== 204 && response.responseCode !== 200)) { return false; }
         } finally { req.destroy(); }
@@ -756,7 +760,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 1500,
         readTimeout: 2000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200 || typeof resp.result !== 'string') {
         return null;
@@ -790,7 +795,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2500,
         readTimeout: 6000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200) {
         return null;
@@ -842,7 +848,14 @@ export class ClashApiService {
               const proxy = value as Record<string, Object>;
               const name = proxy['name'];
               if (typeof name !== 'string' || name.length === 0 || typeof proxy['type'] !== 'string') { continue; }
-              if (occupied.has(name)) { continue; }
+              if (occupied.has(name)) {
+                const existing = table[name] as Record<string, Object>;
+                if (existing !== null && typeof existing === 'object'
+                  && existing['provider-name'] === providerName) {
+                  owners.set(name, providerName);
+                }
+                continue;
+              }
               table[name] = proxy;
               occupied.add(name);
               owners.set(name, providerName);
@@ -867,7 +880,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2500,
         readTimeout: 4000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200) { return null; }
       if (typeof resp.result === 'string') { return resp.result as string; }
@@ -914,7 +928,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2500,
         readTimeout: 6000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200) {
         AppLogger.warn(TAG, `testableProxyNames non-200: code=${resp.responseCode}`);
@@ -973,7 +988,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2500,
         readTimeout: 6000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200) {
         AppLogger.warn(TAG, `proxyTableNames non-200: code=${resp.responseCode}`);
@@ -1017,7 +1033,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2500,
         readTimeout: 6000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200) {
         return null;
@@ -1090,7 +1107,8 @@ export class ClashApiService {
         extraData: JSON.stringify(payload),
         connectTimeout: 3000,
         readTimeout: 3000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       return resp.responseCode === 204 || resp.responseCode === 200;
     } catch (e) {
@@ -1114,7 +1132,8 @@ export class ClashApiService {
         extraData: JSON.stringify(payload),
         connectTimeout: 3000,
         readTimeout: 3000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       return resp.responseCode === 204 || resp.responseCode === 200;
     } catch (e) {
@@ -1160,7 +1179,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       out.reachable = true;
       out.httpCode = resp.responseCode;
@@ -1265,7 +1285,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: outerTimeoutMs,
         readTimeout: outerTimeoutMs,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       out.httpCode = resp.responseCode;
       let body: string = '';
@@ -1374,7 +1395,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2000,
         readTimeout: 2000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       let body: string = '';
       if (typeof resp.result === 'string') {
@@ -1437,7 +1459,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2000,
         readTimeout: 3000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       if (resp.responseCode !== 200) {
         return null;
@@ -1516,7 +1539,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2000,
         readTimeout: 2000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       return resp.responseCode >= 200 && resp.responseCode < 300;
     } catch (e) {
@@ -1536,7 +1560,8 @@ export class ClashApiService {
         header: this.authHeader(),
         connectTimeout: 2000,
         readTimeout: 2000,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       return resp.responseCode >= 200 && resp.responseCode < 300;
     } catch (e) {

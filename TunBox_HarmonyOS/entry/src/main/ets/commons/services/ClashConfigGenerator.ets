@@ -5,7 +5,7 @@
  * 关键约束（与 upstream 行为一致）：
  * - DNS 恒接管（覆写开关只决定配置来源）：`dns.enable: true` + `tun.dns-hijack: any:53` +
  *   VpnConfig.dnsAddresses 指向 TUN sentinel，三处同生同灭
- * - IPv6 双栈由设置项 ipv6Enabled 决定（默认开）：开 ⇒ ipv6: true + dns.ipv6: true +
+ * - IPv6 双栈由设置项 ipv6Enabled 决定（默认关）：开 ⇒ ipv6: true + dns.ipv6: true +
  *   fake-ip-range6（假 v6 池落在 TUN 自己的 fdfe:dcba:9876::/64 内 ⇒ AAAA 返回隧道内地址，
  *   v6 与 v4 一样走隧道/代理，设备侧没有直连 v6 路径）
  * - external-controller 仅绑定 127.0.0.1，secret 由调用方注入
@@ -196,13 +196,13 @@ export class ClashConfigGenerator {
   /**
    * 生成一份 mihomo YAML。
    *
-   * `ipv6Enabled` 是 IPv6 双栈总开关（默认 true = 产品默认开）：生产路径由
+   * `ipv6Enabled` 是 IPv6 双栈总开关（默认 false = 产品默认关）：生产路径由
    * RuntimeConfigBuilder 从 `settings.ipv6Enabled` 传入，是**唯一**决策点；
-   * 默认值取 true 是为了让「忘了传参」的调用方也落在产品默认态上，而不是静默退回 IPv4-only。
+   * 默认值取 false 是为了让「忘了传参」的调用方也落在产品默认态上。
    */
   static generate(selectedNode: ProxyNode, allNodes: ProxyNode[], settings: AppSettings,
     mixedPort: number, apiPort: number, dnsPort: number, apiSecret: string, useGeoip: boolean = true,
-    ipv6Enabled: boolean = true, proxyHosts: Record<string, string> = {},
+    ipv6Enabled: boolean = false, proxyHosts: Record<string, string> = {},
     tunEnabled: boolean = true, proxyGroups: ProxyGroup[] = [],
     ruleProviderReady: boolean = true,
     subscriptionRules: string[] = [], subscriptionRuleProviders: string = '',
@@ -220,7 +220,7 @@ export class ClashConfigGenerator {
     const level = (settings.coreLogLevel ?? '').trim().toLowerCase();
     lines.push('log-level: ' + (level === 'debug' || level === 'info' || level === 'error'
       || level === 'silent' ? level : 'warning'));
-    // ── IPv6 双栈（设置页开关，默认开）──
+    // ── IPv6 双栈（设置页开关，默认关）──
     // 顶层 `ipv6` 是 mihomo 的**唯一总闸**：它同时决定出站 v6 解析与 DNS 侧 v6，
     // 并由 hub/executor/executor.go:108 传给 updateDNS(cfg.DNS, cfg.General.IPv6)。
     // TUN 侧的 v6 地址与 ::/0 路由由 VpnExtensionAbility 读**同一份 YAML 的这一行**安装，

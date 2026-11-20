@@ -40,14 +40,28 @@ export class TunBoxMotion {
    * · > 12 英寸 ≥ 300ms
    *
    * 基线 260ms 已覆盖前两档，只有 12 英寸以上需要抬到 300；
-   * 档位由 EntryAbility.onCreate 按 display 实测尺寸写入 `tb_motion_required_ms`，
+   * 档位由 EntryAbility 在创建及配置变化时按物理 X/Y DPI 写入 `tb_motion_required_ms`，
    * 取 max(基线, 规范下限) —— 小屏保持既有观感，大屏自动合规。
    */
   static get ms(): number {
     const required = AppStorage.get<number>('tb_motion_required_ms');
-    const floor = required !== undefined && required > 0 ? required : 0;
+    const floor = required === 200 || required === 250 || required === 300 ? required : 300;
     return floor > TunBoxMotion.BASE_MS ? floor : TunBoxMotion.BASE_MS;
   }
+  /** 真实物理 X/Y DPI 分别换算英寸；缺失或非法数据统一取规范最大档。 */
+  static requiredMs(width: number, height: number, xDpi: number, yDpi: number): number {
+    if (!Number.isFinite(width) || !Number.isFinite(height)
+      || !Number.isFinite(xDpi) || !Number.isFinite(yDpi)
+      || width <= 0 || height <= 0 || xDpi <= 0 || yDpi <= 0) {
+      return 300;
+    }
+    const wInches = width / xDpi;
+    const hInches = height / yDpi;
+    const inches = Math.sqrt(wInches * wInches + hInches * hInches);
+    if (inches > 12) { return 300; }
+    return inches >= 8.5 ? 250 : 200;
+  }
+
   /** 转场位移：百分比字符串用于路由页（相对页宽），vp 数值用于页签（本机 800vp 宽 → 48vp ≈ 6%） */
   static readonly slidePercent: string = '6%';
   static readonly slideVp: number = 48;
@@ -326,6 +340,20 @@ export class TunBoxColors {
     const g = parseInt(hex.substring(3, 5), 16);
     const b = parseInt(hex.substring(5, 7), 16);
     return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  /** 浮层顶栏渐变底色：取当前主题起点背景色按 alpha 淡出，兼顾可读性与无硬边过渡 */
+  static headerBackdropAt(rev: number, alpha: number): ResourceColor {
+    TunBoxColors.syncPalette(rev);
+    return TunBoxColors.rgba(TunBoxColors.paletteStartHex, alpha);
+  }
+
+  /** 当前启用订阅卡片的柔和描边（低饱和度品牌色，避免纯高饱和线框感） */
+  static activeSubBorderFor(rev: number): ResourceColor {
+    if (ThemeService.isDark()) {
+      return 'rgba(59, 130, 246, 0.45)';
+    }
+    return TunBoxColors.mixToWhite(ThemeService.semanticPalette(rev).brandPrimary, 0.66);
   }
 
   // ── 底栏底部渐隐底（2026-10-26 二次修正）──
@@ -617,6 +645,10 @@ export class TunBoxColors {
 export class TunBoxGeometry {
   /** 页面水平外边距 16vp */
   static readonly pagePadding: number = 16;
+  /** 宽屏/折叠屏内容最大宽度（普通手机自动撑满，宽屏居中收紧避免卡片过度拉伸） */
+  static readonly contentMaxWidth: number = 680;
+  /** 悬浮底栏最大宽度（宽屏避免三页签拉得过散） */
+  static readonly dockMaxWidth: number = 380;
   /** 卡片曲率 20~24vp（标准卡 22 / 次级卡 20 / 大卡 26） */
   static readonly cardRadius: number = 22;
   static readonly cardRadiusSmall: number = 20;
@@ -632,7 +664,7 @@ export class TunBoxGeometry {
    * 内容进入这两条就会按线性 alpha 淡出（比给每个页面再加一层遮罩便宜，也没有接缝）。
    * 48vp ≈ 三行卡片的 1/4，够长才看得出「渐变」；想更柔就调到 64。
    */
-  static readonly scrollFadeEdge: number = 48;
+  static readonly scrollFadeEdge: number = 56;
 
   /**
    * 滚动内容顶部要预留的高度 = 顶栏浮层总高（状态栏让白 + 顶栏行）。

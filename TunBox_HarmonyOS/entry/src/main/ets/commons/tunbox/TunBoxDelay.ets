@@ -241,7 +241,8 @@ export class ArkDelayHttpTransport implements DelayHttpTransport {
       header: headers,
       connectTimeout: timeoutMs,
       readTimeout: timeoutMs,
-      usingCache: false
+      usingCache: false,
+      usingProxy: false
     }).then((resp: http.HttpResponse): DelayHttpReply => {
       // 状态码原样交给 classifyDelayReply；响应体只处理字符串形态（mihomo 返回 JSON 文本）
       const raw = resp.result;

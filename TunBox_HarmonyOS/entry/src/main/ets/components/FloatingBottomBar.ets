@@ -534,7 +534,9 @@ export struct FloatingBottomBar {
       .height('100%')
     }
     // 2026-10-26 用户要求「三个按钮间距稍微缩小一点点」：92% → 86%（页签向中间靠一点）
+    // 宽屏加 maxWidth 约束，避免折叠屏/平板上三页签拉成一条超长胶囊
     .width(this.compact ? '100%' : '86%')
+    .constraintSize({ maxWidth: this.compact ? 340 : TunBoxGeometry.dockMaxWidth })
     .height(TunBoxGeometry.dockHeight)
     .borderRadius(TunBoxGeometry.dockRadius)
     // ── 液态玻璃 ①a：真·背景模糊 + 微弱饱和度提升 ──

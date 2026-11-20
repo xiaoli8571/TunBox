@@ -132,6 +132,13 @@ struct MainPage {
     return this.homeBridge;
   }
 
+  pageTransition() {
+    PageTransitionEnter({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: TunBoxMotion.slidePercent, y: 0 }).opacity(0)
+    PageTransitionExit({ duration: TunBoxMotion.ms, curve: TunBoxMotion.curve })
+      .translate({ x: `-${TunBoxMotion.slidePercent}`, y: 0 }).opacity(0)
+  }
+
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
       Stack() {
@@ -189,6 +196,7 @@ struct MainPage {
           })
         }
         .width('100%')
+        .constraintSize({ maxWidth: TunBoxGeometry.dockMaxWidth + 68 })
         .padding({ left: 12, right: 12 })
         .align(Alignment.Bottom)
       } else {

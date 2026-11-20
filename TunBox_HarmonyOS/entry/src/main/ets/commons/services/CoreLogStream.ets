@@ -75,6 +75,10 @@ export class CoreLogStream {
     }
   }
 
+  listenerCount(): number {
+    return this.listeners.length;
+  }
+
   private emit(): void {
     // 拷贝一份当前缓冲，避免监听方直接持有内部数组
     const snap = this.snapshot();
@@ -122,7 +126,8 @@ export class CoreLogStream {
       if (this.ws === ws) {
         this.state = 'closed';
         this.emit();
-        AppLogger.warn(TAG, `log stream error: ${err !== undefined ? err.message : 'unknown'}`);
+        const detail = err !== undefined ? `${AppLogger.errText(err)} ${JSON.stringify(err)}` : 'unknown';
+        AppLogger.warn(TAG, `log stream error: ${detail}`);
       }
     });
     const url = `ws://127.0.0.1:${port}/logs?level=${this.level}`;
@@ -130,8 +135,11 @@ export class CoreLogStream {
     if (secret.length > 0) {
       headers['Authorization'] = `Bearer ${secret}`;
     }
-    // SDK 的 Promise 重载只支持 (url, header)；本机 loopback 连接无需自定义超时。
-    ws.connect(url, headers as Object).catch((e: Object): void => {
+    const opts: webSocket.WebSocketRequestOptions = {
+      header: headers,
+      proxy: 'no-proxy'
+    };
+    ws.connect(url, opts).catch((e: Object): void => {
       if (this.ws === ws) {
         this.state = 'closed';
         this.emit();

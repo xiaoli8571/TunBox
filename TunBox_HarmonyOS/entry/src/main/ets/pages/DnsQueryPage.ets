@@ -3,6 +3,7 @@ import { TunBoxTextColors } from '../theme/TextColors';
 import { TopNavBar } from '../components/TopNavBar';
 import { CoreLogLine, CoreLogListener, CoreLogStream } from '../commons/services/CoreLogStream';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
+import { ArrayDataSource } from '../commons/utils/ArrayDataSource';
 
 /** 一行 DNS 记录（只保留展示需要的两个字段）。 */
 class DnsRow {
@@ -22,13 +23,18 @@ class DnsRow {
 @Entry
 @Component
 struct DnsQueryPage {
-  @StorageLink('theme_revision') themeRevision: number = 0;
-  @State private rows: DnsRow[] = [];
-  @State private keyword: string = '';
+  @StorageLink('theme_revision') @Watch('syncRowsSource') themeRevision: number = 0;
+  @State @Watch('syncRowsSource') private rows: DnsRow[] = [];
+  @State @Watch('syncRowsSource') private keyword: string = '';
   @State private paused: boolean = false;
   @State private phase: string = 'idle';
+  private rowsSource: ArrayDataSource<DnsRow> = new ArrayDataSource<DnsRow>();
   private stream: CoreLogStream = CoreLogStream.instance();
   private orchestrator: ConnectionOrchestrator = ConnectionOrchestrator.instance();
+
+  private syncRowsSource(): void {
+    this.rowsSource.replaceAll(this.visibleRows());
+  }
   private listener: CoreLogListener = (lines: CoreLogLine[]): void => {
     this.apply(lines);
   };
@@ -41,10 +47,14 @@ struct DnsQueryPage {
 
   aboutToDisappear(): void {
     this.stream.removeListener(this.listener);
-    // 恢复通用页面使用的级别（DNS 页临时开 debug 才能看到解析日志）
-    const port: number = this.orchestrator.api.currentPort();
-    if (port > 0) {
-      this.stream.connect(port, this.orchestrator.api.currentSecret(), 'info');
+    // 只有仍有其他监听者（如诊断面板）在消费日志流时才恢复为 info；无监听者时立即断开，避免后台悬空 WebSocket。
+    if (this.stream.listenerCount() > 0) {
+      const port: number = this.orchestrator.api.currentPort();
+      if (port > 0) {
+        this.stream.connect(port, this.orchestrator.api.currentSecret(), 'info');
+      }
+    } else {
+      this.stream.close();
     }
   }
 
@@ -175,7 +185,7 @@ struct DnsQueryPage {
             .alignItems(HorizontalAlign.Center)
           } else {
             List({ space: 6 }) {
-              ForEach(this.visibleRows(), (row: DnsRow) => {
+              LazyForEach(this.rowsSource, (row: DnsRow) => {
                 ListItem() {
                   Row({ space: 8 }) {
                     Text(row.time).fontSize(10)
@@ -189,8 +199,9 @@ struct DnsQueryPage {
                   .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
                   .alignItems(VerticalAlign.Top)
                 }
-              }, (row: DnsRow) => `${row.time}#${row.text}`)
+              }, (row: DnsRow): string => `${row.time}#${row.text}#${this.themeRevision}`)
             }
+            .cachedCount(6)
             .layoutWeight(1)
             .width('100%')
             .scrollBar(BarState.Off)

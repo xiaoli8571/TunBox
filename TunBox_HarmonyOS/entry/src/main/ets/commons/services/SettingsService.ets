@@ -6,6 +6,7 @@
  */
 import { preferences } from '@kit.ArkData';
 import { asset } from '@kit.AssetStoreKit';
+import { fileIo as fs } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { AppSettings, AppSettingsJson } from '../models/AppSettings';
 import { AppLogger } from '../utils/AppLogger';
@@ -29,6 +30,8 @@ const KEY_NODE_SORT_STATS = 'node_sort_stats_json';
 const ASSET_SERVICE = 'tunbox_service';
 const ASSET_SECRET_KEY = 'api_secret';
 const KEY_SNAPSHOT = 'connection_snapshot_json';
+/** 跨进程原子镜像：避免 ArkData Preferences 进程内缓存导致主进程读不到 :vpn / QuickToggle 更新的连接快照。 */
+const SNAPSHOT_MIRROR_FILE = 'tunbox_connection_snapshot.json';
 const KEY_DOH_PINS = 'doh_pins_json';
 const KEY_ROUTING_SNAPSHOT = 'app_routing_snapshot_json';
 // 2026-10-27：悬浮菜单启用。旧键（subscription_fab_x/y）是历史实验残留，
@@ -129,6 +132,7 @@ class NodeSortShards {
 
 export class SettingsService {
   private static store: preferences.Preferences | null = null;
+  private static filesDir: string = '';
   /**
    * 进程内设置缓存（2026-10-27 写放大整治）：
    * 读走缓存、写走「内存 → 合并 → 防抖落盘」，避免"每个动作都读盘 + 每个动作都 flush"。
@@ -142,6 +146,10 @@ export class SettingsService {
 
   static async init(context: Context): Promise<void> {
     SettingsService.store = await preferences.getPreferences(context, PREF_NAME);
+    if (context !== null && context !== undefined
+      && typeof context.filesDir === 'string' && context.filesDir.length > 0) {
+      SettingsService.filesDir = context.filesDir;
+    }
   }
 
   /** 同步读缓存（仅 UI 展示用；未经 init 时返回 null，调用方必须回退）。 */
@@ -676,28 +684,19 @@ export class SettingsService {
     return task;
   }
 
-  private static async writeSnapshot(snap: ConnectionSnapshot): Promise<void> {
-    if (SettingsService.store === null) {
-      return;
-    }
-    await SettingsService.store.put(KEY_SNAPSHOT, JSON.stringify(snap));
-    await SettingsService.store.flush();
-  }
-
-  static async loadSnapshot(): Promise<ConnectionSnapshot> {
-    const snap = new ConnectionSnapshot();
-    if (SettingsService.store === null) {
-      return snap;
-    }
-    const raw = await SettingsService.store.get(KEY_SNAPSHOT, '') as string;
+  private static parseConnectionSnapshot(raw: string): ConnectionSnapshot | null {
     if (raw.length === 0) {
-      return snap;
+      return null;
     }
     try {
       const j = JSON.parse(raw) as ConnectionSnapshot;
-      snap.desiredConnected = j.desiredConnected;
-      snap.nodeName = j.nodeName;
-      snap.savedAt = j.savedAt;
+      if (j === null || typeof j !== 'object') {
+        return null;
+      }
+      const snap = new ConnectionSnapshot();
+      snap.desiredConnected = j.desiredConnected === true;
+      snap.nodeName = typeof j.nodeName === 'string' ? j.nodeName : '';
+      snap.savedAt = typeof j.savedAt === 'number' && j.savedAt > 0 ? j.savedAt : 0;
       snap.startedAt = typeof j.startedAt === 'number' && j.startedAt > 0 ? j.startedAt : 0;
       // 兼容旧快照：没有 phase 时由 desiredConnected 推导等价相位。
       snap.phase = typeof j.phase === 'string' && j.phase.length > 0
@@ -706,10 +705,88 @@ export class SettingsService {
       // 利用异常 generation 绕过用户主动停止门禁。
       snap.sessionGeneration = typeof j.sessionGeneration === 'number' && j.sessionGeneration >= 0
         ? Math.floor(j.sessionGeneration) : 0;
+      return snap;
     } catch (e) {
-      // 快照损坏则视为空
+      return null;
     }
-    return snap;
+  }
+
+  private static writeSnapshotMirror(raw: string): void {
+    if (SettingsService.filesDir.length === 0) {
+      return;
+    }
+    try {
+      const target = `${SettingsService.filesDir}/${SNAPSHOT_MIRROR_FILE}`;
+      const tmp = `${target}.tmp`;
+      const bytes = util.TextEncoder.create('utf-8').encode(raw);
+      const file = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      try {
+        if (bytes.byteLength > 0) {
+          fs.writeSync(file.fd, bytes.slice().buffer as ArrayBuffer);
+        }
+      } finally {
+        fs.closeSync(file);
+      }
+      fs.renameSync(tmp, target);
+    } catch (e) {
+      // 镜像落盘失败不阻断 Preferences 主写路径
+    }
+  }
+
+  private static readSnapshotMirror(): ConnectionSnapshot | null {
+    if (SettingsService.filesDir.length === 0) {
+      return null;
+    }
+    let file: fs.File | null = null;
+    try {
+      const target = `${SettingsService.filesDir}/${SNAPSHOT_MIRROR_FILE}`;
+      file = fs.openSync(target, fs.OpenMode.READ_ONLY);
+      const buf = new ArrayBuffer(4096);
+      const len = fs.readSync(file.fd, buf);
+      if (len <= 0) {
+        return null;
+      }
+      const text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf, 0, len));
+      return SettingsService.parseConnectionSnapshot(text);
+    } catch (e) {
+      return null;
+    } finally {
+      if (file !== null) {
+        try { fs.closeSync(file); } catch (_closeErr) {}
+      }
+    }
+  }
+
+  private static async writeSnapshot(snap: ConnectionSnapshot): Promise<void> {
+    const raw = JSON.stringify(snap);
+    if (SettingsService.store !== null) {
+      await SettingsService.store.put(KEY_SNAPSHOT, raw);
+      await SettingsService.store.flush();
+    }
+    SettingsService.writeSnapshotMirror(raw);
+  }
+
+  static async loadSnapshot(): Promise<ConnectionSnapshot> {
+    let prefSnap: ConnectionSnapshot | null = null;
+    if (SettingsService.store !== null) {
+      const raw = await SettingsService.store.get(KEY_SNAPSHOT, '') as string;
+      prefSnap = SettingsService.parseConnectionSnapshot(raw);
+    }
+    const fileSnap: ConnectionSnapshot | null = SettingsService.readSnapshotMirror();
+    if (prefSnap !== null && fileSnap !== null) {
+      if (fileSnap.sessionGeneration > prefSnap.sessionGeneration
+        || (fileSnap.sessionGeneration === prefSnap.sessionGeneration && fileSnap.savedAt > prefSnap.savedAt)) {
+        return fileSnap;
+      }
+      return prefSnap;
+    }
+    if (fileSnap !== null) {
+      return fileSnap;
+    }
+    if (prefSnap !== null) {
+      return prefSnap;
+    }
+    return new ConnectionSnapshot();
   }
 
   /**

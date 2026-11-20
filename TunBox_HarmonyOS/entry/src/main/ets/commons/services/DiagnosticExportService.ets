@@ -22,6 +22,7 @@ export function writeDiagnosticReport(filesDir: string, cacheDir: string, uri: s
     }
     logs.push('diagnostics/memory-pressure.json');
     const runtime: string[] = ['core.log.3', 'core.log.2', 'core.log.1', 'core.log',
+      'isolated-latency/core.log.1', 'isolated-latency/core.log',
       'core_resources.jsonl.2', 'core_resources.jsonl.1', 'core_resources.jsonl', 'core_resources.json',
       'vpn_mem.json', 'vpn_status.json', 'vpn_heartbeat.txt', 'vpn_start_error.txt', 'vpn_launch_epoch.txt'];
     for (let i = 0; i < logs.length + runtime.length; i++) {

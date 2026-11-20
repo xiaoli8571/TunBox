@@ -34,7 +34,7 @@ export interface OrchestratorHealthView {
   isIntentConsistent(): Promise<boolean>;
   /** 扩展进程回写的启动错误（空 = 无错误） */
   startErrorText(): string;
-  /** 本次连接是否启用 IPv6 双栈（= 设置页 IPv6 开关，默认开） */
+  /** 本次连接是否启用 IPv6 双栈（= 设置页 IPv6 开关，默认关） */
   isIpv6Enabled(): boolean;
   /** Clash API 是否可达 */
   checkClashApiReachable(): Promise<boolean>;

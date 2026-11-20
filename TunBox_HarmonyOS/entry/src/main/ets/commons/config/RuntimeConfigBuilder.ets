@@ -531,9 +531,9 @@ export class RuntimeConfigBuilder {
     // 测速核是 headless 的延迟探测内核：不开 TUN（避免抢设备的 TUN 设备）。
     const tunEnabled = mode !== RuntimeConfigMode.TEST;
     // IPv6 双栈：**唯一**决策点就在这里。生产值来自 settings.ipv6Enabled（设置页开关，
-    // 默认开）；缺失/脏值按「开」处理，与 AppSettings.fromJson 的口径一致。
+    // 默认关）；缺失/脏值按「关」处理，与 AppSettings.fromJson 的口径一致。
     // 生成器只收这一个布尔，不再自己读设置 —— 隧道与测速核共用同一决策结果。
-    const ipv6Enabled: boolean = profile.settings.ipv6Enabled !== false;
+    const ipv6Enabled: boolean = profile.settings.ipv6Enabled === true;
 
     const yaml = ClashConfigGenerator.generate(
       profileBacked ? overlayNode : node, profileBacked ? [overlayNode] : profile.nodes, profile.settings,
@@ -569,10 +569,11 @@ export class RuntimeConfigBuilder {
       const input = new TunBoxProfileInput();
       input.profileId = profile.profileId;
       input.profilePath = ProfileRepository.pathOf(profile.profileId);
+      input.profileYaml = profile.profileYaml;
       input.profilesDir = ProfileRepository.dir();
       input.overlayYaml = yaml;
       input.overrideYaml = effectiveOverride;
-      input.dnsOverrideEnabled = profile.settings.dnsOverrideEnabled !== false;
+      input.dnsOverrideEnabled = profile.settings.dnsOverrideEnabled === true;
       input.tunEnabled = tunEnabled;
       input.ipv6Enabled = ipv6Enabled;
       input.mtu = BASE_MTU;

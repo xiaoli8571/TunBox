@@ -329,12 +329,13 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		handler: handler,
 		tunName: tunName,
 	}
-	defer func() {
+	// Keep the allocated owner even when an explicit return sets l to nil.
+	defer func(owned *Listener) {
 		if err != nil {
-			l.Close()
+			owned.Close()
 			l = nil
 		}
-	}()
+	}(l)
 
 	interfaceFinder := DefaultInterfaceFinder
 

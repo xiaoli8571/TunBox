@@ -44,7 +44,7 @@
  * 系统会连带回收本进程（exit 0）。会话驻留由 QuickToggleAbility 的 dataTransfer
  * 守护承担；本文件只负责隧道数据面与其内部自愈。
  */
-import { vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
+import { connection, vpnExtension, VpnExtensionAbility } from '@kit.NetworkKit';
 import { taskpool } from '@kit.ArkTS';
 import { sampleProcessPss } from '../commons/services/MemorySampler';
 import { PersistentLogStore } from '../commons/services/PersistentLogStore';
@@ -119,8 +119,11 @@ const START_PARAMS_MAX_AGE_MS = 180000;
  */
 const MEM_FILE = 'vpn_mem.json';
 const MEM_TMP_FILE = 'vpn_mem.json.tmp';
-/** 内存采样周期（ms）：比心跳慢，避免高频 stat 拖慢 ArkTS 线程 */
-const MEM_SAMPLE_MS = 5000;
+/** 内存采样周期（ms）：10s 仍在 MemorySamplePolicy 的 15s 新鲜窗口内，比 5s 少一半 taskpool 唤醒 */
+const MEM_SAMPLE_MS = 10000;
+/** 进程内存日志节流窗口（ms）与显著变化阈值（KiB），避免高频写盘刷爆持久日志 */
+const MEM_LOG_INTERVAL_MS = 60000;
+const MEM_LOG_DELTA_KB = 4096;
 const HEARTBEAT_FILE = 'vpn_heartbeat.txt';
 /** 存活租约的原子替换临时文件（先写 .tmp，再 rename 覆盖心跳本体） */
 const HEARTBEAT_TMP_FILE = 'vpn_heartbeat.txt.tmp';
@@ -168,6 +171,15 @@ const PROTECT_POLL_BASE_MS = 10;
 const PROTECT_POLL_MAX_MS = 100;
 /** 单轮最多排空的 protect 请求数（原实现常量，语义保持不变） */
 const PROTECT_DRAIN_MAX = 16;
+
+/** 内存压力观测记录（供诊断导出，不自杀正在运行的 VPN 隧道） */
+class MemoryPressureRecord {
+  sampledAt: number = 0;
+  reason: string = '';
+  action: string = '';
+  count: number = 0;
+  pssKb: number = -1;
+}
 
 /** 单个 native 阶段的等待结果（ArkTS 不允许无类型对象字面量，显式声明类） */
 class StageOutcome {
@@ -269,10 +281,16 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private memSampleWarned: boolean = false;
   private memSampleLogged: boolean = false;
   private memSampleBusy: boolean = false;
+  private lastPssKb: number = -1;
+  private lastPssLogAt: number = 0;
+  private memCriticalCount: number = 0;
   private protectFailureCount: number = 0;
-  private memoryStopFlight: Promise<void> | null = null;
   /** 连续判定"内核已死"的次数（累计到 CORE_DEATH_CONFIRMATIONS 才动手）。 */
   private coreDeathStrikes: number = 0;
+  /** 是否在本会话中成功观测到系统 BEARER_VPN / vpn-tun 接口（防止部分 ROM 不回报时误判）。 */
+  private sawVpnBearerOnce: boolean = false;
+  /** 连续观测到系统 VPN 接口消失的次数（累计到 CORE_DEATH_CONFIRMATIONS 才触发重建/报障）。 */
+  private vpnBearerLossStrikes: number = 0;
   private recoveryTimer: number = -1;
   /** TUN 重建专用定时器与门控（与内核热恢复互不干扰）。 */
   private rebuildTimer: number = -1;
@@ -319,6 +337,14 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   private protectTimer: number = -1;
   /** protect 轮询当前间隔（自适应：空闲退避 / 命中回底线） */
   private protectPollDelayMs: number = PROTECT_POLL_BASE_MS;
+  /** 进程级实例序号：同一 `:vpn` 进程内快速停启时用于串行化跨实例清理并阻止旧 onDestroy 误杀新会话。 */
+  private static processInstanceSeq: number = 0;
+  /** 当前持有进程级共享资源（Go 内核单例 + cacheDir 心跳/状态文件）的实例序号。 */
+  private static activeOwnerSeq: number = 0;
+  /** 进程级清理串行链：新实例 onCreate 必须等待旧实例在途 cleanupResources 结束再启动内核。 */
+  private static activeCleanupChain: Promise<void> = Promise.resolve();
+  /** 本实例在 `:vpn` 进程内的序号（0 仅出现在绕过 onCreate 的单测桩实例）。 */
+  private instanceSeq: number = 0;
   /** 统一清理的幂等门控。 */
   private cleanupPromise: Promise<void> | null = null;
   /** 本次会话的配置路径（onDestroy 时删除含 API secret 的 YAML） */
@@ -407,7 +433,30 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     return this.readStartParamsFromPreferences(configPath);
   }
 
-  /** cacheDir 回退文件：只接受「≤3 分钟 + configPath 逐字相等」，防串用别的会话。 */
+  /**
+   * 仅把同一沙箱 cacheDir 下的主隧道配置 `mihomo_config.yaml` 与其冷启动暂存路径
+   * `mihomo_config.yaml.next` 视为同一配置（acceptStagedConfig 提升后会把 `.next` 变成正式路径，
+   * 系统丢 want 重启扩展时恢复出来的是正式路径）；任意其他路径（含测速配置）仍严格拒绝。
+   */
+  private isSameTunnelConfigPath(savedPath: string, currentPath: string): boolean {
+    if (savedPath.length === 0 || currentPath.length === 0) {
+      return false;
+    }
+    if (savedPath === currentPath) {
+      return true;
+    }
+    const cacheDir = (this.context !== undefined && this.context !== null
+      && typeof this.context.cacheDir === 'string') ? this.context.cacheDir : '';
+    if (cacheDir.length === 0) {
+      return false;
+    }
+    const canonical = `${cacheDir}/mihomo_config.yaml`;
+    const staged = `${canonical}.next`;
+    return (savedPath === canonical || savedPath === staged)
+      && (currentPath === canonical || currentPath === staged);
+  }
+
+  /** cacheDir 回退文件：只接受「≤3 分钟 + 同会话主隧道 configPath 匹配」，防串用别的会话。 */
   private readStartParamsFile(configPath: string): StartParamsSnapshot | null {
     try {
       const file = fs.openSync(`${this.context.cacheDir}/${START_PARAMS_FILE}`, fs.OpenMode.READ_ONLY);
@@ -428,7 +477,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
         ? rec['appRoutingPackagesJson'] as string : '';
       const needsReview = typeof rec['appRoutingNeedsReview'] === 'boolean'
         ? rec['appRoutingNeedsReview'] as boolean : false;
-      if (filePath.length === 0 || filePath !== configPath || age < 0 || age > START_PARAMS_MAX_AGE_MS ||
+      if (!this.isSameTunnelConfigPath(filePath, configPath) || age < 0 || age > START_PARAMS_MAX_AGE_MS ||
         typeof rec['appRoutingMode'] !== 'string' ||
         typeof rec['appRoutingPackagesJson'] !== 'string' ||
         typeof rec['appRoutingNeedsReview'] !== 'boolean') {
@@ -454,7 +503,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
    *
    * 仍然不猜任何默认值，三重校验缺一不可：
    *  1. 持久化用户意图仍是"想连着"（否则这是用户主动断开后的残留启动）；
-   *  2. configPath 与本次解析出的路径逐字相等（防止串用别的会话的分流范围）；
+   *  2. configPath 与本次解析出的路径同属主隧道配置（允许 `.next` 提升等价，防止串用别的配置）；
    *  3. 三个字段类型完整（脏数据一律拒绝）。
    */
   private async readStartParamsFromPreferences(configPath: string): Promise<StartParamsSnapshot | null> {
@@ -469,7 +518,7 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       if (routing === null) {
         return null;
       }
-      if (routing.configPath.length === 0 || routing.configPath !== configPath) {
+      if (!this.isSameTunnelConfigPath(routing.configPath, configPath)) {
         AppLogger.warn(TAG, `appRouting params: persisted snapshot belongs to another config`
           + ` (${routing.configPath}); keep refusing`);
         return null;
@@ -1299,6 +1348,8 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       candidate = null;
       committed = true;
       this.recoveryAttempts = 0;
+      this.sawVpnBearerOnce = false;
+      this.vpnBearerLossStrikes = 0;
       this.writeStatus('running', true, `tun-rebuilt:${reason}`);
     } catch (e) {
       if (current()) {
@@ -1367,14 +1418,93 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
    *    旧实现一次 false 就 writeStatus('recovering', false)，而 writeStatus 旧版会
    *    **删除心跳文件** → UI 侧立刻判死并拆隧道重连。
    */
+  /**
+   * 探测系统网络栈里是否仍存在 VPN 承载（BEARER_VPN 或 vpn-tun 接口）。
+   *
+   * 安全门禁：只有本会话此前**确实观测到过** BEARER_VPN / vpn-tun（sawVpnBearerOnce=true），
+   * 后续消失才返回 false；若设备 ROM 从不在 getAllNetsSync() 中回报 VPN 承载、或接口抛错/
+   * 返回空表，一律返回 null（unknown），绝不对正常隧道误杀。
+   */
+  private isVpnInterfaceActive(): boolean | null {
+    try {
+      const nets = connection.getAllNetsSync();
+      if (!Array.isArray(nets) || nets.length === 0) {
+        return null;
+      }
+      let inspected: number = 0;
+      for (const handle of nets) {
+        if (handle === null || handle === undefined || handle.netId === 0) {
+          continue;
+        }
+        try {
+          const caps = connection.getNetCapabilitiesSync(handle);
+          inspected++;
+          const bearers = caps.bearerTypes || [];
+          for (const bearer of bearers) {
+            if ((bearer as number) === 4) {
+              this.sawVpnBearerOnce = true;
+              return true;
+            }
+          }
+        } catch (_capErr) {
+          // 忽略单个句柄查询异常
+        }
+        try {
+          const props = connection.getConnectionPropertiesSync(handle);
+          inspected++;
+          if (props.interfaceName === TUN_IFNAME) {
+            this.sawVpnBearerOnce = true;
+            return true;
+          }
+        } catch (_propErr) {
+          // 忽略单个句柄属性查询异常
+        }
+      }
+      if (inspected === 0) {
+        return null;
+      }
+      return this.sawVpnBearerOnce ? false : null;
+    } catch (_e) {
+      return null;
+    }
+  }
+
   private startCoreMonitor(): void {
     this.stopCoreMonitor();
     this.startLeaseTimer();
     this.startMemSampler();
     this.coreDeathStrikes = 0;
+    this.vpnBearerLossStrikes = 0;
     this.coreMonitorTimer = UnifiedScheduler.every((): void => {
       if (this.connection === null || this.recoveryRunning || this.rebuilding || !this.networkAvailable) {
         return;
+      }
+      const vpnActive = (this.networkUpdateFlight !== null || this.pendingNetwork !== null)
+        ? null
+        : this.isVpnInterfaceActive();
+      if (vpnActive === true) {
+        this.vpnBearerLossStrikes = 0;
+      } else if (vpnActive === false) {
+        this.vpnBearerLossStrikes = this.vpnBearerLossStrikes + 1;
+        if (this.vpnBearerLossStrikes >= CORE_DEATH_CONFIRMATIONS) {
+          this.vpnBearerLossStrikes = 0;
+          this.stableSince = 0;
+          AppLogger.warn(TAG,
+            `system VPN interface (${TUN_IFNAME}) disappeared while extension remained alive; `
+            + `rebuilds=${this.tunnelRebuilds}`);
+          if (this.tunnelRebuilds < 1) {
+            this.writeStatus('recovering', false, 'vpn-interface-lost');
+            this.scheduleTunnelRebuild('vpn-interface-lost');
+          } else {
+            this.writeStatus('failed', false, 'vpn-interface-lost: 系统 VPN 连接已断开，请重新连接');
+            this.cleanupResources().catch((e: Error): void => {
+              AppLogger.warn(TAG, `cleanup after vpn interface loss failed: ${AppLogger.errText(e)}`);
+            });
+          }
+          return;
+        }
+        AppLogger.warn(TAG,
+          `system VPN interface missing (${this.vpnBearerLossStrikes}/${CORE_DEATH_CONFIRMATIONS}), awaiting confirmation`);
       }
       coreBridge.isCoreAlive().then((alive: boolean): void => {
         if (this.connection === null || this.recoveryRunning || this.rebuilding) {
@@ -1481,14 +1611,22 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       }
       const target = `${this.heartbeatDir}/${MEM_FILE}`;
       const tmp = `${this.heartbeatDir}/${MEM_TMP_FILE}`;
+      const sampleNow = Date.now();
       const hb = fs.openSync(tmp, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
       try {
-        fs.writeSync(hb.fd, JSON.stringify({ sampledAt: Date.now(), pssKb: kb }));
+        fs.writeSync(hb.fd, JSON.stringify({ sampledAt: sampleNow, pssKb: kb }));
       } finally {
         fs.closeSync(hb);
       }
       fs.renameSync(tmp, target);
-      AppLogger.info(TAG, `resource pssKb=${kb} sampledAt=${Date.now()}`);
+      if (this.lastPssKb < 0 || Math.abs(kb - this.lastPssKb) >= MEM_LOG_DELTA_KB
+        || sampleNow - this.lastPssLogAt >= MEM_LOG_INTERVAL_MS) {
+        this.lastPssKb = kb;
+        this.lastPssLogAt = sampleNow;
+        AppLogger.info(TAG, `resource pssKb=${kb} sampledAt=${sampleNow}`);
+      } else {
+        this.lastPssKb = kb;
+      }
     } catch (e) {
       if (!this.memSampleWarned) {
         this.memSampleWarned = true;
@@ -1623,19 +1761,44 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     }
   }
 
+  /** 当前实例是否仍持有进程级共享资源（Go 内核单例 + cacheDir 状态/心跳文件）。 */
+  private ownsSharedResources(): boolean {
+    if (!(this.instanceSeq > 0)) {
+      return true;
+    }
+    return this.instanceSeq === TunBoxVpnExtension.activeOwnerSeq
+      || (TunBoxVpnExtension.activeOwnerSeq === 0
+        && this.instanceSeq === TunBoxVpnExtension.processInstanceSeq);
+  }
+
+  /** 当前实例是否已被更新的 onCreate 实例取代或已被请求停止。 */
+  private isSupersededOrStopped(): boolean {
+    return this.stopped
+      || (this.instanceSeq > 0 && this.instanceSeq !== TunBoxVpnExtension.processInstanceSeq);
+  }
+
   private cleanupResources(): Promise<void> {
     if (this.cleanupPromise !== null) {
       return this.cleanupPromise;
     }
-    this.cleanupPromise = this.cleanupResourcesInternal().finally(() => {
-      this.cleanupPromise = null;
-    });
-    return this.cleanupPromise;
+    const chained: Promise<void> = TunBoxVpnExtension.activeCleanupChain
+      .then((): Promise<void> => this.cleanupResourcesInternal(),
+        (): Promise<void> => this.cleanupResourcesInternal())
+      .finally((): void => {
+        if (this.cleanupPromise === chained) {
+          this.cleanupPromise = null;
+        }
+      });
+    this.cleanupPromise = chained;
+    TunBoxVpnExtension.activeCleanupChain = chained.then((): void => {}, (): void => {});
+    return chained;
   }
 
   private async cleanupResourcesInternal(): Promise<void> {
     this.stopped = true;
     this.networkReady = false;
+    this.sawVpnBearerOnce = false;
+    this.vpnBearerLossStrikes = 0;
     this.lifecycleGeneration++;
     const connection = this.connection;
     this.connection = null;
@@ -1645,9 +1808,10 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     this.stopMemSampler();
     this.stopNetworkAuthority();
     this.stopProtectMonitor();
-    // 状态文件清理：删除权威态与兼容心跳文件，防止其他进程在陈旧窗口内把
-    // "已断开"误判为"内核还活着"（与 orchestrator.clearTunnelMarkers 双保险）。
-    if (this.heartbeatDir.length > 0) {
+    const isOwnerAtStart: boolean = this.ownsSharedResources();
+    // 状态文件清理：仅在仍持有进程级所有权时删除权威态与兼容心跳文件，防止同进程内
+    // 晚到的旧实例 onDestroy 把新实例刚写好的心跳/状态文件删除，诱发 UI 误判内核无响应。
+    if (isOwnerAtStart && this.heartbeatDir.length > 0) {
       const stale: string[] = [HEARTBEAT_FILE, HEARTBEAT_TMP_FILE, STATUS_FILE, MEM_FILE, MEM_TMP_FILE];
       for (const name of stale) {
         try {
@@ -1665,10 +1829,18 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
     // 临时测速配置随扩展退出删除（无头测速无 TUN，配置不会被内核长期需要）。
     // 删的只是本实例自己的那份（文件名每次启动唯一，见 removePrivateConfig 注释）。
     this.removePrivateConfig(false);
-    try {
-      await coreBridge.stopCore();
-    } catch (e) {
-      AppLogger.warn(TAG, 'core cleanup failed');
+    if (this.ownsSharedResources()) {
+      try {
+        await coreBridge.stopCore();
+      } catch (e) {
+        AppLogger.warn(TAG, 'core cleanup failed');
+      }
+      if (this.instanceSeq > 0 && TunBoxVpnExtension.activeOwnerSeq === this.instanceSeq) {
+        TunBoxVpnExtension.activeOwnerSeq = 0;
+      }
+    } else {
+      AppLogger.info(TAG,
+        `skip shared core/state teardown for superseded instance (seq=${this.instanceSeq} owner=${TunBoxVpnExtension.activeOwnerSeq})`);
     }
     if (connection !== null) {
       try {
@@ -1682,8 +1854,21 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
 
   async onCreate(want: Want): Promise<void> {
     PersistentLogStore.init(this.context, 'vpn');
+    const mySeq: number = ++TunBoxVpnExtension.processInstanceSeq;
+    this.instanceSeq = mySeq;
+    // 进程级串行：同 `:vpn` 进程快速停启时必须等前一个实例的异步 cleanup 完成，
+    // 否则旧实例的 coreBridge.stopCore() 与 unlink(vpn_heartbeat.txt) 会直接击杀新会话。
+    await TunBoxVpnExtension.activeCleanupChain;
     if (this.cleanupPromise !== null) { await this.cleanupPromise; }
+    if (this.instanceSeq !== TunBoxVpnExtension.processInstanceSeq) {
+      AppLogger.info(TAG, `vpn onCreate superseded before start (seq=${mySeq})`);
+      return;
+    }
+    TunBoxVpnExtension.activeOwnerSeq = mySeq;
     this.stopped = false;
+    this.sawVpnBearerOnce = false;
+    this.vpnBearerLossStrikes = 0;
+    this.memCriticalCount = 0;
     this.lifecycleGeneration++;
     AppLogger.info(TAG, 'vpn onCreate');
     // 扩展进程可能先于 UIAbility 被系统拉起：geo 数据在这里也要保证就位。
@@ -1768,6 +1953,9 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
         // 旧连接可能已失效，忽略
       }
     }
+    if (this.isSupersededOrStopped()) {
+      return;
+    }
 
     // headless 测速模式(UI 预启动内核做真实协议测速): 不建 TUN、不请求 VPN
     // 授权、不启 protect/心跳 —— 只拉起内核开 127.0.0.1 的 mixed+API 端口。
@@ -1798,6 +1986,9 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       }
       if (!gateOk) {
         const recovered = await this.readStartParamsFallback(configPath);
+        if (this.isSupersededOrStopped()) {
+          return;
+        }
         if (recovered === null) {
           throw new Error('应用分流参数缺失或冲突，已拒绝恢复 VPN，请在应用内重新连接');
         }
@@ -1807,6 +1998,9 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       }
       this.appRouting = AppRoutingPolicy.fromTransport(mode, packagesJson, needsReview);
     } catch (e) {
+      if (this.isSupersededOrStopped()) {
+        return;
+      }
       const message = AppLogger.errText(e);
       this.reportStartError(configPath, message);
       AppLogger.error(TAG, message);
@@ -1863,19 +2057,35 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.applyAppRouting(config);
       this.connection = vpnExtension.createVpnConnection(this.context);
       const tunFd = await this.connection.create(config);
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       this.platformTunFd = tunFd;
       AppLogger.info(TAG, 'TUN created');
 
       // 同时启用进程级保护与逐 socket Protect 通道，避免出站流量回灌 TUN。
       await this.connection.protectProcessNet();
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       AppLogger.info(TAG, 'protectProcessNet enabled');
 
       const attached = await coreBridge.attachTun(tunFd, this.activeMtu);
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       if (!attached) {
         throw new Error('内核桥加载失败（attachTun）');
       }
       AppLogger.info(TAG, 'attachTun ok');
       const protectReady = await coreBridge.initProtect();
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       if (!protectReady) {
         throw new Error('内核 Protect 通道初始化失败');
       }
@@ -1886,17 +2096,27 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.ensureConfigMtu();
       // startCore 在线程池执行，ArkTS 事件循环持续处理 Protect 请求。
       const ok = await this.startCoreWithTimeout(configPath);
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       AppLogger.info(TAG, `core start result: ${ok}`);
       if (!ok) {
         const coreErr = await coreBridge.lastError();
         throw new Error(coreErr.length > 0 ? coreErr : '内核启动失败（未知原因）');
       }
-      this.reportStartOk(configPath);
+      // 先发布权威状态快照并启动监控（同步落盘首份存活租约 vpn_heartbeat.txt），
+      // 再写 START_OK_FILE 通知 UI 就绪，避免 UI 刚建连即在首轮存活探针里撞见空白租约。
       this.publishStateSnapshot(configPath);
       this.networkReady = true;
       this.startCoreMonitor();
+      this.reportStartOk(configPath);
       this.flushNetworkUpdate();
     } catch (e) {
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       const msg = AppLogger.errText(e);
       const err = e as BusinessError;
       const code = typeof err.code === 'number' ? err.code : -1;
@@ -1917,6 +2137,10 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       const startedAt = Date.now();
       const outcome = await this.runStage('headless startCore', coreBridge.startCore(configPath),
         CORE_START_TIMEOUT_MS);
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       this.logCoreTailIfNeeded('headless startCore', outcome, Date.now() - startedAt);
       if (outcome.timedOut) {
         throw new Error(`测速内核启动超时（${Math.round(CORE_START_TIMEOUT_MS / 1000)}s 无响应），请导出诊断日志查看启动阶段`);
@@ -1928,6 +2152,10 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
       this.reportStartOk(configPath);
       AppLogger.info(TAG, 'headless test-core started');
     } catch (e) {
+      if (this.isSupersededOrStopped()) {
+        await this.cleanupResources();
+        return;
+      }
       const msg = AppLogger.errText(e);
       this.reportStartError(configPath, `测速内核启动失败: ${msg}`);
       AppLogger.error(TAG, `headless start failed: ${msg}`);
@@ -1940,46 +2168,49 @@ export default class TunBoxVpnExtension extends VpnExtensionAbility implements N
   }
 
   /**
-   * 内存压力自适应降级（P2，对标 iOS 50MB 上限的 oomKiller 自救）：
-   * - MEMORY_LEVEL_MODERATE：记日志（观察点，不动隧道）；
-   * - MEMORY_LEVEL_CRITICAL：留存原因、停止 VPN、清除自动连接意图，防止恢复风暴。
-   *   这是系统严重内存压力回调，不是根据固定 PSS 阈值误杀大规则配置。
+   * 内存压力观测回调：
+   *
+   * 2026-11-19 稳定性修复：HarmonyOS 在用户切换到大型前台应用（游戏/相机/视频/浏览器）时，
+   * 会常规向后台扩展广播 `MEMORY_LEVEL_CRITICAL` 作为缓存回收提醒，并不代表本进程已经 OOM。
+   * 旧实现在首次收到 `MEMORY_LEVEL_CRITICAL` 时就主动调用 `cleanupResources()` 拆掉正在工作的
+   * TUN 并把 `desiredConnected` 改成 `false` —— 直接造成「切去其他 App 就掉线且 VPN 图标消失」。
+   *
+   * 现在：只记诊断、刷日志、保持隧道与用户连接意图不变；若极端情况下系统 LMK 真把 `:vpn`
+   * 杀掉，持久化 `desiredConnected=true` 保持完整，UI 侧会准确同步真实状态或按有界策略恢复。
    */
   onMemoryLevel(level: number): void {
     if (level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_CRITICAL) {
-      if (this.memoryStopFlight !== null || this.stopped) { return; }
-      AppLogger.error(TAG, 'memory pressure CRITICAL; stopping VPN and disabling automatic recovery');
-      this.memoryStopFlight = this.stopForMemoryPressure().catch((e: Error): void => {
-        AppLogger.error(TAG, `memory pressure cleanup failed: ${AppLogger.errText(e)}`);
-      }).finally((): void => { this.memoryStopFlight = null; PersistentLogStore.flush(); });
+      if (this.stopped) { return; }
+      this.memCriticalCount = (this.memCriticalCount > 0 ? this.memCriticalCount : 0) + 1;
+      AppLogger.warn(TAG,
+        `memory pressure CRITICAL in vpn extension (count=${this.memCriticalCount}, pssKb=${this.lastPssKb}); `
+        + 'keeping active VPN tunnel alive');
+      PersistentLogStore.flush();
+      this.recordMemoryPressureDiagnostic('system-memory-critical', 'kept-alive');
     } else if (level === AbilityConstant.MemoryLevel.MEMORY_LEVEL_MODERATE) {
-      AppLogger.info(TAG, 'memory pressure MODERATE in vpn extension');
+      AppLogger.info(TAG, `memory pressure MODERATE in vpn extension (pssKb=${this.lastPssKb})`);
     }
   }
 
-  private async stopForMemoryPressure(): Promise<void> {
-    const expectedGeneration = this.lifecycleGeneration + 1;
-    // Preserve the reason outside transient tunnel markers (which cleanup removes).
+  private recordMemoryPressureDiagnostic(reason: string, action: string): void {
     try {
-      const f = fs.openSync(`${this.context.filesDir}/diagnostics/memory-pressure.json`,
+      const dir = `${this.context.filesDir}/diagnostics`;
+      try { fs.mkdirSync(dir, true); } catch (_mkErr) {}
+      const rec = new MemoryPressureRecord();
+      rec.sampledAt = Date.now();
+      rec.reason = reason;
+      rec.action = action;
+      rec.count = this.memCriticalCount;
+      rec.pssKb = this.lastPssKb;
+      const f = fs.openSync(`${dir}/memory-pressure.json`,
         fs.OpenMode.WRITE_ONLY | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      try { fs.writeSync(f.fd, JSON.stringify({ sampledAt: Date.now(), reason: 'system-memory-critical' })); }
-      finally { fs.closeSync(f); }
-    } catch (_e) { /* persistent app log is the fallback */ }
-    const cleanup = this.cleanupResources(); // synchronously cancels timers/recovery first
-    try {
-      await SettingsService.init(this.context);
-      const snap = await SettingsService.loadSnapshot();
-      if (this.lifecycleGeneration === expectedGeneration && this.stopped) {
-        snap.desiredConnected = false;
-        snap.phase = 'failed';
-        snap.sessionGeneration += 1;
-        snap.savedAt = Date.now();
-        await SettingsService.saveSnapshot(snap);
+      try {
+        fs.writeSync(f.fd, JSON.stringify(rec));
+      } finally {
+        fs.closeSync(f);
       }
-    } finally { await cleanup; }
-    if (this.lifecycleGeneration === expectedGeneration && this.stopped) {
-      this.writeStatus('failed', false, 'memCritical: 系统内存严重不足，已停止 VPN，请手动重新连接');
+    } catch (_e) {
+      // 持久日志已作为兜底
     }
   }
 

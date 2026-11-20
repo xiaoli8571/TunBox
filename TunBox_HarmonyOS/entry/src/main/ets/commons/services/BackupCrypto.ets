@@ -14,7 +14,7 @@
  * - base64 用 @kit.CryptoArchitectureKit 的 cryptoFramework DataBlob + util Base64Helper
  */
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
-import { util } from '@kit.ArkTS';
+import { taskpool, util } from '@kit.ArkTS';
 import { AppLogger } from '../utils/AppLogger';
 
 const TAG = 'BackupCrypto';
@@ -23,6 +23,7 @@ const KDF_ITERATIONS = 100000;
 const KEY_BITS = 256;
 const IV_BYTES = 12;
 const SALT_BYTES = 16;
+const TAG_BYTES = 16;
 
 export class EncryptedBackupEnvelope {
   app: string = ENCRYPTED_APP;
@@ -50,77 +51,175 @@ export class BackupCryptoResult {
   message: string = '';
 }
 
-function toBase64(bytes: Uint8Array): string {
-  const helper = new util.Base64Helper();
-  return helper.encodeToStringSync(bytes);
+/**
+ * Worker payload: self-contained for ArkTS @Concurrent execution across taskpool threads.
+ * Uses GCM authTag concatenation [ciphertext || 16-byte tag] so the JSON envelope schema stays v1-compatible.
+ */
+@Concurrent
+export function runBackupEncryptWorker(plainJson: string, password: string): string {
+  const kdfIterations = 100000;
+  const keyBytesLen = 32;
+  const ivBytesLen = 12;
+  const saltBytesLen = 16;
+  const tagBytesLen = 16;
+  const pack = (ok: boolean, text: string, msg: string, err: string): string =>
+    `{"ok":${ok},"text":${JSON.stringify(text)},"message":${JSON.stringify(msg)},"err":${JSON.stringify(err)}}`;
+  if (password.length < 4) {
+    return pack(false, '', '密码至少 4 个字符', '');
+  }
+  try {
+    const rand = cryptoFramework.createRandom();
+    const salt = new Uint8Array(rand.generateRandomSync(saltBytesLen).data);
+    const iv = new Uint8Array(rand.generateRandomSync(ivBytesLen).data);
+    const kdf = cryptoFramework.createKdf('PBKDF2|SHA256');
+    const spec: cryptoFramework.PBKDF2Spec = {
+      algName: 'PBKDF2',
+      password: password,
+      salt: salt,
+      iterations: kdfIterations,
+      keySize: keyBytesLen
+    };
+    const keyBytes = new Uint8Array(kdf.generateSecretSync(spec).data);
+    const symKey = cryptoFramework.createSymKeyGenerator('AES256').convertKeySync({ data: keyBytes });
+    const cipher = cryptoFramework.createCipher('AES256|GCM|NoPadding');
+    const gcmParams: cryptoFramework.GcmParamsSpec = {
+      algName: 'GcmParamsSpec',
+      iv: { data: iv },
+      aad: { data: new Uint8Array(0) },
+      authTag: { data: new Uint8Array(tagBytesLen) }
+    };
+    cipher.initSync(cryptoFramework.CryptoMode.ENCRYPT_MODE, symKey, gcmParams);
+    const plainBytes = util.TextEncoder.create('utf-8').encodeInto(plainJson);
+    const updateOut = plainBytes.length > 0 ? cipher.updateSync({ data: plainBytes }) : null;
+    const tagOut = cipher.doFinalSync(null);
+    const cipherPart = updateOut !== null && updateOut !== undefined ? new Uint8Array(updateOut.data) : new Uint8Array(0);
+    const tagPart = tagOut !== null && tagOut !== undefined ? new Uint8Array(tagOut.data) : new Uint8Array(0);
+    if (tagPart.length !== tagBytesLen) {
+      return pack(false, '', '加密失败，请重试', `unexpected GCM auth tag length: ${tagPart.length}`);
+    }
+    const cipherBytes = new Uint8Array(cipherPart.length + tagPart.length);
+    cipherBytes.set(cipherPart, 0);
+    cipherBytes.set(tagPart, cipherPart.length);
+    const base64 = new util.Base64Helper();
+    const saltB64 = base64.encodeToStringSync(salt);
+    const ivB64 = base64.encodeToStringSync(iv);
+    const cipherB64 = base64.encodeToStringSync(cipherBytes);
+    const envelope = `{\n`
+      + `  "app": "TunBox-Encrypted",\n`
+      + `  "version": "1",\n`
+      + `  "kdf": {\n`
+      + `    "name": "PBKDF2-SHA256",\n`
+      + `    "iterations": ${kdfIterations},\n`
+      + `    "salt": ${JSON.stringify(saltB64)}\n`
+      + `  },\n`
+      + `  "cipher": {\n`
+      + `    "name": "AES-256-GCM",\n`
+      + `    "iv": ${JSON.stringify(ivB64)}\n`
+      + `  },\n`
+      + `  "ciphertext": ${JSON.stringify(cipherB64)}\n`
+      + `}`;
+    return pack(true, envelope, '', '');
+  } catch (e) {
+    return pack(false, '', '加密失败，请重试', String(e));
+  }
 }
 
-function fromBase64(text: string): Uint8Array {
-  const helper = new util.Base64Helper();
-  return helper.decodeSync(text);
+@Concurrent
+export function runBackupDecryptWorker(envelopeJson: string, password: string): string {
+  const defaultIterations = 100000;
+  const keyBytesLen = 32;
+  const tagBytesLen = 16;
+  const pack = (ok: boolean, text: string, msg: string, err: string): string =>
+    `{"ok":${ok},"text":${JSON.stringify(text)},"message":${JSON.stringify(msg)},"err":${JSON.stringify(err)}}`;
+  try {
+    const parsed = JSON.parse(envelopeJson) as Record<string, Object>;
+    const app = parsed['app'];
+    const ciphertextB64 = parsed['ciphertext'];
+    if (app !== 'TunBox-Encrypted' || typeof ciphertextB64 !== 'string' || ciphertextB64.length === 0) {
+      return pack(false, '', '不是合法的加密备份文件', '');
+    }
+    const kdfObj = parsed['kdf'] as Record<string, Object> | undefined;
+    const cipherObj = parsed['cipher'] as Record<string, Object> | undefined;
+    const rawIter = kdfObj !== undefined && kdfObj !== null ? kdfObj['iterations'] : undefined;
+    const iterations = typeof rawIter === 'number' && rawIter >= 1000 ? rawIter : defaultIterations;
+    const saltB64 = kdfObj !== undefined && kdfObj !== null ? kdfObj['salt'] : undefined;
+    const ivB64 = cipherObj !== undefined && cipherObj !== null ? cipherObj['iv'] : undefined;
+    if (typeof saltB64 !== 'string' || typeof ivB64 !== 'string') {
+      return pack(false, '', '加密备份缺少密钥参数，文件已损坏', '');
+    }
+    const base64 = new util.Base64Helper();
+    const salt = base64.decodeSync(saltB64);
+    const iv = base64.decodeSync(ivB64);
+    const cipherBytes = base64.decodeSync(ciphertextB64);
+    if (salt.length === 0 || iv.length === 0 || cipherBytes.length < tagBytesLen) {
+      return pack(false, '', '加密备份缺少密钥参数，文件已损坏', '');
+    }
+    const body = cipherBytes.slice(0, cipherBytes.length - tagBytesLen);
+    const tag = cipherBytes.slice(cipherBytes.length - tagBytesLen);
+    const kdf = cryptoFramework.createKdf('PBKDF2|SHA256');
+    const spec: cryptoFramework.PBKDF2Spec = {
+      algName: 'PBKDF2',
+      password: password,
+      salt: salt,
+      iterations: iterations,
+      keySize: keyBytesLen
+    };
+    const keyBytes = new Uint8Array(kdf.generateSecretSync(spec).data);
+    const symKey = cryptoFramework.createSymKeyGenerator('AES256').convertKeySync({ data: keyBytes });
+    const cipher = cryptoFramework.createCipher('AES256|GCM|NoPadding');
+    const gcmParams: cryptoFramework.GcmParamsSpec = {
+      algName: 'GcmParamsSpec',
+      iv: { data: iv },
+      aad: { data: new Uint8Array(0) },
+      authTag: { data: tag }
+    };
+    cipher.initSync(cryptoFramework.CryptoMode.DECRYPT_MODE, symKey, gcmParams);
+    const part1 = body.length > 0 ? cipher.updateSync({ data: body }) : null;
+    const part2 = cipher.doFinalSync(null);
+    const b1 = part1 !== null && part1 !== undefined ? new Uint8Array(part1.data) : new Uint8Array(0);
+    const b2 = part2 !== null && part2 !== undefined ? new Uint8Array(part2.data) : new Uint8Array(0);
+    const plainBytes = new Uint8Array(b1.length + b2.length);
+    plainBytes.set(b1, 0);
+    plainBytes.set(b2, b1.length);
+    const plainText = util.TextDecoder.create('utf-8').decodeToString(plainBytes);
+    return pack(true, plainText, '', '');
+  } catch (e) {
+    return pack(false, '', '解密失败：密码错误或文件已损坏', String(e));
+  }
 }
 
-// concatBytes：AAD 扩展预留，当前未消费
-function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
+function parseWorkerOutcome(raw: string, actionLabel: string): BackupCryptoResult {
+  const out = new BackupCryptoResult();
+  try {
+    const obj = JSON.parse(raw) as Record<string, Object>;
+    out.ok = obj['ok'] === true;
+    out.text = typeof obj['text'] === 'string' ? obj['text'] as string : '';
+    out.message = typeof obj['message'] === 'string' ? obj['message'] as string : '';
+    const err = typeof obj['err'] === 'string' ? obj['err'] as string : '';
+    if (!out.ok && err.length > 0) {
+      AppLogger.warn(TAG, `backup ${actionLabel} failed: ${err}`);
+    }
+  } catch (e) {
+    AppLogger.error(TAG, `backup ${actionLabel} reply invalid: ${AppLogger.errText(e)}`);
+    out.message = `${actionLabel}失败，请重试`;
+  }
   return out;
 }
-void concatBytes;
 
 export class BackupCrypto {
   /** 用密码加密备份明文 JSON → 封装 JSON 字符串 */
   static encrypt(plainJson: string, password: string): BackupCryptoResult {
-    const out = new BackupCryptoResult();
-    if (password.length < 4) {
-      out.message = '密码至少 4 个字符';
-      return out;
-    }
+    return parseWorkerOutcome(runBackupEncryptWorker(plainJson, password), 'encrypt');
+  }
+
+  /** 在后台任务池中执行 PBKDF2 + AES-256-GCM 加密，避免阻塞 UI 线程。 */
+  static async encryptAsync(plainJson: string, password: string): Promise<BackupCryptoResult> {
     try {
-      const rand = cryptoFramework.createRandom();
-      const saltBlob = rand.generateRandomSync(SALT_BYTES);
-      const ivBlob = rand.generateRandomSync(IV_BYTES);
-      const salt = new Uint8Array(saltBlob.data);
-      const iv = new Uint8Array(ivBlob.data);
-      // PBKDF2 派生 256 位密钥
-      const kdf = cryptoFramework.createKdf('PBKDF2|SHA256');
-      const spec: cryptoFramework.PBKDF2Spec = {
-        algName: 'PBKDF2',
-        password: password,
-        salt: salt,
-        iterations: KDF_ITERATIONS,
-        keySize: KEY_BITS / 8
-      };
-      const secretBlob = kdf.generateSecretSync(spec);
-      const keyBytes = new Uint8Array(secretBlob.data);
-      const keyBlob: cryptoFramework.DataBlob = { data: keyBytes };
-      const symKey = cryptoFramework.createSymKeyGenerator('AES256').convertKeySync(keyBlob);
-      const cipher = cryptoFramework.createCipher('AES256|GCM|NO_padding');
-      const gcmParams: cryptoFramework.GcmParamsSpec = {
-        algName: 'AESGCM',
-        iv: { data: iv },
-        aad: { data: new Uint8Array(0) },
-        authTag: { data: new Uint8Array(16) }
-      };
-      cipher.initSync(cryptoFramework.CryptoMode.ENCRYPT_MODE, symKey, gcmParams);
-      const plainBlob: cryptoFramework.DataBlob = {
-        data: util.TextEncoder.create('utf-8').encodeInto(plainJson)
-      };
-      const encrypted = cipher.doFinalSync(plainBlob);
-      // GCM 密文末尾 16 字节是 authTag，HarmonyOS doFinal 输出已含 tag
-      const cipherBytes = new Uint8Array(encrypted.data);
-      const envelope = new EncryptedBackupEnvelope();
-      envelope.kdf.salt = toBase64(salt);
-      envelope.cipher.iv = toBase64(iv);
-      envelope.ciphertext = toBase64(cipherBytes);
-      out.ok = true;
-      out.text = JSON.stringify(envelope, null, 2);
-      return out;
+      const raw = await taskpool.execute(runBackupEncryptWorker, plainJson, password) as string;
+      return parseWorkerOutcome(raw, 'encrypt');
     } catch (e) {
-      AppLogger.error(TAG, `backup encrypt failed: ${AppLogger.errText(e)}`);
-      out.message = '加密失败，请重试';
-      return out;
+      AppLogger.warn(TAG, `taskpool encrypt fallback to sync: ${AppLogger.errText(e)}`);
+      return BackupCrypto.encrypt(plainJson, password);
     }
   }
 
@@ -137,49 +236,17 @@ export class BackupCrypto {
 
   /** 用密码解密封装 JSON → 明文 JSON 字符串 */
   static decrypt(envelopeJson: string, password: string): BackupCryptoResult {
-    const out = new BackupCryptoResult();
+    return parseWorkerOutcome(runBackupDecryptWorker(envelopeJson, password), 'decrypt');
+  }
+
+  /** 在后台任务池中执行 PBKDF2 + AES-256-GCM 解密，避免阻塞 UI 线程。 */
+  static async decryptAsync(envelopeJson: string, password: string): Promise<BackupCryptoResult> {
     try {
-      const parsed = JSON.parse(envelopeJson) as EncryptedBackupEnvelope;
-      if (parsed.app !== ENCRYPTED_APP || typeof parsed.ciphertext !== 'string' || parsed.ciphertext.length === 0) {
-        out.message = '不是合法的加密备份文件';
-        return out;
-      }
-      const iterations = typeof parsed.kdf?.iterations === 'number' && parsed.kdf.iterations >= 1000
-        ? parsed.kdf.iterations : KDF_ITERATIONS;
-      const salt = fromBase64(parsed.kdf.salt);
-      const iv = fromBase64(parsed.cipher.iv);
-      const cipherBytes = fromBase64(parsed.ciphertext);
-      if (salt.length === 0 || iv.length === 0) {
-        out.message = '加密备份缺少密钥参数，文件已损坏';
-        return out;
-      }
-      const kdf = cryptoFramework.createKdf('PBKDF2|SHA256');
-      const spec: cryptoFramework.PBKDF2Spec = {
-        algName: 'PBKDF2',
-        password: password,
-        salt: salt,
-        iterations: iterations,
-        keySize: KEY_BITS / 8
-      };
-      const keyBytes = new Uint8Array(kdf.generateSecretSync(spec).data);
-      const keyBlob: cryptoFramework.DataBlob = { data: keyBytes };
-      const symKey = cryptoFramework.createSymKeyGenerator('AES256').convertKeySync(keyBlob);
-      const cipher = cryptoFramework.createCipher('AES256|GCM|NO_padding');
-      const gcmParams: cryptoFramework.GcmParamsSpec = {
-        algName: 'AESGCM',
-        iv: { data: iv },
-        aad: { data: new Uint8Array(0) },
-        authTag: { data: new Uint8Array(16) }
-      };
-      cipher.initSync(cryptoFramework.CryptoMode.DECRYPT_MODE, symKey, gcmParams);
-      const decrypted = cipher.doFinalSync({ data: cipherBytes });
-      out.ok = true;
-      out.text = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(decrypted.data));
-      return out;
+      const raw = await taskpool.execute(runBackupDecryptWorker, envelopeJson, password) as string;
+      return parseWorkerOutcome(raw, 'decrypt');
     } catch (e) {
-      AppLogger.warn(TAG, `backup decrypt failed: ${AppLogger.errText(e)}`);
-      out.message = '解密失败：密码错误或文件已损坏';
-      return out;
+      AppLogger.warn(TAG, `taskpool decrypt fallback to sync: ${AppLogger.errText(e)}`);
+      return BackupCrypto.decrypt(envelopeJson, password);
     }
   }
 }

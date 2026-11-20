@@ -196,7 +196,7 @@ export class AppSettingsJson {
   /** 内核日志级别（log-level）：debug/info/warning/error/silent；默认 warning（现状）。 */
   coreLogLevel: string = 'warning';
   /**
-   * IPv6 双栈开关（默认 **true**）。
+   * IPv6 双栈开关（默认 **false**）。
    *
    * true  ⇒ 生成 ipv6: true + dns.ipv6: true + fake-ip-range6: fdfe:dcba:9876::/64
    *         （假 v6 池落在 TUN 自己的 /64 内）⇒ AAAA 返回隧道内地址，v6 与 v4 一样走代理；
@@ -207,16 +207,16 @@ export class AppSettingsJson {
    * 派生 on-link 路由（/126 只有 /126，/64 就有 fdfe:dcba:9876::/64）⇒ 假 v6 有路可达、进隧道、
    * 由代理出口解析真实 v6；设备侧不存在直连 v6 的路径。
    *
-   * 缺字段取 true（升级上来的老配置也默认开），显式 false 才关闭。
+   * 缺字段或非法值默认 false，显式 true 才开启。
    */
-  ipv6Enabled: boolean = true;
+  ipv6Enabled: boolean = false;
   /**
-   * DNS 配置覆写开关（默认 true），只控制 DNS 配置来源，不关闭 TUN DNS 接管。
+   * DNS 配置覆写开关（默认 false），只控制 DNS 配置来源，不关闭 TUN DNS 接管。
    * true：采用应用生成的默认 DNS；false：优先采用显式启用的订阅 DNS。
    * 订阅 DNS 缺失或禁用时仍回退应用默认配置。最终 dns.enable、tun.dns-hijack
    * 与扩展下发的 TUN sentinel 始终保持同步，确保全设备 DNS 经内核处理。
    */
-  dnsOverrideEnabled: boolean = true;
+  dnsOverrideEnabled: boolean = false;
   /**
    * 订阅配额提醒（流量不足/即将到期发系统通知）。默认开启。
    * 阈值常量见 SubscriptionQuotaService：流量剩 <10% 或 3 天内到期。
@@ -392,10 +392,10 @@ export class AppSettings {
   sniffingEnabled: boolean = true;
   /** 内核日志级别：debug/info/warning/error/silent（默认 warning = 现状行为） */
   coreLogLevel: string = 'warning';
-  /** IPv6 双栈开关（默认 true；语义见 AppSettingsJson.ipv6Enabled 注释） */
-  ipv6Enabled: boolean = true;
-  /** DNS 接管开关（默认 true；语义见 AppSettingsJson.dnsOverrideEnabled 注释） */
-  dnsOverrideEnabled: boolean = true;
+  /** IPv6 双栈开关（默认 false；语义见 AppSettingsJson.ipv6Enabled 注释） */
+  ipv6Enabled: boolean = false;
+  /** DNS 覆写开关（默认 false；语义见 AppSettingsJson.dnsOverrideEnabled 注释） */
+  dnsOverrideEnabled: boolean = false;
   /** 订阅配额提醒开关（默认 true；阈值见 SubscriptionQuotaService） */
   quotaNotifyEnabled: boolean = true;
   /** geo 资产下载源偏好：auto/jsdelivr/ghproxy/github（非法回落 auto） */
@@ -704,12 +704,11 @@ export class AppSettings {
     const level = typeof j.coreLogLevel === 'string' ? j.coreLogLevel.trim().toLowerCase() : '';
     s.coreLogLevel = (level === 'debug' || level === 'info' || level === 'warning'
       || level === 'error' || level === 'silent') ? level : 'warning';
-    // IPv6 双栈：缺字段取默认 true（升级上来的老配置默认开启），
-    // 只有显式 false 才关闭 —— 与「默认开」的产品口径一致。
-    s.ipv6Enabled = j.ipv6Enabled === false ? false : true;
-    // DNS 配置覆写缺字段默认开启；显式 false 优先使用已启用的订阅 DNS。
-    // 两种来源都保留 DNS 与 TUN 劫持，订阅 DNS 不可用时回退应用默认块。
-    s.dnsOverrideEnabled = j.dnsOverrideEnabled === false ? false : true;
+    // IPv6 双栈：默认 false（缺字段/非法值关闭），保留显式保存的 true/false。
+    s.ipv6Enabled = typeof j.ipv6Enabled === 'boolean' ? j.ipv6Enabled : false;
+    // DNS 配置覆写：默认 false（缺字段/非法值优先使用已启用的订阅 DNS），
+    // 保留显式保存的 true/false；两种来源都保留 DNS 与 TUN 劫持，订阅 DNS 不可用时回退应用默认块。
+    s.dnsOverrideEnabled = typeof j.dnsOverrideEnabled === 'boolean' ? j.dnsOverrideEnabled : false;
     // 2026-10-23 用户口径：配额提醒恒开（设置页已去掉这个开关，默认就是开）。
     // 旧配置里存过 false 的也一律置 true —— 否则升级后「开关没了却也不提醒」，
     // 等于悄悄把功能弄丢。

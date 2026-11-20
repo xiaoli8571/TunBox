@@ -28,7 +28,7 @@
  *
  * 规则语义：附加规则不设目标白名单，全部保留前置；仅 target=MATCH 的项替换为
  * 选定 matchTarget（缺省 = 最后 profile MATCH），no-resolve 等参数原样。
- * DNS 三段合并（baseline → overrides → appendSystemDns）；无 dns.ipv6 强改。
+ * DNS 来源开关 → 用户按键覆盖 → system DNS → 鸿蒙 IPv6 地址池兼容约束。
  * TunBox 的可选 Smart 增强在同一 map 上执行，仅在当前订阅明确选中 AUTO 且模型就绪时启用。
  */
 import { coreBridge } from '../../core/CoreBridge';
@@ -61,19 +61,20 @@ export class TunBoxProfileInput {
   profileId: string = '';
   /** profile 文件绝对路径（`<filesDir>/profiles/<id>.yaml`）。 */
   profilePath: string = '';
+  /** 同一 profile 的 prepared 原文；只由内核解码，用于区分显式字段与 native 默认值。 */
+  profileYaml: string = '';
   /** profile 目录（provider 缓存根：`<profilesDir>/providers/<id>/<type>/<md5>`）。 */
   profilesDir: string = '';
   /** 生成器 overlay（本仓 patchClashConfig 等价物；仅取运行期键）。 */
   overlayYaml: string = '';
   /** 每 profile 覆盖层（effectiveOverride：per-profile > 全局；空串 = 无）。 */
   overrideYaml: string = '';
-  /** 废弃（FlClash 无此开关；保留字段仅供旧调用点赋值，构建器不再使用）。
-   * 注：调用点在 RuntimeConfigBuilder（作用域外），接线待 lead 安排。 */
-  dnsOverrideEnabled: boolean = true;
+  /** true 使用应用 DNS；false（默认）优先使用已启用的订阅 DNS，不关闭 DNS 接管。 */
+  dnsOverrideEnabled: boolean = false;
   /** TUN 开关（测速核 false）。 */
   tunEnabled: boolean = true;
-  /** 废弃（FlClash 无 dns.ipv6 强改；保留字段仅供旧调用点赋值，构建器不再使用）。 */
-  ipv6Enabled: boolean = true;
+  /** 鸿蒙双栈开关（默认 false）；fake IPv6 池必须与 VPN on-link /64 同源。 */
+  ipv6Enabled: boolean = false;
   /** TUN mtu（与 VpnExtensionAbility 同源）。 */
   mtu: number = 0;
   useSmart: boolean = false;
@@ -147,6 +148,8 @@ export class TunBoxGroupInfo {
  */
 export class TunBoxBaseData {
   config: Record<string, Object> = {} as Record<string, Object>;
+  /** 无 native 默认填充的 DNS；null 表示调用方只提供了原始 map。 */
+  profileDns: Record<string, Object> | null = null;
   digest: string = '';
   proxies: number = 0;
   proxyGroups: number = 0;
@@ -513,6 +516,11 @@ export class TunBoxProfileBuilder {
     }
     const data = new TunBoxBaseData();
     data.config = base.config;
+    if (input.profileYaml.trim().length > 0) {
+      // RawConfig 已填 redir-host/ipv6=false 等默认值，不能用它判断用户是否写过该键。
+      const source = await coreBridge.decodeYaml(input.profileYaml);
+      data.profileDns = mapOf(source['dns']) ?? {} as Record<string, Object>;
+    }
     data.digest = base.digest;
     data.proxies = base.proxies;
     data.proxyGroups = base.proxyGroups;
@@ -779,34 +787,80 @@ export class TunBoxProfileBuilder {
       raw['hosts'] = {} as Record<string, Object>;
     }
 
-    // 3.8 dns（FlClash task.dart:288-321）：三段合并
-    //     ① baseline（应用 DNS 按键集）仅在订阅 dns 未启用时进；
-    //     ② 用户 overrides 按键合并（恒进）；
-    //     ③ appendSystemDns 时 nameserver 尾部追加 system://（已含则不重加）。
-    //     mergeDnsOverride 按键覆盖，仅 fallback-filter 子表深合并。
-    //     FlClash 无 dns.ipv6 强改：ipv6 按三段合并后的值原样落内核。
-    let rawDns: Record<string, Object> = {};
+    // 3.8 DNS：恢复 0.8 的来源开关；用户覆盖仍最后按键应用。
     const baseDns = mapOf(raw['dns']);
-    if (baseDns !== null) {
-      TunBoxProfileBuilder.setAll(rawDns, baseDns);
-    }
+    const sourceDns = base.profileDns ?? baseDns;
     const isEnableDns = baseDns !== null && baseDns['enable'] === true;
     const overlayDns = mapOf(overlay['dns']);
-    if (overlayDns !== null && !isEnableDns) {
-      rawDns = TunBoxProfileBuilder.mergeDnsOverride(rawDns, overlayDns);
+    const useAppDns = overlayDns !== null && (input.dnsOverrideEnabled === true || !isEnableDns);
+    let rawDns: Record<string, Object> = {};
+    if (useAppDns && overlayDns !== null) {
+      TunBoxProfileBuilder.setAll(rawDns, overlayDns);
+      // 机场入口解析不能被公共 DNS 抢答；专用上游替换，不拼接公共列表。
+      if (isEnableDns && baseDns !== null) {
+        if (stringListOf(baseDns['proxy-server-nameserver']).length > 0) {
+          rawDns['proxy-server-nameserver'] = baseDns['proxy-server-nameserver'];
+        }
+        // 默认应用策略与机场策略按域名合并，同域名由机场值覆盖。
+        for (const key of ['nameserver-policy', 'proxy-server-nameserver-policy']) {
+          const policy = mapOf(baseDns[key]);
+          const inheritedPolicy = key === 'proxy-server-nameserver-policy'
+            && stringListOf(baseDns['proxy-server-nameserver']).length === 0
+            && stringListOf(rawDns['proxy-server-nameserver']).length > 0
+            ? mapOf(baseDns['nameserver-policy']) : null;
+          if (policy !== null || inheritedPolicy !== null) {
+            const merged: Record<string, Object> = {};
+            const appPolicy = mapOf(rawDns[key]);
+            if (appPolicy !== null) { TunBoxProfileBuilder.setAll(merged, appPolicy); }
+            // 应用首次引入专用 proxy resolver 时，保住原通用解析器的入口策略。
+            if (inheritedPolicy !== null) { TunBoxProfileBuilder.setAll(merged, inheritedPolicy); }
+            if (policy !== null) { TunBoxProfileBuilder.setAll(merged, policy); }
+            rawDns[key] = merged;
+          }
+        }
+      }
+    } else if (baseDns !== null) {
+      TunBoxProfileBuilder.setAll(rawDns, baseDns);
+      const authored = sourceDns !== null ? Object.keys(sourceDns) : [];
+      // 旧 ensureFakeIpForProfileDns：只补未声明的模式/IPv4 池/最小过滤表。
+      // 已声明的模式沿用 native 规范值，不能把默认填充的 redir-host 当用户选择。
+      if (isEnableDns && !authored.includes('enhanced-mode')) {
+        rawDns['enhanced-mode'] = 'fake-ip';
+        if (!authored.includes('fake-ip-range')) { rawDns['fake-ip-range'] = '198.18.0.1/16'; }
+        if (!authored.includes('fake-ip-filter')) {
+          rawDns['fake-ip-filter'] = ['*.lan', '*.local', 'localhost.ptlogin2.qq.com',
+            '+.msftconnecttest.com', '+.msftncsi.com'];
+        }
+      }
+      // native 的 ipv6=false 是默认值；仅原文显式 false 才代表用户关闭 DNS IPv6。
+      if (!authored.includes('ipv6')) { rawDns['ipv6'] = input.ipv6Enabled === true; }
     }
     const overridesDns = overrides !== null ? mapOf(overrides['dns']) : null;
     if (overridesDns !== null) {
       rawDns = TunBoxProfileBuilder.mergeDnsOverride(rawDns, overridesDns);
     }
-    raw['dns'] = rawDns;
-    applied.push('dns');
     if (input.appendSystemDns) {
       const nameserver = stringListOf(rawDns['nameserver']);
       if (!nameserver.includes('system://')) {
         rawDns['nameserver'] = [...nameserver, 'system://'];
       }
     }
+    // 与旧 enforceTunnelContract 相同的平台约束，只处理 map，不改任何解析上游。
+    const dnsMode = rawDns['enhanced-mode'];
+    const fake = typeof dnsMode === 'string' && dnsMode.toLowerCase() === 'fake-ip';
+    const dns6 = input.ipv6Enabled === true && fake && rawDns['ipv6'] !== false;
+    rawDns['ipv6'] = dns6;
+    if (dns6) {
+      rawDns['fake-ip-range6'] = 'fdfe:dcba:9876::/64';
+    } else {
+      const withoutPool: Record<string, Object> = {};
+      for (const key of Object.keys(rawDns)) {
+        if (key !== 'fake-ip-range6') { withoutPool[key] = rawDns[key]; }
+      }
+      rawDns = withoutPool;
+    }
+    raw['dns'] = rawDns;
+    applied.push('dns');
 
     // 3.8b ntp（FlClash task.dart:307-313）：仅 overrides 非空时按键合并进 raw.ntp。
     const overridesNtp = overrides !== null ? mapOf(overrides['ntp']) : null;

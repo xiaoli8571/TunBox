@@ -36,19 +36,13 @@ export struct TopNavBar {
    * （`TunBoxGeometry.scrollFadeEdge`）负责：边缘渐隐，没有接缝，也不会糊到静止内容。
    * 门禁 `verify-bottom-dock-immersive` 锁着「顶栏与三张页签页不得再出现 linearGradientBlur」。
    */
-  private static readonly TINT_TOP_LIGHT: number = 0.20;
-  private static readonly TINT_TOP_DARK: number = 0.12;
+  private static readonly TINT_TOP_LIGHT: number = 0.06;
+  private static readonly TINT_TOP_DARK: number = 0.04;
 
-  /**
-   * 染色 alpha 曲线：`A0 · (1 − smoothstep(t))`，t = 纵向位置 0..1。
-   *
-   * smoothstep 让**两端斜率都趋近 0**：顶部与状态栏同色无缝，底部与页面同色无缝，
-   * 落差均匀摊在整条顶栏上，眼睛读不到「一条边」。
-   */
   private tintAt(t: number): ResourceColor {
     const s: number = t * t * (3 - 2 * t);
-    const a: number = (ThemeService.isDark() ? TopNavBar.TINT_TOP_DARK : TopNavBar.TINT_TOP_LIGHT) * (1 - s);
-    return ThemeService.isDark() ? `rgba(24, 32, 48, ${a})` : `rgba(255, 255, 255, ${a})`;
+    const peak: number = ThemeService.isDark() ? TopNavBar.TINT_TOP_DARK : TopNavBar.TINT_TOP_LIGHT;
+    return TunBoxColors.headerBackdropAt(this.themeRevision, peak * (1 - s));
   }
 
   private tintStops(): Array<[ResourceColor, number]> {
@@ -133,6 +127,7 @@ export struct TopNavBar {
       .alignItems(VerticalAlign.Center)
     }
     .width('100%')
+    .constraintSize({ maxWidth: TunBoxGeometry.contentMaxWidth })
     // 2026-10-30 二修：顶栏从「实底一条」变成**浮层玻璃**。
     //  · 状态栏那段让白改用 padding（margin 只挪布局、画不到背景，玻璃就盖不住状态栏区）；
     //  · 高度 = 行高 + 让白，padding 让出同样的量，标题仍竖居中在 56vp 行里；

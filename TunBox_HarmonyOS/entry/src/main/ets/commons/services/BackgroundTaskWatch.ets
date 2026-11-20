@@ -75,6 +75,8 @@ export class ContinuousTaskVerdict {
   requireUserAction: boolean = false;
   /** 允许重挂时的最小退避时长（ms）；0 = 无需等待 */
   backoffMs: number = 0;
+  /** 取消原因是否指向 dataTransfer 低速率/无进度（重挂时优先尝试回退类型以避开同类限流） */
+  preferFallbackMode: boolean = false;
   /** 人类可读结论（仅用于日志，不参与判定） */
   summary: string = '';
 }
@@ -86,14 +88,49 @@ export class ContinuousTaskVerdict {
  * 又不至于让 VPN 隧道在无人看管时长时间失去"所有进程不被挂起"的保护。
  */
 export const REARM_BACKOFF_GENERAL_MS: number = 30000;
+/**
+ * dataTransfer 因低速率/无进度被系统取消后的退避时长（2 分钟）。
+ *
+ * VPN 隧道空闲时流量天然偏低，不可立即重申（遵守 Background Tasks Kit 规范），
+ * 但也不应永久关闭看门狗导致整个会话裸奔到被杀；拉长退避并优先尝试回退类型。
+ */
+export const REARM_BACKOFF_LOW_SPEED_MS: number = 120000;
 
 /**
- * 取消原因里属于「系统判定为类型不匹配 / 不合理使用」的一组。
+ * 是否为「dataTransfer 传输速率过低 / 未更新进度」导致的系统取消。
+ * 属于 VPN 空闲期常见降级，而非权限违规或非法借用音频/定位等类型。
+ */
+function isDataTransferLowSpeedCancel(reasonCode: number, detailedReasonCode: number): boolean {
+  const lowSpeedCancel = backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED;
+  if (typeof lowSpeedCancel === 'number' && reasonCode === lowSpeedCancel) {
+    return true;
+  }
+  if (detailedReasonCode <= 0 || typeof backgroundTaskManager.ContinuousTaskDetailedCancelReason === 'undefined') {
+    return false;
+  }
+  const detailLowSpeed = backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED;
+  const detailNotUpdate = backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_NOT_UPDATE;
+  return (typeof detailLowSpeed === 'number' && detailedReasonCode === detailLowSpeed)
+    || (typeof detailNotUpdate === 'number' && detailedReasonCode === detailNotUpdate);
+}
+
+/**
+ * 是否为「dataTransfer 传输速率过低」导致的系统暂停（任务仍在，待流量恢复或系统解冻）。
+ */
+function isDataTransferLowSpeedSuspend(reasonCode: number): boolean {
+  if (typeof backgroundTaskManager.ContinuousTaskSuspendReason === 'undefined') {
+    return false;
+  }
+  const lowSpeedSuspend = backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED;
+  return typeof lowSpeedSuspend === 'number' && reasonCode === lowSpeedSuspend;
+}
+
+/**
+ * 取消原因里属于「系统判定为类型不匹配 / 非法使用」的一组（排除低速率降级）。
  * 逐个列出 SDK `ContinuousTaskCancelReason` 的枚举名，不写裸数字。
  */
 function isMisuseCancelReason(reasonCode: number): boolean {
-  return reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED
-    || reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_AUDIO_PLAYBACK_NOT_USE_AVSESSION
+  return reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_AUDIO_PLAYBACK_NOT_USE_AVSESSION
     || reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_AUDIO_PLAYBACK_NOT_RUNNING
     || reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_AUDIO_RECORDING_NOT_RUNNING
     || reasonCode === backgroundTaskManager.ContinuousTaskCancelReason.SYSTEM_CANCEL_NOT_USE_LOCATION
@@ -103,7 +140,7 @@ function isMisuseCancelReason(reasonCode: number): boolean {
 }
 
 /**
- * 细分原因（API 26+ 的 `detailedReason`）里同样属于「不合理使用」的一组。
+ * 细分原因（API 26+ 的 `detailedReason`）里同样属于「非法/类型不匹配」的一组（排除低速率降级）。
  * 官方枚举：ContinuousTaskDetailedCancelReason。
  */
 function isMisuseDetailedReason(code: number): boolean {
@@ -111,9 +148,7 @@ function isMisuseDetailedReason(code: number): boolean {
   if (code <= 0 || typeof backgroundTaskManager.ContinuousTaskDetailedCancelReason === 'undefined') {
     return false;
   }
-  return code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_LOW_SPEED
-    || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_DATA_TRANSFER_NOT_UPDATE
-    || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_USE_ILLEGALLY
+  return code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_USE_ILLEGALLY
     || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_AUDIO_PLAYBACK_NOT_RUNNING
     || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_AUDIO_RECORDING_NOT_RUNNING
     || code === backgroundTaskManager.ContinuousTaskDetailedCancelReason.SYSTEM_CANCEL_NOT_USE_LOCATION
@@ -124,16 +159,11 @@ function isMisuseDetailedReason(code: number): boolean {
 }
 
 /**
- * 暂停原因里属于「系统判定为类型不匹配 / 不合理使用」的一组。
+ * 暂停原因里属于「系统判定为非法/未授权使用」的一组（排除 dataTransfer 空闲低速率暂停）。
  * 逐个列出 SDK `ContinuousTaskSuspendReason` 的枚举名。
- *
- * 注意 SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED(4)：它表示"申请的是 DATA_TRANSFER
- * 类型但实际传输速率过低"，正是本工程把隧道保活错挂成 dataTransfer 的直接证据 ——
- * VPN 隧道空闲时用户流量本就低，会稳定踩中这个触发条件。
  */
 function isMisuseSuspendReason(reasonCode: number): boolean {
-  return reasonCode === backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_DATA_TRANSFER_LOW_SPEED
-    || reasonCode === backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_AUDIO_PLAYBACK_NOT_USE_AVSESSION
+  return reasonCode === backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_AUDIO_PLAYBACK_NOT_USE_AVSESSION
     || reasonCode === backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_AUDIO_PLAYBACK_NOT_RUNNING
     || reasonCode === backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_AUDIO_RECORDING_NOT_RUNNING
     || reasonCode === backgroundTaskManager.ContinuousTaskSuspendReason.SYSTEM_SUSPEND_LOCATION_NOT_USED
@@ -169,8 +199,19 @@ export function classifyCancelReason(reasonCode: number, detailedReasonCode: num
     verdict.summary = 'user stopped the continuous task (notification removed / user cancel)';
     return verdict;
   }
+  if (isDataTransferLowSpeedCancel(reasonCode, detailedReasonCode)) {
+    // 空闲低速率/无进度取消：严禁立即重申（2 分钟退避 + 有限重试预算），
+    // 且保持看门狗运行并在重挂时优先尝试回退类型，避免永久失去后台防挂起保护。
+    verdict.category = ContinuousTaskEventCategory.SYSTEM_GENERAL;
+    verdict.allowAutoRearm = true;
+    verdict.requireUserAction = false;
+    verdict.preferFallbackMode = true;
+    verdict.backoffMs = REARM_BACKOFF_LOW_SPEED_MS;
+    verdict.summary = 'system canceled dataTransfer due to low speed / no progress; backed-off re-arm allowed';
+    return verdict;
+  }
   if (isMisuseCancelReason(reasonCode) || isMisuseDetailedReason(detailedReasonCode)) {
-    // 系统判定为类型不匹配 / 不合理使用：规范明文"不得立即再次申请"。
+    // 系统判定为类型不匹配 / 非法使用：规范明文"不得立即再次申请"。
     verdict.category = ContinuousTaskEventCategory.SYSTEM_MISUSE;
     verdict.allowAutoRearm = false;
     verdict.requireUserAction = true;
@@ -203,6 +244,16 @@ export function classifySuspendReason(reasonCode: number, suspended: boolean): C
     verdict.requireUserAction = false;
     verdict.backoffMs = 0;
     verdict.summary = 'continuous task resumed (suspendState=false); task still alive, restore accounting only';
+    return verdict;
+  }
+  if (isDataTransferLowSpeedSuspend(reasonCode)) {
+    // dataTransfer 空闲低速率暂停：任务仍在，不重复申请，但不得关闭看门狗或永久抑制 ——
+    // 保留看门狗以在系统恢复时接回进度心跳，若随后演变为取消则按退避窗口处理。
+    verdict.category = ContinuousTaskEventCategory.SYSTEM_GENERAL;
+    verdict.allowAutoRearm = false;
+    verdict.requireUserAction = false;
+    verdict.backoffMs = REARM_BACKOFF_LOW_SPEED_MS;
+    verdict.summary = 'system suspended dataTransfer due to low speed; keep watchdog alive to observe resume';
     return verdict;
   }
   if (isMisuseSuspendReason(reasonCode)) {
@@ -271,6 +322,16 @@ export class BackgroundTaskWatch {
     } catch (e) {
       AppLogger.warn(TAG,
         `continuousTaskSuspend listener registration failed: ${AppLogger.errText(e)}`);
+    }
+    try {
+      backgroundTaskManager.on('continuousTaskActive',
+        (info: backgroundTaskManager.ContinuousTaskActiveInfo): void => {
+          BackgroundTaskWatch.dispatchActive(info);
+        });
+      AppLogger.info(TAG, 'continuousTaskActive listener registered');
+    } catch (e) {
+      AppLogger.warn(TAG,
+        `continuousTaskActive listener registration failed: ${AppLogger.errText(e)}`);
     }
   }
 
@@ -357,6 +418,29 @@ export class BackgroundTaskWatch {
         l.onContinuousTaskSuspend(id, verdict, suspended);
       } catch (e) {
         AppLogger.warn(TAG, `suspend listener threw: ${AppLogger.errText(e)}`);
+      }
+    }
+  }
+
+  /**
+   * 激活事件分发（API 20+ continuousTaskActive）：系统将暂停中的长时任务重新激活时
+   * 触发。立刻恢复守护记账与实况窗通知时钟，不等 30s 看门狗自检。
+   */
+  private static dispatchActive(info: backgroundTaskManager.ContinuousTaskActiveInfo): void {
+    const id: number = (info !== undefined && info !== null && typeof info.id === 'number') ? info.id : -1;
+    if (!UiGuardian.ownsTaskEvent(id)) {
+      AppLogger.info(TAG, `ignore activation of an unowned task: id=${id}`);
+      return;
+    }
+    const verdict: ContinuousTaskVerdict = classifySuspendReason(0, false);
+    UiGuardian.noteExternalSuspend(verdict, false);
+    AppLogger.info(TAG,
+      `continuous task activated: id=${id} category=${verdict.category} summary=${verdict.summary}`);
+    for (const l of BackgroundTaskWatch.listeners.slice()) {
+      try {
+        l.onContinuousTaskSuspend(id, verdict, false);
+      } catch (e) {
+        AppLogger.warn(TAG, `active listener threw: ${AppLogger.errText(e)}`);
       }
     }
   }

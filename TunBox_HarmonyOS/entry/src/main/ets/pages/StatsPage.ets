@@ -105,27 +105,55 @@ struct StatsRateChart {
     return closed;
   }
 
+  private hasTraffic(): boolean {
+    for (let i = 0; i < this.downPoints.length; i++) {
+      if (this.downPoints[i] > 0) { return true; }
+    }
+    for (let i = 0; i < this.upPoints.length; i++) {
+      if (this.upPoints[i] > 0) { return true; }
+    }
+    return false;
+  }
+
   build() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      Polygon({ width: this.chartW, height: this.chartH })
-        .points(this.areaOf(this.downPoints))
-        .fill(TunBoxColors.primaryLightFor(this.themeRevision))
-        .stroke(Color.Transparent)
-        .strokeWidth(0)
+    Stack({ alignContent: Alignment.Center }) {
       Polyline({ width: this.chartW, height: this.chartH })
-        .points(this.toPoints(this.downPoints))
-        .stroke(TunBoxColors.primaryFor(this.themeRevision))
-        .strokeWidth(2.2)
-        .strokeLineCap(LineCapStyle.Round)
-        .strokeLineJoin(LineJoinStyle.Round)
+        .points([[0, this.chartH * 0.5], [this.chartW, this.chartH * 0.5]])
+        .stroke(TunBoxColors.cardBorder(this.themeRevision))
+        .strokeWidth(0.8)
+        .strokeDashArray([4, 4])
         .fill(Color.Transparent)
-      Polyline({ width: this.chartW, height: this.chartH })
-        .points(this.toPoints(this.upPoints))
-        .stroke(TunBoxColors.success)
-        .strokeWidth(2)
-        .strokeLineCap(LineCapStyle.Round)
-        .strokeLineJoin(LineJoinStyle.Round)
-        .fill(Color.Transparent)
+
+      if (this.hasTraffic()) {
+        Polygon({ width: this.chartW, height: this.chartH })
+          .points(this.areaOf(this.downPoints))
+          .fill(TunBoxColors.primaryLightFor(this.themeRevision))
+          .stroke(Color.Transparent)
+          .strokeWidth(0)
+        Polyline({ width: this.chartW, height: this.chartH })
+          .points(this.toPoints(this.downPoints))
+          .stroke(TunBoxColors.primaryFor(this.themeRevision))
+          .strokeWidth(2.2)
+          .strokeLineCap(LineCapStyle.Round)
+          .strokeLineJoin(LineJoinStyle.Round)
+          .fill(Color.Transparent)
+        Polyline({ width: this.chartW, height: this.chartH })
+          .points(this.toPoints(this.upPoints))
+          .stroke(TunBoxColors.success)
+          .strokeWidth(2)
+          .strokeLineCap(LineCapStyle.Round)
+          .strokeLineJoin(LineJoinStyle.Round)
+          .fill(Color.Transparent)
+      } else {
+        Polyline({ width: this.chartW, height: this.chartH })
+          .points([[0, this.chartH - 4], [this.chartW, this.chartH - 4]])
+          .stroke(TunBoxColors.cardBorder(this.themeRevision))
+          .strokeWidth(1)
+          .fill(Color.Transparent)
+        Text('暂无实时速率')
+          .fontSize(11)
+          .fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
+      }
     }
     .width('100%')
     .height(this.chartH)
@@ -854,7 +882,9 @@ export struct StatsPage {
         .width('100%')
         .alignItems(VerticalAlign.Center)
         Text(this.memoryText)
-          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+          .fontSize(20).fontWeight(FontWeight.Bold)
+          .fontColor(this.memoryText === '--'
+            ? TunBoxTextColors.mutedFor(this.themeRevision) : TunBoxTextColors.primaryFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -875,7 +905,9 @@ export struct StatsPage {
         .width('100%')
         .alignItems(VerticalAlign.Center)
         Text(this.uptimeText)
-          .fontSize(20).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+          .fontSize(20).fontWeight(FontWeight.Bold)
+          .fontColor(this.uptimeText === '--:--:--'
+            ? TunBoxTextColors.mutedFor(this.themeRevision) : TunBoxTextColors.primaryFor(this.themeRevision))
           .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
           .width('100%')
       }
@@ -1070,26 +1102,37 @@ export struct StatsPage {
     // 2026-10-30：顶栏改成浮层玻璃（内容从它下面滚过去时渐变模糊，而不是被硬切），
     // 所以根节点从 Column 换成 Stack：Scroll 铺满、顶栏最后画（在最上层）。
     Stack({ alignContent: Alignment.Top }) {
-      Scroll() {
-        Column({ space: 14 }) {
-          this.SpeedCard()
-          this.GridCard()
-          this.IpCard()
-          this.ConnectivityCard()
+      Column() {
+        Blank().height(Math.max(36, TunBoxGeometry.headerReserve() - 36))
+        Scroll() {
+          Column() {
+          Column({ space: 14 }) {
+            this.SpeedCard()
+            this.GridCard()
+            this.IpCard()
+            this.ConnectivityCard()
+          }
+          .width('100%')
+          .constraintSize({ maxWidth: TunBoxGeometry.contentMaxWidth })
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Center)
+          .padding({
+            left: TunBoxGeometry.pagePadding,
+            right: TunBoxGeometry.pagePadding,
+            top: TunBoxGeometry.scrollFadeEdge,
+            bottom: TunBoxGeometry.dockClearance()
+          })
         }
+        .edgeEffect(EdgeEffect.Spring)
+        .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
         .width('100%')
-        .padding({
-          left: TunBoxGeometry.pagePadding,
-          right: TunBoxGeometry.pagePadding,
-          top: TunBoxGeometry.headerReserve(),
-          bottom: TunBoxGeometry.dockClearance()
-        })
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+        .align(Alignment.Top)
       }
-      .edgeEffect(EdgeEffect.Spring)
       .width('100%')
       .height('100%')
-      .scrollBar(BarState.Off)
-      .align(Alignment.Top)
 
       TopNavBar({ title: '数据' })
     }

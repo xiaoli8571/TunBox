@@ -20,12 +20,11 @@
 import { AppLogger } from '../utils/AppLogger';
 import { ConnState, ConnectionOrchestrator } from './ConnectionOrchestrator';
 import { LatencyLiveView } from './LatencyLiveView';
-import { LatencyContext } from './LatencyState';
+import { LatencyContext, LatencyProgress } from './LatencyState';
 import { LatencyStoreBridge } from './LatencyStoreBridge';
 import { IsolatedLatencyCore, IsolatedLatencyPorts } from './IsolatedLatencyCore';
 import { CoreCatalog } from '../tunbox/CoreCatalog';
 import { DelayTarget } from '../tunbox/TunBoxDelay';
-import { LatencyEngine, LatencyProgress } from './LatencyEngine';
 import { ClashApiService } from './ClashApiService';
 import { AppSettings } from '../models/AppSettings';
 import { ProxyNode } from '../models/ProxyNode';
@@ -45,7 +44,7 @@ export class BackgroundLatencyService {
   private static generation: number = 0;
 
   static isRunning(): boolean {
-    return BackgroundLatencyService.preparing || TunBoxLatencyService.isRunning() || LatencyEngine.isRunning();
+    return BackgroundLatencyService.preparing || TunBoxLatencyService.isRunning();
   }
 
   static cancelCurrent(): void {
@@ -159,16 +158,6 @@ export class BackgroundLatencyService {
 
   private static async runWithCatalog(api: ClashApiService, names: string[], url: string,
     expected: string, progress: LatencyProgress): Promise<void> {
-    // 跨引擎互斥（2026-10-24 P1 修复）：手动组测直调本方法（不走 execute 的双检），
-    // 与 LatencyEngine 批次重叠时两引擎合计 64 在途打同一个内核 API（栈内并发 ~8），
-    // 互相制造假超时 + runId 清标交叉。TunBox 自身的旧批允许被新批抢占（start 内
-    // cancel），但**另一引擎**在跑时必须让行。
-    if (LatencyEngine.isRunning()) {
-      progress.cancelled = names.length;
-      progress.running = false;
-      AppLogger.info(TAG, 'kernel group test skipped: LatencyEngine batch in flight');
-      return;
-    }
     const profileId = ProfileRepository.currentId();
     const revision = ProfileRepository.revisionOf(profileId);
     const session = TunBoxLatencyService.start(api, names, url, 'manual', null, expected,
@@ -197,7 +186,7 @@ export class BackgroundLatencyService {
   private static async execute(context: Context, subscriptionId: string | null,
     onChannelReady: (() => void) | null = null, groupName: string = '',
     names: string[] | null = null, source: string = 'manual'): Promise<LatencyProgress | null> {
-    if (BackgroundLatencyService.preparing || LatencyEngine.isRunning() || TunBoxLatencyService.isRunning()) {
+    if (BackgroundLatencyService.preparing || TunBoxLatencyService.isRunning()) {
       return null;
     }
     BackgroundLatencyService.preparing = true;
@@ -275,7 +264,7 @@ export class BackgroundLatencyService {
         // FlClash 空 expected-status 范围、provider 成员同走 /proxies（无 healthcheck 特例）。
         targets.push(new DelayTarget(target.name, target.url));
       }
-      if (LatencyEngine.isRunning() || TunBoxLatencyService.isRunning()) { return null; }
+      if (TunBoxLatencyService.isRunning()) { return null; }
       if (onChannelReady !== null) { onChannelReady(); }
       AppLogger.info(TAG, `delay dispatch: targets=${targets.length} isolated=${isolated} prepareMs=${Date.now() - requestedAt}`);
       const scope = new LatencyContext(profileId, revision, url);

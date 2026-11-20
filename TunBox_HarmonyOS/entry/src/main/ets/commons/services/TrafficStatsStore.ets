@@ -106,6 +106,20 @@ export class TrafficStatsStore {
   private static accountingToken: number = -1;
   /** 是否已注册「内核停止前收尾」钩子 */
   private static hookRegistered: boolean = false;
+  /** 应用退后台时降频记账（累计字节仍按内核计数器做差，零漏记；显著减少后台定时开销）。 */
+  private static appInBackground: boolean = false;
+  private static lastBgAccountingAt: number = 0;
+  private static readonly BG_ACCOUNTING_INTERVAL_MS: number = 15000;
+
+  static setAppBackground(inBackground: boolean): void {
+    TrafficStatsStore.appInBackground = inBackground;
+    if (!inBackground) {
+      TrafficStatsStore.lastBgAccountingAt = 0;
+      if (TrafficStatsStore.accountingToken >= 0) {
+        TrafficStatsStore.accountingTick(true);
+      }
+    }
+  }
 
   // ── 记账基线（落盘，跨进程 / 跨后台与内核累计计数器对齐）──
   /** 基线所属的内核隧道实例（orchestrator.startedAt）；<=0 = 尚未建立 */
@@ -170,7 +184,15 @@ export class TrafficStatsStore {
    * - 轮询失败：`orch.coreTotalUp` 保持上次值（见 ClashApiService.traffic 返回 null 的约定），
    *   不会把"探测失败"误判成"归零"，避免随后一次成功把整个累计值当增量补记（虚高）。
    */
-  private static accountingTick(): void {
+  private static accountingTick(forced: boolean = false): void {
+    if (!forced && TrafficStatsStore.appInBackground) {
+      const now: number = Date.now();
+      if (TrafficStatsStore.lastBgAccountingAt > 0
+        && now - TrafficStatsStore.lastBgAccountingAt < TrafficStatsStore.BG_ACCOUNTING_INTERVAL_MS) {
+        return;
+      }
+      TrafficStatsStore.lastBgAccountingAt = now;
+    }
     const orch: ConnectionOrchestrator = ConnectionOrchestrator.instance();
     const inst: number = orch.startedAt;
     const upNow: number = orch.coreTotalUp;
@@ -233,7 +255,7 @@ export class TrafficStatsStore {
    * 调用方进程仍存活即可完成写盘。
    */
   static flushNow(): void {
-    TrafficStatsStore.accountingTick();
+    TrafficStatsStore.accountingTick(true);
     TrafficStatsStore.accountingDirty = true;
     TrafficStatsStore.lastPersistAt = Date.now();
     TrafficStatsStore.persist(true).catch((): void => {});

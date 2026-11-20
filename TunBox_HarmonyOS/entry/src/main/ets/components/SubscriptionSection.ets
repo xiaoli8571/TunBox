@@ -42,6 +42,7 @@ import { CoreGroup, CoreCatalogModel } from '../commons/tunbox/CoreCatalog';
 import { LatencyContext, LatencyRecord, LatencyState } from '../commons/services/LatencyState';
 import { ProxyPanelMembers } from '../commons/tunbox/ProxyPanelMembers';
 import { AppLogger } from '../commons/utils/AppLogger';
+import { ArrayDataSource } from '../commons/utils/ArrayDataSource';
 
 const TAG = 'SubscriptionSection';
 
@@ -497,42 +498,48 @@ function withExportSkeleton(profileYaml: string): string {  if (profileYaml.incl
 
 @Component
 export struct SubscriptionSection {
-  @StorageLink('theme_revision') themeRevision: number = 0;
+  @StorageLink('theme_revision') @Watch('syncPanelRowsSource') themeRevision: number = 0;
   @StorageLink('smart_model_seq') @Watch('refreshSmartEntry') smartModelSeq: number = 0;
   @State private smartVisible: boolean = false;
   @State private smartSelected: boolean = false;
   private smartRefreshRevision: number = 0;
-  @State private subs: Subscription[] = [];
-  @State private showPanel: boolean = false;
-  @State private panelSubId: string = '';
-  @State private selectedGroup: string = '';
+  @State @Watch('syncPanelRowsSource') private subs: Subscription[] = [];
+  @State @Watch('syncPanelRowsSource') private showPanel: boolean = false;
+  @State @Watch('syncPanelRowsSource') private panelSubId: string = '';
+  @State @Watch('syncPanelRowsSource') private selectedGroup: string = '';
   @State private currentProfileId: string = '';
-  @State private currentNodeName: string = '';
-  @State private coreRevision: number = 0;
-  @State private latencyRevision: number = 0;
+  @State @Watch('syncPanelRowsSource') private currentNodeName: string = '';
+  @State @Watch('syncPanelRowsSource') private coreRevision: number = 0;
+  @State @Watch('syncPanelRowsSource') private latencyRevision: number = 0;
   @State private refreshingIds: string[] = [];
   @State private testingIds: string[] = [];
-  @State private sortByDelay: boolean = true;
+  @State @Watch('syncPanelRowsSource') private sortByDelay: boolean = true;
   /**
    * 节点列表排布（2026-11-03 用户要求：「按延迟」左边加一个双列 / 单列切换按钮）。
    * false = 单列（沿用原来一行一节点），true = 双列紧凑单元格（一行两个）。
    * 与 `sortByDelay` 一样是面板内的即时状态，不进 AppSettings。
    */
-  @State private gridMode: boolean = false;
+  @State @Watch('syncPanelRowsSource') private gridMode: boolean = false;
+  private gridToggledByUser: boolean = false;
   @State private selectingMember: string = '';
   /**
    * 「长按删除节点」底部弹层（2026-10-29 用户要求：“长按任意节点底部弹删除框，
    * 可以多选也可以单独删除”）。
    * 长按时只勾中该节点（= 单独删除），再点其它行就变成多选，最后一次性提交。
    */
-  @State private deleteSheetOn: boolean = false;
-  @State private deleteSheetIds: string[] = [];
+  @State @Watch('syncPanelRowsSource') private deleteSheetOn: boolean = false;
+  @State @Watch('syncPanelRowsSource') private deleteSheetIds: string[] = [];
   /**
    * 节点集合变更计数。
    * 真删后 `service.nodes` 是内部数组变更，只调 `reload()` 拿到的是「同内容新数组」，
    * ForEach 的 key 拼了它才能判定「这一行真的没了」——否则删完列表还看得见。
    */
-  @State private nodeRevision: number = 0;
+  @State @Watch('syncPanelRowsSource') private nodeRevision: number = 0;
+  private panelRowsSource: ArrayDataSource<ProxyNode[]> = new ArrayDataSource<ProxyNode[]>();
+
+  private syncPanelRowsSource(): void {
+    this.panelRowsSource.replaceAll(this.showPanel ? this.panelNodeRows() : []);
+  }
   /**
    * 面板顶部「♻️ 自动选择」入口（2026-10-29 用户口径：
    * **每个订阅展开后都要有自己的自动选择行**）。
@@ -560,8 +567,6 @@ export struct SubscriptionSection {
    */
   /** 状态栏高度（vp）：全屏覆盖层内容要从状态栏之下起排 */
   @State private statusBarH: number = 24;
-  /** 冷启动补重载的定时器句柄（aboutToDisappear 里统一取消） */
-  private reloadTimers: number[] = [];
 
   // ── 长按拖动排序（2026-10-30 用户要求：长按订阅可以拖动排序）──
   /** 正在拖动的订阅 id（'' = 未拖动）；同时用作「是否处于拖动中」的总闸门 */
@@ -711,19 +716,17 @@ export struct SubscriptionSection {
     this.reload();
     this.syncCoreCatalog();
     this.measureStatusBar();
-    if (this.subs.length === 0) {
-      // 冷启动时订阅 hydrate 可能还没完成：补两次重载。句柄要留着 —— 组件在这 1.6s 内
-      // 被销毁（切走页签前的重建）时必须取消，否则 reload() 会跑在已销毁的组件上。
-      this.reloadTimers.push(setTimeout((): void => { this.reload(); }, 600));
-      this.reloadTimers.push(setTimeout((): void => { this.reload(); }, 1600));
-    }
+    // 复用订阅服务的初始化 Promise，数据一就绪就刷新，不猜测 600/1600ms 等待窗口。
+    this.service.init(getContext(this) as Context).then((): void => {
+      if (!this.nodeSetBound) { return; }
+      this.reload();
+      this.syncCoreCatalog();
+    }).catch((e: Object): void => {
+      AppLogger.warn(TAG, `subscription initialization failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   aboutToDisappear(): void {
-    for (const id of this.reloadTimers) {
-      clearTimeout(id);
-    }
-    this.reloadTimers = [];
     this.finishAgeKey('');
     this.ageKeyDialog.close();
     if (this.latencyBound) {
@@ -782,6 +785,7 @@ export struct SubscriptionSection {
     // 偏好必须从磁盘读：本组件此前从未 load 过 AppSettings，
     // 导致「选完节点→重进面板」时 preferredNodeName 恒为空 → 勾选丢失（真机复现）。
     SettingsService.load().then((loaded: AppSettings): void => {
+      if (!this.nodeSetBound) { return; }
       this.settings = loaded;
       this.sortByDelay = loaded.nodeListSortMode !== 'default';
       // 间隔是全局设置（2026-10-29）：跟着 settings 一起刷新，弹窗打开时就能看到真值
@@ -1080,8 +1084,13 @@ export struct SubscriptionSection {
     for (let i = 0; i < row.length; i++) {
       ids += `${row[i].id}:${this.isDeleteChecked(row[i].id)},`;
     }
+    const act: string = row.map((n: ProxyNode): string => this.isActiveNode(n) ? '1' : '0').join('');
+    const del: string = this.deleteSheetOn
+      ? row.map((n: ProxyNode): string => this.isDeleteChecked(n.id) ? '1' : '0').join('')
+      : '';
     return `${ids}|${this.gridMode ? 'g' : 'l'}|${this.selectedGroup}|${this.latencyRevision}`
-      + `|${this.coreRevision}|${this.sortByDelay}|${this.nodeRevision}|${this.deleteSheetOn}`;
+      + `|${this.coreRevision}|${this.sortByDelay}|${this.nodeRevision}|${this.deleteSheetOn}`
+      + `|${act}|${del}|${this.themeRevision}`;
   }
 
   /**
@@ -1963,12 +1972,13 @@ export struct SubscriptionSection {
   CardAction(icon: Resource, label: string, busyRef: () => boolean, onTap: () => void) {
     Stack({ alignContent: Alignment.Center }) {
       if (busyRef()) {
-        LoadingProgress().width(18).height(18).color(TunBoxColors.primaryFor(this.themeRevision))
+        LoadingProgress().width(16).height(16).color(TunBoxColors.primaryFor(this.themeRevision))
       } else {
-        Image(icon).width(18).height(18).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+        Image(icon).width(16).height(16).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
+          .opacity(0.78)
       }
     }
-    .width(40).height(40)
+    .width(34).height(34)
     .borderRadius(TunBoxGeometry.pillRadius)
     .flexShrink(0)
     .accessibilityText(label)
@@ -1980,30 +1990,28 @@ export struct SubscriptionSection {
 
   @Builder
   SubCard(sub: Subscription, tapToClose: boolean) {
-    Column({ space: 8 }) {
-      Row({ space: 8 }) {
-        Stack({ alignContent: Alignment.Center }) {
-          Image($r('app.media.ic_nodes')).width(18).height(18).fillColor(TunBoxColors.primaryFor(this.themeRevision))
-        }
-        .width(32).height(32)
-        .borderRadius(8)
-        .backgroundColor(TunBoxColors.primaryLightFor(this.themeRevision))
-
-        Column({ space: 2 }) {
+    Column({ space: 10 }) {
+      Row({ space: 6 }) {
+        Column({ space: 3 }) {
           Row({ space: 6 }) {
+            if (sub.id === this.currentProfileId) {
+              Circle({ width: 6, height: 6 })
+                .fill(TunBoxColors.success)
+                .flexShrink(0)
+            }
             Text(sub.name.length > 0 ? sub.name : '未命名订阅')
-              .fontSize(14).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+              .fontSize(15).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
               .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
             if (sub.id === this.currentProfileId) {
               Text('使用中')
-                .fontSize(10).fontWeight(FontWeight.Bold).fontColor(TunBoxTextColors.tagTextGreen)
-                .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                .fontSize(10).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.tagTextGreen)
+                .padding({ left: 7, right: 7, top: 2, bottom: 2 })
                 .borderRadius(TunBoxGeometry.pillRadius)
                 .backgroundColor(TunBoxTextColors.tagBgGreen)
                 .flexShrink(0)
             }
-          }.width('100%')
+          }.width('100%').alignItems(VerticalAlign.Center)
           Text(this.nodeCountText(sub).length > 0
             ? `${this.updateText(sub)} · ${this.nodeCountText(sub)}`
             : this.updateText(sub))
@@ -2014,28 +2022,31 @@ export struct SubscriptionSection {
         .layoutWeight(1)
         .alignItems(HorizontalAlign.Start)
 
-        // 顺序（2026-10-28 用户定稿）：测速 → 刷新 → 设置
-        this.CardAction($r('app.media.ic_bolt'), '订阅测速', (): boolean => this.isTestingSub(sub.id),
-          (): void => {
-            this.testSub(sub.id, sub.name);
+        // 顺序（2026-10-28 用户定稿）：测速 → 刷新 → 设置（轻量收紧）
+        Row({ space: 0 }) {
+          this.CardAction($r('app.media.ic_bolt'), '订阅测速', (): boolean => this.isTestingSub(sub.id),
+            (): void => {
+              this.testSub(sub.id, sub.name);
+            })
+          this.CardAction($r('app.media.ic_refresh'), '刷新订阅', (): boolean => this.isRefreshingSub(sub.id),
+            (): void => {
+              this.refreshOne(sub);
+            })
+          this.CardAction($r('app.media.ic_tune'), '编辑订阅', (): boolean => false, (): void => {
+            this.openEdit(sub);
           })
-        this.CardAction($r('app.media.ic_refresh'), '刷新订阅', (): boolean => this.isRefreshingSub(sub.id),
-          (): void => {
-            this.refreshOne(sub);
-          })
-        this.CardAction($r('app.media.ic_tune'), '编辑订阅', (): boolean => false, (): void => {
-          this.openEdit(sub);
-        })
+        }
+        .alignItems(VerticalAlign.Center)
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
       Row() {
-        Text(`↑ ${this.upText(sub)}`)
-          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentBlueFor(this.themeRevision))
-          .maxLines(1)
-        Text(`  ↓ ${this.downText(sub)}`)
-          .fontSize(12).fontWeight(FontWeight.Medium).fontColor(TunBoxTextColors.accentGreen)
+        Text(`↑ ${this.upText(sub)}  ↓ ${this.downText(sub)}`)
+          .fontSize(11).fontWeight(FontWeight.Medium)
+          .fontColor(this.upText(sub) === '--' && this.downText(sub) === '--'
+            ? TunBoxTextColors.mutedFor(this.themeRevision)
+            : TunBoxTextColors.secondaryFor(this.themeRevision))
           .maxLines(1)
         Text(`  / ${this.totalText(sub)}`)
           .fontSize(11).fontColor(TunBoxTextColors.mutedFor(this.themeRevision))
@@ -2052,33 +2063,34 @@ export struct SubscriptionSection {
       Stack({ alignContent: Alignment.Start }) {
         Row()
           .width('100%')
-          .height(6)
-          .borderRadius(3)
+          .height(4)
+          .borderRadius(2)
           .backgroundColor(TunBoxColors.controlTrack(this.themeRevision))
+          .opacity(this.usageRatio(sub) >= 0 ? 1 : 0.45)
         if (this.usageRatio(sub) >= 0) {
           Row()
             .width(`${Math.max(2, Math.round(this.usageRatio(sub) * 100))}%`)
-            .height(6)
-            .borderRadius(3)
-            .linearGradient({
-              angle: 90,
-              colors: [[TunBoxColors.primaryFor(this.themeRevision), 0.0], [TunBoxColors.success, 1.0]]
-            })
+            .height(4)
+            .borderRadius(2)
+            .backgroundColor(TunBoxColors.primaryFor(this.themeRevision))
+            .opacity(0.82)
         }
       }
       .width('100%')
-      .height(6)
+      .height(4)
       .clip(true)
     }
     .width(tapToClose ? '94%' : '100%')
     .margin({ left: tapToClose ? '3%' : 0, right: tapToClose ? '3%' : 0 })
-    .padding(14)
+    .padding({ left: 16, right: 16, top: 14, bottom: 14 })
     .alignItems(HorizontalAlign.Start)
     .borderRadius(TunBoxGeometry.cardRadiusSmall)
     .backgroundColor(TunBoxColors.surfaceCard(this.themeRevision))
     .border({
-      width: sub.id === this.currentProfileId ? 1.5 : 1,
-      color: sub.id === this.currentProfileId ? TunBoxColors.primaryFor(this.themeRevision) : TunBoxColors.cardBorder(this.themeRevision)
+      width: 1,
+      color: sub.id === this.currentProfileId
+        ? TunBoxColors.activeSubBorderFor(this.themeRevision)
+        : TunBoxColors.cardBorder(this.themeRevision)
     })
     .clickEffect(TunBoxMotion.pressCard())
     .onClick((): void => {
@@ -2446,12 +2458,74 @@ export struct SubscriptionSection {
     Column({ space: 0 }) {
       Column({ space: 10 }) {
         if (this.panelSub() !== null) {
-          // 用带忙碌态的 key 包一层 ForEach：@Builder 的按值传参不会随状态刷新，
-          // 展开时若正好在测速/刷新，卡片会被「定格」在转圈状态（见 CardAction 注释）。
           ForEach([this.panelSub() as Subscription], (sub: Subscription): void => {
-            this.SubCard(sub, true)
-          }, (sub: Subscription): string => `${sub.id}|${this.currentNodeName}`
-            + `|${sub.uploadBytes}|${sub.downloadBytes}|${this.refreshingIds.join(',')}|${this.testingIds.join(',')}`)
+            Row({ space: 10 }) {
+              Column({ space: 3 }) {
+                Row({ space: 6 }) {
+                  if (sub.id === this.currentProfileId) {
+                    Circle({ width: 7, height: 7 }).fill(TunBoxColors.success).flexShrink(0)
+                  }
+                  Text(sub.name.length > 0 ? sub.name : '未命名订阅')
+                    .fontSize(18).fontWeight(FontWeight.Bold)
+                    .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
+                    .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .layoutWeight(1)
+                }.width('100%').alignItems(VerticalAlign.Center)
+                Text(this.nodeCountText(sub).length > 0
+                  ? `${this.nodeCountText(sub)} · ${this.updateText(sub)}`
+                  : this.updateText(sub))
+                  .fontSize(12).fontColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+                  .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Start)
+              .onClick((): void => { this.closePanel(); })
+
+              Row({ space: 6 }) {
+                Stack({ alignContent: Alignment.Center }) {
+                  if (this.isTestingSub(sub.id)) {
+                    LoadingProgress().width(16).height(16).color(TunBoxColors.primaryFor(this.themeRevision))
+                  } else {
+                    Image($r('app.media.ic_bolt')).width(16).height(16).fillColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+                  }
+                }
+                .width(34).height(34).borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
+                .accessibilityText('订阅测速')
+                .onClick((): void => { this.testSub(sub.id, sub.name); })
+
+                Stack({ alignContent: Alignment.Center }) {
+                  if (this.isRefreshingSub(sub.id)) {
+                    LoadingProgress().width(16).height(16).color(TunBoxColors.primaryFor(this.themeRevision))
+                  } else {
+                    Image($r('app.media.ic_refresh')).width(16).height(16).fillColor(TunBoxTextColors.secondaryFor(this.themeRevision))
+                  }
+                }
+                .width(34).height(34).borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
+                .accessibilityText('刷新订阅')
+                .onClick((): void => { this.refreshOne(sub); })
+
+                Stack({ alignContent: Alignment.Center }) {
+                  Image($r('app.media.ic_close')).width(16).height(16).fillColor(TunBoxTextColors.primaryFor(this.themeRevision))
+                }
+                .width(34).height(34).borderRadius(TunBoxGeometry.pillRadius)
+                .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
+                .accessibilityText('关闭面板')
+                .onClick((): void => {
+                  if (this.deleteSheetOn) {
+                    this.closeDeleteSheet();
+                    return;
+                  }
+                  this.closePanel();
+                })
+              }.alignItems(VerticalAlign.Center)
+            }
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 6, bottom: 2 })
+            .alignItems(VerticalAlign.Center)
+          }, (sub: Subscription): string => `${sub.id}|${this.currentProfileId}|${this.currentNodeName}`
+            + `|${this.refreshingIds.join(',')}|${this.testingIds.join(',')}`)
         }
 
         // 分组 chips + 排序方式同一行（分组左、排序右；分组多了左侧横向滚动）
@@ -2464,7 +2538,7 @@ export struct SubscriptionSection {
                 }, (g: ProxyGroup) => `${g.subscriptionId}|${g.name}`)
               }
             }
-            .padding({ left: 24, right: 8 })
+            .padding({ left: 20, right: 8 })
           }
           .scrollable(ScrollDirection.Horizontal)
           .scrollBar(BarState.Off)
@@ -2480,7 +2554,10 @@ export struct SubscriptionSection {
           .borderRadius(TunBoxGeometry.pillRadius)
           .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
           .accessibilityText(this.gridMode ? '切换为单列显示' : '切换为双列显示')
-          .onClick((): void => { this.gridMode = !this.gridMode; })
+          .onClick((): void => {
+            this.gridToggledByUser = true;
+            this.gridMode = !this.gridMode;
+          })
 
           Row({ space: 4 }) {
             Image($r('app.media.ic_sort')).width(13).height(13).fillColor(TunBoxColors.textMutedFor(this.themeRevision))
@@ -2490,7 +2567,7 @@ export struct SubscriptionSection {
           .padding({ left: 10, right: 10, top: 6, bottom: 6 })
           .borderRadius(TunBoxGeometry.pillRadius)
           .backgroundColor(TunBoxColors.chipBg(this.themeRevision))
-          .margin({ right: 24 })
+          .margin({ right: 20 })
           .accessibilityText('切换节点排序')
           .onClick((): void => {
             this.sortByDelay = !this.sortByDelay;
@@ -2505,7 +2582,7 @@ export struct SubscriptionSection {
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .padding({ top: 8, bottom: 8 })
+      .padding({ top: 4, bottom: 8 })
 
       if (this.panelNodes().length === 0 && !this.smartVisible) {
         Column({ space: 6 }) {
@@ -2533,7 +2610,7 @@ export struct SubscriptionSection {
           }
           // 2026-11-03 用户第二轮口径（对齐 FlClash）：组行就是可选项，点一下直接选中，
           // 不展开、不下钻，所以列表里没有「上级：xxx」这一行（ClashPlus/FlClash 都没有）。
-          ForEach(this.panelNodeRows(), (row: ProxyNode[]) => {
+          LazyForEach(this.panelRowsSource, (row: ProxyNode[]) => {
             ListItem() {
               if (this.gridMode) {
                 // 双列：一行两个紧凑单元格；节点总数为奇数时最后一行只占左半边。
@@ -2553,38 +2630,26 @@ export struct SubscriptionSection {
             }
           }, (row: ProxyNode[]): string => this.panelRowKey(row))
         }
+        .cachedCount(6)
         .width('100%')
         .layoutWeight(1)
-        .padding({ left: 24, right: 24 })
+        .padding({ left: 20, right: 20, bottom: 24 })
         // 选择态下给底部操作条让位（操作条高约 100vp）
         .margin({ bottom: this.deleteSheetOn ? 108 : 0 })
         .scrollBar(BarState.Off)
         .edgeEffect(EdgeEffect.Spring)
         .fadingEdge(true, { fadingEdgeLength: LengthMetrics.vp(TunBoxGeometry.scrollFadeEdge) })
       }
-
-      // 底部返回：与页面背景同色，融为一体
-      Button('返回')
-        .width('100%')
-        .height(44)
-        .fontSize(14)
-        .fontColor(TunBoxTextColors.primaryFor(this.themeRevision))
-        .backgroundColor(TunBoxColors.background(this.themeRevision))
-        .borderRadius(TunBoxGeometry.controlRadius)
-        .margin({ left: 24, right: 24, top: 4, bottom: 12 })
-        .onClick((): void => {
-          // 删除选择态下「返回」先退出选择态（不直接关面板），否则误触会把整个面板关掉
-          if (this.deleteSheetOn) {
-            this.closeDeleteSheet();
-            return;
-          }
-          this.closePanel();
-        })
     }
     .width('100%')
     .height('100%')
-    .backgroundColor(TunBoxColors.background(this.themeRevision))
-    .padding({ top: this.statusBarH })
+    .constraintSize({ maxWidth: TunBoxGeometry.contentMaxWidth })
+    .onAreaChange((_oldArea: Area, curArea: Area): void => {
+      const w: number = Number(curArea.width);
+      if (!this.gridToggledByUser && w >= 520 && !this.gridMode) {
+        this.gridMode = true;
+      }
+    })
 
     if (this.deleteSheetOn) {
       this.NodeDeleteBar()
@@ -2592,6 +2657,8 @@ export struct SubscriptionSection {
     }
     .width('100%')
     .height('100%')
+    .backgroundColor(TunBoxColors.background(this.themeRevision))
+    .padding({ top: this.statusBarH })
   }
 
   build() {

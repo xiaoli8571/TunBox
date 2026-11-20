@@ -364,3 +364,46 @@ export class LatencyPolicy {
   }
 
 }
+
+/** Batch latency progress summary shared by BackgroundLatencyService and UI pages. */
+export class LatencyProgress {
+  /** No-target/channel diagnostics are not successful node measurements. */
+  message: string = '';
+  total: number = 0;
+  finished: number = 0;
+  measured: number = 0;
+  timeout: number = 0;
+  failed: number = 0;
+  cancelled: number = 0;
+  /** cancelled 为兼容字段，包含无结论数量；只有明确取消才置本标志。 */
+  wasCancelled: boolean = false;
+  /** 因结果仍新鲜而跳过的节点数（force=false 时） */
+  skipped: number = 0;
+  queueTimeout: number = 0;
+  /** 通道不可用（内核/凭证层面）的连续命中总数 */
+  coreNotReady: number = 0;
+  coreOverloaded: number = 0;
+  dnsUnresolved: number = 0;
+  /** 整批因通道不可用而中止：此时**不能**把结果当节点结论 */
+  coreUnavailable: boolean = false;
+  /** 本批实际使用的通道：LatencyChannel.CORE / OFFLINE */
+  channel: string = LatencyChannel.CORE;
+  running: boolean = false;
+
+  done(): boolean {
+    return !this.running;
+  }
+
+  /** 订阅卡与节点页共用收尾口径，不以个别无回复推断整批中断。 */
+  completionMessage(): string {
+    if (this.message.length > 0) { return this.message; }
+    if (this.wasCancelled) { return '本次测速已取消，已完成的结果已保留'; }
+    if (this.total === 0) { return '测速未执行：没有可测速目标'; }
+    const counts = `${this.measured}成功，${this.timeout}超时`
+      + (this.failed > 0 ? `，${this.failed}失败` : '');
+    if (this.cancelled > 0) {
+      return `测速结束：${counts}，${this.cancelled}项未取得结果，请重试`;
+    }
+    return `测速完成：${counts}`;
+  }
+}

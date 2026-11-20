@@ -172,7 +172,8 @@ export class ArkHttpTransport implements LatencyHttpTransport {
         header: headers,
         connectTimeout: timeoutMs,
         readTimeout: timeoutMs,
-        usingCache: false
+        usingCache: false,
+        usingProxy: false
       });
       reply.responseCode = resp.responseCode;
       if (typeof resp.result === 'string') {

@@ -11,9 +11,10 @@ import { LatencyTestUrl } from '../latency/LatencyTestUrl';
  *   → VpnExtensionAbility：create() 得到 TUN fd → coreBridge.attachTun + startCore
  *   → 本编排器轮询 Clash API 就绪 → selectNode → CONNECTED
  */
-import { vpnExtension, http, webSocket, connection } from '@kit.NetworkKit';
-import { LocalPortProbe } from './LocalPortProbe';
+import { vpnExtension, webSocket } from '@kit.NetworkKit';
 import { isNonRetryableStartupError, CORE_READY_WAIT_MS } from './VpnRecoveryPolicy';
+import { GeoAssetManager, GeoAssetStatus, AssetMirror, AssetDownloadFn } from './GeoAssetManager';
+import { OrchestratorNetChecks, RuntimePorts } from './OrchestratorNetChecks';
 import { UnifiedScheduler } from './UnifiedScheduler';
 import type Want from '@ohos.app.ability.Want';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -41,7 +42,7 @@ import { TaskProgressUpdater } from './TaskProgressUpdater';
 import { TunnelAuthorityState, resolveAuthority, parseExtensionStatus, ExtensionStatusView, deriveUiPhase } from './TunnelAuthority';
 import {
   MAX_STATE_FILE_BYTES,
-  SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText, testConfigFileName
+  SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText, parseHeartbeatTimestamp, testConfigFileName
 } from './RuntimeFilePolicy';
 import { chmodPrivate, ensurePrivateDir, privateFs, removeTestConfigs } from './PrivateFileStore';
 import { ConnState } from './connection/ConnState';
@@ -75,7 +76,7 @@ import { CoreNodeBridge } from '../tunbox/CoreNodeBridge';
 
 // 状态枚举已抽到零依赖叶子模块（避免 stateMachine ↔ orchestrator 循环依赖）；
 // 这里再导出，保持既有 `import { ConnState } from '.../ConnectionOrchestrator'` 不变。
-export { ConnState };
+export { ConnState, GeoAssetStatus, RuntimePorts };
 // 重连运行态快照已随 ReconnectManager 迁到 connection/（Phase 3）；同样再导出，
 // 保证 `import { ReconnectRuntimeState } from '.../ConnectionOrchestrator'` 的调用点不改。
 export { ReconnectRuntimeState, ReconnectTelemetry };
@@ -97,16 +98,6 @@ const TAG = 'ConnectionOrchestrator';
 const MIXED_PORT = 7890;
 const API_PORT = 9090;
 const DNS_LISTEN_PORT = 1053;
-/**
- * 端口候选组（用户真机实证 2026-09-18）：NekoBox/v2rayNG 等 mihomo 系 VPN 默认
- * 同样占用 9090/7890/1053，任一被占都会导致内核 controller bind 失败 → 看似"无法启动"。
- * 三组候选依次 TCP 探测，全部空闲才采用；组间错开 10000，避免与常见服务冲突。
- */
-const PORT_CANDIDATE_SETS: number[][] = [
-  [9090, 7890, 1053],
-  [19090, 17890, 11053],
-  [29090, 27890, 21053]
-];
 const CONFIG_FILE = 'mihomo_config.yaml';
 /**
  * 最后一份「内核真的连上过」的配置快照。
@@ -117,93 +108,6 @@ const CONFIG_FILE = 'mihomo_config.yaml';
  * 效果与 FlClash 的「校验通过才替换」一致：坏配置永不永久顶掉能用的配置。
  */
 const LAST_GOOD_CONFIG_FILE = 'mihomo_config.lastgood.yaml';
-/** 内核 home 下的规则集子目录（config 里写作 ./ruleset/xxx.mrs） */
-const RULESET_SUBDIR = 'ruleset';
-/** 去广告规则集（rule-providers: hyper-adrules, type: http） */
-const HYPER_AD_RULES_FILE = 'hyper_adrules_ads.mrs';
-/**
- * 去广告 MRS 体积下限（byte）。真源数 MB；这里只兜「空文件/半截下载」，
- * 真正的格式判据是下面的 zstd 魔数（错误页也常大于 1KB，只查体积挡不住）。
- */
-const RULE_SET_MIN_BYTES = 1024;
-/**
- * MRS 的落盘形态是 **zstd frame**（内层才是 `MRS\x01 | behavior | count …`，
- * 见 mihomo `rules/provider/mrs_converter.go`），所以合法 .mrs 的前 4 字节必为
- * zstd 魔数 0x28 0xB5 0x2F 0xFD。用它把 GitHub 加速代理返回的 HTML/JSON 错误页挡住。
- */
-const ZSTD_MAGIC: number[] = [0x28, 0xB5, 0x2F, 0xFD];
-/**
- * 「上一次连接成功时那份规则集」的副本后缀：内核能成功加载 = 文件与当前配置的
- * behavior/format 匹配。之后更新到坏文件导致启动失败时，用它回滚（见 healRuleSet）。
- */
-const RULE_SET_GOOD_SUFFIX = '.good';
-/**
- * 随包内置的去广告规则集（`entry/src/main/resources/rawfile/` 下的名字）。
- *
- * 2026-10-23 用户口径：规则集不再作为「数据」页里的可更新资产暴露，安装包自带一份，
- * 去广告开关打开即可用；需要更新时后台自动拉取覆盖（见 downloadRuleProviderInBackground）。
- */
-const BUNDLED_RULE_SET_RAWFILE = 'hyper_adrules_ads.mrs';
-/**
- * geo 资产候选镜像。tag 标记来源类型，供按用户偏好（assetSource）重排：
- * jsdelivr=CDN / ghproxy=加速前缀 / github=官方直链。auto 偏好 = 保持实测可达性排序。
- */
-class AssetMirror {
-  url: string = '';
-  tag: string = 'auto';
-
-  constructor(url: string, tag: string) {
-    this.url = url;
-    this.tag = tag;
-  }
-}
-
-/** geoip.metadb 候选源（jsdelivr 取仓库 release 分支直链可用；release asset 才走前缀代理） */
-const GEOIP_MIRRORS: AssetMirror[] = [
-  new AssetMirror('https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb', 'jsdelivr'),
-  new AssetMirror('https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb', 'jsdelivr'),
-  new AssetMirror('https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.metadb', 'jsdelivr'),
-  new AssetMirror('https://gh-proxy.com/https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip.metadb', 'ghproxy'),
-  new AssetMirror('https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip.metadb', 'github')
-];
-/** LightGBM Model.bin（release asset：jsdelivr 不可用，实测仅前缀代理可达但限速） */
-const MODEL_MIRRORS: AssetMirror[] = [
-  new AssetMirror('https://gh-proxy.com/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin', 'ghproxy'),
-  new AssetMirror('https://ghproxy.net/https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin', 'ghproxy'),
-  new AssetMirror('https://github.com/vernesong/mihomo/releases/download/LightGBM-Model/Model.bin', 'github')
-];
-/**
- * 去广告规则集下载源。注意：这是 GitHub **release 资产**，jsdelivr 的 gh 通道
- * 不覆盖 release asset，因此官方直链 + 通用 GitHub 加速前置代理依次回退。
- */
-const HYPER_AD_RULES_MIRRORS: AssetMirror[] = [
-  new AssetMirror('https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs', 'github'),
-  new AssetMirror('https://gh-proxy.com/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs', 'ghproxy'),
-  new AssetMirror('https://ghfast.top/https://github.com/Lynricsy/HyperADRules/releases/latest/download/hyper_adrules_ads.mrs', 'ghproxy')
-];
-
-/** geo 资产状态（设置页「数据与规则」展示用） */
-export class GeoAssetStatus {
-  /** geoip | model | ruleset */
-  id: string = '';
-  /** 展示名 */
-  label: string = '';
-  /** 用途说明 */
-  detail: string = '';
-  ready: boolean = false;
-  sizeBytes: number = 0;
-  mtimeMs: number = 0;
-}
-
-/** 按用户偏好重排镜像：偏好 tag 提前（保持相对顺序），auto/未知 = 原序 */
-function reorderAssetMirrors(mirrors: AssetMirror[], source: string): AssetMirror[] {
-  if (source !== 'jsdelivr' && source !== 'ghproxy' && source !== 'github') {
-    return mirrors.slice();
-  }
-  const preferred = mirrors.filter((m: AssetMirror): boolean => m.tag === source);
-  const rest = mirrors.filter((m: AssetMirror): boolean => m.tag !== source);
-  return preferred.concat(rest);
-}
 const START_ERROR_FILE = 'vpn_start_error.txt';
 const START_OK_FILE = 'vpn_start_ok.txt';
 /** 本次拉起的路由参数快照（扩展进程在 want 被系统丢弃时回退读取，见 VpnExtensionAbility） */
@@ -275,6 +179,18 @@ const READINESS_INITIAL_DELAY_MS = 40;
 const READINESS_MAX_DELAY_MS = 300;
 /** Two-second traffic sampling reduces /connections allocations and UI redraws. */
 const TRAFFIC_POLL_INTERVAL_MS = 2000;
+/** 应用退到后台后的流量轮询间隔（ms）：降低 /connections 与通知 IPC 唤醒频率，回前台立即恢复 2s */
+const BG_TRAFFIC_POLL_INTERVAL_MS = 15000;
+/** 运行时配置文件最大读取字节数（与扩展侧 readConfigText 8MB 上限一致，覆盖大型 JSON/YAML 配置） */
+const MAX_CONFIG_READ_BYTES = 8 * 1024 * 1024;
+
+/** 从运行配置（JSON 或 YAML）解析出的本地控制器与端口元数据（ArkTS 显式类型类） */
+class RuntimeEndpoint {
+  public apiPort: number = 0;
+  public mixedPort: number = 0;
+  public dnsPort: number = 0;
+  public mode: string = '';
+}
 /** 测速内核停扩展的重试次数与间隔：停失败必须重试，或至少让下次启动能正确重建 */
 const TEST_CORE_STOP_ATTEMPTS = 2;
 const TEST_CORE_STOP_RETRY_DELAY_MS = 300;
@@ -344,18 +260,6 @@ const RECONNECT_BASE_MS: number = 1000;
 const RECONNECT_MAX_MS: number = 8000;
 /** 网络切换触发的最大重连尝试次数 */
 const RECONNECT_MAX_ATTEMPTS: number = 3;
-
-/**
- * 一次内核会话的端口三元组。
- *
- * 刻意做成**不可变输入**而不是共享可变字段：测速核与隧道核各自持有一份，
- * 互不写回（审计 F1：旧实现里测速核的端口探测会改写隧道核正在用的端口）。
- */
-export class RuntimePorts {
-  apiPort: number = 0;
-  mixedPort: number = 0;
-  dnsPort: number = 0;
-}
 
 /**
  * DoH 快照（节点域名 → 固定 IP + 本次尝试解析过的域名名单）。
@@ -431,6 +335,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private trafficTimer: number = -1;
   /** Prevent overlapping requests when a traffic poll is slow. */
   private trafficPollRunning: boolean = false;
+  /** 应用处于后台时降频轮询流量，避免 2s 一次的 /connections 与实况窗 IPC 持续唤醒。 */
+  private appInBackground: boolean = false;
+  private lastBgTrafficPollAt: number = 0;
+
+  setAppBackground(inBackground: boolean): void {
+    this.appInBackground = inBackground;
+    if (!inBackground) {
+      this.lastBgTrafficPollAt = 0;
+    }
+  }
   private connectSeq: number = 0; // 进程内启动序列，仅用于取消同进程旧连接流程
   /**
    * 持久化 VPN 会话代次。每次用户连接或主动停止前递增并写入 ConnectionSnapshot；
@@ -773,9 +687,19 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       this.init(context);
       const snap = await SettingsService.loadSnapshot();
       if (!snap.desiredConnected) {
+        if (this.state === ConnState.CONNECTED || this.state === ConnState.RECOVERING) {
+          const view = this.extensionStatus();
+          this.reconcileExternalStop('restore-no-intent',
+            view.ok && view.phase === 'failed' ? view.detail : '');
+        }
         return 'no-intent';
       }
       if (snap.phase !== 'connecting' && snap.phase !== 'connected' && snap.phase !== 'recovering') {
+        if (this.state === ConnState.CONNECTED || this.state === ConnState.RECOVERING) {
+          const view = this.extensionStatus();
+          this.reconcileExternalStop(`restore-phase-${snap.phase}`,
+            view.ok && view.phase === 'failed' ? view.detail : '');
+        }
         AppLogger.info(TAG, `restore skipped: snapshot phase=${snap.phase}`);
         return `phase-${snap.phase}`;
       }
@@ -794,9 +718,11 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         const changedSession = this.sessionGeneration !== snap.sessionGeneration;
         this.sessionGeneration = snap.sessionGeneration;
         if (changedSession || this.startedAt <= 0) { this.startedAt = snap.startedAt; }
+        this.lastError = '';
         this.lastNodeName = snap.nodeName;
         this.lastSubs = SubscriptionService.instance();
         this.lastNode = this.lastSubs.nodes.find((node: ProxyNode): boolean => node.name === snap.nodeName) ?? null;
+        TaskProgressUpdater.setSessionStartedAt(this.startedAt);
         if (this.state === ConnState.DISCONNECTED || this.state === ConnState.ERROR) {
           this.setState(ConnState.RECOVERING);
         }
@@ -807,8 +733,20 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       }
       if (seq !== this.connectSeq || this.disconnectRequested
         || !await this.isCurrentSession(snap.sessionGeneration)) { return 'session-changed'; }
-      // 已有监控必须先完成间隔确认，避免唤醒后瞬时探测失败就拆正常隧道。
-      if (this.state === ConnState.CONNECTED && this.monitorTimer >= 0) { return 'runtime-unconfirmed'; }
+      // 已有监控必须先完成间隔确认，避免唤醒后瞬时探测失败就拆正常隧道；
+      // 但若扩展已明确写下 failed/stopped 终态（且上面 authority+controller 均已确认失联），
+      // 不再白等 6~9s 展示假“已连接”；否则立即触发一轮存活探测以缩短首轮等待。
+      if (this.state === ConnState.CONNECTED && this.monitorTimer >= 0) {
+        const extView = this.extensionStatus();
+        const terminalExtDead = extView.ok && !extView.coreAlive
+          && (extView.phase === 'failed' || extView.phase === 'stopped');
+        if (!terminalExtDead) {
+          this.pollRuntimeLiveness(this.monitorGeneration).catch((e: Error): void => {
+            AppLogger.warn(TAG, `foreground liveness probe failed: ${AppLogger.errText(e)}`);
+          });
+          return 'runtime-unconfirmed';
+        }
+      }
       const subs = SubscriptionService.instance();
       await subs.init(context);
       await this.restoreTunnelController(snap, false, false);
@@ -900,7 +838,95 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return ready;
   }
 
-  /** 恢复真实隧道的 controller；只读本机配置头，凭据仍只从 AssetStore 获取。 */
+  /**
+   * 仅接纳绑定在 127.0.0.1 回环地址上的合法端口（1..65535）；任何非回环地址一律返回 0。
+   */
+  private static parseLoopbackPort(raw: string): number {
+    const trimmed = raw.trim().replace(/^['"]|['"]$/g, '').trim();
+    const m = /^127\.0\.0\.1:(\d{1,5})$/.exec(trimmed);
+    if (m === null) {
+      return 0;
+    }
+    const port = Number(m[1]);
+    return Number.isFinite(port) && port > 0 && port <= 65535 ? port : 0;
+  }
+
+  /**
+   * 从运行配置文件（支持 TunBoxProfileBuilder 的单行 JSON 与历史多行 YAML）提取控制器与端口。
+   *
+   * 2026-11-19 修复：TunBoxProfileBuilder 输出的是单行压缩 JSON，`external-controller` 常位于
+   * 4KB 之后，且原多行 YAML 正则对 JSON 恒不匹配 —— 导致 UI 重启或回前台时 `restoreTunnelController`
+   * 恒返回 false，误判存活隧道已死或无法接管。
+   */
+  private static parseRuntimeEndpointFromConfig(text: string): RuntimeEndpoint | null {
+    const trimmed = text.trimStart();
+    if (trimmed.length === 0) {
+      return null;
+    }
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed) as Object;
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const map = parsed as Record<string, Object>;
+          const extRaw = map['external-controller'];
+          const apiPort = typeof extRaw === 'string'
+            ? ConnectionOrchestrator.parseLoopbackPort(extRaw) : 0;
+          if (apiPort <= 0) {
+            return null;
+          }
+          const out = new RuntimeEndpoint();
+          out.apiPort = apiPort;
+          const modeRaw = map['mode'];
+          if (modeRaw === 'rule' || modeRaw === 'global' || modeRaw === 'direct') {
+            out.mode = modeRaw as string;
+          }
+          const mixedRaw = map['mixed-port'];
+          const mixedNum = typeof mixedRaw === 'number' ? mixedRaw
+            : (typeof mixedRaw === 'string' ? Number(mixedRaw) : 0);
+          if (Number.isFinite(mixedNum) && mixedNum > 0 && mixedNum <= 65535) {
+            out.mixedPort = Math.floor(mixedNum);
+          }
+          const dnsObj = map['dns'];
+          if (dnsObj !== null && dnsObj !== undefined && typeof dnsObj === 'object' && !Array.isArray(dnsObj)) {
+            const dnsMap = dnsObj as Record<string, Object>;
+            const listenRaw = dnsMap['listen'];
+            const dnsPort = typeof listenRaw === 'string'
+              ? ConnectionOrchestrator.parseLoopbackPort(listenRaw) : 0;
+            if (dnsPort > 0) {
+              out.dnsPort = dnsPort;
+            }
+          }
+          return out;
+        }
+      } catch (_jsonErr) {
+        // JSON 解析失败（如半截文本）不回落伪造端口
+        return null;
+      }
+      return null;
+    }
+    const match = /^external-controller:[ \t]*['"]?127\.0\.0\.1:(\d{1,5})['"]?[ \t]*\r?$/m.exec(text);
+    const port = match === null ? 0 : Number(match[1]);
+    if (port <= 0 || port > 65535) {
+      return null;
+    }
+    const out = new RuntimeEndpoint();
+    out.apiPort = port;
+    const mode = /^mode:[ \t]*['"]?(rule|global|direct)['"]?[ \t]*\r?$/m.exec(text);
+    if (mode !== null) {
+      out.mode = mode[1];
+    }
+    const mixed = /^mixed-port:[ \t]*(\d{1,5})[ \t]*\r?$/m.exec(text);
+    if (mixed !== null && Number(mixed[1]) > 0 && Number(mixed[1]) <= 65535) {
+      out.mixedPort = Number(mixed[1]);
+    }
+    const dns = /^  listen:[ \t]*['"]?127\.0\.0\.1:(\d{1,5})['"]?[ \t]*\r?$/m.exec(text);
+    if (dns !== null && Number(dns[1]) > 0 && Number(dns[1]) <= 65535) {
+      out.dnsPort = Number(dns[1]);
+    }
+    return out;
+  }
+
+  /** 恢复真实隧道的 controller；支持 YAML 头部快速读取与 JSON 完整配置解析，凭据只从 AssetStore 获取。 */
   private async restoreTunnelController(snapshot: ConnectionSnapshot, verifyResponse: boolean,
     applyRoute: boolean = true): Promise<boolean> {
     if (this.context === null || !snapshot.desiredConnected
@@ -911,12 +937,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     const seq = this.connectSeq;
     try {
-      // 生成器把 external-controller 放在第二行；只取 4 KiB，不扫描/记录整份订阅配置。
-      const header = await privateFs.readCappedAsync(`${this.context.cacheDir}/${CONFIG_FILE}`, 4096);
-      const match = header.ok
-        ? /^external-controller:[ \t]*127\.0\.0\.1:(\d{1,5})[ \t]*\r?$/m.exec(header.text) : null;
-      const port = match === null ? 0 : Number(match[1]);
-      if (port <= 0 || port > 65535) { return false; }
+      const configFile = `${this.context.cacheDir}/${CONFIG_FILE}`;
+      let raw = await privateFs.readCappedAsync(configFile, 4096);
+      if (!raw.ok) {
+        return false;
+      }
+      let endpoint = ConnectionOrchestrator.parseRuntimeEndpointFromConfig(raw.text);
+      if (endpoint === null && raw.truncated) {
+        const full = await privateFs.readCappedAsync(configFile, MAX_CONFIG_READ_BYTES);
+        if (full.ok && !full.truncated) {
+          endpoint = ConnectionOrchestrator.parseRuntimeEndpointFromConfig(full.text);
+        }
+      }
+      if (endpoint === null || endpoint.apiPort <= 0 || endpoint.apiPort > 65535) {
+        return false;
+      }
+      const port = endpoint.apiPort;
       const secret = await SettingsService.getApiSecret();
       if (secret.length === 0) { return false; }
       const probe = new ClashApiService();
@@ -927,16 +963,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return false;
       }
       this.apiPort = port;
-      const mode = /^mode:[ \t]*(rule|global|direct)[ \t]*\r?$/m.exec(header.text);
-      if (mode !== null) { this.runtimeProxyMode = mode[1]; }
-      const mixed = /^mixed-port:[ \t]*(\d{1,5})[ \t]*\r?$/m.exec(header.text);
-      const dns = /^  listen:[ \t]*127\.0\.0\.1:(\d{1,5})[ \t]*\r?$/m.exec(header.text);
-      if (mixed !== null && Number(mixed[1]) > 0 && Number(mixed[1]) <= 65535) {
-        this.mixedPort = Number(mixed[1]);
-      }
-      if (dns !== null && Number(dns[1]) > 0 && Number(dns[1]) <= 65535) {
-        this.dnsPort = Number(dns[1]);
-      }
+      if (endpoint.mode.length > 0) { this.runtimeProxyMode = endpoint.mode; }
+      if (endpoint.mixedPort > 0) { this.mixedPort = endpoint.mixedPort; }
+      if (endpoint.dnsPort > 0) { this.dnsPort = endpoint.dnsPort; }
       this.apiSecret = secret;
       this.api.setEndpoint(port, secret);
       if (applyRoute) { await this.activateAppHttpProxy('restore'); }
@@ -1240,6 +1269,25 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 代价只是「下次冷启动的基准配置」仍是旧的一份（并且 last-good 会照常更新）。
       AppLogger.warn(TAG, `staged config promote failed: ${AppLogger.errText(e)}`);
     }
+  }
+
+  /**
+   * 暂存配置（`.next`）提升为正式 `mihomo_config.yaml` 后，把启动参数回退文件与
+   * Preferences 里的分流快照路径同步为正式路径：避免系统在无 want 参数下重启扩展时，
+   * 扩展按 mtime 选出 `mihomo_config.yaml` 却与快照里的 `.next` 路径不匹配而被拒。
+   */
+  private syncPromotedStartParams(configPath: string, mode: string, needsReview: boolean,
+    packagesJson: string): void {
+    this.writeStartParamsFile(configPath, mode, needsReview, packagesJson);
+    const routingSnap = new AppRoutingSnapshot();
+    routingSnap.appRoutingMode = mode;
+    routingSnap.appRoutingPackagesJson = packagesJson;
+    routingSnap.appRoutingNeedsReview = needsReview;
+    routingSnap.configPath = configPath;
+    routingSnap.ts = Date.now();
+    SettingsService.saveAppRoutingSnapshot(routingSnap).catch((e: Error): void => {
+      AppLogger.warn(TAG, `promoted app routing snapshot persist failed: ${AppLogger.errText(e)}`);
+    });
   }
 
   /**
@@ -1785,6 +1833,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       || !await this.isCurrentSession(snapshot.sessionGeneration)) { return ReconnectAttemptOutcome.SUPERSEDED; }
     if (responsive && authority.connected) {
       this.automaticRecoveryActive = false;
+      this.lastError = '';
+      TaskProgressUpdater.setSessionStartedAt(this.startedAt);
       this.setState(ConnState.CONNECTED);
       this.startMonitors();
       this.notify();
@@ -2601,80 +2651,16 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /**
-   * DNS 自检：**问系统解析器**，而不是自己再去 doh.pub 问一遍。
-   *
-   * 旧实现拿 www.gstatic.com 去 doh.pub/alidns 做一次 DoH，判据是"第三方端点通不通"：
-   *  - 通了只能证明公网 HTTPS 通，证明不了内核 DNS 是否正常；
-   *  - 不通则报 fix-dns，而那个修复动作本来就是空操作，用户被误导。
-   * 另外它还会把用户的探测域名再泄露一次给两家第三方解析商。
-   *
-   * 改用系统解析器后：隧道在时该查询走 VpnConfig.dnsAddresses（TUN sentinel 172.19.0.2）
-   * → 被 TUN 接管 → any:53 劫持进内核 DNS 解析链路（默认 fake-ip；也可能采用订阅 DNS 模式）——
-   * 这一次探测真正走的就是用户业务流量所走的那条 DNS 路径。隧道不在时它退化为
-   * 普通系统解析，符合探针语义。
-   */
   async checkDnsResolvable(): Promise<boolean> {
-    try {
-      const addresses = await connection.getAddressesByName('www.gstatic.com');
-      return Array.isArray(addresses) && addresses.length > 0;
-    } catch (e) {
-      AppLogger.info(TAG, `dns self-check failed: ${AppLogger.errText(e)}`);
-      return false;
-    }
+    return OrchestratorNetChecks.checkDnsResolvable();
   }
 
-  /**
-   * IPv6 DNS 应答探针（不是端到端验证）：客户端侧（系统解析器 → 隧道 DNS）能否拿到 AAAA。
-   *
-   * 必须用 `connection.getAddressesByName` 走**系统解析路径**（与普通应用一致）。
-   * 不能用 Clash REST `/dns/query`：mihomo 那条路由绕过了 withResolver(ipv6=false)
-   * （hub/route/dns.go:44），即使 dns.ipv6=false 也会返回 AAAA —— 会给出假阳性，
-   * 正是这次报障里「看着有 v6、实际 AAAA 被清空」最容易踩的坑。
-   */
   async checkIpv6Resolvable(): Promise<boolean> {
-    try {
-      // 注意：`getAddressesByName` 返回的是 **NetAddress 对象**（{address, family}），
-      // 不是字符串数组（SDK @ohos.net.connection.d.ts:2258-2267，family 1=IPv4 / 2=IPv6）。
-      const addresses = await connection.getAddressesByName('ipv6.google.com');
-      if (!Array.isArray(addresses)) {
-        return false;
-      }
-      for (let i = 0; i < addresses.length; i++) {
-        const entry = addresses[i];
-        if (entry === null || entry === undefined) {
-          continue;
-        }
-        // family 优先；拿不到 family 时退回「地址里含冒号 ⇒ v6 字面量」。
-        if (entry.family === 2) {
-          return true;
-        }
-        if (typeof entry.address === 'string' && entry.address.indexOf(':') >= 0) {
-          return true;
-        }
-      }
-      return false;
-    } catch (e) {
-      AppLogger.info(TAG, `ipv6 self-check failed: ${AppLogger.errText(e)}`);
-      return false;
-    }
+    return OrchestratorNetChecks.checkIpv6Resolvable();
   }
 
   async checkEgressReachable(): Promise<boolean> {
-    const client = http.createHttp();
-    try {
-      const resp = await client.request('https://www.gstatic.com/generate_204', {
-        method: http.RequestMethod.GET,
-        expectDataType: http.HttpDataType.STRING,
-        connectTimeout: 1500,
-        readTimeout: 1500
-      });
-      return resp.responseCode === 204 || resp.responseCode === 200;
-    } catch (e) {
-      return false;
-    } finally {
-      client.destroy();
-    }
+    return OrchestratorNetChecks.checkEgressReachable();
   }
 
   /** 读取 VPN Extension 进程回写的启动错误（跨进程文件通道） */
@@ -2688,7 +2674,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     return res.ok ? res.text.trim() : '';
   }
 
-  private clearStartError(): void {
+  private clearStartError(clearStatus: boolean = true): void {
     if (this.context === null) {
       return;
     }
@@ -2702,12 +2688,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } catch (e) {
       // 文件不存在属正常
     }
-    // Extension 权威态与心跳租约同属隧道生命周期，断开时一并清除，
-    // 防止 UI 冷启动读到上一会话的陈旧 running 而误判为已连接。
-    try {
-      fs.unlinkSync(`${this.context.cacheDir}/${EXTENSION_STATUS_FILE}`);
-    } catch (e) {
-      // 文件不存在属正常
+    // Extension 权威态与心跳租约同属隧道生命周期，启动前/断开时一并清除，
+    // 防止 UI 冷启动读到上一会话的陈旧 running 而误判为已连接；
+    // 连接成功时传入 clearStatus=false，保留扩展刚发布的运行态快照。
+    if (clearStatus) {
+      try {
+        fs.unlinkSync(`${this.context.cacheDir}/${EXTENSION_STATUS_FILE}`);
+      } catch (e) {
+        // 文件不存在属正常
+      }
     }
     // 拉起送达标记随启动生命周期复位（判定本身按时间戳过滤，清盘只为留痕干净）
     try {
@@ -2773,6 +2762,21 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.stateProbeHeartbeatAge = -1;
   }
 
+  /** 允许的跨进程心跳微小前倾容忍窗（ms）：覆盖异步读盘期间扩展刚刷新租约与 NTP 回调 */
+  private static readonly HEARTBEAT_FUTURE_TOLERANCE_MS: number = 5000;
+
+  private normalizeHeartbeatAge(text: string, nowMs: number): number {
+    const age = heartbeatAgeFromText(text, nowMs);
+    if (age >= 0) {
+      return age;
+    }
+    const ts = parseHeartbeatTimestamp(text);
+    if (ts > 0 && ts > nowMs && ts - nowMs <= ConnectionOrchestrator.HEARTBEAT_FUTURE_TOLERANCE_MS) {
+      return 0;
+    }
+    return -1;
+  }
+
   /**
    * 同步刷新探针缓存（**仅限同步上下文**，如 readStartOk 的既有调用点）。
    *
@@ -2798,7 +2802,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     const res: SyncReadResult = privateFs.readCapped(
       `${this.context.cacheDir}/${HEARTBEAT_FILE}`, MAX_STATE_FILE_BYTES);
-    this.stateProbeHeartbeatAge = res.ok ? heartbeatAgeFromText(res.text, nowMs) : -1;
+    this.stateProbeHeartbeatAge = res.ok ? this.normalizeHeartbeatAge(res.text, nowMs) : -1;
     this.stateProbeCachedAt = nowMs;
   }
 
@@ -2826,7 +2830,9 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
     try {
       const text = await privateFs.readCappedAsync(heartbeatPath, MAX_STATE_FILE_BYTES);
-      this.stateProbeHeartbeatAge = text.ok ? heartbeatAgeFromText(text.text, nowMs) : -1;
+      const sampleNow = Date.now();
+      this.stateProbeHeartbeatAge = text.ok ? this.normalizeHeartbeatAge(text.text, sampleNow) : -1;
+      this.stateProbeCachedAt = sampleNow;
     } catch (e) {
       this.stateProbeHeartbeatAge = -1;
     }
@@ -2839,7 +2845,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (this.stateProbeHeartbeatAge < 0) {
       return -1;
     }
-    return this.stateProbeHeartbeatAge + Math.max(0, nowMs - this.stateProbeCachedAt);
+    return this.stateProbeHeartbeatAge + Math.max(0, Date.now() - this.stateProbeCachedAt);
   }
 
   /**
@@ -3830,11 +3836,6 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /** 同时检查已有监听和独占绑定，避开独立测速进程残留的 controller。 */
-  private static async portIsFree(port: number): Promise<boolean> {
-    return LocalPortProbe.isFree(port);
-  }
-
   /**
    * 构造运行配置输入（IR）。
    *
@@ -3989,29 +3990,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
    * @param excludeApiPort 需要避开的 api 端口（正在运行的隧道核）；-1 = 不避让。
    */
   private async pickPorts(excludeApiPort: number): Promise<RuntimePorts> {
-    const picked = new RuntimePorts();
-    picked.apiPort = this.apiPort;
-    picked.mixedPort = this.mixedPort;
-    picked.dnsPort = this.dnsPort;
-    for (const candidate of PORT_CANDIDATE_SETS) {
-      if (excludeApiPort > 0 && candidate[0] === excludeApiPort) {
-        continue;
-      }
-      let allFree = true;
-      for (const port of candidate) {
-        if (!(await ConnectionOrchestrator.portIsFree(port))) {
-          allFree = false;
-          break;
-        }
-      }
-      if (allFree) {
-        picked.apiPort = candidate[0];
-        picked.mixedPort = candidate[1];
-        picked.dnsPort = candidate[2];
-        return picked;
-      }
-    }
-    throw new Error('本地内核端口均被占用，请关闭其他代理后重试');
+    return OrchestratorNetChecks.pickPorts(this.apiPort, this.mixedPort, this.dnsPort, excludeApiPort);
   }
 
   /**
@@ -4030,21 +4009,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /**
-   * 判别「自己的内核不可达」与「别的 Clash/mihomo 内核占着端口」。
-   * 真机实证（2026-09-18，NekoBox 2.0.1 共存事故）：另一款 Clash 系的 VPN 扩展进程
-   * 驻留时会话槽位与回环端口 9090 都可能被它持有，且它可能在 reservePorts 探测
-   * 之后、本端内核 bind 之前的窗口里抢回端口（TOCTOU）。探测特征：/version 可达
-   * 但携带本端 secret 返回 401/403 —— 端口上活着的是一个不认我们凭证的外来控制器。
-   */
   private async detectForeignControllerBusy(): Promise<boolean> {
-    try {
-      const probe = await this.api.probeController(1500);
-      return probe.reachable && !probe.secretAccepted
-        && (probe.httpCode === 401 || probe.httpCode === 403);
-    } catch (e) {
-      return false;
-    }
+    return OrchestratorNetChecks.detectForeignControllerBusy(this.api);
   }
 
   async connect(node: ProxyNode, subs: SubscriptionService, modeOverride: string = ''): Promise<boolean> {
@@ -4168,6 +4134,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     // 先作废并等待测速启动/清理结算，再把共享扩展交给真实隧道。
     this.cancelTestCoreRecycle();
     this.testCoreLaunchGeneration++;
+    const hadActiveTestCore: boolean = this.testCoreFlight !== null
+      && (this.testCoreFlight.isActive() || this.testCoreFlight.isStarting());
     if (this.testCoreFlight !== null) { await this.stopTestCore(); }
     if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
 
@@ -4295,6 +4263,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       const hadLiveTunnel = stateBeforeConnect === ConnState.CONNECTED
         || stateBeforeConnect === ConnState.RECOVERING
         || stateBeforeConnect === ConnState.DISCONNECTING
+        || hadActiveTestCore
         || this.isCoreAliveByHeartbeat();
       if (hadLiveTunnel) {
         await new Promise<void>((resolve) => setTimeout(() => resolve(), 400));
@@ -4340,14 +4309,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       // 并且把**本次要连的节点**排在最前解析，预算再紧也先把它 pin 住 ——
       // 连不上当前节点的代价远高于漏 pin 几个备用节点。
 
-      // IPv6 双栈（设置页开关，默认开）：这里只做「记录意图」，真正落地的两处分别是
+      // IPv6 双栈（设置页开关，默认关）：这里只做「记录意图」，真正落地的两处分别是
       //   ① YAML：RuntimeConfigBuilder 把 settings.ipv6Enabled 传给生成器（ipv6 / dns.ipv6
       //      两行同开同关；DNS 段是 redir-host，AAAA 走真实上游）；
       //   ② TUN：VpnExtensionAbility 读**同一份 YAML 的 ipv6 行**决定是否装 v6 地址与 ::/0。
       // 之所以不在这里额外下发 want 参数：TUN 与内核必须同源，YAML 已经是唯一真源，
       // 多一条 want 通道就多一个「两处不一致 ⇒ v6 黑洞/泄漏」的机会。
       // ipv6Active 仅供诊断/健康探针展示真实意图，不再参与任何下发决策。
-      this.ipv6Active = settings.ipv6Enabled !== false;
+      this.ipv6Active = settings.ipv6Enabled === true;
       const priorityDomains: string[] = (target.server.length > 0) ? [target.server] : [];
       // 端口探测提前发起，与下面的 DoH 预解析并行推进：两者互不依赖
       // （端口探测只 bind/close 本地回环，DoH 只发 HTTPS 查询），
@@ -4985,33 +4954,40 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         return false;
       }
       this.runtimeProxyMode = settings.proxyMode;
-      this.setState(ConnState.CONNECTED);
-      attempt.complete();
       this.startedAt = Date.now();
       this.recoveryAttempts = 0;
       this.automaticRecoveryActive = false;
-      this.startMonitors();
-      this.clearStartError(); // 连接成功，清掉启动标记文件
+      this.clearStartError(false); // 连接成功，清掉启动标记文件（保留扩展刚发布的权威状态 vpn_status.json）
       // 内核已接受本次配置 ⇒ 才把暂存文件提升为**正式配置**（2026-10-22 冷启动口径）：
       // 写 `${configPath}.tmp` 再 rename（同目录 rename 原子），任何时刻磁盘上都有一份完整文件；
       // 拒载路径从来不走到这里 ⇒ 正式配置保持上一份能用的字节。
       this.acceptStagedConfig(stagedConfigPath, configPath, preparedConfig);
       // 本次配置已被内核接受并真的连上 → 留作 last-good，供未来拒载时回滚。
       this.snapshotLastGoodConfig(preparedConfig);
+      this.syncPromotedStartParams(configPath, appRouting.mode, appRouting.needsReview, packagesJson);
       // 重连成功 → 取消挂起的退避定时器并复位尝试计数（禁止重连风暴）
       this.reconnectManager().resetAttempts();
       this.reconnectManager().cancel('connected');
-      this.notify();
-      AppLogger.info(TAG, `connect timing: prep=${tPrep}ms prelaunch=${tPrelaunch}ms`
-        + ` launch=${tLaunch}ms ready=${tReady}ms pinned=${Date.now() - connectT0}ms`
-        + ` total=${Date.now() - connectT0}ms`);
-      // 连接快照升格为 connected：同代写入。期间若用户已推进新代次（又点了
-      // 断开或连接）则放弃写入 —— 绝不用旧结果覆盖更新的用户意图。
+      // 连接快照先升格为 connected 再对外置 CONNECTED 与启监控，避免首轮监控读到旧 phase=connecting。
+      // 同代写入：期间若用户已推进新代次（又点了断开或连接）则放弃写入 —— 绝不用旧结果覆盖更新的用户意图。
       const committed = await this.updateSessionSnapshot(intentGeneration, true, 'connected',
         finalNodeName, this.startedAt);
       if (!committed) {
         AppLogger.warn(TAG, 'session generation moved on during connect; snapshot not overwritten');
       }
+      if (!attempt.checkpoint(this.attempts.currentGeneration()) || seq !== this.connectSeq
+        || this.disconnectRequested || !await this.isCurrentSession(intentGeneration)) {
+        await this.disconnectInternal(intentGeneration, this.automaticRecoveryActive);
+        return false;
+      }
+      TaskProgressUpdater.setSessionStartedAt(this.startedAt);
+      this.setState(ConnState.CONNECTED);
+      attempt.complete();
+      this.startMonitors();
+      this.notify();
+      AppLogger.info(TAG, `connect timing: prep=${tPrep}ms prelaunch=${tPrelaunch}ms`
+        + ` launch=${tLaunch}ms ready=${tReady}ms pinned=${Date.now() - connectT0}ms`
+        + ` total=${Date.now() - connectT0}ms`);
       // 集成点③：连接成功 → 复位该节点连续失败统计（复用 NodeSortPersistence 记录结构）
       await this.recordNodeSuccess(finalNodeName);
       if (seq !== this.connectSeq || this.disconnectRequested) {
@@ -5057,6 +5033,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
       if (seq !== this.connectSeq || this.disconnectRequested) { return false; }
       this.setState(this.automaticRecoveryActive ? ConnState.RECOVERING : ConnState.DISCONNECTED);
       this.startedAt = 0;
+      TaskProgressUpdater.setSessionStartedAt(0);
       this.ipv6Active = false;
       this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
       this.api.resetTrafficBaseline();
@@ -5185,6 +5162,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     await this.disconnectInternal();
     this.setState(this.inRepairConnect ? ConnState.RECOVERING : ConnState.DISCONNECTED);
     this.startedAt = 0;
+    TaskProgressUpdater.setSessionStartedAt(0);
     this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
     this.api.resetTrafficBaseline();
     this.disconnectRequested = false;
@@ -5192,103 +5170,21 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     AppLogger.info(TAG, this.inRepairConnect ? 'repair-disconnected (kept RECOVERING)' : 'disconnected');
   }
 
-  /** 后台下载 geoip.metadb 到内核 home 目录（cacheDir），成功后下次连接启用 GEOIP 直连规则 */
-  private geoipDownloading: boolean = false;
+  private readonly geoAssets: GeoAssetManager = new GeoAssetManager();
 
-  /** 校验下载 buffer 的魔数（geoip=AB CD EF 4D；model="tree"；ruleset 仅查体积） */
-  private static bufferMagicOk(buf: ArrayBuffer, magic: number[]): boolean {
-    if (buf.byteLength < magic.length) {
-      return false;
-    }
-    const head = new Uint8Array(buf, 0, magic.length);
-    for (let i = 0; i < magic.length; i++) {
-      if (head[i] !== magic[i]) {
-        return false;
-      }
-    }
-    return true;
-  }
+  private readonly assetTransport: AssetDownloadFn = (mirrors: AssetMirror[], destPath: string,
+    minSize: number, validate: (buf: ArrayBuffer) => boolean, source: string,
+    what: string): Promise<boolean> => this.downloadAsset(mirrors, destPath, minSize, validate, source, what);
 
-  /**
-   * 共享的可等待资产下载：镜像按偏好重排后逐个尝试，成功（状态 200 + 体积 + 魔数）
-   * 才落盘，绝不把错误页写进内核 home（坏文件会让内核删档重下 → 90s 阻塞坑）。
-   */
   private async downloadAsset(mirrors: AssetMirror[], destPath: string, minSize: number,
     validate: (buf: ArrayBuffer) => boolean, source: string, what: string): Promise<boolean> {
-    const ordered = reorderAssetMirrors(mirrors, source);
-    // Bounded transport allocation + validation; magic is format checking, NOT authenticity.
-    const maxSize = 64 * 1024 * 1024;
-    let idx = 0;
-    for (const mirror of ordered) {
-      const tempPath = `${destPath}.download-${Date.now()}-${idx}.tmp`;
-      const client = http.createHttp();
-      try {
-        const resp = await client.request(mirror.url, {
-          method: http.RequestMethod.GET,
-          expectDataType: http.HttpDataType.ARRAY_BUFFER,
-          connectTimeout: 15000,
-          // geo/规则集/模型都托管在 GitHub：必须跟着隧道走，否则国内必失败
-          usingProxy: AppProxyRoute.isReady(),
-          // Model.bin 9.3MB 而且只能从 GitHub release 资产的限速前缀代理取
-          // （实测 gh-proxy 120s 只下到 5.9MB ⇒ 至少需要 ~190s），所以保留长超时；
-          // 代价是设置页会一直显示「更新中…」，由 downloadSmartModelAsset 的
-          // 并发守卫 + 手动更新提示来解释，而不是把慢但能成的下载改成必失败。
-          readTimeout: what === 'Model.bin' ? 300000 : 90000,
-          maxLimit: maxSize
-        });
-        const buf = resp.result as ArrayBuffer;
-        if (resp.responseCode === 200 && buf instanceof ArrayBuffer
-          && buf.byteLength > minSize && buf.byteLength <= maxSize && validate(buf)) {
-          const file = fs.openSync(tempPath,
-            fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-          try {
-            const written = fs.writeSync(file.fd, buf);
-            if (written !== buf.byteLength) { throw new Error('short asset write'); }
-            fs.fsyncSync(file.fd);
-          } finally {
-            fs.closeSync(file);
-          }
-          // Same-directory rename replaces atomically; never unlink the old asset first.
-          fs.renameSync(tempPath, destPath);
-          AppLogger.info(TAG, `${what} downloaded (${buf.byteLength} bytes, source=${mirror.tag})`);
-          return true;
-        }
-        AppLogger.warn(TAG, `${what} mirror ${idx}(${mirror.tag}) returned ${resp.responseCode},`
-          + ` size ${buf.byteLength}`);
-      } catch (e) {
-        AppLogger.warn(TAG, `${what} mirror ${idx}(${mirror.tag}) failed: ${e}`);
-      } finally {
-        client.destroy();
-        try { fs.unlinkSync(tempPath); } catch (e) { /* renamed or never created */ }
-      }
-      idx = idx + 1;
-    }
-    return false;
+    return GeoAssetManager.downloadAsset(mirrors, destPath, minSize, validate, source, what);
   }
 
-  /** 等待型 geoip.metadb 下载（设置页手动更新与连接后台补齐共用） */
   private async downloadGeoipAsset(source: string): Promise<boolean> {
-    if (this.geoipDownloading || this.context === null) {
-      return false;
-    }
-    this.geoipDownloading = true;
-    try {
-      const dest = `${this.context.cacheDir}/geoip.metadb`;
-      // 校验 MMDB 魔数（0xAB 0xCD 0xEF 'M'），不能只看体积：坑 39 的教训是
-      // CDN 错误页/拦截页同样可能很大，一旦把非 MMDB 内容按 geoip.metadb 落盘，
-      // 内核侧 mmdb.Verify 会判定无效并**删除文件后重新联网下载**，等于把坑 40
-      // 又引回来（config.Parse 阶段同步阻塞）。宁可下载失败，也不要写坏文件。
-      // 真源 8.4MB：体积下限 4MB（半截下载必小于它），标记在**尾部**而非头部
-      // （旧头部魔数判据把合法文件全判成坏，见 isGeoipReady 注释）。
-      return await this.downloadAsset(GEOIP_MIRRORS, dest, 1024 * 1024 * 4,
-        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferTailMagicOk(buf),
-        source, 'geoip.metadb');
-    } finally {
-      this.geoipDownloading = false;
-    }
+    return this.geoAssets.downloadGeoipAsset(this.context, source, this.assetTransport);
   }
 
-  /** 连接路径的后台补齐（fire-and-forget，失败下次连接重试） */
   private downloadGeoipInBackground(source: string = 'auto'): void {
     this.downloadGeoipAsset(source).then((ok: boolean): void => {
       if (!ok) {
@@ -5299,414 +5195,57 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     });
   }
 
-  /**
-   * geoip.metadb 是否**真正可用**（存在 + 体积够 + MMDB 魔数正确）。
-   *
-   * 只判 `size > 0` 是不够的：文件存在但内容损坏时，`useGeoip` 会误判为就绪，
-   * 于是生成带 GEOIP 规则 / dns.fallback 的配置，内核在 config.Parse 阶段
-   * `mmdb.Verify` 判定无效 → **删除文件并重新联网下载** → 启动期同步阻塞
-   * （国内直连 github 不可达），等于把坑 40 重新引回来。
-   * 魔数：MMDB 文件头前 4 字节固定为 0xAB 0xCD 0xEF 'M'。
-   */
-  /** geoip.metadb 尾部 MMDB 标记（`«ÍïMaxMind.com`）查找窗口 */
-  private static bufferTailMagicOk(buf: ArrayBuffer): boolean {
-    const marker: number[] = [0xAB, 0xCD, 0xEF, 0x4D, 0x61, 0x78, 0x4D, 0x69, 0x6E, 0x64, 0x2E,
-      0x63, 0x6F, 0x6D];
-    const b = new Uint8Array(buf);
-    if (b.byteLength < marker.length) {
-      return false;
-    }
-    for (let i = b.byteLength - marker.length; i >= 0; i--) {
-      let hit = true;
-      for (let j = 0; j < marker.length; j++) {
-        if (b[i + j] !== marker[j]) {
-          hit = false;
-          break;
-        }
-      }
-      if (hit) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private isGeoipReady(): boolean {
-    if (this.context === null) {
-      return false;
-    }
-    const path = `${this.context.cacheDir}/geoip.metadb`;
-    let file: fs.File | null = null;
-    try {
-      const size = fs.statSync(path).size;
-      if (size < 1024 * 100) {
-        return false;
-      }
-      // MMDB 元数据标记 `«ÍïMaxMind.com` 在**文件尾部**（实测 meta-rules-dat
-      // geoip.metadb 8.4MB，标记位于倒数 ~185 字节；文件头是 `00 00 01 15 ...`）。
-      // 旧版读头部 4 字节判魔数，真文件永远判「损坏」→ GEOIP 分流被降级；
-      // 更糟的是内核 mmdb.Verify 判定损坏时会**删档并同步联网重下**，国内不可达
-      // → config.Parse 阻塞 20s 超时（真机表现为「内核启动超时」）。
-      // 判据改为：体积够 + 尾部窗口内存在标记。
-      file = fs.openSync(path, fs.OpenMode.READ_ONLY);
-      const window = 4096;
-      const readLen = Math.min(window, size);
-      const tail = new ArrayBuffer(readLen);
-      // HarmonyOS fileIo 无 lseekSync：readSync 支持 options.offset（**文件内**偏移）
-      // + length（读多少），第四参误传会落到缓冲区长度上。直接用 options 定位读取。
-      const got = fs.readSync(file.fd, tail, { offset: size - readLen, length: readLen });
-      if (got < readLen) {
-        return false;
-      }
-      return ConnectionOrchestrator.bufferTailMagicOk(tail);
-    } catch (e) {
-      return false;
-    } finally {
-      if (file !== null) {
-        try {
-          fs.closeSync(file);
-        } catch (e) {
-          // ignore
-        }
-      }
-    }
+    return GeoAssetManager.isGeoipReady(this.context);
   }
 
-  /**
-   * LightGBM 模型（`Model.bin`）是否已就绪可用。
-   *
-   * 与 geoip.metadb 完全同源的风险：内核 `lightgbm.GetModel()` 在文件缺失时会
-   * **同步联网下载** `https://github.com/vernesong/mihomo/releases/.../Model.bin`，
-   * 国内直连不可达 → 实测在 config.Parse 阶段阻塞 **90.1s** 后才软失败降级
-   * （比 MMDB 温和：不 hard fail，但连接已经卡到用户以为挂死）。
-   * 最终配置声明 `type: smart` 且 `uselightgbm: true` 时须在启动前准备模型。
-   * Smart 未开启 LightGBM 时不依赖该文件。
-   *
-   * 魔数：LightGBM 文本模型首 4 字节为 "tree"。
-   */
   private isSmartModelReady(): boolean {
-    if (this.context === null) {
-      return false;
-    }
-    const path = `${this.context.cacheDir}/Model.bin`;
-    let file: fs.File | null = null;
-    try {
-      // 旧版自动铺盘不等于用户选择安装；仅设置页手动更新成功才写入该标记。
-      if (!fs.accessSync(`${path}.manual`)) { return false; }
-      // 模型 9.3MB；小于 1MB 必为截断/错误页
-      if (fs.statSync(path).size < 1024 * 1024) {
-        return false;
-      }
-      file = fs.openSync(path, fs.OpenMode.READ_ONLY);
-      const head = new ArrayBuffer(4);
-      const read = fs.readSync(file.fd, head);
-      if (read < 4) {
-        return false;
-      }
-      const b = new Uint8Array(head);
-      return b[0] === 0x74 && b[1] === 0x72 && b[2] === 0x65 && b[3] === 0x65; // "tree"
-    } catch (e) {
-      return false;
-    } finally {
-      if (file !== null) {
-        try {
-          fs.closeSync(file);
-        } catch (e) {
-          // ignore
-        }
-      }
-    }
+    return GeoAssetManager.isSmartModelReady(this.context);
   }
 
-
-  /**
-   * 纯查询：内核 smart 选点模型是否已就位（`cacheDir/Model.bin` 非空且魔数正确）。
-   *
-   * 只有用户手动更新成功且本地模型有效时可用。绝不铺盘、下载或碰网络。
-   */
   isSmartModelAvailable(): boolean {
     return this.isSmartModelReady();
   }
 
-  /** 仅设置页手动更新允许下载模型；启动、测速和页面查询均不得触发。 */
-  private smartModelDownloading: boolean = false;
-
-  /** 是否有 Model.bin 下载在飞行中（设置页据此区分「正在下」与「下载失败」） */
   isSmartModelDownloading(): boolean {
-    return this.smartModelDownloading;
+    return this.geoAssets.smartModelDownloading;
   }
 
-  /** 设置页显式触发，校验、原子替换成功后才标记为手动安装。 */
   private async downloadSmartModelAsset(source: string): Promise<boolean> {
-    if (this.smartModelDownloading || this.context === null) {
-      return false;
-    }
-    this.smartModelDownloading = true;
-    try {
-      const dest = `${this.context.cacheDir}/Model.bin`;
-      // LightGBM 文本模型魔数 "tree"；体积必须够（9.3MB）。
-      // 同 geoip 的理由：坏文件比没有文件更糟 —— 内核会删掉它再联网重下。
-      const ok = await this.downloadAsset(MODEL_MIRRORS, dest, 1024 * 1024,
-        (buf: ArrayBuffer): boolean => ConnectionOrchestrator.bufferMagicOk(buf,
-          [0x74, 0x72, 0x65, 0x65]), source, 'Model.bin');
-      if (ok) { privateFs.writePrivate(`${dest}.manual`, 'manual-v1'); }
-      return ok && this.isSmartModelReady();
-    } finally {
-      this.smartModelDownloading = false;
-    }
+    return this.geoAssets.downloadSmartModelAsset(this.context, source, this.assetTransport);
   }
 
 
-  /**
-   * 去广告规则集是否**可用**（存在 + 体积下限 + zstd 魔数）。
-   *
-   * 【2026-10-23 用户报障】手动更新去广告规则后 VPN 启动失败，删掉规则集就正常。
-   *
-   * 根因：手动更新走的是 GitHub 加速前缀（gh-proxy / ghfast），代理返回 **HTML/JSON
-   * 错误页**（都大于 1KB，旧校验只有 `size > 0` 与下载侧 `byteLength > 1024`），
-   * 坏内容被当成 .mrs 落盘。内核加载 rule-provider 时 `zstd` 解不开 / 内层头不是
-   * `MRS\x01` / behavior 不匹配 → **config.Parse 整份失败 → 隧道起不来**。
-   * 删掉文件后 `ruleProviderReady=false`，配置里不声明 RULE-SET，于是又能连。
-   *
-   * .mrs 的真实形态（mihomo `rules/provider/mrs_converter.go` + `mrs_reader.go`）：
-   *   zstd frame（首 4 字节 0x28 0xB5 0x2F 0xFD）→ 解压后才是 `MRS\x01 | behavior | count …`
-   * 所以「前 4 字节是 zstd 魔数」足以把错误页/半截下载挡在门外。
-   *
-   * 判据变了之后：文件损坏 = 视为未就绪 = 本轮配置不带 RULE-SET（隧道照常能起，
-   * 只是没有去广告），而不是「带着坏文件必起不来」。
-   */
   private isRuleProviderReady(): boolean {
-    // 内置规则集随包发布：首次（或文件被删/坏了）就地铺一份，去广告开箱即用，
-    // 不依赖「用户先手动点更新」也不依赖首次联网（2026-10-23 产品口径）。
-    this.seedRuleSetFromRawfile();
-    return this.ruleSetFileOk();
+    return GeoAssetManager.isRuleProviderReady(this.context);
   }
 
-  /**
-   * 把随包内置的去广告规则集（rawfile/hyper_adrules_ads.mrs）铺到
-   * `cacheDir/ruleset/hyper_adrules_ads.mrs`。
-   *
-   * 为什么内置（2026-10-23 用户要求）：
-   *  · 规则集是去广告能力的**唯一必需品**，让它依赖一次 GitHub 下载 = 首次开开关
-   *    十有八九失败（真机实测加速代理限速严重）；
-   *  · 用户把「数据」页里的手动更新入口去掉后，更需要一个开箱即用的基线版本；
-   *  · 之后想更新仍可走后台自动拉取（`downloadRuleProviderInBackground`）。
-   *
-   * 只在「目标不存在或不合法」时才写盘；已就绪（可能是更新的版本）一律不动。
-   *
-   * @returns 目标文件当前是否可用（铺好或本来就在）
-   */
   private seedRuleSetFromRawfile(): boolean {
-    if (this.context === null) {
-      return false;
-    }
-    if (this.ruleSetFileOk()) {
-      return true;
-    }
-    const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
-    const dst = `${dir}/${HYPER_AD_RULES_FILE}`;
-    let file: fs.File | null = null;
-    try {
-      try {
-        ensurePrivateDir(dir);
-      } catch (e) {
-        AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
-      }
-      const bytes: Uint8Array = this.context.resourceManager.getRawFileContentSync(BUNDLED_RULE_SET_RAWFILE);
-      if (bytes.byteLength < RULE_SET_MIN_BYTES) {
-        AppLogger.warn(TAG, `bundled ruleset too small (${bytes.byteLength} bytes); ignoring`);
-        return false;
-      }
-      // zstd 魔数与下载侧同一判据：坏文件比没文件更糟（内核会整份拒载）
-      const head = bytes.slice(0, ZSTD_MAGIC.length).buffer as ArrayBuffer;
-      if (!ConnectionOrchestrator.bufferMagicOk(head, ZSTD_MAGIC)) {
-        AppLogger.warn(TAG, 'bundled ruleset has wrong magic; ignoring');
-        return false;
-      }
-      file = fs.openSync(dst, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
-      const ab: ArrayBuffer = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
-        ? bytes.buffer as ArrayBuffer
-        : bytes.slice().buffer as ArrayBuffer;
-      fs.writeSync(file.fd, ab);
-      AppLogger.info(TAG, `ad ruleset seeded from bundle (${bytes.byteLength} bytes); ad-block ready offline`);
-      return true;
-    } catch (e) {
-      AppLogger.warn(TAG, `seed ad ruleset from bundle failed: ${AppLogger.errText(e)}`);
-      return false;
-    } finally {
-      if (file !== null) {
-        try {
-          fs.closeSync(file);
-        } catch (e) {
-          // ignore
-        }
-      }
-    }
+    return GeoAssetManager.seedRuleSetFromRawfile(this.context);
   }
 
-  /**
-   * 内核启动错误文本是否指向「规则集/规则提供者」损坏。
-   *
-   * 覆盖 mihomo 侧可能的几类措辞：
-   *  · `initial rule provider ...` / `rule-provider` / `ruleset`
-   *  · `invalid MrsMagic bytes`、`invalid behavior`（mrs_reader.go 的两个显式报错）
-   *  · `zstd: ...` 解压失败、`unexpected EOF`（半截下载）
-   */
   private looksLikeRuleSetFailure(errorText: string): boolean {
-    if (errorText.length === 0) {
-      return false;
-    }
-    const t = errorText.toLowerCase();
-    if (t.indexOf('mrs') >= 0 || t.indexOf('rule-provider') >= 0
-      || t.indexOf('rule provider') >= 0 || t.indexOf('ruleset') >= 0
-      || t.indexOf('rule-set') >= 0 || t.indexOf('invalid behavior') >= 0) {
-      return this.ruleSetFileExists();
-    }
-    // zstd 解压类报错只有在规则集文件存在时才可能是它
-    if (t.indexOf('zstd') >= 0 || t.indexOf('unexpected eof') >= 0) {
-      return this.ruleSetFileExists();
-    }
-    return false;
+    return GeoAssetManager.looksLikeRuleSetFailure(this.context, errorText);
   }
 
-  /** 规则集文件是否存在（不看是否有效：自愈要处理的就是无效文件） */
   private ruleSetFileExists(): boolean {
-    if (this.context === null) {
-      return false;
-    }
-    try {
-      fs.statSync(`${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`);
-      return true;
-    } catch (e) {
-      return false;
-    }
+    return GeoAssetManager.ruleSetFileExists(this.context);
   }
 
-  /** 规则集文件本体校验（stat 体积 + 头部 zstd 魔数），任何异常都按不可用处理 */
   private ruleSetFileOk(): boolean {
-    if (this.context === null) {
-      return false;
-    }
-    const p = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
-    try {
-      const size = Number(fs.statSync(p).size);
-      if (!(size >= RULE_SET_MIN_BYTES)) {
-        return false;
-      }
-      const file = fs.openSync(p, fs.OpenMode.READ_ONLY);
-      try {
-        const head = new ArrayBuffer(ZSTD_MAGIC.length);
-        const read = fs.readSync(file.fd, head);
-        if (read < ZSTD_MAGIC.length) {
-          return false;
-        }
-        return ConnectionOrchestrator.bufferMagicOk(head, ZSTD_MAGIC);
-      } finally {
-        fs.closeSync(file);
-      }
-    } catch (e) {
-      return false;
-    }
+    return GeoAssetManager.ruleSetFileOk(this.context);
   }
 
-  /**
-   * 内核因规则集起不来时的自愈（2026-10-23 用户报障）。
-   *
-   * 两级策略：
-   *  1) 有 `last-good` 副本 → **回滚**到上一份被内核成功加载过的规则集
-   *     （用户在「设置 → 数据与规则」更新后坏掉时，去广告能力不丢）；
-   *  2) 没有副本 → 把坏文件**隔离**成 `.bad-<时间戳>`（不删，便于排查），
-   *     下一次连接生成不带 RULE-SET 的配置。
-   *
-   * 为什么不能只靠回滚配置：坏的是 rule-provider 文件本身，配置文本是好的；
-   * 回滚后的配置照样引用同一个坏文件，用户会一直连不上（实测症状就是
-   * 「更新去广告规则后起不来，删掉规则集就好了」）。
-   */
   private healRuleSet(reason: string): string {
-    if (this.context === null) {
-      return '';
-    }
-    const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
-    const p = `${dir}/${HYPER_AD_RULES_FILE}`;
-    const good = `${p}${RULE_SET_GOOD_SUFFIX}`;
-    try {
-      const goodSize = Number(fs.statSync(good).size);
-      if (goodSize >= RULE_SET_MIN_BYTES) {
-        fs.renameSync(good, p);
-        AppLogger.warn(TAG, `ad ruleset restored from last-good copy (${reason}, ${goodSize} bytes)`);
-        return 'restored';
-      }
-    } catch (e) {
-      // 没有 last-good 副本：走隔离
-    }
-    try {
-      fs.renameSync(p, `${p}.bad-${Date.now()}`);
-      AppLogger.warn(TAG, `ad ruleset quarantined (${reason}); next connect runs without RULE-SET`);
-      return 'quarantined';
-    } catch (e) {
-      AppLogger.warn(TAG, `ad ruleset quarantine failed: ${AppLogger.errText(e)}`);
-      return '';
-    }
+    return GeoAssetManager.healRuleSet(this.context, reason);
   }
 
-  /**
-   * 连接成功后把当前规则集留一份 last-good 副本（供 healRuleSet 回滚）。
-   * 只在规则集文件本体校验通过时快照，避免把坏文件当"good"存下来。
-   */
   private snapshotRuleSetGood(): void {
-    if (this.context === null || !this.ruleSetFileOk()) {
-      return;
-    }
-    const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
-    const p = `${dir}/${HYPER_AD_RULES_FILE}`;
-    const tmp = `${p}${RULE_SET_GOOD_SUFFIX}.tmp`;
-    try {
-      fs.copyFileSync(p, tmp);
-      fs.renameSync(tmp, `${p}${RULE_SET_GOOD_SUFFIX}`);
-    } catch (e) {
-      AppLogger.warn(TAG, `ad ruleset last-good snapshot failed: ${AppLogger.errText(e)}`);
-    }
+    GeoAssetManager.snapshotRuleSetGood(this.context);
   }
 
-  /**
-   * geo 资产状态快照（设置页「数据」）。就绪判定与连接路径同源：
-   * geoip/model 走魔数校验；mtime 供「多久没更新」展示。
-   *
-   * 去广告规则集**不在这里**（2026-10-23）：它随安装包内置、开关打开即生效，
-   * 不再是需要用户手动更新/删除的独立资产 —— 用户口径「去广告规则集去掉，
-   * 默认自带这个数据」。
-   */
   geoAssetStatuses(): GeoAssetStatus[] {
-    const out: GeoAssetStatus[] = [];
-    const stat = (relPath: string): number[] => {
-      if (this.context === null) {
-        return [-1, 0];
-      }
-      try {
-        const s = fs.statSync(`${this.context.cacheDir}/${relPath}`);
-        return [Number(s.size), Number(s.mtime) * 1000];
-      } catch (e) {
-        return [-1, 0];
-      }
-    };
-    const geoip = stat('geoip.metadb');
-    const model = stat('Model.bin');
-    const item = (id: string, label: string, detail: string, info: number[],
-      ready: boolean): GeoAssetStatus => {
-      const g = new GeoAssetStatus();
-      g.id = id;
-      g.label = label;
-      g.detail = detail;
-      g.sizeBytes = info[0] < 0 ? 0 : info[0];
-      g.mtimeMs = info[1];
-      g.ready = ready;
-      return g;
-    };
-    out.push(item('geoip', 'GeoIP 数据库', 'GEOIP,CN 直连分流与 DNS fallback 依赖', geoip,
-      this.isGeoipReady()));
-    out.push(item('model', 'Smart 选点模型', 'LightGBM 自动选点依赖（需手动更新）', model,
-      this.isSmartModelAvailable()));
-    return out;
+    return GeoAssetManager.geoAssetStatuses(this.context);
   }
 
   /**
@@ -5723,9 +5262,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     if (id === 'geoip') {
       ok = await this.downloadGeoipAsset(source);
     } else if (id === 'model') {
-      // 后台任务正持有下载锁时，downloadSmartModelAsset 会立刻返回 false，
-      // 旧实现把它报成「全部下载源均失败」—— 与事实相反（正在下）。
-      if (this.smartModelDownloading) {
+      if (this.geoAssets.smartModelDownloading) {
         return '模型正在更新，请稍候再看状态';
       }
       ok = await this.downloadSmartModelAsset(source);
@@ -5734,17 +5271,12 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } else {
       return '未知的数据项';
     }
-    // 去广告规则集更新成功 → 热加载新规则；失败保留当前会话，不自动重连。
-    // 会话代次不符说明用户已重连/断开：迟到的下载结果不能改写新会话的配置。
     if (ok && id === 'ruleset' && this.isRuleSessionCurrent(seq, generation)) {
       await this.applyRulesChanged('ruleset-updated');
     }
-    // 【2026-10-22】模型下载成功后也要 bump 信号：订阅页的「自动选择」入口跟着
-    // `smart_model_seq` 重算（与删除对称）。否则用户点「更新」把模型装回来了、
-    // 入口却还藏着，得杀进程才会出现。
     if (ok && id === 'model') {
-      const seq = AppStorage.get<number>('smart_model_seq');
-      AppStorage.setOrCreate<number>('smart_model_seq', (seq ?? 0) + 1);
+      const modelSeq = AppStorage.get<number>('smart_model_seq');
+      AppStorage.setOrCreate<number>('smart_model_seq', (modelSeq ?? 0) + 1);
     }
     return ok ? '' : (id === 'model'
       ? '模型下载失败，请先使用普通节点启动代理，再点击更新重试'
@@ -5752,14 +5284,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   /**
-   * 删除可按需重下的资产（**仅** Smart 选点模型与去广告规则集）。
-   *
-   * 用户口径（2026-10-22）：这两个都不是必需品，允许用户删掉腾空间；
-   * 删除后：
-   *  · 模型消失 → 订阅页/节点页的「自动选择」入口自动隐藏（见 smartModelSeq 信号）；
-   *  · 规则集消失 → 调用方触发一次代理重启，让内核换用不含 RULE-SET 的配置。
-   * GeoIP/GeoSite **不允许删**：内核缺它们会在 config.Parse 阶段直接退出。
-   *
+   * 删除可按需重下的资产（仅 Smart 选点模型与去广告规则集）。
    * @returns '' = 成功；非空 = 用户可读的失败原因
    */
   deleteGeoAsset(id: string): string {
@@ -5769,28 +5294,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     try {
       if (id === 'model') {
         if (this.state !== ConnState.DISCONNECTED) { return '删除模型前请先断开代理'; }
-        if (this.smartModelDownloading) { return '模型正在更新，请稍后再删除'; }
-        const path = `${this.context.cacheDir}/Model.bin`;
-        if (fs.accessSync(path)) { fs.unlinkSync(path); }
-        if (fs.accessSync(`${path}.manual`)) { fs.unlinkSync(`${path}.manual`); }
-        // 通知所有页面重算「自动选择」是否该显示
-        const seq = AppStorage.get<number>('smart_model_seq');
-        AppStorage.setOrCreate<number>('smart_model_seq', (seq === undefined ? 0 : seq) + 1);
+        if (this.geoAssets.smartModelDownloading) { return '模型正在更新，请稍后再删除'; }
+        GeoAssetManager.deleteModel(this.context);
+        const modelSeq = AppStorage.get<number>('smart_model_seq');
+        AppStorage.setOrCreate<number>('smart_model_seq', (modelSeq === undefined ? 0 : modelSeq) + 1);
         AppLogger.info(TAG, 'smart model deleted; auto-select entry hidden');
         return '';
       }
       if (id === 'ruleset') {
-        const path = `${this.context.cacheDir}/${RULESET_SUBDIR}/${HYPER_AD_RULES_FILE}`;
-        try {/* 连同 last-good 副本一起删：否则下次启动失败时会被自愈逻辑"复活" */
-          fs.unlinkSync(`${path}${RULE_SET_GOOD_SUFFIX}`);
-        } catch (e) {
-          // 副本不存在属正常
-        }
-        try {
-          fs.unlinkSync(path);
-        } catch (e) {
-          // 同上
-        }
+        GeoAssetManager.deleteRuleset(this.context);
         this.lastRuleProviderFileReady = false;
         AppLogger.info(TAG, 'ad-block ruleset deleted; next rules reload drops RULE-SET');
         return '';
@@ -5801,54 +5313,8 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     }
   }
 
-  /** 多个入口共享同一下载，避免重复写入和把「正在下载」误判为失败。 */
-  private ruleProviderDownloadTask: Promise<boolean> | null = null;
-
-  /** 等待型去广告规则集下载 */
   private async downloadRuleProviderAsset(source: string): Promise<boolean> {
-    if (this.context === null) {
-      return false;
-    }
-    if (this.ruleProviderDownloadTask !== null) {
-      return this.ruleProviderDownloadTask;
-    }
-    const task = this.performRuleProviderDownload(source);
-    this.ruleProviderDownloadTask = task;
-    try {
-      return await task;
-    } catch (e) {
-      AppLogger.warn(TAG, `hyper-adrules download task error: ${AppLogger.errText(e)}`);
-      return false;
-    } finally {
-      if (this.ruleProviderDownloadTask === task) {
-        this.ruleProviderDownloadTask = null;
-      }
-    }
-  }
-
-  private async performRuleProviderDownload(source: string): Promise<boolean> {
-    if (this.context === null) {
-      return false;
-    }
-    try {
-      const dir = `${this.context.cacheDir}/${RULESET_SUBDIR}`;
-      const dest = `${dir}/${HYPER_AD_RULES_FILE}`;
-      // ruleset 子目录可能不存在，写盘前必须先建（openSync CREATE 不递归建目录）
-      try {
-        ensurePrivateDir(dir);
-      } catch (e) {
-        AppLogger.warn(TAG, `ruleset dir create failed: ${AppLogger.errText(e)}`);
-      }
-      // 体积下限 + zstd 魔数：加速代理的错误页（HTML/JSON）体积也常超 1KB，
-      // 只查体积会把坏内容写进内核 home，导致下次启动 config.Parse 整份失败。
-      return await this.downloadAsset(HYPER_AD_RULES_MIRRORS, dest, RULE_SET_MIN_BYTES - 1,
-        (buf: ArrayBuffer): boolean => buf.byteLength >= RULE_SET_MIN_BYTES
-          && ConnectionOrchestrator.bufferMagicOk(buf, ZSTD_MAGIC),
-        source, 'hyper-adrules');
-    } catch (e) {
-      AppLogger.warn(TAG, `hyper-adrules download failed: ${AppLogger.errText(e)}`);
-      return false;
-    }
+    return this.geoAssets.downloadRuleProviderAsset(this.context, source, this.assetTransport);
   }
 
   /**
@@ -5863,6 +5329,7 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   private async disconnectInternal(expectedGeneration: number = 0, preserveIntent: boolean = false): Promise<void> {
     this.invalidateStateProbeCache();
     this.stopMonitors();
+    TaskProgressUpdater.setSessionStartedAt(0);
     // 隧道要没了：立刻撤销 App 级 HTTP 代理，否则后续请求全打到空端口
     AppProxyRoute.clear();
     // 测速内核与真实隧道互斥：断开/回滚路径一并回收单航班状态机（含配置清理）
@@ -5937,6 +5404,13 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     this.trafficTimer = UnifiedScheduler.every(() => {
       if (this.trafficPollRunning || this.state !== ConnState.CONNECTED) {
         return;
+      }
+      if (this.appInBackground) {
+        const bgNow = Date.now();
+        if (this.lastBgTrafficPollAt > 0 && bgNow - this.lastBgTrafficPollAt < BG_TRAFFIC_POLL_INTERVAL_MS) {
+          return;
+        }
+        this.lastBgTrafficPollAt = bgNow;
       }
       this.trafficPollRunning = true;
       const seq = this.connectSeq;
@@ -6015,10 +5489,14 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         //   ① coreAlive=true / 文件不可信 → 真 ALIVE；
         //   ② phase 在恢复中且 status 仍在更新（ts 前进 <90s）→ 扩展在自救，不抢跑；
         //   ③ 本地 API 探针（127.0.0.1 回环，不受物理断网影响）再确认一次；
-        //   ④ 连续 3 票（时间间隔与心跳死亡同口径）才升级 handleCoreLoss。
+        //   ④ 连续 3 票（时间间隔与心跳死亡同口径）才升级 handleCoreLoss；
+        //      若扩展已写下 failed/stopped 终态且持久化快照也已非连接意图，则立即对齐到 DISCONNECTED。
         const view = this.extensionStatus();
+        const terminalExtPhase = view.ok && !view.coreAlive
+          && (view.phase === 'failed' || view.phase === 'stopped');
         const stuckBlackhole = view.ok && !view.coreAlive
           && (view.phase === 'running'
+            || terminalExtPhase
             || (view.phase === 'recovering' && Date.now() - view.ts > CORE_RECOVERY_STUCK_MS));
         if (!stuckBlackhole) {
           this.coreDownStrikes = 0;
@@ -6034,6 +5512,15 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           this.coreDownStrikes = 0;
           this.resetCoreDeathConfirmation();
           return;
+        }
+        if (terminalExtPhase) {
+          const snap = await SettingsService.loadSnapshot();
+          if (!this.isCurrentMonitor(generation, seq)) { return; }
+          if (!snap.desiredConnected || snap.phase === 'failed' || snap.phase === 'disconnected') {
+            this.reconcileExternalStop(`extension-terminal-${view.phase}`,
+              view.phase === 'failed' ? view.detail : '');
+            return;
+          }
         }
         const downNow = Date.now();
         if (this.coreDownStrikes > 0 && downNow - this.coreDownLastAt < CORE_LIVENESS_POLL_MS) {
@@ -6051,9 +5538,17 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
         this.coreDownStrikes = 0;
         this.coreDownFirstAt = 0;
         this.coreDownLastAt = 0;
-        if (!await this.isCurrentSession(this.sessionGeneration)
-          || !this.isCurrentMonitor(generation, seq)) {
+        if (!this.isCurrentMonitor(generation, seq)) {
           this.resetCoreDeathConfirmation();
+          return;
+        }
+        if (!await this.isCurrentSession(this.sessionGeneration)) {
+          if (!this.isCurrentMonitor(generation, seq)) {
+            this.resetCoreDeathConfirmation();
+            return;
+          }
+          this.reconcileExternalStop('blackhole-session-ended',
+            view.ok && view.phase === 'failed' ? view.detail : '');
           return;
         }
         this.resetCoreDeathConfirmation();
@@ -6077,10 +5572,22 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
           + `strikes=${this.coreDeathStrikes}/${CORE_DEATH_CONFIRMATIONS}`);
         return;
       }
-      // 最后再核对持久化意图；用户可能从另一 Ability/进程停止了 VPN。
-      if (!await this.isCurrentSession(this.sessionGeneration)
-        || !this.isCurrentMonitor(generation, seq)) {
+      // 最后再核对持久化意图；用户或扩展进程可能已从另一进程停止/终止了 VPN。
+      // 注意：此时已跨 6s 连续 3 次确认心跳与控制接口皆死，若持久化会话已结束或换代，
+      // 必须同步将本进程状态收敛到 DISCONNECTED 并清理 AppProxyRoute，绝不可只清计数
+      // 而让 UI 永远卡在「已连接 + 没网」的死循环。
+      if (!this.isCurrentMonitor(generation, seq)) {
         this.resetCoreDeathConfirmation();
+        return;
+      }
+      if (!await this.isCurrentSession(this.sessionGeneration)) {
+        if (!this.isCurrentMonitor(generation, seq)) {
+          this.resetCoreDeathConfirmation();
+          return;
+        }
+        const extView = this.extensionStatus();
+        this.reconcileExternalStop('liveness-session-ended',
+          extView.ok && extView.phase === 'failed' ? extView.detail : '');
         return;
       }
       this.resetCoreDeathConfirmation();
@@ -6092,6 +5599,31 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
     } finally {
       if (generation === this.monitorGeneration) { this.livenessPollRunning = false; }
     }
+  }
+
+  /**
+   * 跨进程会话已终结（另一 Ability 断开、扩展终态失败或会话已换代且旧核已死）时的本地收敛：
+   * 停监控、清 App HTTP 代理路由（防止 App 流量继续打向死端口导致“没网”）、推 DISCONNECTED 事件。
+   * 不覆写持久化快照（writes=0），也不触发旧会话自动修复（losses=0）。
+   */
+  private reconcileExternalStop(reason: string, errorMessage: string = ''): void {
+    this.stopMonitors();
+    this.reconnectManager().cancel('external-stop');
+    this.automaticRecoveryActive = false;
+    AppProxyRoute.clear();
+    if (typeof this.api.resetTrafficBaseline === 'function') {
+      this.api.resetTrafficBaseline();
+    }
+    this.traffic = { uploadBytes: 0, downloadBytes: 0, uploadSpeed: 0, downloadSpeed: 0 };
+    this.startedAt = 0;
+    TaskProgressUpdater.setSessionStartedAt(0);
+    if (errorMessage.length > 0) {
+      this.lastError = errorMessage;
+    }
+    AppLogger.info(TAG, `reconciled local state to DISCONNECTED (${reason})`
+      + (errorMessage.length > 0 ? `: ${errorMessage}` : ''));
+    this.setState(ConnState.DISCONNECTED);
+    this.notify();
   }
 
   private isCurrentMonitor(generation: number, seq: number): boolean {
@@ -6139,53 +5671,18 @@ export class ConnectionOrchestrator implements NetworkStateListener, Orchestrato
   }
 
   formatSpeed(bytesPerSecond: number): string {
-    if (bytesPerSecond < 1024) {
-      return `${bytesPerSecond.toFixed(0)} B/s`;
-    }
-    if (bytesPerSecond < 1024 * 1024) {
-      return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
-    }
-    return `${(bytesPerSecond / 1024 / 1024).toFixed(2)} MB/s`;
+    return OrchestratorNetChecks.formatSpeed(bytesPerSecond);
   }
 
-  /**
-   * 常驻通知栏的连接时长（H:MM:SS）。startedAt=0（未连接）时不显示时长段。
-   */
   private connDurationText(): string {
-    if (this.startedAt <= 0) {
-      return '';
-    }
-    let s = Math.floor((Date.now() - this.startedAt) / 1000);
-    if (s < 0) {
-      s = 0;
-    }
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    const mm = m < 10 ? `0${m}` : `${m}`;
-    const ss = sec < 10 ? `0${sec}` : `${sec}`;
-    return `${h}:${mm}:${ss}`;
+    return OrchestratorNetChecks.connDurationText(this.startedAt);
   }
 
-  /** 通知标题里的节点名：截断过长的名字，避免通知栏标题被挤没 */
   private notifyNodeText(name: string): string {
-    const n = name.trim();
-    if (n.length <= 24) {
-      return n;
-    }
-    return `${n.substring(0, 24)}…`;
+    return OrchestratorNetChecks.notifyNodeText(name);
   }
 
   formatBytes(total: number): string {
-    if (total < 1024) {
-      return `${total} B`;
-    }
-    if (total < 1024 * 1024) {
-      return `${(total / 1024).toFixed(1)} KB`;
-    }
-    if (total < 1024 * 1024 * 1024) {
-      return `${(total / 1024 / 1024).toFixed(1)} MB`;
-    }
-    return `${(total / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    return OrchestratorNetChecks.formatBytes(total);
   }
 }

@@ -764,32 +764,31 @@ export struct HomePage {
     }
   }
 
-  /** 代理模式三段按钮（2026-10-26 用户定稿：透明按钮 + 小椭圆高亮）：
-   *  整条三段按钮没有底；只有选中项带一个小胶囊（宽度=文字+左右 20vp，高 34vp），
-   *  胶囊用 modeChipFill/modeChipBorder（比 primaryLight 蓝一档，用户要求「再加重一点点」）。
-   *  胶囊不再铺满 1/3 栏宽（用户「椭圆范围小一点，不用这么长」），点击热区仍是整个 1/3 槽位。 */
+  /** 代理模式三段分段器：居中紧凑胶囊底槽 + 选中滑片高亮，避免三项在宽屏上零散分布 */
   @Builder
   ProxyModeButton(mode: string, label: string) {
     Row() {
       Text(label)
-        .fontSize(14)
+        .fontSize(13)
         .fontWeight(this.proxyMode === mode ? FontWeight.Bold : FontWeight.Medium)
         .fontColor(this.proxyMode === mode ? TunBoxTextColors.accentBlueFor(this.themeRevision) : TunBoxTextColors.secondaryFor(this.themeRevision))
-        .textAlign(TextAlign.Center)
-        .height(34)
-        .padding({ left: 20, right: 20 })
-        .borderRadius(TunBoxGeometry.pillRadius)
-        .backgroundColor(this.proxyMode === mode ? TunBoxColors.modeChipFillFor(this.themeRevision) : Color.Transparent)
-        .border({
-          width: 1,
-          color: this.proxyMode === mode ? TunBoxColors.modeChipBorderFor(this.themeRevision) : Color.Transparent
-        })
-        // 选中胶囊换色走过渡（底色 / 描边 / 字色一起淡过去），不再硬切
-        .animation(TunBoxMotion.stateChange())
+        .maxLines(1)
     }
     .layoutWeight(1)
-    .height(40)
+    .height('100%')
     .justifyContent(FlexAlign.Center)
+    .borderRadius(TunBoxGeometry.pillRadius)
+    .backgroundColor(this.proxyMode === mode
+      ? (ThemeService.isDark() ? TunBoxColors.modeChipFillFor(this.themeRevision) : TunBoxColors.surfaceCard(this.themeRevision))
+      : Color.Transparent)
+    .border({
+      width: this.proxyMode === mode && ThemeService.isDark() ? 1 : 0,
+      color: this.proxyMode === mode && ThemeService.isDark() ? TunBoxColors.modeChipBorderFor(this.themeRevision) : Color.Transparent
+    })
+    .shadow(this.proxyMode === mode && !ThemeService.isDark()
+      ? { radius: 6, color: 'rgba(15, 23, 42, 0.08)', offsetX: 0, offsetY: 1 }
+      : { radius: 0, color: '#00000000', offsetX: 0, offsetY: 0 })
+    .animation(TunBoxMotion.stateChange())
     .clickEffect(TunBoxMotion.pressControl())
     .onClick(() => this.applyProxyMode(mode))
   }
@@ -808,7 +807,10 @@ export struct HomePage {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
       Column() {
+        // 滚动区置于顶栏主标题线附近，保留 56vp 透明渐隐带且静止时首屏不裁切
+        Blank().height(Math.max(36, TunBoxGeometry.headerReserve() - 36))
         Scroll() {
+          Column() {
           Column({ space: 16 }) {
             // ── 2. 天体轨域启动按钮（2026-10-17 用户按 stitch 设计稿「方案一」重构；
             //       节点名放回按钮内部，副标题/状态胶囊按用户要求删除）──
@@ -844,13 +846,19 @@ export struct HomePage {
                 .transition(TunBoxMotion.revealDown())
             }
 
-            // ── 代理模式三段按钮：规则/全局/直连（2026-10-17 自分流模式卡片迁出，置于启动按钮下方）──
-            Row({ space: 10 }) {
+            // ── 代理模式三段分段器（规则/全局/直连）：紧凑居中胶囊槽 ──
+            Row({ space: 2 }) {
               this.ProxyModeButton('rule', '规则')
               this.ProxyModeButton('global', '全局')
               this.ProxyModeButton('direct', '直连')
             }
             .width('100%')
+            .constraintSize({ maxWidth: 320 })
+            .height(42)
+            .padding(3)
+            .borderRadius(TunBoxGeometry.pillRadius)
+            .backgroundColor(TunBoxColors.controlTrackSoft(this.themeRevision))
+            .border({ width: 1, color: TunBoxColors.cardBorder(this.themeRevision) })
 
             // ── 订阅区块（2026-10-28：订阅从独立页签迁到主页，对齐 ClashPlus「内联 profiles」）──
             // 点订阅卡 → 全屏覆盖展开节点列表（bindContentCover），选完节点自动返回。
@@ -884,13 +892,16 @@ export struct HomePage {
 
           }
           .width('100%')
+          .constraintSize({ maxWidth: TunBoxGeometry.contentMaxWidth })
+          .alignItems(HorizontalAlign.Center)
+          }
+          .width('100%')
+          .alignItems(HorizontalAlign.Center)
           // 页签页底部为悬浮 Dock 留白（TunBoxGeometry.dockClearance = 96，契约硬性规则）
           .padding({
             left: TunBoxGeometry.pagePadding,
             right: TunBoxGeometry.pagePadding,
-            // 顶栏是浮层（见 build() 末尾）：首屏内容要让出它的总高，
-            // 滚动起来以后内容从玻璃底下穿过 —— 2026-10-30 用户要求「渐变模糊」。
-            top: TunBoxGeometry.headerReserve(),
+            top: 30,
             bottom: TunBoxGeometry.dockClearance()
           })
         }.edgeEffect(EdgeEffect.Spring)

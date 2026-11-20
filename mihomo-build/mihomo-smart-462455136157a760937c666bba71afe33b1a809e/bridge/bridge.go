@@ -394,6 +394,8 @@ func Start(configPath string, tunFd int64) (result string) {
 		cfg.General.Tun.FileDescriptor = int(tunFd)
 		cfg.General.Tun.DNSHijack = []string{"any:53"}
 		cfg.General.Tun.AutoRoute = false
+		// Platform VPN owns routing; kernel redirect requires kernel auto-route.
+		cfg.General.Tun.AutoRedirect = false
 		cfg.General.Tun.AutoDetectInterface = false
 		log.Infoln("Bridge: TUN descriptor attached; effective stack=%s mtu=%d congestion=%s", cfg.General.Tun.Stack.String(), cfg.General.Tun.MTU, cfg.General.Tun.CongestionController)
 	} else {

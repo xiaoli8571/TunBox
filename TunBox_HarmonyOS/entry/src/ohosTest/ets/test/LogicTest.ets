@@ -9,7 +9,7 @@ import {
   HEARTBEAT_STALE_MS, CoreLivenessProbe, isHeartbeatFresh, resolveAuthority,
   shouldExecuteDisconnect, shouldSuppressConnect
 } from '../../../main/ets/commons/services/TunnelAuthority';
-import { LatencyStyle, NodeDisplay } from '../../../main/ets/theme/UiTokens';
+import { LatencyStyle, NodeDisplay, Ui } from '../../../main/ets/theme/UiTokens';
 import { LatencyLiveView } from '../../../main/ets/commons/services/LatencyLiveView';
 import {
   NodeSortSnapshot, NodeSortModes, NodeLatencyRecord, NodeProtocolPolicy
@@ -19,8 +19,9 @@ import { ProxyGroup } from '../../../main/ets/commons/models/ProxyGroup';
 import { AppSettings, AppSettingsJson } from '../../../main/ets/commons/models/AppSettings';
 import {
   MAX_STATE_FILE_BYTES, PRIVATE_CONFIG_FILE, PRIVATE_TEST_CONFIG_FILE, PrivateFs,
-  SyncReadResult, clearPrivateArtifacts, heartbeatAgeFromText, parseHeartbeatTimestamp,
-  removeFilesIndependently
+  SyncReadResult, TUNNEL_STATE_FILES, clearPrivateArtifacts, heartbeatAgeFromText,
+  isTestConfigFileName, isTestConfigPath, parseHeartbeatTimestamp,
+  removeFilesIndependently, testConfigFileName
 } from '../../../main/ets/commons/services/RuntimeFilePolicy';
 import {
   SingleFlightTestCore, TestCoreStatus
@@ -109,10 +110,8 @@ class FakePrivateFs implements PrivateFs {
 export default function logicTest() {
   describe('tunboxLogicTest', () => {
     it('ssr_parse', 0, () => {
-      // ssr:// 1.2.3.4:8388:origin:aes-256-cfb:plain:<base64("pass")>/?remarks=<base64("测试")>
-      const pass = 'cGFzcw==';
-      const remarks = '5rGf6IO9';
-      const uri = `ssr://1.2.3.4:8388:origin:aes-256-cfb:plain:${pass}/?remarks=${remarks}&obfsparam=`;
+      // ssr://base64(host:port:protocol:method:obfs:password/?remarks=base64("测试"))
+      const uri = 'ssr://MS4yLjMuNDo4Mzg4Om9yaWdpbjphZXMtMjU2LWNmYjpwbGFpbjpwYXNzLz9yZW1hcmtzPTVyV0w2SytWJm9iZnNwYXJhbT0=';
       const nodes = SubscriptionParser.parse(uri, 'sub1');
       expect(nodes.length).assertEqual(1);
       expect(nodes[0].server).assertEqual('1.2.3.4');
@@ -153,17 +152,21 @@ export default function logicTest() {
 
     it('config_generator_ipv4_only_and_mode', 0, () => {
       const s = new AppSettings();
+      s.ipv6Enabled = false;
       const node = new ProxyNode();
       node.name = 'HK-01';
+      node.proxyType = 'ss';
       node.server = 'h.example.com';
       node.port = 443;
       node.method = 'aes-128-gcm';
       node.password = 'pw';
-      const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec');
+      const yaml = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec', false, false);
       expect(yaml.includes('ipv6: false')).assertTrue();
       expect(yaml.includes('mode: rule')).assertTrue();
       expect(yaml.includes('external-controller: 127.0.0.1:9090')).assertTrue();
-      expect(yaml.includes('GEOIP,CN,DIRECT')).assertTrue();
+      expect(yaml.includes('GEOIP,CN,DIRECT')).assertFalse();
+      const yamlGeo = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec', true, false);
+      expect(yamlGeo.includes('GEOIP,CN,DIRECT')).assertTrue();
       const sGlobal = new AppSettings();
       sGlobal.proxyMode = 'global';
       const yamlGlobal = ClashConfigGenerator.generate(node, [node], sGlobal, 7890, 9090, 1053, 'sec');
@@ -176,6 +179,7 @@ export default function logicTest() {
       s.forceProxySites = ['openai.com'];
       const node = new ProxyNode();
       node.name = 'n';
+      node.proxyType = 'ss';
       node.server = 's';
       node.port = 1;
       node.method = 'aes-128-gcm';
@@ -190,8 +194,10 @@ export default function logicTest() {
       //   parse config:rules[0] [DOMAIN-SUFFIX,local, 本地直连] error: proxy not found
       // 整份配置拒载 → 启动代理失败。
       const s = new AppSettings();
+      s.rulesEnabled = true;
       const node = new ProxyNode();
       node.name = 'HK-01';
+      node.proxyType = 'ss';
       node.server = 'h.example.com';
       node.port = 443;
       node.method = 'aes-128-gcm';
@@ -202,7 +208,7 @@ export default function logicTest() {
       dead.groupType = 'select';
       dead.members = [];
       const yamlDead = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec',
-        true, false, {}, true, [dead], true, false,
+        true, false, {}, true, [dead], true,
         ['DOMAIN-SUFFIX,local,本地直连']);
       expect(yamlDead.includes('DOMAIN-SUFFIX,local,本地直连')).assertFalse();
 
@@ -212,7 +218,7 @@ export default function logicTest() {
       live.groupType = 'select';
       live.members = ['HK-01'];
       const yamlLive = ClashConfigGenerator.generate(node, [node], s, 7890, 9090, 1053, 'sec',
-        true, false, {}, true, [live], true, false,
+        true, false, {}, true, [live], true,
         ['DOMAIN-SUFFIX,local,本地直连']);
       expect(yamlLive.includes('DOMAIN-SUFFIX,local,本地直连')).assertTrue();
     });
@@ -227,7 +233,8 @@ export default function logicTest() {
     it('country_detect', 0, () => {
       expect(NodeCountryPolicy.detect('🇭🇰 香港 IEPL 01').code).assertEqual('HK');
       expect(NodeCountryPolicy.detect('Japan Tokyo 02').code).assertEqual('JP');
-      expect(NodeCountryPolicy.detect('unknown-node').code).assertEqual('XX');
+      expect(NodeCountryPolicy.detect('DE Frankfurt 01').code).assertEqual('DE');
+      expect(NodeCountryPolicy.detect('zzz-01').code).assertEqual('XX');
     });
 
     it('log_redact', 0, () => {
@@ -244,10 +251,11 @@ export default function logicTest() {
     });
 
     it('latency_style', 0, () => {
-      expect(LatencyStyle.color(null)).assertEqual('#A7AFC2');
-      expect(LatencyStyle.color(120)).assertEqual('#29C978');
-      expect(LatencyStyle.color(200)).assertEqual('#F3B83F');
-      expect(LatencyStyle.color(400)).assertEqual('#E35D6A');
+      expect(LatencyStyle.color(null) === Ui.textSecondary).assertTrue();
+      expect(LatencyStyle.color(120) === Ui.success).assertTrue();
+      expect(LatencyStyle.color(200) === Ui.success).assertTrue();
+      expect(LatencyStyle.color(400) === Ui.warning).assertTrue();
+      expect(LatencyStyle.color(900) === Ui.error).assertTrue();
       expect(LatencyStyle.text(-1)).assertEqual('超时');
       expect(LatencyStyle.text(null)).assertEqual('--');
     });
@@ -271,27 +279,19 @@ export default function logicTest() {
         "  - {name: 'A', type: ss, server: a.com, port: 1, cipher: aes-128-gcm, password: p}\n" +
         "  - {name: 'B', type: ss, server: b.com, port: 2, cipher: aes-128-gcm, password: p}\n";
       const yaml2 = 'proxies:\n' +
+        "  - {name: 'A', type: ss, server: a.com, port: 1, cipher: aes-128-gcm, password: p}\n" +
         "  - {name: 'A-2', type: ss, server: a.com, port: 1, cipher: aes-128-gcm, password: p}\n" +
         "  - {name: 'C', type: ss, server: c.com, port: 3, cipher: aes-128-gcm, password: p}\n";
       // 第一次合并
       const first = YamlMerger.merge([yaml1], 'subA', '');
       expect(first.length).assertEqual(2);
-      // 第二次刷新（A 内容不变 → 名称保留；C 为新节点）
+      // 第二次合并（名称含在 identityFingerprint 中：同指纹保留原名 A，同名端点不同名 A-2 独立保留，C 为新节点）
       const second = YamlMerger.merge([yaml2], 'subA', YamlMerger.toYaml(first));
-      expect(second.length).assertEqual(2);
-      let hasA = false;
-      let hasC = false;
-      for (const m of second) {
-        if (m.server === 'a.com') {
-          hasA = true;
-          expect(m.name).assertEqual('A');
-        }
-        if (m.server === 'c.com') {
-          hasC = true;
-        }
-      }
-      expect(hasA).assertTrue();
-      expect(hasC).assertTrue();
+      expect(second.length).assertEqual(3);
+      const names = second.map((m) => m.name);
+      expect(names.includes('A')).assertTrue();
+      expect(names.includes('A-2')).assertTrue();
+      expect(names.includes('C')).assertTrue();
     });
 
     it('mixed_protocol_yaml_skips_bad_nodes_and_roundtrips_options', 0, () => {
@@ -365,7 +365,7 @@ export default function logicTest() {
       expect(n?.obfsParam ?? '').assertEqual('abc123');
       expect(n?.hyUp ?? '').assertEqual('114');
       expect(n?.hyDown ?? '').assertEqual('514');
-      expect(n?.clientFingerprint ?? '').assertEqual('deadbeef');
+      expect(n?.certFingerprint ?? '').assertEqual('deadbeef');
       // 2) 配置生成：键名 sni/fingerprint/obfs-password/up/down 正确
       const line = ClashConfigGenerator.proxyYamlLine(n!);
       expect(line.includes('type: hysteria2')).assertTrue();
@@ -398,11 +398,12 @@ export default function logicTest() {
         .assertEqual('sub.example.com');
       expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://a.com/x')).assertTrue();
       expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('ftp://a.com')).assertFalse();
-      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('http://a.com/x')).assertFalse();
+      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('http://a.com/x')).assertTrue();
       expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://localhost/x')).assertFalse();
       expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://127.0.0.1/x')).assertFalse();
       expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://192.168.1.1/x')).assertFalse();
-      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://a.com:8443/x')).assertFalse();
+      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://a.com:8443/x')).assertTrue();
+      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://a.com:70000/x')).assertFalse();
     });
 
     it('subscription_ip_policy_rejects_reserved_ranges', 0, () => {
@@ -426,20 +427,19 @@ export default function logicTest() {
       expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('https://[fe80::1]/sub')).assertFalse();
     });
 
-    it('subscription_http_requires_explicit_risk_and_drops_sensitive_header', 0, () => {
-      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('http://a.com/x')).assertFalse();
-      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('http://a.com/x', true)).assertTrue();
-      expect(SubscriptionFetchPolicy.maySendCustomHeader('https://a.com/x', 'Authorization')).assertTrue();
+    it('subscription_http_allowed_public_and_drops_sensitive_header', 0, () => {
+      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('http://a.com/x')).assertTrue();
+      expect(SubscriptionFetchPolicy.isValidSubscriptionUrl('http://127.0.0.1/x')).assertFalse();
+      // 自定义请求头透传已整体删除（FlClash 同构：唯一放行的是 URL userinfo 派生的 Basic）。
+      expect(SubscriptionFetchPolicy.maySendCustomHeader('https://a.com/x', 'Authorization')).assertFalse();
       expect(SubscriptionFetchPolicy.maySendCustomHeader('http://a.com/x', 'Authorization')).assertFalse();
     });
 
-    it('subscription_limits_response_fields_and_nodes', 0, () => {
+    it('subscription_limits_response_and_fields', 0, () => {
       expect(SubscriptionFetchPolicy.isResponseSizeAllowed(1024)).assertTrue();
       expect(SubscriptionFetchPolicy.isResponseSizeAllowed(8 * 1024 * 1024 + 1)).assertFalse();
       expect(SubscriptionFetchPolicy.isFieldLengthAllowed('a'.repeat(4096))).assertTrue();
       expect(SubscriptionFetchPolicy.isFieldLengthAllowed('a'.repeat(4097))).assertFalse();
-      expect(SubscriptionFetchPolicy.isNodeCountAllowed(2000)).assertTrue();
-      expect(SubscriptionFetchPolicy.isNodeCountAllowed(2001)).assertFalse();
     });
 
     it('subscription_userinfo_parses_traffic_and_expiry', 0, () => {
@@ -610,6 +610,8 @@ export default function logicTest() {
       const def = AppSettings.fromJson(new AppSettings().toJson());
       expect(def.nodeSortMode).assertEqual(NodeSortModes.DEFAULT);
       expect(def.nodeSortSnapshot).assertEqual('');
+      expect(def.ipv6Enabled).assertFalse();
+      expect(def.dnsOverrideEnabled).assertFalse();
     });
 
     it('preferred_node_memory_is_scoped_per_subscription', 0, () => {
@@ -647,11 +649,13 @@ export default function logicTest() {
       // type 枚举派生 ss/ssr
       expect(NodeProtocolPolicy.resolve('', 'ss', '', '').label).assertEqual('SS');
       expect(NodeProtocolPolicy.resolve('', 'ssr', '', '').label).assertEqual('SSR');
-      // 未知值兜底
-      const unknown = NodeProtocolPolicy.resolve('gibberish', '', '', '');
-      expect(unknown.key).assertEqual('');
-      expect(unknown.label).assertEqual('未知');
-      expect(NodeProtocolPolicy.resolve('', '', '', '').label).assertEqual('未知');
+      // 未知协议保留原键名并大写展示；空串兜底「未知」
+      const custom = NodeProtocolPolicy.resolve('gibberish', '', '', '');
+      expect(custom.key).assertEqual('gibberish');
+      expect(custom.label).assertEqual('GIBBERISH');
+      const empty = NodeProtocolPolicy.resolve('', '', '', '');
+      expect(empty.key).assertEqual('');
+      expect(empty.label).assertEqual('未知');
       // REALITY: vless + 公钥/短id
       const reality = NodeProtocolPolicy.resolve('vless', '', 'PUBKEY', '');
       expect(reality.reality).assertTrue();
@@ -692,8 +696,29 @@ export default function logicTest() {
       expect(removed.length).assertEqual(1);
       expect(removed[0]).assertEqual(PRIVATE_CONFIG_FILE);
       expect(mem.exists('/cache/mihomo_config.yaml')).assertFalse();
-      // 每个目标文件都被尝试过（缺失也要尝试，才能覆盖后续创建的文件）
-      expect(mem.removeCalls).assertEqual(5);
+      // 每个目标文件都被尝试过（缺失也要尝试，才能覆盖后续创建的文件）：
+      // 主配置 + 旧版固定名测速配置 + 6 个隧道状态文件
+      expect(mem.removeCalls).assertEqual(2 + TUNNEL_STATE_FILES.length);
+    });
+
+    // 2026-11-11 真机：测速配置共用一个文件名时，退出中的旧扩展会删掉新一轮刚写的配置
+    it('test_config_name_is_per_launch_and_recognised', 0, () => {
+      const a = testConfigFileName('mhw3k2a1-1-9zz');
+      const b = testConfigFileName('mhw3k2a1-2-a01');
+      expect(a).assertEqual('mihomo_test_config.mhw3k2a1-1-9zz.yaml');
+      expect(a === b).assertFalse();
+      // 路径字符一律清洗掉；清洗后为空退回旧固定名
+      expect(testConfigFileName('A/../b c')).assertEqual('mihomo_test_config.abc.yaml');
+      expect(testConfigFileName('../')).assertEqual(PRIVATE_TEST_CONFIG_FILE);
+      // 新旧两种名字都认；隧道配置及其 .next/.lastgood 绝不能被认成测速配置
+      expect(isTestConfigFileName(a)).assertTrue();
+      expect(isTestConfigFileName(PRIVATE_TEST_CONFIG_FILE)).assertTrue();
+      expect(isTestConfigPath(`/data/storage/el2/base/haps/entry/cache/${a}`)).assertTrue();
+      expect(isTestConfigFileName(PRIVATE_CONFIG_FILE)).assertFalse();
+      expect(isTestConfigFileName('mihomo_config.yaml.next')).assertFalse();
+      expect(isTestConfigFileName('mihomo_config.yaml.lastgood')).assertFalse();
+      expect(isTestConfigFileName('mihomo_test_config.yaml.bak')).assertFalse();
+      expect(isTestConfigPath('/cache/mihomo_config.yaml')).assertFalse();
     });
 
     it('cleanup_continues_when_one_delete_fails', 0, () => {
@@ -904,7 +929,7 @@ export default function logicTest() {
       expect(normalizeNetType([BEARER_WIFI, BEARER_ETHERNET], true)).assertEqual(NetTypes.WIFI);
       expect(normalizeNetType([BEARER_VPN, BEARER_CELLULAR], true)).assertEqual(NetTypes.CELLULAR);
       // 默认去抖窗口
-      expect(NET_DEBOUNCE_MS).assertEqual(1500);
+      expect(NET_DEBOUNCE_MS).assertEqual(200);
     });
 
     // ── NetworkStateWatcher：shouldEmit 去抖全分支 ──────────────────
@@ -917,9 +942,9 @@ export default function logicTest() {
       expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, 10, 0)).assertTrue();
       // 时钟回拨 → 不阻塞上报
       expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, -5, NET_DEBOUNCE_MS)).assertTrue();
-      // 窗口内 → 抑制；达窗口 → 上报（边界 1499/1500）
-      expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, 1499, NET_DEBOUNCE_MS)).assertFalse();
-      expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, 1500, NET_DEBOUNCE_MS)).assertTrue();
+      // 窗口内 → 抑制；达窗口 → 上报（边界 NET_DEBOUNCE_MS - 1 / NET_DEBOUNCE_MS）
+      expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, NET_DEBOUNCE_MS - 1, NET_DEBOUNCE_MS)).assertFalse();
+      expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, NET_DEBOUNCE_MS, NET_DEBOUNCE_MS)).assertTrue();
       // 自定义窗口生效
       expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, 300, 300)).assertTrue();
       expect(shouldEmit(NetTypes.WIFI, NetTypes.CELLULAR, 299, 300)).assertFalse();

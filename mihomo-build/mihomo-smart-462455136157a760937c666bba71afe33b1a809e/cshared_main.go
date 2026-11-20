@@ -263,7 +263,9 @@ func redirectCoreLogs(homeDir string) {
 
 //export TunBoxInit
 func TunBoxInit(homeDir *C.char, configFile *C.char) {
-	redirectCoreLogs(C.GoString(homeDir))
+	// Do not bind coreLogOnce to homeDir here: UI-process helpers (fetch/validate/decode)
+	// and IsolatedLatencyCore share loadCore(), while :vpn writes cache/core.log and
+	// IsolatedLatencyCore writes cache/isolated-latency/core.log in TunBoxStart.
 	bridge.Init(C.GoString(homeDir), C.GoString(configFile))
 }
 

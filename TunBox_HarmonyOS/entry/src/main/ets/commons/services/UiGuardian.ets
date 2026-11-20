@@ -115,6 +115,8 @@ export class UiGuardian {
   private static watchdogAttempts: number = 0;
   private static missingSince: number = 0;
   private static suspended: boolean = false;
+  /** dataTransfer 因低速率/无进度被取消后，下一次退避重挂优先尝试 taskKeeping（不可用再回退 dataTransfer）。 */
+  private static preferTaskKeepingOnce: boolean = false;
 
   /**
    * **全工程唯一**的长时任务申请入口（唯一调用 startBackgroundRunning 的地方）。
@@ -202,11 +204,38 @@ export class UiGuardian {
       return result;
     }
 
-    // ① 优先 dataTransfer —— 通知栏右侧圆环（实况窗）只有这个类型能写：
-    //    官方规范允许 DATA_TRANSFER 更新通知进度，而 taskKeeping 明令禁止改通知内容。
-    //    代价是低速率场景下可能被系统判成「无进度」取消任务，故保留 5 分钟进度
-    //    心跳（TaskProgressUpdater），并由 UiGuardian 看门狗重挂兜底。
-    if (generation !== UiGuardian.generation) { return new ContinuousTaskApplyResult(); }
+    // ① 正常路径优先 dataTransfer（实况窗 LIVE_VIEW + 右侧配额圆环），失败回退 taskKeeping；
+    // ② 若刚因 dataTransfer 低速率/无进度被系统取消，退避后重挂优先尝试 taskKeeping
+    //    （具备授权的设备可彻底避开低速率限流），失败再回退 dataTransfer。
+    const tryTaskKeepingFirst: boolean = UiGuardian.preferTaskKeepingOnce;
+    UiGuardian.preferTaskKeepingOnce = false;
+    if (tryTaskKeepingFirst) {
+      const tk = await UiGuardian.tryStartTaskKeeping(context, generation, agent);
+      if (tk.ok || generation !== UiGuardian.generation) { return tk; }
+      const dt = await UiGuardian.tryStartDataTransfer(context, generation, agent);
+      if (dt.ok || generation !== UiGuardian.generation) { return dt; }
+      result.ok = false;
+      result.kind = ContinuousTaskKind.NONE;
+      result.detail = `both taskKeeping and dataTransfer failed: ${tk.detail} | ${dt.detail}`;
+      AppLogger.warn(TAG, `continuous task registration failed: ${result.detail}`);
+      return result;
+    }
+
+    const dt = await UiGuardian.tryStartDataTransfer(context, generation, agent);
+    if (dt.ok || generation !== UiGuardian.generation) { return dt; }
+    const tk = await UiGuardian.tryStartTaskKeeping(context, generation, agent);
+    if (tk.ok || generation !== UiGuardian.generation) { return tk; }
+    result.ok = false;
+    result.kind = ContinuousTaskKind.NONE;
+    result.detail = `both dataTransfer and taskKeeping failed: ${tk.detail}`;
+    AppLogger.warn(TAG, `continuous task registration failed: ${result.detail}`);
+    return result;
+  }
+
+  private static async tryStartDataTransfer(context: Context, generation: number,
+    agent: WantAgent): Promise<ContinuousTaskApplyResult> {
+    const result: ContinuousTaskApplyResult = new ContinuousTaskApplyResult();
+    if (generation !== UiGuardian.generation) { return result; }
     try {
       const modes: string[] = ['dataTransfer'];
       const res = await backgroundTaskManager.startBackgroundRunning(context, modes, agent);
@@ -216,16 +245,22 @@ export class UiGuardian {
       result.continuousTaskId = res?.continuousTaskId ?? -1;
       result.detail = 'dataTransfer';
       await UiGuardian.acceptApplication(context, generation, result);
-      AppLogger.info(TAG, 'continuous task registered (type=dataTransfer, live view + quota ring)');
+      if (result.ok) {
+        AppLogger.info(TAG, 'continuous task registered (type=dataTransfer, live view + quota ring)');
+      }
       return result;
     } catch (e) {
+      result.detail = AppLogger.errText(e);
       AppLogger.warn(TAG,
-        `dataTransfer continuous task request failed, falling back to taskKeeping: ${AppLogger.errText(e)}`);
+        `dataTransfer continuous task request failed, falling back to taskKeeping: ${result.detail}`);
+      return result;
     }
+  }
 
-    // ② 回退 taskKeeping（需要受限权限 ohos.permission.KEEP_BACKGROUND_RUNNING_SYSTEM，
-    //    多数设备拿不到；挂上时通知栏是「系统卡 + 应用卡」两条，没有圆环）
-    if (generation !== UiGuardian.generation) { return new ContinuousTaskApplyResult(); }
+  private static async tryStartTaskKeeping(context: Context, generation: number,
+    agent: WantAgent): Promise<ContinuousTaskApplyResult> {
+    const result: ContinuousTaskApplyResult = new ContinuousTaskApplyResult();
+    if (generation !== UiGuardian.generation) { return result; }
     try {
       const request = new backgroundTaskManager.ContinuousTaskRequest();
       request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_TASK_KEEPING];
@@ -238,13 +273,14 @@ export class UiGuardian {
       result.continuousTaskId = res?.continuousTaskId ?? -1;
       result.detail = 'taskKeeping';
       await UiGuardian.acceptApplication(context, generation, result);
-      AppLogger.info(TAG, 'continuous task registered (type=taskKeeping submode=normalNotification, fallback)');
+      if (result.ok) {
+        AppLogger.info(TAG, 'continuous task registered (type=taskKeeping submode=normalNotification, fallback)');
+      }
       return result;
     } catch (e) {
       result.ok = false;
       result.kind = ContinuousTaskKind.NONE;
-      result.detail = `both dataTransfer and taskKeeping failed: ${AppLogger.errText(e)}`;
-      AppLogger.warn(TAG, `continuous task registration failed: ${result.detail}`);
+      result.detail = AppLogger.errText(e);
       return result;
     }
   }
@@ -276,6 +312,7 @@ export class UiGuardian {
     UiGuardian.missingSince = 0;
     UiGuardian.watchdogAttempts = 0;
     UiGuardian.suspended = false;
+    UiGuardian.preferTaskKeepingOnce = false;
     // 进度心跳按类型分叉：dataTransfer 接管通知 id 推实况窗；taskKeeping 不碰通知内容。
     TaskProgressUpdater.attach(result.notificationId, result.kind);
   }
@@ -360,7 +397,8 @@ export class UiGuardian {
       if (!await check()) { return; }
       if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
       // Query failure is unknown, never proof that the task is missing.
-      const tasks = await backgroundTaskManager.getAllContinuousTasks(context);
+      // Pass includeSuspended=true (API 20+) so suspended tasks stay observable instead of looking missing.
+      const tasks = await backgroundTaskManager.getAllContinuousTasks(context, true);
       if (generation !== UiGuardian.generation || UiGuardian.autoEngageSuppressed) { return; }
       for (const task of tasks) {
         const ownsTask = UiGuardian.lastContinuousTaskId >= 0
@@ -507,6 +545,9 @@ export class UiGuardian {
       // 系统取消事件已经确认任务缺失，下一次自检只需等同一轮退避。
       UiGuardian.missingSince = Date.now();
       UiGuardian.earliestRearmAt = Date.now() + verdict.backoffMs;
+      if (verdict.preferFallbackMode === true) {
+        UiGuardian.preferTaskKeepingOnce = true;
+      }
       AppLogger.info(TAG,
         `guardian auto re-arm allowed after backoff: category=${verdict.category} reason=${verdict.reasonCode} `
         + `backoff=${verdict.backoffMs}ms earliestRearmAt=${UiGuardian.earliestRearmAt}`);
@@ -544,9 +585,10 @@ export class UiGuardian {
         + `summary=${verdict.summary}; app loses the "never suspended" protection while suspended`);
       return;
     }
-    // 恢复：任务重新激活 → 重新记账（dataTransfer 还要把进度心跳接回来）
+    // 恢复：任务重新激活 → 重新记账（dataTransfer 还要把进度心跳接回来；已挂则不重复重置 5 分钟心跳）
     UiGuardian.registered = true;
-    if (UiGuardian.currentKind === ContinuousTaskKind.DATA_TRANSFER && UiGuardian.lastNotificationId >= 0) {
+    if (UiGuardian.currentKind === ContinuousTaskKind.DATA_TRANSFER
+      && !TaskProgressUpdater.isActive() && UiGuardian.lastNotificationId >= 0) {
       TaskProgressUpdater.attach(UiGuardian.lastNotificationId, UiGuardian.currentKind);
     }
     AppLogger.info(TAG, `guardian resumed: type=${UiGuardian.currentKind} (accounting restored)`);
@@ -587,6 +629,7 @@ export class UiGuardian {
     UiGuardian.retireCurrentTask();
     UiGuardian.lastContinuousTaskId = -1;
     UiGuardian.earliestRearmAt = 0;
+    UiGuardian.preferTaskKeepingOnce = false;
     TaskProgressUpdater.detach();
   }
 
@@ -626,6 +669,7 @@ export class UiGuardian {
     UiGuardian.earliestRearmAt = 0;
     UiGuardian.missingSince = 0;
     UiGuardian.watchdogAttempts = 0;
+    UiGuardian.preferTaskKeepingOnce = false;
   }
 
   static isAutoEngageSuppressed(): boolean {

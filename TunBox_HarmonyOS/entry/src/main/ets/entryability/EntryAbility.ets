@@ -12,14 +12,15 @@ import { TrafficStatsStore } from '../commons/services/TrafficStatsStore';
 import { SubscriptionService } from '../commons/services/SubscriptionService';
 import { ConnectionOrchestrator } from '../commons/services/ConnectionOrchestrator';
 import { UiGuardian } from '../commons/services/UiGuardian';
+import { TaskProgressUpdater } from '../commons/services/TaskProgressUpdater';
 import { BackgroundTaskWatch } from '../commons/services/BackgroundTaskWatch';
 import { SubscriptionUpdateScheduler } from '../commons/services/SubscriptionUpdateScheduler';
 import { GeoDataInstaller } from '../commons/services/GeoDataInstaller';
-import { BackgroundLatencyService } from '../commons/services/BackgroundLatencyService';
 import { AppLogger } from '../commons/utils/AppLogger';
 import { PersistentLogStore } from '../commons/services/PersistentLogStore';
 import { ThemeService } from '../theme/ThemeService';
 import { SafeArea } from '../theme/SafeArea';
+import { TunBoxMotion } from '../theme/TunBoxTokens';
 
 
 const TAG = 'EntryAbility';
@@ -29,56 +30,17 @@ export default class EntryAbility extends UIAbility {
   private windowReady: boolean = false;
   /** 自愈编排单航班：冷启动与回前台都走它，避免重复拉起隧道 */
   private healTask: Promise<string> | null = null;
-  /** 冷启动空闲预热测速通道是否已排入（进程内只排一次） */
-  private latencyPrewarmScheduled: boolean = false;
-
-  /**
-   * 按屏幕对角线英寸设置转场时长的规范下限（华为应用市场上架要求）：
-   * < 8.5" → 200ms；8.5~12" → 250ms；> 12" → 300ms。
-   * 实际时长由 TunBoxMotion.ms 取 max(260 设计基线, 该下限)。
-   *
-   * 英寸换算：vp = px / densityPixels；1 英寸 = 160vp（display 的 density 以 160 为基准）。
-   */
-  /**
-   * 按屏幕对角线英寸设置转场时长的规范下限（AGC 审核意见 2026-10-23）：
-   * < 8.5" → 200ms；8.5~12" → 250ms；> 12" → 300ms。
-   * 实际时长由 TunBoxMotion.ms 取 max(260 设计基线, 该下限)。
-   *
-   * 英寸换算必须用**物理像素 + 真实 DPI**：
-   *   inches = sqrt(widthPx² + heightPx²) / densityDPI
-   * 旧实现用 densityPixels 把 px 折成 vp 再除 160，而 densityPixels 会被系统
-   * 显示缩放（字体/显示大小/折叠屏比例）改写——12.6" 平板会被算成 9.4"，
-   * 转场落在 250ms 档，低于 >12" 要求的 300ms，正是本次审核被点名的原因。
-   */
+  /** AGC 物理屏幕分档；逻辑 densityDPI/显示缩放不能用于计算英寸。 */
   private applyMotionFloorByScreenSize(): void {
+    let floor: number = 300;
     try {
       const d = display.getDefaultDisplaySync();
-      let inches: number;
-      const dpi = d.densityDPI > 0 ? d.densityDPI : (d.xDPI > 0 ? d.xDPI : 0);
-      let basis: string;
-      if (dpi > 0) {
-        inches = Math.sqrt(d.width * d.width + d.height * d.height) / dpi;
-        basis = `${d.width}x${d.height}px @${dpi}dpi`;
-      } else {
-        // 极端兜底：DPI 拿不到时退回 vp/160（只用于老设备/模拟器）
-        const density = d.densityPixels > 0 ? d.densityPixels : 3;
-        const wVp = d.width / density;
-        const hVp = d.height / density;
-        inches = Math.sqrt(wVp * wVp + hVp * hVp) / 160;
-        basis = `${wVp.toFixed(0)}x${hVp.toFixed(0)}vp(兜底)`;
-      }
-      let floor = 200;
-      if (inches > 12) {
-        floor = 300;
-      } else if (inches >= 8.5) {
-        floor = 250;
-      }
-      AppStorage.setOrCreate<number>('tb_motion_required_ms', floor);
-      AppLogger.info(TAG, `screen ${basis} ≈ ${inches.toFixed(2)}in → motion floor ${floor}ms`);
+      floor = TunBoxMotion.requiredMs(d.width, d.height, d.xDPI, d.yDPI);
     } catch (e) {
-      // 拿不到 display 时保持设计基线（260ms），不阻断启动
-      AppLogger.warn(TAG, `display probe failed: ${AppLogger.errText(e)}`);
+      // 无法确定物理尺寸时使用最大档，不能让未知大屏退回手机时长。
+      AppLogger.warn(TAG, 'display size unavailable; use 300ms page transitions');
     }
+    AppStorage.setOrCreate<number>('tb_motion_required_ms', floor);
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
@@ -118,43 +80,7 @@ export default class EntryAbility extends UIAbility {
     SubscriptionUpdateScheduler.instance().onAppStart(this.context);
     // 冷启动先接管活会话；进程已退出时按未结束的持久意图进入有限恢复。
     this.scheduleSelfHeal('cold-start');
-    this.scheduleLatencyPrewarm();
-  }
-
-  /**
-   * 冷启动后**空闲预热测速通道**（2026-10-26，用户要求「点了测速立刻开测」；
-   * 2026-11-12 按审计第 2 项调整触发点）。
-   *
-   * 未连接时测速走 headless 测速内核，冷启动这套流程（读 1.1MB profile →
-   * 合并生成配置 → 停/启扩展 → 就绪轮询 → 预热窗口）在真机上要 2~5s，
-   * 用户看到的就是「点测速 → 准备测速通道… → 等好几秒」。三家客户端的内核本就常驻，
-   * 不存在这个等待。
-   *
-   * 这里把这段准备挪到**用户还没点测速**的时候：
-   *  - 触发点：等 `SubscriptionService.init()` 的进程内记忆化 Promise 落定后
-   *    **让出一帧**再预热。原实现是「onCreate 末尾起一个固定 1s 定时器」，与订阅
-   *    初始化、首帧都无关联；真机上订阅与首屏约 0.4s 就绪，定时器还要空等 ~0.6s
-   *    （2026-11-12 审计归因）。让出一帧是因为预热里读 profile + 生成配置
-   *    有主线程同步段，不能和首帧抢同一帧；
-   *  - 只预热、不探测：`prewarmChannel` 不写任何延迟结论、不动排序；
-   *  - 已连接/连接中：`ensureTestCore` 的安全门禁直接跳过，不会碰用户的隧道；
-   *  - 失败静默：预热失败不影响任何功能，用户真点测速时照常按需启动。
-   */
-  private scheduleLatencyPrewarm(): void {
-    if (this.latencyPrewarmScheduled) {
-      return;
-    }
-    this.latencyPrewarmScheduled = true;
-    SubscriptionService.instance().init(this.context).then((): void => {
-      // 让出一帧：预热的配置生成有主线程同步段，不能和首帧抢同一帧
-      setTimeout((): void => {
-        BackgroundLatencyService.prewarmChannel(this.context).catch((e: Object): void => {
-          AppLogger.warn(TAG, `latency prewarm failed: ${AppLogger.errText(e)}`);
-        });
-      }, 0);
-    }).catch((e: Object): void => {
-      AppLogger.warn(TAG, `latency prewarm skipped: ${AppLogger.errText(e)}`);
-    });
+    // Entry 冷启动不再预热测速核；保留既有按需入口和订阅变更处理，避免与首屏争抢资源。
   }
 
   onSaveState(reason: AbilityConstant.StateType, wantParam: Record<string, Object>): AbilityConstant.OnSaveResult {
@@ -178,6 +104,9 @@ export default class EntryAbility extends UIAbility {
    * 只有磁盘上的用户意图 + 跨进程心跳租约还在 —— 自愈判定正是基于这两者。
    */
   onForeground(): void {
+    ConnectionOrchestrator.instance().setAppBackground(false);
+    TaskProgressUpdater.setBackground(false);
+    TrafficStatsStore.setAppBackground(false);
     this.publishPendingWant();
     // 订阅自动刷新的前台兜底（双轨触发之二，5 分钟节流）：
     // WorkScheduler 实际触发时机受系统调度影响，回前台立刻补一次过期检查。
@@ -194,12 +123,15 @@ export default class EntryAbility extends UIAbility {
    * 这里在配置回调里把新配色交给 ThemeService（它会重刷系统栏并递增 theme_revision）。
    */
   onConfigurationUpdate(newConfig: Configuration): void {
+    this.applyMotionFloorByScreenSize();
     ThemeService.onSystemColorModeChanged(newConfig.colorMode).catch((e: Object): void => {
       AppLogger.warn(TAG, `theme system bar sync failed: ${AppLogger.errText(e)}`);
     });
   }
 
   onBackground(): void {
+    ConnectionOrchestrator.instance().setAppBackground(true);
+    TaskProgressUpdater.setBackground(true);
     PersistentLogStore.flush();
     // 设置采用「内存 → 合并 → 防抖落盘」（2026-10-27 写放大整治）：
     // 进后台是最后一个可靠的刷盘点，必须强制落盘，否则防抖窗口内的改动会丢。
@@ -209,6 +141,7 @@ export default class EntryAbility extends UIAbility {
     // 流量记账同理：进后台是最后一个可靠刷盘点。内核累计计数器只在隧道存活期间有效，
     // 若不在此把增量补齐落盘，App 随后被系统回收就会把这段流量永久丢掉。
     TrafficStatsStore.flushNow();
+    TrafficStatsStore.setAppBackground(true);
     // 进后台时若隧道确实活着，补一次驻留凭证：UiGuardian.registered 是进程级静态
     // 布尔，进程重启后必然为 false，只有 HomePage 存在时才会被重新 engage ——
     // 卡片/快捷方式路径拉起的会话没有页面，这里兜住最后一环。
